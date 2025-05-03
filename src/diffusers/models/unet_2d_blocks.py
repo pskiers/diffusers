@@ -2175,8 +2175,8 @@ class CrossAttnUpBlock2D(nn.Module):
                     **ckpt_kwargs,
                 )
                 hidden_states = attn(
-                    hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
+                    hidden_states.to(attn.device),
+                    encoder_hidden_states=encoder_hidden_states.to(attn.device),
                     cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
                     encoder_attention_mask=encoder_attention_mask,

@@ -1,5 +1,9 @@
 # Initially taken from Github's Python gitignore file
 
+# Dreambooth
+examples/dreambooth/*/*.jpeg
+examples/dreambooth/lora-trained-xl/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
