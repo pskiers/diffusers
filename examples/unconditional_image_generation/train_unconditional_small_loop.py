@@ -260,6 +260,28 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+    parser.add_argument(
+        "--channels", nargs="+", type=int, default=[128, 128], required=False, help="Channels in each UNet block."
+    )
+    parser.add_argument(
+        "--down_block_types",
+        nargs="+",
+        type=str,
+        default=["AttnDownBlock2D", "DownBlock2D"],
+        required=False,
+        help="Down block types."
+    )
+    parser.add_argument(
+        "--up_block_types",
+        nargs="+",
+        type=str,
+        default=["UpBlock2D", "AttnUpBlock2D"],
+        required=False,
+        help="Up block types."
+    )
+    parser.add_argument("--T", type=int, default=3, help="T")
+    parser.add_argument("--n", type=int, default=6, help="n")
+    parser.add_argument("--N_supervision", type=int, default=4, help="N_supervision")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -355,27 +377,17 @@ def main(args):
 
     # Initialize the model
 
+    T=args.T
+    n=args.n
+    N_supervision=args.N_supervision
+
     sample_size = args.resolution
-    in_channels = 3
-    out_channels = 3
-    layers_per_block = 2
-    block_out_channels = (128, 128, 256, 256, 512, 512)
-    down_block_types = (
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-        "AttnDownBlock2D",
-        "DownBlock2D",
-    )
-    up_block_types = (
-        "UpBlock2D",
-        "AttnUpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-    )
+    in_channels = 3 + 3 + 3  # x, y, z - noisy input, pred noise, reasoning token
+    out_channels = 3 + 3 # y, z - pred noise, reasoning token
+    layers_per_block = 1
+    block_out_channels = args.channels
+    down_block_types = args.down_block_types
+    up_block_types = args.up_block_types
 
     if args.model_config_name_or_path is None:
         model = UNet2DModel(
@@ -387,12 +399,20 @@ def main(args):
             down_block_types=down_block_types,
             up_block_types=up_block_types,
         )
+        model.y_init = torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1), persistent=True)
+        model.z_init = torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1), persistent=True)
+
+        torch.save(model.y_init, os.path.join(args.output_dir, "y_init.pt"))
+        torch.save(model.z_init, os.path.join(args.output_dir, "z_init.pt"))
     else:
         config = UNet2DModel.load_config(args.model_config_name_or_path)
         model = UNet2DModel.from_config(config)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logger.info(f"Total number of parameters: {total_params}")
+    logger.info(f"Number of trainable parameters: {trainable_params}")
 
     if accelerator.is_main_process and args.logger == "wandb":
         accelerator.init_trackers(
@@ -534,8 +554,8 @@ def main(args):
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=(len(train_dataloader) * args.num_epochs),
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * N_supervision,
+        num_training_steps=(len(train_dataloader) * args.num_epochs * N_supervision),
     )
 
     # Prepare everything with our `accelerator`.
@@ -618,29 +638,50 @@ def main(args):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
+                model.old_forward = model.forward
+                def latent_recursion(model, x, y, z, timesteps, n=6):
+                    for _ in range(n):
+                        _, z = model.old_forward(torch.cat([x, y, z], dim=1), timesteps).sample.chunk(2, dim=1)
+                    y, _ = model.old_forward(torch.cat([x, y, z], dim=1), timesteps).sample.chunk(2, dim=1)
+                    return y, z
+
+                def deep_recursion(model, x, y, z, timesteps, n=6, T=3):
+                    x = x[:, :3]
+                    with torch.no_grad():
+                        for _ in range(T - 1):
+                            y, z = latent_recursion(model, x, y, z, timesteps, n)
+                    y, z = latent_recursion(model, x, y, z, timesteps, n)
+                    return y, y.detach(), z.detach()
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps).sample
+                # y, z = model.module.get_init_y_z(args.train_batch_size)
 
-                if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
-                elif args.prediction_type == "sample":
-                    alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
-                    )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
-                    loss = loss.mean()
-                else:
-                    raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                y = torch.cat([model.module.y_init for _ in range(args.train_batch_size)], dim=0).to(model.device)
+                z = torch.cat([model.module.z_init for _ in range(args.train_batch_size)], dim=0).to(model.device)
+                for _ in range(N_supervision):
 
-                accelerator.backward(loss)
+                    # model_output, y, z = model(noisy_images, timesteps, y=y, z=z)
+                    model_output, y, z = deep_recursion(model, noisy_images, y, z, timesteps, n, T)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    if args.prediction_type == "epsilon":
+                        loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        # use SNR weighting from distillation paper
+                        loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
+                        loss = loss.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -709,21 +750,28 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                with torch.no_grad():
-                    model_output = model(noisy_images, timesteps).sample
+                # y, z = model.module.get_init_y_z(args.train_batch_size)
 
-                if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
-                elif args.prediction_type == "sample":
-                    alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
-                    )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
-                    loss = loss.mean()
-                else:
-                    raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                y = torch.cat([model.module.y_init for _ in range(args.train_batch_size)], dim=0).to(model.device)
+                z = torch.cat([model.module.z_init for _ in range(args.train_batch_size)], dim=0).to(model.device)
+                for _ in range(N_supervision):
+
+                    # model_output, y, z = model(noisy_images, timesteps, y=y, z=z)
+                    with torch.no_grad():
+                        model_output, y, z = deep_recursion(model, noisy_images, y, z, timesteps, n, T)
+
+                    if args.prediction_type == "epsilon":
+                        loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        # use SNR weighting from distillation paper
+                        loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
+                        loss = loss.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
             logs = {"val/loss": loss.detach().item()}
             progress_bar.set_postfix(**logs)
@@ -738,6 +786,20 @@ def main(args):
                 if args.use_ema:
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
+
+                class OutputUnet:
+                    pass
+                def new_forward(sample, timesteps, *args, **kwargs):
+                    y = torch.cat([model.module.y_init for _ in range(sample.shape[0])], dim=0).to(unet.device)
+                    z = torch.cat([model.module.z_init for _ in range(sample.shape[0])], dim=0).to(unet.device)
+                    for _ in range(N_supervision):
+                        model_output, y, z = deep_recursion(unet, sample, y, z, timesteps, n, T)
+                    output = OutputUnet()
+                    output.sample = model_output
+                    return output
+                unet.old_forward = unet.forward
+                unet.forward = new_forward
+                unet.config.in_channels = 3
 
                 pipeline = DDPMPipeline(
                     unet=unet,
@@ -755,6 +817,9 @@ def main(args):
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
+
+                unet.forward = unet.old_forward
+                unet.config.in_channels = 9
 
                 # denormalize the images and save to tensorboard
                 images_processed = (images * 255).round().astype("uint8")
@@ -799,6 +864,81 @@ def main(args):
                     )
 
     accelerator.end_training()
+
+
+# class HMR_UNet(UNet2DModel):
+#     def __init__(
+#         self,
+#         *args,
+#         y_init=None,
+#         z_init=None,
+#         n=6,
+#         T=3,
+#         N_supervision=16,
+#         **kwargs
+#     ):
+#         super().__init__(*args, **kwargs)
+#         sample_size = kwargs["sample_size"]
+#         self.y_init = y_init if y_init is not None else torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=self.dtype), std=1), persistent=True)
+#         self.z_init = z_init if z_init is not None else torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=self.dtype), std=1), persistent=True)
+#         self.n = n
+#         self.T = T
+#         self.N_supervision = N_supervision
+
+
+#     def get_init_y_z(self, bs):
+#         y = torch.cat([self.y_init for _ in range(bs)], dim=0).to(self.device)
+#         z = torch.cat([self.z_init for _ in range(bs)], dim=0).to(self.device)
+#         return y, z
+
+#     def latent_recursion(self, x, y, z, *args, **kwargs):
+#         for _ in range(1):
+#             _, z = super().forward(torch.cat([x, y, z], dim=1), *args).sample.chunk(2, dim=1)
+#         y, _ = super().forward(torch.cat([x, y, z], dim=1), *args).sample.chunk(2, dim=1)
+#         return y, z
+
+#     def deep_recursion(self, x, y, z, *args, **kwargs):
+#         with torch.no_grad():
+#             for _ in range(self.T - 1):
+#                 y, z = self.latent_recursion(x, y, z, *args, **kwargs)
+#         y, z = self.latent_recursion(x, y, z, *args, **kwargs)
+#         return y, y.detach(), z.detach()
+
+#     def forward(self, x, *args, z=None, y=None, **kwargs):
+#         if z is None or y is None:
+#             y, z = self.get_init_y_z(x.shape[0])
+#             for _ in range(self.N_supervision):
+#                 model_output, y, z = self.deep_recursion(x, y, z, *args, **kwargs)
+#             return model_output
+#         else:
+#             return self.deep_recursion(x, y, z, *args, **kwargs)
+
+def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0):
+    # NOTE: PyTorch nn.init.trunc_normal_ is not mathematically correct, the std dev is not actually the std dev of initialized tensor
+    # This function is a PyTorch version of jax truncated normal init (default init method in flax)
+    # https://github.com/jax-ml/jax/blob/main/jax/_src/random.py#L807-L848
+    # https://github.com/jax-ml/jax/blob/main/jax/_src/nn/initializers.py#L162-L199
+
+    with torch.no_grad():
+        if std == 0:
+            tensor.zero_()
+        else:
+            sqrt2 = math.sqrt(2)
+            a = math.erf(lower / sqrt2)
+            b = math.erf(upper / sqrt2)
+            z = (b - a) / 2
+
+            c = (2 * math.pi) ** -0.5
+            pdf_u = c * math.exp(-0.5 * lower ** 2)
+            pdf_l = c * math.exp(-0.5 * upper ** 2)
+            comp_std = std / math.sqrt(1 - (upper * pdf_u - lower * pdf_l) / z - ((pdf_u - pdf_l) / z) ** 2)
+
+            tensor.uniform_(a, b)
+            tensor.erfinv_()
+            tensor.mul_(sqrt2 * comp_std)
+            tensor.clip_(lower * comp_std, upper * comp_std)
+
+    return tensor
 
 
 if __name__ == "__main__":

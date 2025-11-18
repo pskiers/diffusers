@@ -1,4 +1,15 @@
 # Initially taken from GitHub's Python gitignore file
+examples/**/*.jpg
+examples/**/*.jpeg
+examples/**/*.png
+examples/**/*.safetensors
+examples/**/*.bin
+examples/**/*.pkl
+examples/**/*.pt
+examples/**/*.json
+examples/**/*.tar.gz
+examples/**/cifar100/*
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
