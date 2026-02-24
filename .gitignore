@@ -9,7 +9,7 @@ examples/**/*.pt
 examples/**/*.json
 examples/**/*.tar.gz
 examples/**/cifar100/*
-
+examples/unconditional_image_generation/cache_dir
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
