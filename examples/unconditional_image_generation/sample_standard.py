@@ -41,15 +41,6 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
-        "--resolution",
-        type=int,
-        default=64,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
         "--prediction_type",
         type=str,
         default="epsilon",
@@ -115,8 +106,6 @@ def main(args):
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Initialize the model
-
-    sample_size = args.resolution
 
     model = UNet2DModel.from_pretrained(args.model_config_name_or_path)
 

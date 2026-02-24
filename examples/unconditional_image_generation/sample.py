@@ -35,6 +35,12 @@ def parse_args():
         help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
     )
     parser.add_argument(
+        "--model_z_y_path",
+        type=str,
+        default=None,
+        help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="ddpm-model-64",
@@ -124,11 +130,9 @@ def main(args):
     n=args.n
     N_supervision=args.N_supervision
 
-    sample_size = args.resolution
-
     model = UNet2DModel.from_pretrained(args.model_config_name_or_path)
-    model.y_init = torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1), persistent=True)
-    model.z_init = torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1), persistent=True)
+    model.y_init = torch.load(os.path.join(args.model_z_y_path, "y_init.pt"))
+    model.z_init = torch.load(os.path.join(args.model_z_y_path, "z_init.pt"))
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
