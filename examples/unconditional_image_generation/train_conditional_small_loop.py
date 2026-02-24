@@ -18,10 +18,11 @@ from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, AutoencoderKL
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -283,6 +284,19 @@ def parse_args():
     parser.add_argument("--n", type=int, default=6, help="n")
     parser.add_argument("--N_supervision", type=int, default=4, help="N_supervision")
     parser.add_argument("--num_classes", type=int, default=100, help="Number of classes")
+    parser.add_argument("--image_key", type=str, default="img", help="Image key in the dataset")
+    parser.add_argument("--class_key", type=str, default="fine_label", help="Image key in the dataset")
+    parser.add_argument(
+        "--vae_name",
+        type=str,
+        required=False,
+        default=None,
+        help="If doing ldm pass path to VAE here, otherwise don't set it to anything."
+    )
+    parser.add_argument("--input_channels", type=int, default=3, help="Number of input channels")
+    parser.add_argument("--test_split_name", type=str, default="test", help="Name of split to use for testing")
+    parser.add_argument("--epoch_max_batches_train", type=int, default=1000, help="Max number of batches per epoch for train")
+    parser.add_argument("--epoch_max_batches_eval", type=int, default=250, help="Max number of batches per epoch for eval")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -293,6 +307,54 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     return args
+
+
+class SafeIterator:
+    """
+    A wrapper around a DataLoader (or any iterator) that catches and skips
+    exceptions during iteration (like corrupted images in ImageNet).
+    """
+    def __init__(self, iterable, logger=None):
+        self.iterable = iterable
+        self.iterator = iter(iterable)
+        self.logger = logger
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            try:
+                return next(self.iterator)
+            except StopIteration:
+                raise
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"SafeIterator caught error: {e}. Skipping batch.")
+                else:
+                    print(f"SafeIterator caught error: {e}. Skipping batch.")
+
+
+class LimitedLoader:
+    """
+    Wraps a DataLoader to stop iteration after a fixed number of batches.
+    For 'short epochs' on huge datasets. Should be compatible with multigpu accelerate logic etc. (I hope).
+    """
+    def __init__(self, dataloader, limit_batches):
+        self.dataloader = dataloader
+        self.limit_batches = min(limit_batches, len(dataloader))
+
+    def __len__(self):
+        return self.limit_batches
+
+    def __iter__(self):
+        iterator = iter(self.dataloader)
+
+        for _ in range(self.limit_batches):
+            try:
+                yield next(iterator)
+            except StopIteration:
+                break
 
 
 def main(args):
@@ -382,9 +444,9 @@ def main(args):
     n=args.n
     N_supervision=args.N_supervision
 
-    sample_size = args.resolution
-    in_channels = 3 + 3 + 3  # x, y, z - noisy input, pred noise, reasoning token
-    out_channels = 3 + 3 # y, z - pred noise, reasoning token
+    sample_size = args.resolution if args.vae_name is None else args.resolution // 8
+    in_channels = args.input_channels * 3  # x, y, z - noisy input, pred noise, reasoning token
+    out_channels = args.input_channels * 2  # y, z - pred noise, reasoning token
     layers_per_block = 1
     block_out_channels = args.channels
     down_block_types = args.down_block_types
@@ -401,8 +463,8 @@ def main(args):
             up_block_types=up_block_types,
             num_class_embeds=args.num_classes
         )
-        model.y_init = trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1)
-        model.z_init = trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=model.dtype), std=1)
+        model.y_init = trunc_normal_init_(torch.empty((1, args.input_channels, sample_size, sample_size), dtype=model.dtype), std=1)
+        model.z_init = trunc_normal_init_(torch.empty((1, args.input_channels, sample_size, sample_size), dtype=model.dtype), std=1)
 
         torch.save(model.y_init, os.path.join(args.output_dir, "y_init.pt"))
         torch.save(model.z_init, os.path.join(args.output_dir, "z_init.pt"))
@@ -412,6 +474,14 @@ def main(args):
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    vae = None
+    if args.vae_name is not None:
+        vae = AutoencoderKL.from_pretrained(args.vae_name, cache_dir=args.cache_dir)
+        vae.requires_grad_(False)
+        vae_scaling_factor = vae.config.scaling_factor
+        vae.to(accelerator.device, dtype=torch.float32)
+        vae.eval()
 
     logger.info(f"Total number of parameters: {total_params}")
     logger.info(f"Number of trainable parameters: {trainable_params}")
@@ -507,7 +577,7 @@ def main(args):
             args.dataset_name,
             args.dataset_config_name,
             cache_dir=args.cache_dir,
-            split="test",
+            split=args.test_split_name,
         )
     else:
         dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
@@ -527,29 +597,35 @@ def main(args):
     )
     test_augmentations = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
 
     def transform_images(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["img"]]  # TODO maybe need to change for other
-        return {"input": images, "class": examples["fine_label"]}
+        images = [augmentations(image.convert("RGB")) for image in examples[args.image_key]]
+        return {"input": images, "class": examples[args.class_key]}
 
     def test_transform_images(examples):
-        images = [test_augmentations(image.convert("RGB")) for image in examples["img"]]  # TODO maybe need to change for other
-        return {"input": images, "class": examples["fine_label"]}
+        images = [test_augmentations(image.convert("RGB")) for image in examples[args.image_key]]
+        return {"input": images, "class": examples[args.class_key]}
 
-    logger.info(f"Dataset size: {len(dataset)}")
+    # logger.info(f"Dataset size: {len(dataset)}")
 
     dataset.set_transform(transform_images)
     test_dataset.set_transform(test_transform_images)
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+    train_dataloader = LimitedLoader(
+        torch.utils.data.DataLoader(
+            dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, drop_last=True
+        ),
+        limit_batches=args.epoch_max_batches_train,
     )
-    test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
+    test_dataloader = LimitedLoader(
+        torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers, drop_last=True
+        ),
+        limit_batches=args.epoch_max_batches_eval,
     )
 
     # Initialize the learning rate scheduler
@@ -619,15 +695,27 @@ def main(args):
         model.train()
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in SafeIterator(enumerate(train_dataloader), logger=logger):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
 
-            clean_images = batch["input"].to(weight_dtype)
+            clean_images = batch["input"]
             cond = batch["class"].to(model.device)
+
+            if vae is not None:
+                clean_images = clean_images.to(device=accelerator.device, dtype=vae.dtype)
+                with torch.no_grad():
+                    dist = vae.encode(clean_images).latent_dist
+                    latents = dist.sample()
+                    clean_images = latents * vae_scaling_factor
+                    clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
+            else:
+                clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
+
+
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
             bsz = clean_images.shape[0]
@@ -656,7 +744,7 @@ def main(args):
                     return y, z
 
                 def deep_recursion(model, x, y, z, timesteps, cond, n=6, T=3):
-                    x = x[:, :3]
+                    # x = x[:, :args.input_channels]
                     with torch.no_grad():
                         for _ in range(T - 1):
                             y, z = latent_recursion(model, x, y, z, timesteps, cond, n)
@@ -738,15 +826,26 @@ def main(args):
         model.eval()
         progress_bar = tqdm(total=len(test_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Eval epoch {epoch}")
-        for step, batch in enumerate(test_dataloader):
+        for step, batch in SafeIterator(enumerate(test_dataloader), logger=logger):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
 
-            clean_images = batch["input"].to(weight_dtype)
+            clean_images = batch["input"]
             cond = batch["class"].to(model.device)
+
+            if vae is not None:
+                clean_images = clean_images.to(device=accelerator.device, dtype=vae.dtype)
+                with torch.no_grad():
+                    dist = vae.encode(clean_images).latent_dist
+                    latents = dist.sample()
+                    clean_images = latents * vae_scaling_factor
+                    clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
+            else:
+                clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
+
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
             bsz = clean_images.shape[0]
@@ -785,6 +884,7 @@ def main(args):
                         raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
             logs = {"val/loss": loss.detach().item()}
+            progress_bar.update(1)
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
         progress_bar.close()
@@ -810,7 +910,7 @@ def main(args):
                     return output
                 unet.old_forward = unet.forward
                 unet.forward = new_forward
-                unet.config.in_channels = 3
+                unet.config.in_channels = args.input_channels
 
                 pipeline = DDPMPipeline(
                     unet=unet,
@@ -826,17 +926,24 @@ def main(args):
                     generator=generator,
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="np",
+                    output_type="pt",
                 ).images
+                if vae is not None:
+                    latents = images / vae_scaling_factor
+                    latents = latents.to(torch.float32)
+
+                    with torch.no_grad():
+                        images = vae.decode(latents).sample
+                images = (images / 2 + 0.5).clamp(0, 1).cpu().float()
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
                 unet.forward = unet.old_forward
-                unet.config.in_channels = 9
+                unet.config.in_channels = args.input_channels * 3
 
                 # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
+                # images_processed = (images * 255).round().astype("uint8")
 
                 if args.logger == "tensorboard":
                     if is_accelerate_version(">=", "0.17.0.dev0"):
@@ -846,10 +953,18 @@ def main(args):
                     tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
                 elif args.logger == "wandb":
                     # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
+                    n_images = len(images)
+                    n_cols = math.ceil(math.sqrt(n_images) * 1.5)
+                    image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=True)
                     accelerator.get_tracker("wandb").log(
-                        {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
+                        {"test_samples": wandb.Image(image_grid), "epoch": epoch},
                         step=global_step,
                     )
+                del pipeline
+                del images
+                if 'latents' in locals():
+                    del latents
+                torch.cuda.empty_cache()
 
             if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 # save the model
@@ -879,53 +994,6 @@ def main(args):
 
     accelerator.end_training()
 
-
-# class HMR_UNet(UNet2DModel):
-#     def __init__(
-#         self,
-#         *args,
-#         y_init=None,
-#         z_init=None,
-#         n=6,
-#         T=3,
-#         N_supervision=16,
-#         **kwargs
-#     ):
-#         super().__init__(*args, **kwargs)
-#         sample_size = kwargs["sample_size"]
-#         self.y_init = y_init if y_init is not None else torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=self.dtype), std=1), persistent=True)
-#         self.z_init = z_init if z_init is not None else torch.nn.Buffer(trunc_normal_init_(torch.empty((1, 3, sample_size, sample_size), dtype=self.dtype), std=1), persistent=True)
-#         self.n = n
-#         self.T = T
-#         self.N_supervision = N_supervision
-
-
-#     def get_init_y_z(self, bs):
-#         y = torch.cat([self.y_init for _ in range(bs)], dim=0).to(self.device)
-#         z = torch.cat([self.z_init for _ in range(bs)], dim=0).to(self.device)
-#         return y, z
-
-#     def latent_recursion(self, x, y, z, *args, **kwargs):
-#         for _ in range(1):
-#             _, z = super().forward(torch.cat([x, y, z], dim=1), *args).sample.chunk(2, dim=1)
-#         y, _ = super().forward(torch.cat([x, y, z], dim=1), *args).sample.chunk(2, dim=1)
-#         return y, z
-
-#     def deep_recursion(self, x, y, z, *args, **kwargs):
-#         with torch.no_grad():
-#             for _ in range(self.T - 1):
-#                 y, z = self.latent_recursion(x, y, z, *args, **kwargs)
-#         y, z = self.latent_recursion(x, y, z, *args, **kwargs)
-#         return y, y.detach(), z.detach()
-
-#     def forward(self, x, *args, z=None, y=None, **kwargs):
-#         if z is None or y is None:
-#             y, z = self.get_init_y_z(x.shape[0])
-#             for _ in range(self.N_supervision):
-#                 model_output, y, z = self.deep_recursion(x, y, z, *args, **kwargs)
-#             return model_output
-#         else:
-#             return self.deep_recursion(x, y, z, *args, **kwargs)
 
 def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0):
     # NOTE: PyTorch nn.init.trunc_normal_ is not mathematically correct, the std dev is not actually the std dev of initialized tensor
