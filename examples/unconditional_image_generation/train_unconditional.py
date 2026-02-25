@@ -260,6 +260,8 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+    parser.add_argument("--epoch_max_batches_train", type=int, default=1000, help="Max number of batches per epoch for train")
+    parser.add_argument("--epoch_max_batches_eval", type=int, default=250, help="Max number of batches per epoch for eval")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -270,6 +272,28 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     return args
+
+
+class LimitedLoader:
+    """
+    Wraps a DataLoader to stop iteration after a fixed number of batches.
+    For 'short epochs' on huge datasets. Should be compatible with multigpu accelerate logic etc. (I hope).
+    """
+    def __init__(self, dataloader, limit_batches):
+        self.dataloader = dataloader
+        self.limit_batches = min(limit_batches, len(dataloader))
+
+    def __len__(self):
+        return self.limit_batches
+
+    def __iter__(self):
+        iterator = iter(self.dataloader)
+
+        for _ in range(self.limit_batches):
+            try:
+                yield next(iterator)
+            except StopIteration:
+                break
 
 
 def main(args):
@@ -523,11 +547,17 @@ def main(args):
 
     dataset.set_transform(transform_images)
     test_dataset.set_transform(test_transform_images)
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+    train_dataloader = LimitedLoader(
+        torch.utils.data.DataLoader(
+            dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, drop_last=True
+        ),
+        limit_batches=args.epoch_max_batches_train,
     )
-    test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
+    test_dataloader = LimitedLoader(
+        torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers, drop_last=True
+        ),
+        limit_batches=args.epoch_max_batches_eval,
     )
 
     # Initialize the learning rate scheduler
