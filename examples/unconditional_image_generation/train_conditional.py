@@ -10,6 +10,7 @@ from pathlib import Path
 import accelerate
 import datasets
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -22,11 +23,12 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, AutoencoderKL
+from diffusers import DDPMPipeline, DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.configuration_utils import register_to_config
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -233,7 +235,7 @@ def parse_args():
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
+    parser.add_argument("--ddpm_beta_schedule", type=str, default="scaled_linear")  # scaled_linear for Latent Diffusion
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
@@ -275,6 +277,9 @@ def parse_args():
     parser.add_argument("--test_split_name", type=str, default="test", help="Name of split to use for testing")
     parser.add_argument("--epoch_max_batches_train", type=int, default=1000, help="Max number of batches per epoch for train")
     parser.add_argument("--epoch_max_batches_eval", type=int, default=250, help="Max number of batches per epoch for eval")
+
+    parser.add_argument("--cfg_drop_rate", type=float, default=0.1, help="Probability of dropping class labels for CFG.")
+    parser.add_argument("--guidance_scale", type=float, default=4.0, help="CFG guidance scale during evaluation.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -335,6 +340,84 @@ class LimitedLoader:
                 break
 
 
+class ImageNetDiffusionModel(UNet2DConditionModel):
+    @register_to_config
+    def __init__(
+        self,
+        num_classes=1000,
+        sample_size=64,
+        in_channels=3,
+        out_channels=3,
+        center_input_sample=False,
+        flip_sin_to_cos=True,
+        freq_shift=0,
+        down_block_types=(
+            "DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"
+        ),
+        up_block_types=(
+            "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"
+        ),
+        block_out_channels=(256, 512, 1024),
+        layers_per_block=3,
+        downsample_padding=1,
+        mid_block_scale_factor=1,
+        act_fn="silu",
+        norm_num_groups=32,
+        norm_eps=1e-5,
+        cross_attention_dim=1024,
+        attention_head_dim=8,
+        **kwargs,
+    ):
+        kwargs.pop("num_class_embeds", None)  # pop num_class_embeds if it exists to avoid conflict with UNet2DConditionModel
+        super().__init__(
+            sample_size=sample_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            center_input_sample=center_input_sample,
+            flip_sin_to_cos=flip_sin_to_cos,
+            freq_shift=freq_shift,
+            down_block_types=down_block_types,
+            up_block_types=up_block_types,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            downsample_padding=downsample_padding,
+            mid_block_scale_factor=mid_block_scale_factor,
+            act_fn=act_fn,
+            norm_num_groups=norm_num_groups,
+            norm_eps=norm_eps,
+            cross_attention_dim=cross_attention_dim,
+            attention_head_dim=attention_head_dim,
+            num_class_embeds=None,  # Explicitly tell parent NOT to build embeddings
+            **kwargs,
+        )
+
+        # Mapping class index -> Cross Attention vector.
+        # We add +1 to the num_classes to create a "null" slot for unconditional CFG generation.
+        self.class_embedding = nn.Embedding(num_classes + 1, cross_attention_dim)
+
+    def get_class_embed(self, sample, class_labels=None):
+        # By overriding this method and returning None, we forcefully disable
+        # the base UNet's default global timestep conditioning.
+        return None
+
+    def forward(self, sample, timestep, class_labels, **kwargs):
+        """
+        Args:
+            sample: The noisy image tensor (Batch, Channels, H, W)
+            timestep: The current timestep (Batch,)
+            class_labels: Class index for the conditional generation (Batch,)
+        """
+        # (Batch, 1, Cross_Attention_Dim)
+        encoder_hidden_states = self.class_embedding(class_labels).unsqueeze(1)
+
+        return super().forward(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            **kwargs,
+        )
+
+
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -373,7 +456,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), ImageNetDiffusionModel)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -383,7 +466,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = ImageNetDiffusionModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -421,39 +504,24 @@ def main(args):
     sample_size = args.resolution if args.vae_name is None else args.resolution // 8
     in_channels = args.input_channels
     out_channels = args.input_channels
-    # layers_per_block = 2
-    # block_out_channels = (128, 128, 256, 256, 512, 512)
-    # down_block_types = (
-    #     "DownBlock2D",
-    #     "DownBlock2D",
-    #     "DownBlock2D",
-    #     "DownBlock2D",
-    #     "AttnDownBlock2D",
-    #     "DownBlock2D",
-    # )
-    # up_block_types = (
-    #     "UpBlock2D",
-    #     "AttnUpBlock2D",
-    #     "UpBlock2D",
-    #     "UpBlock2D",
-    #     "UpBlock2D",
-    #     "UpBlock2D",
-    # )
+
     layers_per_block = 3
     block_out_channels = (256, 512, 1024)
     down_block_types =(
-        "AttnDownBlock2D",
         "DownBlock2D",
-        "AttnDownBlock2D",
+        "CrossAttnDownBlock2D",
+        "CrossAttnDownBlock2D",
     )
     up_block_types = (
-        "AttnUpBlock2D",
+        "CrossAttnUpBlock2D",
+        "CrossAttnUpBlock2D",
         "UpBlock2D",
-        "AttnUpBlock2D",
     )
 
     if args.model_config_name_or_path is None:
-        model = UNet2DModel(
+        model = ImageNetDiffusionModel(
+            num_classes=args.num_classes,
+            cross_attention_dim=1024,
             sample_size=sample_size,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -461,11 +529,10 @@ def main(args):
             block_out_channels=block_out_channels,
             down_block_types=down_block_types,
             up_block_types=up_block_types,
-            num_class_embeds=args.num_classes,
         )
     else:
-        config = UNet2DModel.load_config(args.model_config_name_or_path)
-        model = UNet2DModel.from_config(config)
+        config = ImageNetDiffusionModel.load_config(args.model_config_name_or_path)
+        model = ImageNetDiffusionModel.from_config(config)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -509,7 +576,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=UNet2DModel,
+            model_cls=ImageNetDiffusionModel,
             model_config=model.config,
         )
 
@@ -698,6 +765,10 @@ def main(args):
             clean_images = batch["input"]
             cond = batch["class"].to(model.device)
 
+            # Randomly drop condition labels for Classifier-Free Guidance
+            drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
+            cond = torch.where(drop_mask, torch.tensor(args.num_classes, device=cond.device), cond)
+
             if vae is not None:
                 clean_images = clean_images.to(device=accelerator.device, dtype=vae.dtype)
                 with torch.no_grad():
@@ -855,43 +926,60 @@ def main(args):
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
-
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                generator = torch.Generator(device=unet.device).manual_seed(0)
                 classes = torch.randint(
                     0, args.num_classes, [args.eval_batch_size], generator=generator, device=unet.device
                 )
-                # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
-                    generator=generator,
-                    batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="pt",
-                    class_labels=classes,
-                ).images
+
+                # Manual CFG Generation Loop
+                cond_labels = classes
+                uncond_labels = torch.full_like(classes, args.num_classes)
+
+                latents = torch.randn(
+                    (args.eval_batch_size, unet.config.in_channels, sample_size, sample_size),
+                    generator=generator, device=unet.device, dtype=weight_dtype
+                )
+
+                noise_scheduler.set_timesteps(args.ddpm_num_inference_steps)
+
+                for t in tqdm(noise_scheduler.timesteps, desc="Sampling", disable=not accelerator.is_local_main_process):
+                    # Double batch for CFG: conditional + unconditional
+                    latent_model_input = torch.cat([latents] * 2)
+                    class_input = torch.cat([cond_labels, uncond_labels])
+
+                    with torch.no_grad():
+                        # Pass 't' directly instead of 't_batch'
+                        noise_pred = unet(latent_model_input, t, class_labels=class_input).sample
+
+                    # Split and apply Guidance Scale
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                    latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+
                 if vae is not None:
-                    latents = images / vae_scaling_factor
+                    latents = latents / vae_scaling_factor
                     latents = latents.to(torch.float32)
 
                     with torch.no_grad():
                         images = vae.decode(latents).sample
+                else:
+                    images = latents
+
                 images = (images / 2 + 0.5).clamp(0, 1).cpu().float()
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
                 # denormalize the images and save to tensorboard
-                # images_processed = (images * 255).round().astype("uint8")
+                images_processed = (images * 255).round().numpy().astype("uint8")
 
                 if args.logger == "tensorboard":
                     if is_accelerate_version(">=", "0.17.0.dev0"):
                         tracker = accelerator.get_tracker("tensorboard", unwrap=True)
                     else:
                         tracker = accelerator.get_tracker("tensorboard")
-                    tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
+                    tracker.add_images("test_samples", images_processed, epoch)
                 elif args.logger == "wandb":
                     # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
                     n_images = len(images)
@@ -901,7 +989,7 @@ def main(args):
                         {"test_samples": wandb.Image(image_grid), "epoch": epoch},
                         step=global_step,
                     )
-                del pipeline
+
                 del images
                 if 'latents' in locals():
                     del latents
