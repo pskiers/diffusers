@@ -6,18 +6,10 @@ import os
 import shutil
 from datetime import timedelta
 from pathlib import Path
-import json
-import zipfile
-import requests
-import random
-from PIL import Image
 
-from torch.utils.data import Dataset
-import torchvision.transforms as T
 import accelerate
 import datasets
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -29,16 +21,16 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DConditionModel, AutoencoderKL
+from diffusers import DDPMPipeline, DDPMScheduler, AutoencoderKL
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.configuration_utils import register_to_config
 
 from model_utils import _extract_into_tensor, trunc_normal_init_
 from data_utils import SafeIterator, LimitedLoader
 from clevr_dataset import CLEVRHybridDataset, make_tensor_from_scene, sample_random_scene
+from conditional_unet_model import UnifiedConditionUNet
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -310,83 +302,6 @@ def parse_args():
     return args
 
 
-class CLEVRDiffusionModel(UNet2DConditionModel):
-    @register_to_config
-    def __init__(
-        self,
-        raw_dim=21,
-        # 2. The Standard UNet Arguments you are customizing
-        sample_size=64,
-        in_channels=3,
-        out_channels=3,
-        center_input_sample=False,
-        flip_sin_to_cos=True,
-        freq_shift=0,
-        down_block_types=(
-            "DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D",
-            "AttnDownBlock2D", "DownBlock2D"
-        ),
-        up_block_types=(
-            "UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D",
-            "UpBlock2D", "UpBlock2D"
-        ),
-        block_out_channels=(128, 128, 256, 256, 512, 512),
-        layers_per_block=2,
-        downsample_padding=1,
-        mid_block_scale_factor=1,
-        act_fn="silu",
-        norm_num_groups=32,
-        norm_eps=1e-5,
-        cross_attention_dim=512,
-        attention_head_dim=8,
-        **kwargs,
-    ):
-        super().__init__(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            center_input_sample=center_input_sample,
-            flip_sin_to_cos=flip_sin_to_cos,
-            freq_shift=freq_shift,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            downsample_padding=downsample_padding,
-            mid_block_scale_factor=mid_block_scale_factor,
-            act_fn=act_fn,
-            norm_num_groups=norm_num_groups,
-            norm_eps=norm_eps,
-            cross_attention_dim=cross_attention_dim,
-            attention_head_dim=attention_head_dim,
-            **kwargs,
-        )
-
-        self.projector = nn.Sequential(
-            nn.Linear(raw_dim, cross_attention_dim),
-            nn.SiLU(),
-            nn.Linear(cross_attention_dim, cross_attention_dim)
-        )
-
-    def forward(self, sample, timestep, raw_objects, obj_mask=None, **kwargs):
-        """
-        Args:
-            sample: The noisy image tensor (Batch, 3, H, W)
-            timestep: The current timestep (Batch,)
-            raw_objects: Object data (Batch, 10, raw_dim)
-            obj_mask: (Optional) Mask for padding (Batch, 10)
-        """
-        object_embeddings = self.projector(raw_objects)
-
-        return super().forward(
-            sample,
-            timestep,
-            encoder_hidden_states=object_embeddings,
-            encoder_attention_mask=obj_mask,
-            **kwargs,
-        )
-
-
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -425,7 +340,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), CLEVRDiffusionModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UnifiedConditionUNet)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -435,7 +350,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = CLEVRDiffusionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UnifiedConditionUNet.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -483,7 +398,8 @@ def main(args):
     up_block_types = args.up_block_types
 
     if args.model_config_name_or_path is None:
-        model = CLEVRDiffusionModel(
+        model = UnifiedConditionUNet(
+            condition_mode="sequence",
             raw_dim=21 if args.dataset_mode == "absolute" else 55,
             cross_attention_dim=512,
             sample_size=sample_size,
@@ -500,8 +416,8 @@ def main(args):
         torch.save(model.y_init, os.path.join(args.output_dir, "y_init.pt"))
         torch.save(model.z_init, os.path.join(args.output_dir, "z_init.pt"))
     else:
-        config = CLEVRDiffusionModel.load_config(args.model_config_name_or_path)
-        model = CLEVRDiffusionModel.from_config(config)
+        config = UnifiedConditionUNet.load_config(args.model_config_name_or_path)
+        model = UnifiedConditionUNet.from_config(config)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -547,7 +463,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=CLEVRDiffusionModel,
+            model_cls=UnifiedConditionUNet,
             model_config=model.config,
         )
 
@@ -767,14 +683,14 @@ def main(args):
                         _, z = model.old_forward(
                             torch.cat([x, y, z], dim=1),
                             timesteps,
-                            raw_objects=cond,
-                            obj_mask=mask,
+                            condition_tensors=cond,
+                            attention_mask=mask,
                         ).sample.chunk(2, dim=1)
                     y, _ = model.old_forward(
                         torch.cat([x, y, z], dim=1),
                         timesteps,
-                        raw_objects=cond,
-                        obj_mask=mask,
+                        condition_tensors=cond,
+                        attention_mask=mask,
                     ).sample.chunk(2, dim=1)
                     return y, z
 
@@ -940,7 +856,7 @@ def main(args):
                     y = torch.cat([model.module.y_init for _ in range(sample.shape[0])], dim=0).to(unet.device)
                     z = torch.cat([model.module.z_init for _ in range(sample.shape[0])], dim=0).to(unet.device)
                     for _ in range(N_supervision):
-                        model_output, y, z = deep_recursion(unet, sample, y, z, timesteps, kwargs["raw_objects"], kwargs["obj_mask"], n, T)
+                        model_output, y, z = deep_recursion(unet, sample, y, z, timesteps, kwargs["condition_tensors"], kwargs["attention_mask"], n, T)
                     output = OutputUnet()
                     output.sample = model_output
                     return output
@@ -986,8 +902,8 @@ def main(args):
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="pt",
-                    raw_objects=cond_tensor,
-                    obj_mask=mask,
+                    condition_tensors=cond_tensor,
+                    attention_mask=mask,
                 ).images
                 if vae is not None:
                     latents = images / vae_scaling_factor

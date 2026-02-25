@@ -4,43 +4,34 @@ import shutil
 import pytest
 
 def run_script(script_name, output_dir, extra_args):
-    """
-    Helper function to run the accelerate command via subprocess.
-    Handles environment isolation, fast-forward flags, and immediate cleanup.
-    """
     os.makedirs(output_dir, exist_ok=True)
-
     env = os.environ.copy()
     env["WANDB_MODE"] = "offline"
     env["WANDB_DIR"] = output_dir
 
     base_cmd = [
-        "accelerate", "launch",
-        "--mixed_precision=fp16",
-        "--num_processes=1",
-        script_name,
-        "--output_dir", output_dir,
-        # FAST FORWARD FLAGS
-        "--num_epochs", "1",
-        "--train_batch_size", "4",
-        "--eval_batch_size", "4",
-        "--epoch_max_batches_train", "1",
-        "--epoch_max_batches_eval", "1",
-        "--save_model_epochs", "1",
-        "--save_images_epochs", "1",
-        "--ddpm_num_inference_steps", "1",
-        # SHARED SETTINGS
-        "--logger", "wandb",
-        "--gradient_accumulation_steps", "1",
-        "--use_ema",
-        "--learning_rate", "1e-4",
-        "--lr_warmup_steps", "1"
+        "accelerate", "launch", "--mixed_precision=fp16", "--num_processes=1",
+        script_name, "--output_dir", output_dir,
+        "--train_batch_size", "4", "--eval_batch_size", "4",
+        "--epoch_max_batches_train", "1", "--epoch_max_batches_eval", "1",
+        "--save_model_epochs", "1", "--save_images_epochs", "1",
+        "--ddpm_num_inference_steps", "1", "--checkpointing_steps", "1",
+        "--logger", "wandb", "--gradient_accumulation_steps", "1",
+        "--use_ema", "--learning_rate", "1e-4", "--lr_warmup_steps", "1"
     ]
 
-    cmd = base_cmd + extra_args
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    assert result.returncode == 0, f"Script {script_name} failed!\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-    shutil.rmtree(output_dir, ignore_errors=True)  # cleanup after test
+    # 1. Run Initial Training (2 epochs to ensure checkpoints are written)
+    cmd_initial = base_cmd + extra_args + ["--num_epochs", "2"]
+    res_initial = subprocess.run(cmd_initial, env=env, capture_output=True, text=True)
+    assert res_initial.returncode == 0, f"Initial Run Failed!\n{res_initial.stdout}\n{res_initial.stderr}"
+
+    # 2. Test Checkpoint Resume & EMA Loading (Run for 1 more epoch)
+    cmd_resume = base_cmd + extra_args + ["--num_epochs", "3", "--resume_from_checkpoint", "latest"]
+    res_resume = subprocess.run(cmd_resume, env=env, capture_output=True, text=True)
+    assert res_resume.returncode == 0, f"Resume Run Failed!\n{res_resume.stdout}\n{res_resume.stderr}"
+
+    # 3. Cleanup on success
+    shutil.rmtree(output_dir, ignore_errors=True)
 
 
 # def test_unconditional_standard():

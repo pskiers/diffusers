@@ -10,7 +10,6 @@ from pathlib import Path
 import accelerate
 import datasets
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -23,15 +22,15 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, AutoencoderKL, UNet2DConditionModel
+from diffusers import DDPMPipeline, DDPMScheduler, AutoencoderKL
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.configuration_utils import register_to_config
 
 from model_utils import _extract_into_tensor, trunc_normal_init_
 from data_utils import SafeIterator, LimitedLoader
+from conditional_unet_model import UnifiedConditionUNet
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.34.0.dev0")
@@ -298,84 +297,6 @@ def parse_args():
     return args
 
 
-class ImageNetDiffusionModel(UNet2DConditionModel):
-    @register_to_config
-    def __init__(
-        self,
-        num_classes=1000,
-        sample_size=64,
-        in_channels=3,
-        out_channels=3,
-        center_input_sample=False,
-        flip_sin_to_cos=True,
-        freq_shift=0,
-        down_block_types=(
-            "DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"
-        ),
-        up_block_types=(
-            "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"
-        ),
-        block_out_channels=(256, 512, 1024),
-        layers_per_block=3,
-        downsample_padding=1,
-        mid_block_scale_factor=1,
-        act_fn="silu",
-        norm_num_groups=32,
-        norm_eps=1e-5,
-        cross_attention_dim=1024,
-        attention_head_dim=8,
-        **kwargs,
-    ):
-        # FIX: Strip out old config parameters that confuse the parent class
-        kwargs.pop("num_class_embeds", None)
-
-        super().__init__(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            center_input_sample=center_input_sample,
-            flip_sin_to_cos=flip_sin_to_cos,
-            freq_shift=freq_shift,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            downsample_padding=downsample_padding,
-            mid_block_scale_factor=mid_block_scale_factor,
-            act_fn=act_fn,
-            norm_num_groups=norm_num_groups,
-            norm_eps=norm_eps,
-            cross_attention_dim=cross_attention_dim,
-            attention_head_dim=attention_head_dim,
-            num_class_embeds=None,
-            **kwargs,
-        )
-
-        # Mapping class index -> Cross Attention vector.
-        self.conditional_embedding = nn.Embedding(num_classes + 1, cross_attention_dim)
-
-    def get_class_embed(self, sample, class_labels=None):
-        # By overriding this method and returning None, we forcefully disable
-        # the base UNet's default global timestep conditioning.
-        return None
-
-    def forward(self, sample, timestep, class_labels, **kwargs):
-        """
-        Args:
-            sample: The noisy image tensor (Batch, Channels, H, W)
-            timestep: The current timestep (Batch,)
-            class_labels: Class index for the conditional generation (Batch,)
-        """
-        encoder_hidden_states = self.conditional_embedding(class_labels).unsqueeze(1)
-
-        return super().forward(
-            sample,
-            timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            **kwargs,
-        )
-
-
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -414,7 +335,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), ImageNetDiffusionModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UnifiedConditionUNet)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -424,7 +345,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ImageNetDiffusionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UnifiedConditionUNet.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -476,7 +397,8 @@ def main(args):
     up_block_types = args.up_block_types
 
     if args.model_config_name_or_path is None:
-        model = ImageNetDiffusionModel(
+        model = UnifiedConditionUNet(
+            condition_mode="class",
             num_classes=args.num_classes,
             cross_attention_dim=block_out_channels[-1] if block_out_channels else 1024,
             sample_size=sample_size,
@@ -493,8 +415,8 @@ def main(args):
         torch.save(model.y_init, os.path.join(args.output_dir, "y_init.pt"))
         torch.save(model.z_init, os.path.join(args.output_dir, "z_init.pt"))
     else:
-        config = ImageNetDiffusionModel.load_config(args.model_config_name_or_path)
-        model = ImageNetDiffusionModel.from_config(config)
+        config = UnifiedConditionUNet.load_config(args.model_config_name_or_path)
+        model = UnifiedConditionUNet.from_config(config)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -540,7 +462,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=ImageNetDiffusionModel,
+            model_cls=UnifiedConditionUNet,
             model_config=model.config,
         )
 
@@ -762,12 +684,12 @@ def main(args):
                         _, z = model.old_forward(
                             torch.cat([x, y, z], dim=1),
                             timesteps,
-                            class_labels=cond
+                            condition_tensors=cond
                         ).sample.chunk(2, dim=1)
                     y, _ = model.old_forward(
                         torch.cat([x, y, z], dim=1),
                         timesteps,
-                        class_labels=cond
+                        condition_tensors=cond
                     ).sample.chunk(2, dim=1)
                     return y, z
 
