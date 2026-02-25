@@ -30,29 +30,14 @@ from diffusers.utils import check_min_version, is_accelerate_version, is_tensorb
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.configuration_utils import register_to_config
 
+from model_utils import _extract_into_tensor
+from data_utils import SafeIterator, LimitedLoader
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
-
-
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    Extract values from a 1-D numpy array for a batch of indices.
-
-    :param arr: the 1-D numpy array.
-    :param timesteps: a tensor of indices into the array to extract.
-    :param broadcast_shape: a larger shape of K dimensions with the batch
-                            dimension equal to the length of timesteps.
-    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
-    """
-    if not isinstance(arr, torch.Tensor):
-        arr = torch.from_numpy(arr)
-    res = arr[timesteps].float().to(timesteps.device)
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res.expand(broadcast_shape)
 
 
 def parse_args():
@@ -290,54 +275,6 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     return args
-
-
-class SafeIterator:
-    """
-    A wrapper around a DataLoader (or any iterator) that catches and skips
-    exceptions during iteration (like corrupted images in ImageNet).
-    """
-    def __init__(self, iterable, logger=None):
-        self.iterable = iterable
-        self.iterator = iter(iterable)
-        self.logger = logger
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        while True:
-            try:
-                return next(self.iterator)
-            except StopIteration:
-                raise
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"SafeIterator caught error: {e}. Skipping batch.")
-                else:
-                    print(f"SafeIterator caught error: {e}. Skipping batch.")
-
-
-class LimitedLoader:
-    """
-    Wraps a DataLoader to stop iteration after a fixed number of batches.
-    For 'short epochs' on huge datasets. Should be compatible with multigpu accelerate logic etc. (I hope).
-    """
-    def __init__(self, dataloader, limit_batches):
-        self.dataloader = dataloader
-        self.limit_batches = min(limit_batches, len(dataloader))
-
-    def __len__(self):
-        return self.limit_batches
-
-    def __iter__(self):
-        iterator = iter(self.dataloader)
-
-        for _ in range(self.limit_batches):
-            try:
-                yield next(iterator)
-            except StopIteration:
-                break
 
 
 class ImageNetDiffusionModel(UNet2DConditionModel):

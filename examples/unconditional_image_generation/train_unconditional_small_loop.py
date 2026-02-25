@@ -27,29 +27,13 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from model_utils import _extract_into_tensor, trunc_normal_init_
+from data_utils import LimitedLoader
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
-
-
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
-    """
-    Extract values from a 1-D numpy array for a batch of indices.
-
-    :param arr: the 1-D numpy array.
-    :param timesteps: a tensor of indices into the array to extract.
-    :param broadcast_shape: a larger shape of K dimensions with the batch
-                            dimension equal to the length of timesteps.
-    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
-    """
-    if not isinstance(arr, torch.Tensor):
-        arr = torch.from_numpy(arr)
-    res = arr[timesteps].float().to(timesteps.device)
-    while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-    return res.expand(broadcast_shape)
 
 
 def parse_args():
@@ -294,28 +278,6 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     return args
-
-
-class LimitedLoader:
-    """
-    Wraps a DataLoader to stop iteration after a fixed number of batches.
-    For 'short epochs' on huge datasets. Should be compatible with multigpu accelerate logic etc. (I hope).
-    """
-    def __init__(self, dataloader, limit_batches):
-        self.dataloader = dataloader
-        self.limit_batches = min(limit_batches, len(dataloader))
-
-    def __len__(self):
-        return self.limit_batches
-
-    def __iter__(self):
-        iterator = iter(self.dataloader)
-
-        for _ in range(self.limit_batches):
-            try:
-                yield next(iterator)
-            except StopIteration:
-                break
 
 
 def main(args):
@@ -942,33 +904,6 @@ def main(args):
 #             return model_output
 #         else:
 #             return self.deep_recursion(x, y, z, *args, **kwargs)
-
-def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0):
-    # NOTE: PyTorch nn.init.trunc_normal_ is not mathematically correct, the std dev is not actually the std dev of initialized tensor
-    # This function is a PyTorch version of jax truncated normal init (default init method in flax)
-    # https://github.com/jax-ml/jax/blob/main/jax/_src/random.py#L807-L848
-    # https://github.com/jax-ml/jax/blob/main/jax/_src/nn/initializers.py#L162-L199
-
-    with torch.no_grad():
-        if std == 0:
-            tensor.zero_()
-        else:
-            sqrt2 = math.sqrt(2)
-            a = math.erf(lower / sqrt2)
-            b = math.erf(upper / sqrt2)
-            z = (b - a) / 2
-
-            c = (2 * math.pi) ** -0.5
-            pdf_u = c * math.exp(-0.5 * lower ** 2)
-            pdf_l = c * math.exp(-0.5 * upper ** 2)
-            comp_std = std / math.sqrt(1 - (upper * pdf_u - lower * pdf_l) / z - ((pdf_u - pdf_l) / z) ** 2)
-
-            tensor.uniform_(a, b)
-            tensor.erfinv_()
-            tensor.mul_(sqrt2 * comp_std)
-            tensor.clip_(lower * comp_std, upper * comp_std)
-
-    return tensor
 
 
 if __name__ == "__main__":
