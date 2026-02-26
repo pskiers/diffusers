@@ -242,7 +242,7 @@ class CLEVRHybridDataset(Dataset):
         cond_tensor, mask = make_tensor_from_scene(scene)
 
         return {
-            "img": self.transform(image),
-            "obj_features": cond_tensor[0],
-            "obj_mask": mask[0]
+            "images": self.transform(image),
+            "conditions": cond_tensor[0],
+            "masks": mask[0]
         }

@@ -8,6 +8,8 @@ from clevr_dataset import (
     CLEVRHybridDataset,
     COLORS, MATERIALS, SHAPES, SIZES
 )
+from config import parse_args
+from data_factory import get_dataloaders
 
 
 @pytest.mark.parametrize("num_objects", [3, 5, 10, None])
@@ -152,15 +154,15 @@ def test_clevr_hybrid_dataset(tmp_path):
 
     sample = dataset[0]
 
-    assert "img" in sample
-    assert "obj_features" in sample
-    assert "obj_mask" in sample
+    assert "images" in sample
+    assert "conditions" in sample
+    assert "masks" in sample
 
     # Image should be transformed to (C, H, W) -> (3, 64, 64)
-    assert sample["img"].shape == (3, 64, 64)
+    assert sample["images"].shape == (3, 64, 64)
     # Tensors should not have a batch dimension here
-    assert sample["obj_features"].shape == (10, 21)
-    assert sample["obj_mask"].shape == (10,)
+    assert sample["conditions"].shape == (10, 21)
+    assert sample["masks"].shape == (10,)
 
 
 @pytest.mark.parametrize("mode", ["absolute", "relative"])
@@ -194,11 +196,11 @@ def test_clevr_hybrid_dataset_exact_values(mode):
     for i in range(n_items_to_check):
         # 1. Get the output directly from the Dataset class
         sample = dataset[i]
-        ds_features = sample["obj_features"]
-        ds_mask = sample["obj_mask"]
+        ds_features = sample["conditions"]
+        ds_mask = sample["masks"]
 
         # Check basic shapes
-        assert sample["img"].shape == (3, 64, 64)
+        assert sample["images"].shape == (3, 64, 64)
         assert ds_mask.shape == (10,)
         assert ds_features.shape == (10, 21 if mode == "absolute" else 55)
 
@@ -220,3 +222,41 @@ def test_clevr_hybrid_dataset_exact_values(mode):
         # Print the first object's features of the first scene just so you can visually inspect it
         if i == 0:
             print(f"\nScene 0, Object 0 features ({mode}):\n{ds_features[0].tolist()}")
+
+
+def test_data_factory_standardization(monkeypatch):
+    """Ensure the factory yields strictly standardized dictionary keys for all datasets."""
+
+    # 1. Test Unconditional HF Dataset
+    monkeypatch.setattr("sys.argv", ["train.py", "--dataset_name", "uoft-cs/cifar100", "--epoch_max_batches_train", "1", "--train_batch_size", "2"])
+    args_uncond = parse_args()
+    args_uncond.num_classes = 0 # Force unconditional
+    train_dl, _ = get_dataloaders(args_uncond)
+    batch = next(iter(train_dl))
+
+    assert "images" in batch and batch["images"].shape == (2, 3, 64, 64)
+    assert batch["conditions"] is None
+    assert batch["masks"] is None
+
+    # 2. Test Conditional HF Dataset
+    monkeypatch.setattr("sys.argv", ["train.py", "--dataset_name", "uoft-cs/cifar100", "--epoch_max_batches_train", "1", "--train_batch_size", "2", "--num_classes", "100"])
+    args_cond = parse_args()
+    train_dl, _ = get_dataloaders(args_cond)
+    batch = next(iter(train_dl))
+
+    assert "images" in batch
+    assert batch["conditions"] is not None and batch["conditions"].shape == (2,)
+    assert batch["masks"] is None
+
+    # 3. Test CLEVR Dataset
+    monkeypatch.setattr("sys.argv", ["train.py", "--train_data_dir", "cache_dir", "--output_dir", "test-clevr", "--epoch_max_batches_train", "1", "--train_batch_size", "2"])
+    args_clevr = parse_args()
+    # Skip if CLEVR isn't downloaded locally to avoid breaking the test
+    import os
+    if os.path.exists(os.path.join("cache_dir", "CLEVR_v1.0", "scenes", "CLEVR_train_scenes.json")):
+        train_dl, _ = get_dataloaders(args_clevr)
+        batch = next(iter(train_dl))
+
+        assert "images" in batch
+        assert batch["conditions"] is not None and batch["conditions"].shape == (2, 10, 55) # default relative mode
+        assert batch["masks"] is not None and batch["masks"].shape == (2, 10)

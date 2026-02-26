@@ -19,6 +19,7 @@ def parse_args():
     # Dataset & Dataloading
     # ---------------------------------------------------------
     data_group = parser.add_argument_group("Dataset & Dataloading")
+    data_group.add_argument("--dataset_type", type=str, default="hf", choices=["hf", "clevr"], help="Type of dataset to load.")
     data_group.add_argument("--dataset_name", type=str, default=None, help="Name of the Dataset from the HuggingFace hub.")
     data_group.add_argument("--dataset_config_name", type=str, default=None, help="Config of the Dataset.")
     data_group.add_argument("--train_data_dir", type=str, default=None, help="Folder containing the training data.")
@@ -37,6 +38,7 @@ def parse_args():
     # Architecture
     # ---------------------------------------------------------
     arch_group = parser.add_argument_group("Architecture")
+    arch_group.add_argument("--model_type", type=str, default="unet2d", choices=["unet2d", "unified_class", "unified_sequence"], help="Explicitly choose the model architecture.")
     arch_group.add_argument("--model_config_name_or_path", type=str, default=None)
     arch_group.add_argument("--vae_name", type=str, default=None, help="Path to VAE if doing Latent Diffusion.")
     arch_group.add_argument("--input_channels", type=int, default=3, help="Number of input channels")
@@ -44,6 +46,7 @@ def parse_args():
     arch_group.add_argument("--channels", nargs="+", type=int, default=[128, 128], help="Channels in each UNet block.")
     arch_group.add_argument("--down_block_types", nargs="+", type=str, default=["AttnDownBlock2D", "DownBlock2D"])
     arch_group.add_argument("--up_block_types", nargs="+", type=str, default=["UpBlock2D", "AttnUpBlock2D"])
+    arch_group.add_argument("--layers_per_block", type=int, default=2, help="Layers per UNet block")
 
     # ---------------------------------------------------------
     # "Small Loop" & Recursive Thinking Arguments
@@ -52,6 +55,7 @@ def parse_args():
     loop_group.add_argument("--T", type=int, default=3, help="Number of macroscopic steps (T)")
     loop_group.add_argument("--n", type=int, default=6, help="Number of microscopic iterations (n)")
     loop_group.add_argument("--N_supervision", type=int, default=4, help="Supervision factor")
+    loop_group.add_argument("--use_small_loop", action="store_true", help="Enable the recursive latent loop")
 
     # ---------------------------------------------------------
     # Training Hyperparameters
