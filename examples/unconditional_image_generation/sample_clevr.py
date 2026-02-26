@@ -251,10 +251,10 @@ def main(args):
             #   blue cylinder - middle back
             scene_dict = {
                 "objects": [
-                    {"color": "gray", "shape": "cube", "size": "small", "material": "rubber", "rotation": 0, "3d_coords": [0, 0, 0]},
-                    {"color": "red", "shape": "sphere", "size": "small", "material": "rubber", "rotation": 0, "3d_coords": [0, 0, 0]},
-                    {"color": "blue", "shape": "cylinder", "size": "large", "material": "metal", "rotation": 0, "3d_coords": [0, 0, 0]},
-                    {"color": "green", "shape": "cylinder", "size": "large", "material": "metal", "rotation": 0, "3d_coords": [0, 0, 0]},
+                    {"color": "gray", "shape": "cube", "size": "small", "material": "rubber", "rotation": 0, "3d_coords": [0, 0, 0], "pixel_coords": [100, 200, 10]},
+                    {"color": "red", "shape": "sphere", "size": "small", "material": "rubber", "rotation": 0, "3d_coords": [0, 0, 0], "pixel_coords": [200, 100, 10]},
+                    {"color": "blue", "shape": "cylinder", "size": "large", "material": "metal", "rotation": 0, "3d_coords": [0, 0, 0], "pixel_coords": [20, 200, 10]},
+                    {"color": "green", "shape": "cylinder", "size": "large", "material": "metal", "rotation": 0, "3d_coords": [0, 0, 0], "pixel_coords": [100, 20, 10]},
                 ],
                 "relationships": {
                     "left": [[1,2,3], [3], [1,3], []],
@@ -270,7 +270,7 @@ def main(args):
                     # "front": [[1], []],
                     # "behind": [[], [0]],
                 },
-                "mode": "relative"
+                "mode": "absolute"
             }
             for _ in range(batch_size):
                 # scene_dict = sample_random_scene(num_objects=4, mode="relative")
