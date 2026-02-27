@@ -67,3 +67,74 @@ accelerate launch --mixed_precision="fp16" --num_processes=1 train.py experiment
 # Small Loop (TRM) CLEVR
 accelerate launch --mixed_precision="fp16" --num_processes=1 train.py experiment=clevr_relative_trm
 ```
+
+## Sampling
+
+
+### CIFAR-100 Unconditional
+```bash
+# Standard Diffusion Unconditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=uncond_cifar100_std \
+  checkpoint_path="cifar100-standard-long/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=250
+
+# TRM Diffusion Unconditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=uncond_cifar100_trm \
+  checkpoint_path="cifar100-size-small-nsup1-long/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=5000
+```
+
+### CIFAR-100 Conditional
+```bash
+# Standard Conditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=cond_cifar100_std \
+  checkpoint_path="cifar100-conditional-standard/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=250
+
+# Small Loop (TRM) Conditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=cond_cifar100_trm \
+  checkpoint_path="cifar100-conditional-hrm-nsup-4-T-3-n-6/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=5000
+```
+
+### ImageNet
+```bash
+# Standard Conditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=cond_imgnet_std \
+  checkpoint_path="imagenet-conditional-standard-big/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=64
+
+# Small Loop (TRM) Conditional
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=cond_imgnet_trm \
+  checkpoint_path="imagenet-conditional-hrm-nsup-4-T-3-n-6-fix-ch256/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=64
+```
+
+### Clevr
+```bash
+# Standard CLEVR
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=clevr_relative_std \
+  checkpoint_path="clevr-standard-att-early-cross-att-relative-fix/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=64
+
+# Small Loop (TRM) CLEVR
+accelerate launch --mixed_precision="fp16" sample.py \
+  experiment=clevr_relative_trm \
+  checkpoint_path="clevr-hrm-nsup-4-T-3-n-6-cross-att-pred-eps-relative-fix/checkpoint-<STEP>" \
+  num_samples=10000 \
+  sample_batch_size=64
+```
