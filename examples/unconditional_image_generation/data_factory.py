@@ -5,6 +5,7 @@ from datasets import load_dataset
 from data_utils import LimitedLoader
 from clevr_dataset import CLEVRHybridDataset
 
+
 def get_dataloaders(args):
     """
     Factory function to return standardized dataloaders.
@@ -12,24 +13,47 @@ def get_dataloaders(args):
     Values are None if the dataset doesn't use them.
     """
     # 1. Define standard image augmentations
-    train_augmentations = transforms.Compose([
-        transforms.Resize((args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args.dataset.resolution) if args.dataset.center_crop else transforms.RandomCrop(args.dataset.resolution) if not args.dataset.center_crop else transforms.Lambda(lambda x: x),
-        transforms.RandomHorizontalFlip() if args.dataset.random_flip else transforms.Lambda(lambda x: x),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
+    train_augmentations = transforms.Compose(
+        [
+            transforms.Resize(
+                (args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            (
+                transforms.CenterCrop(args.dataset.resolution)
+                if args.dataset.center_crop
+                else (
+                    transforms.RandomCrop(args.dataset.resolution)
+                    if not args.dataset.center_crop
+                    else transforms.Lambda(lambda x: x)
+                )
+            ),
+            transforms.RandomHorizontalFlip() if args.dataset.random_flip else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
 
-    eval_augmentations = transforms.Compose([
-        transforms.Resize((args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
+    eval_augmentations = transforms.Compose(
+        [
+            transforms.Resize(
+                (args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
 
     # 2. Determine Dataset Type
     if args.dataset.dataset_type == "hf":
-        train_ds = load_dataset(args.dataset.dataset_name, args.dataset.dataset_config_name, cache_dir=args.cache_dir, split="train")
-        eval_ds = load_dataset(args.dataset.dataset_name, args.dataset.dataset_config_name, cache_dir=args.cache_dir, split=args.dataset.test_split_name)
+        train_ds = load_dataset(
+            args.dataset.dataset_name, args.dataset.dataset_config_name, cache_dir=args.cache_dir, split="train"
+        )
+        eval_ds = load_dataset(
+            args.dataset.dataset_name,
+            args.dataset.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split=args.dataset.test_split_name,
+        )
 
         is_conditional = args.dataset.num_classes is not None and args.dataset.num_classes > 0
 
@@ -51,8 +75,20 @@ def get_dataloaders(args):
         eval_ds.set_transform(hf_eval_transform)
 
     elif args.dataset.dataset_type == "clevr":
-        train_ds = CLEVRHybridDataset(root_dir=args.dataset.train_data_dir, split="train", mode=args.dataset.dataset_mode, image_size=args.dataset.resolution, download=False)
-        eval_ds = CLEVRHybridDataset(root_dir=args.dataset.train_data_dir, split="validation", mode=args.dataset.dataset_mode, image_size=args.dataset.resolution, download=False)
+        train_ds = CLEVRHybridDataset(
+            root_dir=args.dataset.train_data_dir,
+            split="train",
+            mode=args.dataset.dataset_mode,
+            image_size=args.dataset.resolution,
+            download=False,
+        )
+        eval_ds = CLEVRHybridDataset(
+            root_dir=args.dataset.train_data_dir,
+            split="validation",
+            mode=args.dataset.dataset_mode,
+            image_size=args.dataset.resolution,
+            download=False,
+        )
         train_ds.set_transform(train_augmentations)
         eval_ds.set_transform(eval_augmentations)
 
@@ -79,8 +115,22 @@ def get_dataloaders(args):
         return batch
 
     # 4. Create standard DataLoaders
-    train_dl = DataLoader(train_ds, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers, drop_last=True, collate_fn=collate_fn)
-    eval_dl = DataLoader(eval_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers, drop_last=True, collate_fn=collate_fn)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+    eval_dl = DataLoader(
+        eval_ds,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
 
     # 5. Wrap with LimitedLoader
     train_dl = LimitedLoader(train_dl, limit_batches=args.epoch_max_batches_train)

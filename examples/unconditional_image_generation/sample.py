@@ -20,6 +20,7 @@ from trm_utils import get_model_output
 
 logger = get_logger(__name__, log_level="INFO")
 
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(args: DictConfig):
     accelerator = Accelerator(mixed_precision=args.mixed_precision)
@@ -102,7 +103,7 @@ def main(args: DictConfig):
     # Model configuration flags
     is_unified_class = getattr(args.model, "condition_mode", None) == "class"
     is_unified_sequence = getattr(args.model, "condition_mode", None) == "sequence"
-    is_standard_conditional = ("UNet2DModel" in args.model._target_ and args.dataset.num_classes)
+    is_standard_conditional = "UNet2DModel" in args.model._target_ and args.dataset.num_classes
     do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional)
 
     # ---------------------------------------------------------
@@ -118,12 +119,15 @@ def main(args: DictConfig):
         unconds = None
 
         if is_unified_class or is_standard_conditional:
-            conds = torch.randint(0, args.dataset.num_classes, [current_bsz], generator=generator, device=accelerator.device)
+            conds = torch.randint(
+                0, args.dataset.num_classes, [current_bsz], generator=generator, device=accelerator.device
+            )
             if do_cfg:
                 unconds = torch.full_like(conds, args.dataset.num_classes)
 
         elif is_unified_sequence:
             from clevr_dataset import sample_random_scene, make_tensor_from_scene
+
             c_list, m_list = [], []
             for _ in range(current_bsz):
                 scene = sample_random_scene(num_objects=4, mode=args.dataset.dataset_mode)
@@ -134,7 +138,9 @@ def main(args: DictConfig):
             masks = torch.cat(m_list, dim=0).to(accelerator.device)
 
         # --- B. Denoising Loop ---
-        latents = torch.randn((current_bsz, sample_channels, sample_size, sample_size), generator=generator, device=accelerator.device)
+        latents = torch.randn(
+            (current_bsz, sample_channels, sample_size, sample_size), generator=generator, device=accelerator.device
+        )
 
         for t in scheduler.timesteps:
             latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
@@ -184,7 +190,9 @@ def main(args: DictConfig):
             img_path = output_dir / f"sample_{global_idx:06d}.png"
             Image.fromarray(img).save(img_path)
 
+
 if __name__ == "__main__":
     import sys
+
     sys.argv = [a for a in sys.argv if not a.startswith("--")]
     main()

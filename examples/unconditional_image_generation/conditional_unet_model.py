@@ -58,7 +58,7 @@ class UnifiedConditionUNet(UNet2DConditionModel):
             self.condition_projector = nn.Sequential(
                 nn.Linear(self.config.raw_dim, self.config.cross_attention_dim),
                 nn.SiLU(),
-                nn.Linear(self.config.cross_attention_dim, self.config.cross_attention_dim)
+                nn.Linear(self.config.cross_attention_dim, self.config.cross_attention_dim),
             )
         else:
             raise ValueError(f"Unknown condition_mode: {self.config.condition_mode}")

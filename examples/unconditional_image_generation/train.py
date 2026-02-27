@@ -44,6 +44,7 @@ check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+
 def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args):
     if args.prediction_type == "epsilon":
         return F.mse_loss(model_output.float(), noise.float())
@@ -108,7 +109,9 @@ def main(args: DictConfig):
     # ---------------------------------------------------------
     vae, vae_scaling_factor = None, 1.0
     if args.dataset.vae_name is not None:
-        vae = AutoencoderKL.from_pretrained(args.dataset.vae_name, cache_dir=args.cache_dir).to(accelerator.device, dtype=torch.float32)
+        vae = AutoencoderKL.from_pretrained(args.dataset.vae_name, cache_dir=args.cache_dir).to(
+            accelerator.device, dtype=torch.float32
+        )
         vae.requires_grad_(False)
         vae.eval()
         vae_scaling_factor = vae.config.scaling_factor
@@ -121,6 +124,7 @@ def main(args: DictConfig):
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
+
             if version.parse(xformers.__version__) == version.parse("0.0.16"):
                 logger.warning("xFormers 0.0.16 cannot be used for training in some GPUs. Please update to >=0.0.17.")
             model.enable_xformers_memory_efficient_attention()
@@ -138,20 +142,25 @@ def main(args: DictConfig):
     ema_model = None
     if args.use_ema:
         ema_model = EMAModel(
-            model.parameters(), decay=args.ema_max_decay, use_ema_warmup=True,
-            inv_gamma=args.ema_inv_gamma, power=args.ema_power,
-            model_cls=model_cls, model_config=model.config
+            model.parameters(),
+            decay=args.ema_max_decay,
+            use_ema_warmup=True,
+            inv_gamma=args.ema_inv_gamma,
+            power=args.ema_power,
+            model_cls=model_cls,
+            model_config=model.config,
         )
 
     # `accelerate` custom saving & loading hooks
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
                     ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
                 for i, m in enumerate(models):
                     m.save_pretrained(os.path.join(output_dir, "unet"))
-                    weights.pop() # pop weight so it's not saved twice
+                    weights.pop()  # pop weight so it's not saved twice
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
@@ -184,8 +193,12 @@ def main(args: DictConfig):
         # Otherwise, save the factory's freshly generated ones for future resumes
         elif accelerator.is_main_process:
             logger.info("Generating new small loop anchor tokens")
-            model.y_init = trunc_normal_init_(torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1)
-            model.z_init = trunc_normal_init_(torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1)
+            model.y_init = trunc_normal_init_(
+                torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1
+            )
+            model.z_init = trunc_normal_init_(
+                torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1
+            )
             if accelerator.is_main_process:
                 os.makedirs(args.output_dir, exist_ok=True)
                 torch.save(model.y_init, y_path)
@@ -194,16 +207,24 @@ def main(args: DictConfig):
     # 4. Optimizers, Schedulers, and Trackers
     # ---------------------------------------------------------
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay, eps=args.adam_epsilon
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
     )
-    noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule, prediction_type=args.prediction_type)
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=args.ddpm_num_steps,
+        beta_schedule=args.ddpm_beta_schedule,
+        prediction_type=args.prediction_type,
+    )
 
     mult = args.N_supervision if args.use_small_loop else 1
     lr_scheduler = get_scheduler(
-        args.lr_scheduler, optimizer=optimizer,
+        args.lr_scheduler,
+        optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * mult,
-        num_training_steps=len(train_dl) * args.num_epochs * mult
+        num_training_steps=len(train_dl) * args.num_epochs * mult,
     )
 
     model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(
@@ -219,15 +240,17 @@ def main(args: DictConfig):
         accelerator.init_trackers(
             project_name="small-llm-diffusion",
             config=tracker_config,
-            init_kwargs={"wandb": {"name": args.output_dir}} if args.logger == "wandb" else {}
+            init_kwargs={"wandb": {"name": args.output_dir}} if args.logger == "wandb" else {},
         )
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
 
     weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16": weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16": weight_dtype = torch.bfloat16
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
 
     # ---------------------------------------------------------
     # 5. Resume from Checkpoint Logic
@@ -258,7 +281,9 @@ def main(args: DictConfig):
     logger.info("***** Running training *****")
     logger.info(f"  Num Epochs = {args.num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size = {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
+    logger.info(
+        f"  Total train batch size = {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
+    )
     logger.info(f"  Total optimization steps = {args.num_epochs * num_update_steps_per_epoch}")
 
     # ---------------------------------------------------------
@@ -294,7 +319,9 @@ def main(args: DictConfig):
             clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device).long()
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+            ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             # Forward & Backward Pass
@@ -305,11 +332,14 @@ def main(args: DictConfig):
                     z = torch.cat([base_model.z_init for _ in range(bsz)], dim=0).to(model.device)
 
                     for _ in range(args.N_supervision):
-                        model_output, y, z = deep_recursion(model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T)
+                        model_output, y, z = deep_recursion(
+                            model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                        )
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                         accelerator.backward(loss)
-                        if accelerator.sync_gradients: accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad()
@@ -318,14 +348,16 @@ def main(args: DictConfig):
                     loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                     accelerator.backward(loss)
-                    if accelerator.sync_gradients: accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
             # Sync & Checkpoint
             if accelerator.sync_gradients:
-                if args.use_ema: ema_model.step(model.parameters())
+                if args.use_ema:
+                    ema_model.step(model.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
@@ -348,7 +380,8 @@ def main(args: DictConfig):
                     logger.info(f"Saved state to {save_path}")
 
             logs = {"train/loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-            if args.use_ema: logs["ema_decay"] = ema_model.cur_decay_value
+            if args.use_ema:
+                logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -380,7 +413,9 @@ def main(args: DictConfig):
                 clean_images = clean_images.to(dtype=weight_dtype)
 
             noise = torch.randn_like(clean_images)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (clean_images.shape[0],), device=clean_images.device).long()
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, (clean_images.shape[0],), device=clean_images.device
+            ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             with torch.no_grad():
@@ -388,7 +423,9 @@ def main(args: DictConfig):
                     base_model = accelerator.unwrap_model(model)
                     y = torch.cat([base_model.y_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
                     z = torch.cat([base_model.z_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
-                    model_output, _, _ = deep_recursion(model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T)
+                    model_output, _, _ = deep_recursion(
+                        model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                    )
                 else:
                     model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
 
@@ -401,7 +438,18 @@ def main(args: DictConfig):
         val_pbar.close()
 
         if accelerator.is_main_process and (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
-            evaluate_and_save(model, ema_model, noise_scheduler, args, accelerator, epoch, global_step, vae, vae_scaling_factor, weight_dtype)
+            evaluate_and_save(
+                model,
+                ema_model,
+                noise_scheduler,
+                args,
+                accelerator,
+                epoch,
+                global_step,
+                vae,
+                vae_scaling_factor,
+                weight_dtype,
+            )
 
         if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):
             # Save standard diffusers pipeline to output_dir
@@ -418,10 +466,14 @@ def main(args: DictConfig):
 
             if args.push_to_hub:
                 upload_folder(
-                    repo_id=repo_id, folder_path=args.output_dir, commit_message=f"Epoch {epoch}", ignore_patterns=["step_*", "epoch_*"]
+                    repo_id=repo_id,
+                    folder_path=args.output_dir,
+                    commit_message=f"Epoch {epoch}",
+                    ignore_patterns=["step_*", "epoch_*"],
                 )
 
     accelerator.end_training()
+
 
 if __name__ == "__main__":
     # Accelerate passes --local_rank via sys.argv. Hydra hates this.

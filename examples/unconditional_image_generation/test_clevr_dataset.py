@@ -8,7 +8,10 @@ from clevr_dataset import (
     sample_random_scene,
     make_tensor_from_scene,
     CLEVRHybridDataset,
-    COLORS, MATERIALS, SHAPES, SIZES
+    COLORS,
+    MATERIALS,
+    SHAPES,
+    SIZES,
 )
 from data_factory import get_dataloaders
 
@@ -41,7 +44,7 @@ def test_sample_random_scene(num_objects):
         assert len(obj["pixel_coords"]) == 3
 
     # Check relationships structure
-    for rel in ['left', 'right', 'front', 'behind']:
+    for rel in ["left", "right", "front", "behind"]:
         assert len(scene["relationships"][rel]) == actual_num_objects
 
 
@@ -51,16 +54,16 @@ def test_make_tensor_from_scene_absolute():
         "mode": "absolute",
         "objects": [
             {
-                "color": "red",         # Index 1 in COLORS
-                "material": "metal",    # Index 1 in MATERIALS
-                "shape": "cube",        # Index 0 in SHAPES
-                "size": "large",        # Index 1 in SIZES
-                "rotation": 90.0,       # sin(90)=1, cos(90)=0
+                "color": "red",  # Index 1 in COLORS
+                "material": "metal",  # Index 1 in MATERIALS
+                "shape": "cube",  # Index 0 in SHAPES
+                "size": "large",  # Index 1 in SIZES
+                "rotation": 90.0,  # sin(90)=1, cos(90)=0
                 "3d_coords": [2.5, -2.5, 0.0],
-                "pixel_coords": [240.0, 160.0, 10.0]
+                "pixel_coords": [240.0, 160.0, 10.0],
             }
         ],
-        "relationships": {"left": [[]], "right": [[]], "front": [[]], "behind": [[]]}
+        "relationships": {"left": [[]], "right": [[]], "front": [[]], "behind": [[]]},
     }
 
     cond, mask = make_tensor_from_scene(test_scene)
@@ -76,10 +79,10 @@ def test_make_tensor_from_scene_absolute():
     # Reconstruct the expected 21-dim vector mathematically
     # [sin(90), cos(90)]
     rot_vec = [math.sin(math.radians(90)), math.cos(math.radians(90))]
-    sz_vec = [1.0] # large
-    mat_vec = [1.0] # metal
-    sh_vec = [1.0, 0.0, 0.0] # cube (one-hot out of 3)
-    col_vec = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # red (one-hot out of 8)
+    sz_vec = [1.0]  # large
+    mat_vec = [1.0]  # metal
+    sh_vec = [1.0, 0.0, 0.0]  # cube (one-hot out of 3)
+    col_vec = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # red (one-hot out of 8)
 
     # [px/480, py/320, pz/20] -> [240/480, 160/320, 10/20]
     p_vec = [0.5, 0.5, 0.5]
@@ -100,20 +103,30 @@ def test_make_tensor_from_scene_relative():
         "mode": "relative",
         "objects": [
             {
-                "color": "gray", "material": "rubber", "shape": "sphere", "size": "small",
-                "rotation": 0.0, "3d_coords": [0,0,0], "pixel_coords": [0,0,0]
+                "color": "gray",
+                "material": "rubber",
+                "shape": "sphere",
+                "size": "small",
+                "rotation": 0.0,
+                "3d_coords": [0, 0, 0],
+                "pixel_coords": [0, 0, 0],
             },
             {
-                "color": "blue", "material": "metal", "shape": "cylinder", "size": "large",
-                "rotation": 0.0, "3d_coords": [0,0,0], "pixel_coords": [0,0,0]
-            }
+                "color": "blue",
+                "material": "metal",
+                "shape": "cylinder",
+                "size": "large",
+                "rotation": 0.0,
+                "3d_coords": [0, 0, 0],
+                "pixel_coords": [0, 0, 0],
+            },
         ],
         "relationships": {
             "left": [[1], []],  # Object 1 is to the left of Object 0
-            "right": [[], [0]], # Object 0 is to the right of Object 1
+            "right": [[], [0]],  # Object 0 is to the right of Object 1
             "front": [[], []],
-            "behind": [[], []]
-        }
+            "behind": [[], []],
+        },
     }
 
     cond, mask = make_tensor_from_scene(test_scene)
@@ -143,13 +156,7 @@ def test_clevr_hybrid_dataset(tmp_path):
     if not os.path.exists(clevr_path):
         pytest.skip(f"CLEVR dataset not found in {cache_dir}. Skipping iteration test to prevent download.")
 
-    dataset = CLEVRHybridDataset(
-        root_dir=cache_dir,
-        split="train",
-        mode="absolute",
-        image_size=64,
-        download=False
-    )
+    dataset = CLEVRHybridDataset(root_dir=cache_dir, split="train", mode="absolute", image_size=64, download=False)
 
     assert len(dataset) > 0, "Dataset loaded but contains no scenes!"
 
@@ -179,13 +186,7 @@ def test_clevr_hybrid_dataset_exact_values(mode):
     if not os.path.exists(clevr_path):
         pytest.skip(f"CLEVR dataset not found in {cache_dir}. Skipping iteration test to prevent download.")
 
-    dataset = CLEVRHybridDataset(
-        root_dir=cache_dir,
-        split="train",
-        mode=mode,
-        image_size=64,
-        download=False
-    )
+    dataset = CLEVRHybridDataset(root_dir=cache_dir, split="train", mode=mode, image_size=64, download=False)
 
     assert len(dataset) > 0, "Dataset loaded but contains no scenes!"
 
@@ -223,26 +224,28 @@ def test_data_factory_standardization():
     """Ensure the factory yields strictly standardized dictionary keys for all datasets via Hydra Configs."""
 
     # Base Mock Hydra Config (Notice the clean separation of dataset vs root args we just implemented!)
-    base_cfg = OmegaConf.create({
-        "cache_dir": "cache_dir",
-        "train_batch_size": 2,
-        "eval_batch_size": 2,
-        "dataloader_num_workers": 0,
-        "epoch_max_batches_train": 1,
-        "epoch_max_batches_eval": 1,
-        "dataset": {
-            "dataset_type": "hf",
-            "dataset_name": "uoft-cs/cifar100",
-            "dataset_config_name": None,
-            "resolution": 32,
-            "center_crop": True,
-            "random_flip": True,
-            "image_key": "img",
-            "class_key": "fine_label",
-            "test_split_name": "test",
-            "num_classes": None, # Null = Unconditional
+    base_cfg = OmegaConf.create(
+        {
+            "cache_dir": "cache_dir",
+            "train_batch_size": 2,
+            "eval_batch_size": 2,
+            "dataloader_num_workers": 0,
+            "epoch_max_batches_train": 1,
+            "epoch_max_batches_eval": 1,
+            "dataset": {
+                "dataset_type": "hf",
+                "dataset_name": "uoft-cs/cifar100",
+                "dataset_config_name": None,
+                "resolution": 32,
+                "center_crop": True,
+                "random_flip": True,
+                "image_key": "img",
+                "class_key": "fine_label",
+                "test_split_name": "test",
+                "num_classes": None,  # Null = Unconditional
+            },
         }
-    })
+    )
 
     # 1. Test Unconditional HF Dataset
     train_dl, _ = get_dataloaders(base_cfg)
@@ -263,27 +266,29 @@ def test_data_factory_standardization():
     assert batch.get("masks") is None
 
     # 3. Test CLEVR Dataset
-    clevr_cfg = OmegaConf.create({
-        "cache_dir": "cache_dir",
-        "train_batch_size": 2,
-        "eval_batch_size": 2,
-        "dataloader_num_workers": 0,
-        "epoch_max_batches_train": 1,
-        "epoch_max_batches_eval": 1,
-        "dataset": {
-            "dataset_type": "clevr",
-            "train_data_dir": "cache_dir",
-            "dataset_mode": "relative",
-            "resolution": 256,
-            "center_crop": False,
-            "random_flip": False,
+    clevr_cfg = OmegaConf.create(
+        {
+            "cache_dir": "cache_dir",
+            "train_batch_size": 2,
+            "eval_batch_size": 2,
+            "dataloader_num_workers": 0,
+            "epoch_max_batches_train": 1,
+            "epoch_max_batches_eval": 1,
+            "dataset": {
+                "dataset_type": "clevr",
+                "train_data_dir": "cache_dir",
+                "dataset_mode": "relative",
+                "resolution": 256,
+                "center_crop": False,
+                "random_flip": False,
+            },
         }
-    })
+    )
 
     if os.path.exists(os.path.join("cache_dir", "CLEVR_v1.0", "scenes", "CLEVR_train_scenes.json")):
         train_dl, _ = get_dataloaders(clevr_cfg)
         batch = next(iter(train_dl))
 
         assert "images" in batch
-        assert "conditions" in batch and batch["conditions"].shape == (2, 10, 55) # default relative mode
+        assert "conditions" in batch and batch["conditions"].shape == (2, 10, 55)  # default relative mode
         assert "masks" in batch and batch["masks"].shape == (2, 10)

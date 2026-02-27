@@ -14,7 +14,7 @@ def test_deep_recursion_memory_leak():
     # 1. Setup a dummy unconditional small-loop model
     model = UNet2DModel(
         sample_size=32,
-        in_channels=9,   # x(3) + y(3) + z(3)
+        in_channels=9,  # x(3) + y(3) + z(3)
         out_channels=6,  # y(3) + z(3)
         block_out_channels=(64, 128),
         layers_per_block=1,

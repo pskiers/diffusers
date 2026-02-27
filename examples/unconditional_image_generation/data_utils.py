@@ -3,6 +3,7 @@ class SafeIterator:
     A wrapper around a DataLoader (or any iterator) that catches and skips
     exceptions during iteration (like corrupted images in ImageNet).
     """
+
     def __init__(self, iterable, logger=None):
         self.iterable = iterable
         self.iterator = iter(iterable)
@@ -29,6 +30,7 @@ class LimitedLoader:
     Wraps a DataLoader to stop iteration after a fixed number of batches.
     For 'short epochs' on huge datasets. Should be compatible with multigpu accelerate logic etc. (I hope).
     """
+
     def __init__(self, dataloader, limit_batches):
         self.dataloader = dataloader
         self.limit_batches = min(limit_batches, len(dataloader))

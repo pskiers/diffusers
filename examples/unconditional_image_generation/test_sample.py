@@ -8,6 +8,7 @@ from hydra import compose, initialize
 from hydra.utils import instantiate
 from hydra.core.global_hydra import GlobalHydra
 
+
 def create_dummy_checkpoint(experiment_name, ckpt_dir):
     """
     Dynamically generates a checkpoint with random weights based on the YAML config
@@ -52,15 +53,18 @@ def run_sample_test(experiment_name):
         env = os.environ.copy()
 
         cmd = [
-            "accelerate", "launch", "--num_processes=1", "--mixed_precision=fp16",
+            "accelerate",
+            "launch",
+            "--num_processes=1",
+            "--mixed_precision=fp16",
             "sample.py",
             f"experiment={experiment_name}",
             f"checkpoint_path={ckpt_dir}",
             f"output_dir={out_dir}",
             "num_samples=2",
             "sample_batch_size=2",
-            "ddpm_num_inference_steps=2", # 2 steps makes the test finish in seconds!
-            "use_ddim=true"               # DDIM is required to safely do only 2 steps
+            "ddpm_num_inference_steps=2",  # 2 steps makes the test finish in seconds!
+            "use_ddim=true",  # DDIM is required to safely do only 2 steps
         ]
 
         res = subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -77,41 +81,52 @@ def run_sample_test(experiment_name):
             img_path = os.path.join(samples_dir, img_name)
 
             with Image.open(img_path) as img:
-                img.verify() # Validates the PNG headers are uncorrupted
+                img.verify()  # Validates the PNG headers are uncorrupted
 
             # Reopen to check the physical canvas size
             with Image.open(img_path) as img:
-                assert img.size == (expected_res, expected_res), \
-                    f"Wrong resolution! Expected {expected_res}, got {img.size}"
+                assert img.size == (
+                    expected_res,
+                    expected_res,
+                ), f"Wrong resolution! Expected {expected_res}, got {img.size}"
 
     finally:
         # Clean up the gigabytes of dummy models we just made
         shutil.rmtree(base_dir, ignore_errors=True)
 
+
 # ---------------------------------------------------------
 # The Test Suite
 # ---------------------------------------------------------
 
+
 def test_sample_uncond_cifar100_std():
     run_sample_test("uncond_cifar100_std")
+
 
 def test_sample_uncond_cifar100_trm():
     run_sample_test("uncond_cifar100_trm")
 
+
 def test_sample_cond_cifar100_std():
     run_sample_test("cond_cifar100_std")
+
 
 def test_sample_cond_cifar100_trm():
     run_sample_test("cond_cifar100_trm")
 
+
 def test_sample_cond_imgnet_std():
     run_sample_test("cond_imgnet_std")
+
 
 def test_sample_cond_imgnet_trm():
     run_sample_test("cond_imgnet_trm")
 
+
 def test_sample_clevr_relative_std():
     run_sample_test("clevr_relative_std")
+
 
 def test_sample_clevr_relative_trm():
     run_sample_test("clevr_relative_trm")

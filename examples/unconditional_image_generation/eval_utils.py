@@ -10,8 +10,16 @@ from trm_utils import get_model_output, deep_recursion
 
 @torch.no_grad()
 def evaluate_and_save(
-    model, ema_model, noise_scheduler, args, accelerator,
-    epoch, global_step, vae=None, vae_scaling_factor=1.0, weight_dtype=torch.float32
+    model,
+    ema_model,
+    noise_scheduler,
+    args,
+    accelerator,
+    epoch,
+    global_step,
+    vae=None,
+    vae_scaling_factor=1.0,
+    weight_dtype=torch.float32,
 ):
     unet = accelerator.unwrap_model(model)
     if args.use_ema:
@@ -28,14 +36,16 @@ def evaluate_and_save(
     # 1. Setup Base Latents
     latents = torch.randn(
         (bsz, args.dataset.input_channels, sample_size, sample_size),
-        generator=generator, device=device, dtype=weight_dtype
+        generator=generator,
+        device=device,
+        dtype=weight_dtype,
     )
 
     # 2. Route Conditions (Unconditional vs Class vs Sequence)
     conds, masks, unconds = None, None, None
     is_unified_class = getattr(args.model, "condition_mode", None) == "class"
     is_unified_sequence = getattr(args.model, "condition_mode", None) == "sequence"
-    is_standard_conditional = ("UNet2DModel" in args.model._target_ and args.dataset.num_classes)
+    is_standard_conditional = "UNet2DModel" in args.model._target_ and args.dataset.num_classes
 
     do_cfg = args.guidance_scale > 1.0 and is_unified_class
 
@@ -46,6 +56,7 @@ def evaluate_and_save(
 
     elif is_unified_sequence:
         from clevr_dataset import sample_random_scene, make_tensor_from_scene
+
         c_list, m_list = [], []
         for _ in range(bsz):
             scene = sample_random_scene(num_objects=4, mode=args.dataset.dataset_mode)
@@ -95,12 +106,18 @@ def evaluate_and_save(
     # 5. Log Images
     images_processed = (images * 255).round().numpy().astype("uint8")
     if args.logger == "tensorboard":
-        tracker = accelerator.get_tracker("tensorboard", unwrap=True) if is_accelerate_version(">=", "0.17.0.dev0") else accelerator.get_tracker("tensorboard")
+        tracker = (
+            accelerator.get_tracker("tensorboard", unwrap=True)
+            if is_accelerate_version(">=", "0.17.0.dev0")
+            else accelerator.get_tracker("tensorboard")
+        )
         tracker.add_images("test_samples", images_processed, epoch)
     elif args.logger == "wandb":
         n_cols = math.ceil(math.sqrt(bsz) * 1.5)
         image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=True)
-        accelerator.get_tracker("wandb").log({"test_samples": wandb.Image(image_grid), "epoch": epoch}, step=global_step)
+        accelerator.get_tracker("wandb").log(
+            {"test_samples": wandb.Image(image_grid), "epoch": epoch}, step=global_step
+        )
 
     # 6. Save Pipeline
     if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
