@@ -12,19 +12,19 @@ from torch.utils.data import Dataset
 
 
 # Constants aligned with CLEVR
-COLORS = ['gray', 'red', 'blue', 'green', 'brown', 'purple', 'cyan', 'yellow']
-MATERIALS = ['rubber', 'metal']
-SHAPES = ['cube', 'sphere', 'cylinder']
-SIZES = ['small', 'large']
-RELATIONS = ['left', 'right', 'front', 'behind']
+COLORS = ["gray", "red", "blue", "green", "brown", "purple", "cyan", "yellow"]
+MATERIALS = ["rubber", "metal"]
+SHAPES = ["cube", "sphere", "cylinder"]
+SIZES = ["small", "large"]
+RELATIONS = ["left", "right", "front", "behind"]
 
 MAX_OBJECTS = 10
 
 # Global mappings
 COLOR2ID = {k: i for i, k in enumerate(COLORS)}
-MAT2ID   = {k: i for i, k in enumerate(MATERIALS)}
+MAT2ID = {k: i for i, k in enumerate(MATERIALS)}
 SHAPE2ID = {k: i for i, k in enumerate(SHAPES)}
-SIZE2ID  = {k: i for i, k in enumerate(SIZES)}
+SIZE2ID = {k: i for i, k in enumerate(SIZES)}
 
 # Approximate boundaries for CLEVR scene generation
 X_RANGE = (-3.0, 3.0)
@@ -44,7 +44,7 @@ def sample_random_scene(num_objects=None, mode="absolute"):
         num_objects = random.randint(3, 10)
 
     objects = []
-    positions = [] # Store (x, y) for distance checks
+    positions = []  # Store (x, y) for distance checks
 
     for _ in range(num_objects):
         valid_pos = False
@@ -55,7 +55,7 @@ def sample_random_scene(num_objects=None, mode="absolute"):
 
             too_close = False
             for px, py in positions:
-                dist = math.sqrt((x - px)**2 + (y - py)**2)
+                dist = math.sqrt((x - px) ** 2 + (y - py) ** 2)
                 if dist < MIN_DIST:
                     too_close = True
                     break
@@ -65,53 +65,47 @@ def sample_random_scene(num_objects=None, mode="absolute"):
                 positions.append((x, y))
 
                 obj = {
-                    'color': random.choice(COLORS),
-                    'material': random.choice(MATERIALS),
-                    'shape': random.choice(SHAPES),
-                    'size': random.choice(SIZES),
-                    'rotation': random.uniform(0, 360),
-                    '3d_coords': [x, y, 0.0],
-                    'pixel_coords': [
-                        (x + 3) / 6 * 480,
-                        (y + 3) / 6 * 320,
-                        10.0
-                    ]
+                    "color": random.choice(COLORS),
+                    "material": random.choice(MATERIALS),
+                    "shape": random.choice(SHAPES),
+                    "size": random.choice(SIZES),
+                    "rotation": random.uniform(0, 360),
+                    "3d_coords": [x, y, 0.0],
+                    "pixel_coords": [(x + 3) / 6 * 480, (y + 3) / 6 * 320, 10.0],
                 }
                 objects.append(obj)
             attempts += 1
 
     relationships = {
-        'left':  [[] for _ in objects],
-        'right': [[] for _ in objects],
-        'front': [[] for _ in objects],
-        'behind': [[] for _ in objects]
+        "left": [[] for _ in objects],
+        "right": [[] for _ in objects],
+        "front": [[] for _ in objects],
+        "behind": [[] for _ in objects],
     }
 
     for i in range(len(objects)):
         obj_A = objects[i]
-        pos_A = obj_A['3d_coords']
+        pos_A = obj_A["3d_coords"]
 
         for j in range(len(objects)):
-            if i == j: continue
+            if i == j:
+                continue
 
             obj_B = objects[j]
-            pos_B = obj_B['3d_coords']
+            pos_B = obj_B["3d_coords"]
 
             if pos_B[0] < pos_A[0]:
-                relationships['left'][i].append(j)
+                relationships["left"][i].append(j)
             else:
-                relationships['right'][i].append(j)
+                relationships["right"][i].append(j)
 
             if pos_B[1] < pos_A[1]:
-                relationships['front'][i].append(j)
+                relationships["front"][i].append(j)
             else:
-                relationships['behind'][i].append(j)
+                relationships["behind"][i].append(j)
 
-    return {
-        "objects": objects,
-        "relationships": relationships,
-        "mode": mode
-    }
+    return {"objects": objects, "relationships": relationships, "mode": mode}
+
 
 def make_tensor_from_scene(scene_dict):
     """
@@ -121,31 +115,31 @@ def make_tensor_from_scene(scene_dict):
         cond_tensor (Tensor): Shape (1, MAX_OBJECTS, Feature_Dim)
         mask (Tensor): Shape (1, MAX_OBJECTS) - 1.0 for real objects, 0.0 for padding
     """
-    mode = scene_dict['mode']
-    objects = scene_dict['objects']
-    relationships = scene_dict['relationships']
+    mode = scene_dict["mode"]
+    objects = scene_dict["objects"]
+    relationships = scene_dict["relationships"]
 
     obj_vectors = []
 
     for i, obj in enumerate(objects):
         # --- 1. Common Attributes (15 dims) ---
-        rot_rad = math.radians(obj['rotation'])
+        rot_rad = math.radians(obj["rotation"])
         rot_vec = torch.tensor([math.sin(rot_rad), math.cos(rot_rad)], dtype=torch.float32)
 
-        sz_vec = torch.tensor([SIZE2ID[obj['size']]], dtype=torch.float32)
-        mat_vec = torch.tensor([MAT2ID[obj['material']]], dtype=torch.float32)
-        sh_vec = F.one_hot(torch.tensor(SHAPE2ID[obj['shape']]), num_classes=3).float()
-        col_vec = F.one_hot(torch.tensor(COLOR2ID[obj['color']]), num_classes=8).float()
+        sz_vec = torch.tensor([SIZE2ID[obj["size"]]], dtype=torch.float32)
+        mat_vec = torch.tensor([MAT2ID[obj["material"]]], dtype=torch.float32)
+        sh_vec = F.one_hot(torch.tensor(SHAPE2ID[obj["shape"]]), num_classes=3).float()
+        col_vec = F.one_hot(torch.tensor(COLOR2ID[obj["color"]]), num_classes=8).float()
 
         base = torch.cat([rot_vec, sz_vec, mat_vec, sh_vec, col_vec])
 
         # --- 2. Mode Specifics ---
         if mode == "absolute":
-            px, py, pz = obj['pixel_coords']
-            p_vec = torch.tensor([px/480.0, py/320.0, pz/20.0], dtype=torch.float32)
+            px, py, pz = obj["pixel_coords"]
+            p_vec = torch.tensor([px / 480.0, py / 320.0, pz / 20.0], dtype=torch.float32)
 
-            x3, y3, z3 = obj['3d_coords']
-            c3_vec = torch.tensor([x3/5.0, y3/5.0, z3/5.0], dtype=torch.float32)
+            x3, y3, z3 = obj["3d_coords"]
+            c3_vec = torch.tensor([x3 / 5.0, y3 / 5.0, z3 / 5.0], dtype=torch.float32)
 
             spatial = torch.cat([p_vec, c3_vec])
             full_vec = torch.cat([base, spatial])
@@ -201,16 +195,12 @@ class CLEVRHybridDataset(Dataset):
         scene_path = os.path.join(self.dataset_path, "scenes", f"CLEVR_{filename_split}_scenes.json")
 
         print(f"Loading {mode} scenes from {scene_path}...")
-        with open(scene_path, 'r') as f:
-            self.scenes = json.load(f)['scenes']
+        with open(scene_path, "r") as f:
+            self.scenes = json.load(f)["scenes"]
 
         self.image_dir = os.path.join(self.dataset_path, "images", filename_split)
 
-        self.transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.ToTensor(),
-            T.Normalize([0.5], [0.5])
-        ])
+        self.transform = T.Compose([T.Resize((image_size, image_size)), T.ToTensor(), T.Normalize([0.5], [0.5])])
 
     def set_transform(self, transform):
         self.transform = transform
@@ -225,24 +215,21 @@ class CLEVRHybridDataset(Dataset):
         zip_path = os.path.join(self.root_dir, "CLEVR_v1.0.zip")
         if not os.path.exists(zip_path):
             r = requests.get(self.URL, stream=True)
-            with open(zip_path, 'wb') as f:
+            with open(zip_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024):
-                    if chunk: f.write(chunk)
-        with zipfile.ZipFile(zip_path, 'r') as z:
+                    if chunk:
+                        f.write(chunk)
+        with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(self.root_dir)
 
     def __getitem__(self, idx):
         scene = self.scenes[idx]
-        image = Image.open(os.path.join(self.image_dir, scene['image_filename'])).convert("RGB")
+        image = Image.open(os.path.join(self.image_dir, scene["image_filename"])).convert("RGB")
 
         # Temporarily inject the mode so our shared function knows how to process it
-        scene['mode'] = self.mode
+        scene["mode"] = self.mode
 
         # Get tensors. make_tensor_from_scene adds a batch dim of 1, so we strip it off here.
         cond_tensor, mask = make_tensor_from_scene(scene)
 
-        return {
-            "images": self.transform(image),
-            "conditions": cond_tensor[0],
-            "masks": mask[0]
-        }
+        return {"images": self.transform(image), "conditions": cond_tensor[0], "masks": mask[0]}

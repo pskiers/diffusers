@@ -9,9 +9,9 @@ examples/**/*.pt
 examples/**/*.json
 examples/**/*.tar.gz
 examples/**/cifar100/*
-examples/unconditional_image_generation/cache_dir
-examples/unconditional_image_generation/checkpoints
-examples/unconditional_image_generation/outputs
+examples/trm_diffusion/cache_dir
+examples/trm_diffusion/checkpoints
+examples/trm_diffusion/outputs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
