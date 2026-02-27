@@ -33,9 +33,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 
 # Local abstracted modules
-from config import parse_args
 from data_factory import get_dataloaders
-from model_factory import build_model
 from model_utils import _extract_into_tensor
 from trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save

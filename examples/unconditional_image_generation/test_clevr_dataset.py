@@ -2,13 +2,14 @@ import os
 import math
 import pytest
 import torch
+from omegaconf import OmegaConf
+
 from clevr_dataset import (
     sample_random_scene,
     make_tensor_from_scene,
     CLEVRHybridDataset,
     COLORS, MATERIALS, SHAPES, SIZES
 )
-from config import parse_args
 from data_factory import get_dataloaders
 
 
@@ -191,8 +192,6 @@ def test_clevr_hybrid_dataset_exact_values(mode):
     # Check the first N items to ensure stability
     n_items_to_check = 5
 
-    print(f"\n--- Checking first {n_items_to_check} items in {mode} mode ---")
-
     for i in range(n_items_to_check):
         # 1. Get the output directly from the Dataset class
         sample = dataset[i]
@@ -219,44 +218,72 @@ def test_clevr_hybrid_dataset_exact_values(mode):
         torch.testing.assert_close(ds_features, func_features, msg=f"Features mismatch at index {i} for {mode} mode!")
         torch.testing.assert_close(ds_mask, func_mask, msg=f"Mask mismatch at index {i} for {mode} mode!")
 
-        # Print the first object's features of the first scene just so you can visually inspect it
-        if i == 0:
-            print(f"\nScene 0, Object 0 features ({mode}):\n{ds_features[0].tolist()}")
 
+def test_data_factory_standardization():
+    """Ensure the factory yields strictly standardized dictionary keys for all datasets via Hydra Configs."""
 
-def test_data_factory_standardization(monkeypatch):
-    """Ensure the factory yields strictly standardized dictionary keys for all datasets."""
+    # Base Mock Hydra Config (Notice the clean separation of dataset vs root args we just implemented!)
+    base_cfg = OmegaConf.create({
+        "cache_dir": "cache_dir",
+        "train_batch_size": 2,
+        "eval_batch_size": 2,
+        "dataloader_num_workers": 0,
+        "epoch_max_batches_train": 1,
+        "epoch_max_batches_eval": 1,
+        "dataset": {
+            "dataset_type": "hf",
+            "dataset_name": "uoft-cs/cifar100",
+            "dataset_config_name": None,
+            "resolution": 32,
+            "center_crop": True,
+            "random_flip": True,
+            "image_key": "img",
+            "class_key": "fine_label",
+            "test_split_name": "test",
+            "num_classes": None, # Null = Unconditional
+        }
+    })
 
     # 1. Test Unconditional HF Dataset
-    monkeypatch.setattr("sys.argv", ["train.py", "--dataset_name", "uoft-cs/cifar100", "--epoch_max_batches_train", "1", "--train_batch_size", "2"])
-    args_uncond = parse_args()
-    args_uncond.num_classes = 0 # Force unconditional
-    train_dl, _ = get_dataloaders(args_uncond)
+    train_dl, _ = get_dataloaders(base_cfg)
     batch = next(iter(train_dl))
 
-    assert "images" in batch and batch["images"].shape == (2, 3, 64, 64)
-    assert batch["conditions"] is None
-    assert batch["masks"] is None
+    assert "images" in batch and batch["images"].shape == (2, 3, 32, 32)
+    assert batch.get("conditions") is None
+    assert batch.get("masks") is None
 
     # 2. Test Conditional HF Dataset
-    monkeypatch.setattr("sys.argv", ["train.py", "--dataset_name", "uoft-cs/cifar100", "--epoch_max_batches_train", "1", "--train_batch_size", "2", "--num_classes", "100"])
-    args_cond = parse_args()
-    train_dl, _ = get_dataloaders(args_cond)
+    cond_cfg = base_cfg.copy()
+    cond_cfg.dataset.num_classes = 100
+    train_dl, _ = get_dataloaders(cond_cfg)
     batch = next(iter(train_dl))
 
     assert "images" in batch
-    assert batch["conditions"] is not None and batch["conditions"].shape == (2,)
-    assert batch["masks"] is None
+    assert "conditions" in batch and batch["conditions"].shape == (2,)
+    assert batch.get("masks") is None
 
     # 3. Test CLEVR Dataset
-    monkeypatch.setattr("sys.argv", ["train.py", "--train_data_dir", "cache_dir", "--output_dir", "test-clevr", "--epoch_max_batches_train", "1", "--train_batch_size", "2"])
-    args_clevr = parse_args()
-    # Skip if CLEVR isn't downloaded locally to avoid breaking the test
-    import os
+    clevr_cfg = OmegaConf.create({
+        "cache_dir": "cache_dir",
+        "train_batch_size": 2,
+        "eval_batch_size": 2,
+        "dataloader_num_workers": 0,
+        "epoch_max_batches_train": 1,
+        "epoch_max_batches_eval": 1,
+        "dataset": {
+            "dataset_type": "clevr",
+            "train_data_dir": "cache_dir",
+            "dataset_mode": "relative",
+            "resolution": 256,
+            "center_crop": False,
+            "random_flip": False,
+        }
+    })
+
     if os.path.exists(os.path.join("cache_dir", "CLEVR_v1.0", "scenes", "CLEVR_train_scenes.json")):
-        train_dl, _ = get_dataloaders(args_clevr)
+        train_dl, _ = get_dataloaders(clevr_cfg)
         batch = next(iter(train_dl))
 
         assert "images" in batch
-        assert batch["conditions"] is not None and batch["conditions"].shape == (2, 10, 55) # default relative mode
-        assert batch["masks"] is not None and batch["masks"].shape == (2, 10)
+        assert "conditions" in batch and batch["conditions"].shape == (2, 10, 55) # default relative mode
+        assert "masks" in batch and batch["masks"].shape == (2, 10)

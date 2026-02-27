@@ -34,14 +34,14 @@ def get_dataloaders(args):
         is_conditional = args.dataset.num_classes is not None and args.dataset.num_classes > 0
 
         def hf_train_transform(examples):
-            images = [train_augmentations(image.convert("RGB")) for image in examples[args.dataset.img_key]]
+            images = [train_augmentations(image.convert("RGB")) for image in examples[args.dataset.image_key]]
             out = {"images": images}
             if is_conditional:
                 out["conditions"] = examples[args.dataset.class_key]
             return out
 
         def hf_eval_transform(examples):
-            images = [eval_augmentations(image.convert("RGB")) for image in examples[args.dataset.img_key]]
+            images = [eval_augmentations(image.convert("RGB")) for image in examples[args.dataset.image_key]]
             out = {"images": images}
             if is_conditional:
                 out["conditions"] = examples[args.dataset.class_key]

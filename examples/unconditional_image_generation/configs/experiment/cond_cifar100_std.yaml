@@ -8,3 +8,6 @@ train_batch_size: 256
 
 model:
   num_class_embeds: 100
+
+cfg_drop_rate: 0
+guidance_scale: 0
