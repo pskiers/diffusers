@@ -23,31 +23,32 @@ def evaluate_and_save(
     generator = torch.Generator(device=device).manual_seed(0)
 
     bsz = args.eval_batch_size
-    sample_size = args.resolution if vae is None else args.resolution // 8
+    sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
 
     # 1. Setup Base Latents
     latents = torch.randn(
-        (bsz, args.input_channels, sample_size, sample_size),
+        (bsz, args.dataset.input_channels, sample_size, sample_size),
         generator=generator, device=device, dtype=weight_dtype
     )
 
     # 2. Route Conditions (Unconditional vs Class vs Sequence)
     conds, masks, unconds = None, None, None
-    do_cfg = args.guidance_scale > 1.0 and args.model_type == "unified_class"
+    is_unified_class = getattr(args.model, "condition_mode", None) == "class"
+    is_unified_sequence = getattr(args.model, "condition_mode", None) == "sequence"
+    is_standard_conditional = ("UNet2DModel" in args.model._target_ and args.dataset.num_classes)
 
-    # Check if this is a standard UNet2DModel with class conditioning
-    is_standard_conditional = (args.model_type == "unet2d" and args.num_classes is not None and args.num_classes > 0)
+    do_cfg = args.guidance_scale > 1.0 and is_unified_class
 
-    if args.model_type == "unified_class" or is_standard_conditional:
-        conds = torch.randint(0, args.num_classes, [bsz], generator=generator, device=device)
+    if is_unified_class or is_standard_conditional:
+        conds = torch.randint(0, args.dataset.num_classes, [bsz], generator=generator, device=device)
         if do_cfg:
-            unconds = torch.full_like(conds, args.num_classes)
+            unconds = torch.full_like(conds, args.dataset.num_classes)
 
-    elif args.model_type == "unified_sequence":
+    elif is_unified_sequence:
         from clevr_dataset import sample_random_scene, make_tensor_from_scene
         c_list, m_list = [], []
         for _ in range(bsz):
-            scene = sample_random_scene(num_objects=4, mode=args.dataset_mode)
+            scene = sample_random_scene(num_objects=4, mode=args.dataset.dataset_mode)
             c, m = make_tensor_from_scene(scene)
             c_list.append(c)
             m_list.append(m)

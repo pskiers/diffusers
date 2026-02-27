@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /dataset: cifar100
+  - override /model: unet2d_trm
+
+use_small_loop: true
+T: 3
+n: 6
+N_supervision: 4
+
+output_dir: "cifar100-conditional-hrm-nsup-4-T-3-n-6"
+train_batch_size: 64
+
+model:
+  num_class_embeds: 100

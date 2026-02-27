@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - override /dataset: cifar100
+  - override /model: unet2d
+
+dataset:
+  num_classes: null
+
+output_dir: "cifar100-standard-long"
+train_batch_size: 256

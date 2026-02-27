@@ -10,6 +10,8 @@ examples/**/*.json
 examples/**/*.tar.gz
 examples/**/cifar100/*
 examples/unconditional_image_generation/cache_dir
+examples/unconditional_image_generation/checkpoints
+examples/unconditional_image_generation/outputs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

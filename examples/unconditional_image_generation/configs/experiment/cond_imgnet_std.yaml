@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /dataset: imagenet
+  - override /model: imagenet_condition_unet
+
+output_dir: "imagenet-conditional-standard-big"
+train_batch_size: 224
+eval_batch_size: 4

@@ -1,0 +1,9 @@
+_target_: diffusers.UNet2DModel
+sample_size: 32
+in_channels: 9  # 3 * 3 (x, y, z)
+out_channels: 6 # 3 * 2 (y, z)
+layers_per_block: 1
+block_out_channels: [128, 128]
+down_block_types: ["AttnDownBlock2D", "DownBlock2D"]
+up_block_types: ["UpBlock2D", "AttnUpBlock2D"]
+num_class_embeds: null

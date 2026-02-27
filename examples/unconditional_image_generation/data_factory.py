@@ -13,51 +13,51 @@ def get_dataloaders(args):
     """
     # 1. Define standard image augmentations
     train_augmentations = transforms.Compose([
-        transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution) if not args.center_crop else transforms.Lambda(lambda x: x),
-        transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+        transforms.Resize((args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(args.dataset.resolution) if args.dataset.center_crop else transforms.RandomCrop(args.dataset.resolution) if not args.dataset.center_crop else transforms.Lambda(lambda x: x),
+        transforms.RandomHorizontalFlip() if args.dataset.random_flip else transforms.Lambda(lambda x: x),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
     ])
 
     eval_augmentations = transforms.Compose([
-        transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.Resize((args.dataset.resolution, args.dataset.resolution), interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
     ])
 
     # 2. Determine Dataset Type
-    if args.dataset_type == "hf":
-        train_ds = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, split="train")
-        eval_ds = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, split=args.test_split_name)
+    if args.dataset.dataset_type == "hf":
+        train_ds = load_dataset(args.dataset.dataset_name, args.dataset.dataset_config_name, cache_dir=args.cache_dir, split="train")
+        eval_ds = load_dataset(args.dataset.dataset_name, args.dataset.dataset_config_name, cache_dir=args.cache_dir, split=args.dataset.test_split_name)
 
-        is_conditional = args.num_classes is not None and args.num_classes > 0
+        is_conditional = args.dataset.num_classes is not None and args.dataset.num_classes > 0
 
         def hf_train_transform(examples):
-            images = [train_augmentations(image.convert("RGB")) for image in examples[args.img_key]]
+            images = [train_augmentations(image.convert("RGB")) for image in examples[args.dataset.img_key]]
             out = {"images": images}
             if is_conditional:
-                out["conditions"] = examples[args.class_key]
+                out["conditions"] = examples[args.dataset.class_key]
             return out
 
         def hf_eval_transform(examples):
-            images = [eval_augmentations(image.convert("RGB")) for image in examples[args.img_key]]
+            images = [eval_augmentations(image.convert("RGB")) for image in examples[args.dataset.img_key]]
             out = {"images": images}
             if is_conditional:
-                out["conditions"] = examples[args.class_key]
+                out["conditions"] = examples[args.dataset.class_key]
             return out
 
         train_ds.set_transform(hf_train_transform)
         eval_ds.set_transform(hf_eval_transform)
 
-    elif args.dataset_type == "clevr":
-        train_ds = CLEVRHybridDataset(root_dir=args.train_data_dir, split="train", mode=args.dataset_mode, image_size=args.resolution, download=False)
-        eval_ds = CLEVRHybridDataset(root_dir=args.train_data_dir, split="validation", mode=args.dataset_mode, image_size=args.resolution, download=False)
+    elif args.dataset.dataset_type == "clevr":
+        train_ds = CLEVRHybridDataset(root_dir=args.dataset.train_data_dir, split="train", mode=args.dataset.dataset_mode, image_size=args.dataset.resolution, download=False)
+        eval_ds = CLEVRHybridDataset(root_dir=args.dataset.train_data_dir, split="validation", mode=args.dataset.dataset_mode, image_size=args.dataset.resolution, download=False)
         train_ds.set_transform(train_augmentations)
         eval_ds.set_transform(eval_augmentations)
 
     else:
-        raise ValueError(f"Unknown dataset_type: {args.dataset_type}")
+        raise ValueError(f"Unknown dataset_type: {args.dataset.dataset_type}")
 
     # 3. Custom Collate Function to handle missing keys cleanly
     def collate_fn(examples):

@@ -1,0 +1,14 @@
+dataset_type: "hf"
+dataset_name: "uoft-cs/cifar100"
+dataset_config_name: null
+train_data_dir: null
+test_split_name: "test"
+image_key: "img"
+class_key: "fine_label"
+num_classes: 100
+
+resolution: 32
+center_crop: true
+random_flip: true
+vae_name: null
+input_channels: 3

@@ -1,0 +1,11 @@
+_target_: conditional_unet_model.UnifiedConditionUNet
+condition_mode: "class"
+num_classes: 1000
+sample_size: 32
+in_channels: 12  # 4 * 3
+out_channels: 8  # 4 * 2
+layers_per_block: 1
+block_out_channels: [256, 256]
+down_block_types: ["DownBlock2D", "CrossAttnDownBlock2D"]
+up_block_types: ["CrossAttnUpBlock2D", "UpBlock2D"]
+cross_attention_dim: 256

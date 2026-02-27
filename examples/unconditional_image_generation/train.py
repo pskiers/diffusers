@@ -1,3 +1,8 @@
+import sys
+import hydra
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+from model_utils import trunc_normal_init_
 import os
 import math
 import shutil
@@ -52,9 +57,8 @@ def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, 
     raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
 
-def main():
-    args = parse_args()
-
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(args: DictConfig):
     # ---------------------------------------------------------
     # 1. Setup Accelerator & Loggers
     # ---------------------------------------------------------
@@ -105,14 +109,14 @@ def main():
     # 2. Initialize VAE, Data, and Model
     # ---------------------------------------------------------
     vae, vae_scaling_factor = None, 1.0
-    if args.vae_name is not None:
-        vae = AutoencoderKL.from_pretrained(args.vae_name, cache_dir=args.cache_dir).to(accelerator.device, dtype=torch.float32)
+    if args.dataset.vae_name is not None:
+        vae = AutoencoderKL.from_pretrained(args.dataset.vae_name, cache_dir=args.cache_dir).to(accelerator.device, dtype=torch.float32)
         vae.requires_grad_(False)
         vae.eval()
         vae_scaling_factor = vae.config.scaling_factor
 
     train_dl, eval_dl = get_dataloaders(args)
-    model = build_model(args)
+    model = instantiate(args.model, _convert_="all")
     model_cls = type(model)
 
     # Enable xformers
@@ -170,6 +174,7 @@ def main():
 
     # Save initial reasoning tokens for small loop
     if args.use_small_loop:
+        sample_size = args.dataset.resolution if args.dataset.vae_name is None else args.dataset.resolution // 8
         y_path = os.path.join(args.output_dir, "y_init.pt")
         z_path = os.path.join(args.output_dir, "z_init.pt")
 
@@ -180,11 +185,13 @@ def main():
             model.z_init = torch.load(z_path, map_location="cpu")
         # Otherwise, save the factory's freshly generated ones for future resumes
         elif accelerator.is_main_process:
-            logger.info("Saving new small loop anchor tokens (y_init.pt, z_init.pt)")
-            os.makedirs(args.output_dir, exist_ok=True)
-            torch.save(model.y_init, y_path)
-            torch.save(model.z_init, z_path)
-
+            logger.info("Generating new small loop anchor tokens")
+            model.y_init = trunc_normal_init_(torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1)
+            model.z_init = trunc_normal_init_(torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1)
+            if accelerator.is_main_process:
+                os.makedirs(args.output_dir, exist_ok=True)
+                torch.save(model.y_init, y_path)
+                torch.save(model.z_init, z_path)
     # ---------------------------------------------------------
     # 4. Optimizers, Schedulers, and Trackers
     # ---------------------------------------------------------
@@ -208,7 +215,7 @@ def main():
         ema_model.to(accelerator.device)
 
     if accelerator.is_main_process and args.logger == "wandb":
-        tracker_config = vars(args)
+        tracker_config = OmegaConf.to_container(args, resolve=True)
         tracker_config["total_params"] = total_params
         tracker_config["trainable_params"] = trainable_params
         accelerator.init_trackers(
@@ -276,9 +283,9 @@ def main():
             mask = batch["masks"].to(model.device) if batch["masks"] is not None else None
 
             # CFG Label Dropout
-            if cond is not None and args.model_type == "unified_class" and args.cfg_drop_rate > 0:
+            if cond is not None and args.cfg_drop_rate > 0:
                 drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
-                cond = torch.where(drop_mask, torch.tensor(args.num_classes, device=cond.device), cond)
+                cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
 
             # VAE Encoding & Noise Addition
             if vae is not None:
@@ -419,4 +426,7 @@ def main():
     accelerator.end_training()
 
 if __name__ == "__main__":
+    # Accelerate passes --local_rank via sys.argv. Hydra hates this.
+    # This strips all dashes so Hydra only processes key=value pairs.
+    sys.argv = [a for a in sys.argv if not a.startswith("--")]
     main()

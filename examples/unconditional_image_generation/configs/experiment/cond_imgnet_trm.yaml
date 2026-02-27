@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - override /dataset: imagenet
+  - override /model: imagenet_condition_unet_trm
+
+use_small_loop: true
+T: 3
+n: 6
+N_supervision: 4
+
+output_dir: "imagenet-conditional-hrm-nsup-4-T-3-n-6-fix-ch256"
+train_batch_size: 64
