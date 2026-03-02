@@ -11,6 +11,7 @@ git clone https://github.com/pskiers/diffusers.git
 cd diffusers
 git checkout pskiers/trm-diffusion
 pip install .
+pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
 ```
 
 Then cd in the example folder  and run

@@ -1,4 +1,4 @@
-huggingface_hub==0.24.6
+huggingface_hub>=0.27.0
 kiwisolver==1.4.7
 matplotlib==3.9.2
 numpy==1.26.4
@@ -15,7 +15,7 @@ jupyterlab==4.0.13
 jupyterlab-pygments==0.3.0
 jupyterlab-server==2.27.3
 datasets==2.21.0
-transformers==4.29.2
+transformers==4.41.2
 accelerate==0.34.2
 mediapy
 umap-learn

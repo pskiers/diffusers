@@ -12,6 +12,7 @@ examples/**/cifar100/*
 examples/trm_diffusion/cache_dir
 examples/trm_diffusion/checkpoints
 examples/trm_diffusion/outputs
+env/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
