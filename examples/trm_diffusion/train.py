@@ -38,6 +38,7 @@ from model_utils import _extract_into_tensor
 from trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save
 from data_utils import SafeIterator
+from backward_compatibility import load_with_backward_compatibility
 
 # Will error if the minimal version of diffusers is not installed.
 check_min_version("0.34.0.dev0")
@@ -163,18 +164,48 @@ def main(args: DictConfig):
                     weights.pop()  # pop weight so it's not saved twice
 
         def load_model_hook(models, input_dir):
-            if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), model_cls)
-                ema_model.load_state_dict(load_model.state_dict())
-                ema_model.to(accelerator.device)
-                del load_model
+            from model_utils import load_with_backward_compatibility
+            from safetensors.torch import load_file
 
             for _ in range(len(models)):
                 m = models.pop()
-                load_model = model_cls.from_pretrained(input_dir, subfolder="unet")
-                m.register_to_config(**load_model.config)
-                m.load_state_dict(load_model.state_dict())
-                del load_model
+
+                # --- 1. Load EMA Weights (if using EMA) ---
+                if args.use_ema:
+                    ema_dir = os.path.join(input_dir, "unet_ema")
+                    sf_path = os.path.join(ema_dir, "diffusion_pytorch_model.safetensors")
+                    bin_path = os.path.join(ema_dir, "diffusion_pytorch_model.bin")
+
+                    if os.path.exists(sf_path):
+                        ema_state_dict = load_file(sf_path)
+                    elif os.path.exists(bin_path):
+                        ema_state_dict = torch.load(bin_path, map_location="cpu")
+                    else:
+                        raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
+
+                    # Temporarily load translated EMA weights into the main model
+                    load_with_backward_compatibility(m, ema_state_dict)
+
+                    # Snap those translated weights into the EMA wrapper
+                    new_ema = EMAModel(m.parameters(), model_cls=model_cls, model_config=m.config)
+                    ema_model.load_state_dict(new_ema.state_dict())
+                    ema_model.to(accelerator.device)
+                    del new_ema
+
+                # --- 2. Load Main UNet Weights ---
+                unet_dir = os.path.join(input_dir, "unet")
+                sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
+                bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
+
+                if os.path.exists(sf_path):
+                    state_dict = load_file(sf_path)
+                elif os.path.exists(bin_path):
+                    state_dict = torch.load(bin_path, map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
+
+                # Overwrite the main model with the actual step weights
+                load_with_backward_compatibility(m, state_dict)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)

@@ -33,6 +33,7 @@ def generate_image_batch(
 
     # 2. Build Conditions
     conds, masks, unconds = None, None, None
+    metadata = []
     is_unified_class = getattr(args.model, "condition_mode", None) == "class"
     is_unified_sequence = getattr(args.model, "condition_mode", None) == "sequence"
     is_standard_conditional = "UNet2DModel" in args.model._target_ and args.dataset.num_classes
@@ -41,6 +42,7 @@ def generate_image_batch(
 
     if is_unified_class or is_standard_conditional:
         conds = torch.randint(0, args.dataset.num_classes, [bsz], generator=generator, device=device)
+        metadata = [{"class_label": int(c.item())} for c in conds]
         if do_cfg:
             unconds = torch.full_like(conds, args.dataset.num_classes)
 
@@ -53,8 +55,12 @@ def generate_image_batch(
             c, m = make_tensor_from_scene(scene)
             c_list.append(c)
             m_list.append(m)
+            metadata.append(scene)
         conds = torch.cat(c_list, dim=0).to(device)
         masks = torch.cat(m_list, dim=0).to(device)
+    else:
+        # Unconditional fallback
+        metadata = [{"class_label": "unconditional"} for _ in range(bsz)]
 
     # 3. The Denoising Loop
     for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
@@ -92,7 +98,7 @@ def generate_image_batch(
     else:
         images = latents
 
-    return (images / 2 + 0.5).clamp(0, 1)
+    return (images / 2 + 0.5).clamp(0, 1), metadata
 
 
 @torch.no_grad()
@@ -119,7 +125,7 @@ def evaluate_and_save(
     generator = torch.Generator(device=unet.device).manual_seed(0)
 
     # --- Use the Shared Engine ---
-    images = generate_image_batch(
+    images, _ = generate_image_batch(
         unet=unet,
         scheduler=noise_scheduler,
         vae=vae,
