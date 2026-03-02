@@ -51,7 +51,7 @@ def generate_image_batch(
 
         c_list, m_list = [], []
         for _ in range(bsz):
-            scene = sample_random_scene(num_objects=4, mode=args.dataset.dataset_mode)
+            scene = sample_random_scene(num_objects=None, mode=args.dataset.dataset_mode)
             c, m = make_tensor_from_scene(scene)
             c_list.append(c)
             m_list.append(m)
@@ -94,7 +94,16 @@ def generate_image_batch(
     # 4. VAE Decoding & Clamping
     if vae is not None:
         latents = latents / vae_scaling_factor
-        images = vae.decode(latents.to(vae.dtype)).sample
+        vae_bsz = getattr(args, "vae_batch_size", bsz)
+        decoded_images = []
+
+        # Spoon-feed the latents to the VAE in chunks
+        for i in range(0, latents.shape[0], vae_bsz):
+            latent_chunk = latents[i : i + vae_bsz].to(vae.dtype)
+            decoded_chunk = vae.decode(latent_chunk).sample
+            decoded_images.append(decoded_chunk)
+
+        images = torch.cat(decoded_images, dim=0)
     else:
         images = latents
 

@@ -30,6 +30,7 @@ from diffusers.utils import (
     is_wandb_available,
 )
 from diffusers.utils.import_utils import is_xformers_available
+from safetensors.torch import load_file
 from tqdm.auto import tqdm
 
 # Local abstracted modules
@@ -164,9 +165,6 @@ def main(args: DictConfig):
                     weights.pop()  # pop weight so it's not saved twice
 
         def load_model_hook(models, input_dir):
-            from model_utils import load_with_backward_compatibility
-            from safetensors.torch import load_file
-
             for _ in range(len(models)):
                 m = models.pop()
 

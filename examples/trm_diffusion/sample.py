@@ -31,9 +31,6 @@ def main(args: DictConfig):
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    if args.checkpoint_path is None:
-        raise ValueError("You must provide a checkpoint_path to sample from!")
-
     # 1. Load Model
     if args.get("checkpoint_step") is not None:
         if str(args.checkpoint_step).lower() == "latest":
@@ -144,7 +141,7 @@ def main(args: DictConfig):
             generator=generator,
             device=accelerator.device,
             weight_dtype=torch.float32,
-            show_progress=False,  # Disable inner progress bar to prevent terminal spam
+            show_progress=True,  # Disable inner progress bar to prevent terminal spam
         )
 
         # Format and save to disk

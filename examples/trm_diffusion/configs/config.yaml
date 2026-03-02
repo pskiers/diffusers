@@ -65,4 +65,5 @@ checkpoint_step: "latest"
 checkpoint_path: null
 num_samples: 10000
 sample_batch_size: 64
+vae_batch_size: 64
 use_ddim: false
