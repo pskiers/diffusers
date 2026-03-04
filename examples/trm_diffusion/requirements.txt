@@ -24,3 +24,11 @@ opencv-python
 wandb
 pytest
 hydra-core
+wheel
+setuptools
+packaging
+ninja
+flash_attn
+einops
+timm
+sentencepiece
