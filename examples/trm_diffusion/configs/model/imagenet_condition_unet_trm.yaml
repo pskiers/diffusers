@@ -1,4 +1,4 @@
-_target_: conditional_unet_model.UnifiedConditionUNet
+_target_: models.UnifiedConditionUNet
 condition_mode: "class"
 num_classes: 1000
 sample_size: 32
