@@ -35,11 +35,10 @@ from tqdm.auto import tqdm
 
 # Local abstracted modules
 from data_factory import get_dataloaders
-from model_utils import _extract_into_tensor
+from model_utils import extract_into_tensor, load_with_backward_compatibility
 from trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save
 from data_utils import SafeIterator
-from backward_compatibility import load_with_backward_compatibility
 
 # Will error if the minimal version of diffusers is not installed.
 check_min_version("0.34.0.dev0")
@@ -51,7 +50,7 @@ def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, 
     if args.prediction_type == "epsilon":
         return F.mse_loss(model_output.float(), noise.float())
     elif args.prediction_type == "sample":
-        alpha_t = _extract_into_tensor(noise_scheduler.alphas_cumprod, timesteps, clean_images.shape)
+        alpha_t = extract_into_tensor(noise_scheduler.alphas_cumprod, timesteps, clean_images.shape)
         snr_weights = alpha_t / (1 - alpha_t)
         loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
         return loss.mean()

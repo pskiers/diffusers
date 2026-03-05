@@ -1,8 +1,50 @@
 import math
 import torch
+import re
 
 
-def _extract_into_tensor(arr, timesteps, broadcast_shape):
+def load_with_backward_compatibility(unet, state_dict, logger=None):
+    """
+    Translates old checkpoint keys to the new unified model architecture keys.
+    """
+
+    # Regex map: pattern -> replacement
+    RENAME_MAP = {
+        r"^module\.": "",
+        r"^unet\.": "",
+        r"(^|\.)projector(\.)": r"\g<1>condition_projector\g<2>",
+        r"(^|\.)class_embedding(\.)": r"\g<1>condition_projector\g<2>",
+    }
+
+    adapted_dict = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for pattern, replacement in RENAME_MAP.items():
+            new_key = re.sub(pattern, replacement, new_key)
+        adapted_dict[new_key] = value
+
+    # strict=False prevents crashing if minor structural parameters differ
+    missing, unexpected = unet.load_state_dict(adapted_dict, strict=False)
+
+    if len(missing) > 0:
+        if logger is not None:
+            logger.warning(
+                f"Missing keys when loading checkpoint (showing first 5): {missing[:5]} ... ({len(missing)} total)"
+            )
+        else:
+            print(f"Missing keys when loading checkpoint (showing first 5): {missing[:5]} ... ({len(missing)} total)")
+    if len(unexpected) > 0:
+        if logger is not None:
+            logger.warning(
+                f"Unexpected keys in checkpoint (showing first 5): {unexpected[:5]} ... ({len(unexpected)} total)"
+            )
+            logger.warning("If these unexpected keys should map to the missing keys, add them to the RENAME_MAP!")
+        else:
+            print(f"Unexpected keys in checkpoint (showing first 5): {unexpected[:5]} ... ({len(unexpected)} total)")
+            print("If these unexpected keys should map to the missing keys, add them to the RENAME_MAP!")
+
+
+def extract_into_tensor(arr, timesteps, broadcast_shape):
     """
     Extract values from a 1-D numpy array for a batch of indices.
 
