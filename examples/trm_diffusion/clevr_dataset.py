@@ -30,6 +30,7 @@ SIZE2ID = {k: i for i, k in enumerate(SIZES)}
 X_RANGE = (-3.0, 3.0)
 Y_RANGE = (-3.0, 3.0)
 MIN_DIST = 0.7  # Minimum distance between objects to avoid overlap
+ORIG_W, ORIG_H = 480, 320
 
 
 def sample_random_scene(num_objects=None, mode="absolute"):
