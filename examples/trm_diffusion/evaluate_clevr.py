@@ -33,7 +33,7 @@ JOINT_PROMPTS = [f"a 3d render of a {c} {m} {s}" for c, m, s in JOINT_COMBOS]
 
 # --- 3D CALIBRATION ---
 def calibrate_camera_and_size(data_dir, split="val"):
-    """Uses the official CLEVR dataset to calibrate the 3D projeWction for evaluation."""
+    """Uses the official CLEVR dataset to calibrate the 3D projection for evaluation."""
     print("Calibrating 3D Geometry and Size Thresholds from official CLEVR...")
     dataset = CLEVRHybridDataset(root_dir=data_dir, split=split, download=False)
     scenes = dataset.scenes[:150]
@@ -112,7 +112,6 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
     with open(metadata_path, 'r') as f:
         samples = [json.loads(line) for line in f]
 
-    # Use original CLEVR to calibrate the 3D observer
     H, l_vec, f_vec, sz_thresh = calibrate_camera_and_size(clevr_dir)
 
     print("Loading Models (DINO & SigLIP)...")
@@ -131,14 +130,17 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
     loop_limit = limit if limit is not None else len(samples)
     for i, item in enumerate(tqdm(samples[:loop_limit])):
         img_path = samples_path / item["file_name"]
-        image = Image.open(img_path).convert("RGB")
+        raw_image = Image.open(img_path).convert("RGB")
+
+        # --- THE ELEGANT FIX: UN-SQUASH THE IMAGE IMMEDIATELY ---
+        if raw_image.size != (ORIG_W, ORIG_H):
+            image = raw_image.resize((ORIG_W, ORIG_H), Image.BILINEAR)
+        else:
+            image = raw_image
+
         gt_objects = item.get("objects", [])
 
-        # --- DYNAMIC SCALING MAPPING ---
-        scale_x = ORIG_W / image.width
-        scale_y = ORIG_H / image.height
-
-        # 1. STAGE 1: DETECTION (Hybrid Prompt + Scaled Ghost Filter)
+        # 1. STAGE 1: DETECTION
         gt_phrases = [f"{o['size']} {o['color']} {o['material']} {o['shape']}" for o in gt_objects]
         text_in = " . ".join(gt_phrases) + " . cube . sphere . cylinder ."
 
@@ -153,18 +155,13 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
             sorted_boxes = [b for _, b in sorted(zip(n_scores, n_boxes), reverse=True)]
 
             for b in sorted_boxes:
-                # Map back to 480x320 space before calculating distance threshold
-                cx1 = ((b[0]+b[2])/2) * scale_x
-                cy1 = ((b[1]+b[3])/2) * scale_y
+                cx1, cy1 = (b[0]+b[2])/2, (b[1]+b[3])/2
                 is_ghost = False
-
                 for kb in bboxes:
-                    cx2 = ((kb[0]+kb[2])/2) * scale_x
-                    cy2 = ((kb[1]+kb[3])/2) * scale_y
+                    cx2, cy2 = (kb[0]+kb[2])/2, (kb[1]+kb[3])/2
                     if (cx1-cx2)**2 + (cy1-cy2)**2 < 15**2:
                         is_ghost = True
                         break
-
                 if not is_ghost: bboxes.append(b)
 
         m["t_req"] += len(gt_objects); m["t_pred"] += len(bboxes)
@@ -173,7 +170,6 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
         pred_objs = []; all_crops = []
         for b in bboxes:
             x1, y1, x2, y2 = map(int, b)
-            # Crop using the actual generated image pixels (unscaled)
             all_crops.extend([
                 image.crop((max(0, x1-5), max(0, y1-5), min(image.width, x2+5), min(image.height, y2+5))), # Full view
                 image.crop((x1+(x2-x1)//4, y1+(y2-y1)//4, x2-(x2-x1)//4, y2-(y2-y1)//4)) # Center view
@@ -191,17 +187,14 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
                 win = avg_logits.argmax().item()
                 color, mat_str, shape = JOINT_COMBOS[win]
 
-                # Un-squash bounding box to 480x320 for accurate 3D Geometric Math
-                mapped_b = [b[0] * scale_x, b[1] * scale_y, b[2] * scale_x, b[3] * scale_y]
-
-                w_3d = get_3d_width(mapped_b, H)
+                w_3d = get_3d_width(b, H)
                 pred_objs.append({
                     "bbox": b,
                     "size": "large" if w_3d > sz_thresh else "small",
                     "color": color,
                     "material": "rubber" if "matte" in mat_str else "metal",
                     "shape": shape,
-                    "center_3d": get_3d_center(mapped_b, H)
+                    "center_3d": get_3d_center(b, H)
                 })
 
         # 3. HUNGARIAN MATCHING
