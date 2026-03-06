@@ -34,9 +34,22 @@ def generate_image_batch(
     # 2. Build Conditions
     conds, masks, unconds = None, None, None
     metadata = []
-    is_unified_class = getattr(args.model, "condition_mode", None) == "class"
-    is_unified_sequence = getattr(args.model, "condition_mode", None) == "sequence"
-    is_standard_conditional = "UNet2DModel" in args.model._target_ and args.dataset.num_classes
+
+    # Safely check condition_mode (handling both old direct models and new wrapped models)
+    model_config = getattr(args, "model", {})
+
+    # If using our new OOP wrapper, we need to inspect the inner core_model!
+    core_model_config = getattr(model_config, "core_model", model_config)
+
+    cond_mode = getattr(core_model_config, "condition_mode", None)
+
+    is_unified_class = cond_mode in ["class", "class_adaln"]
+    is_unified_sequence = cond_mode == "sequence"
+
+    target_str = str(getattr(core_model_config, "_target_", ""))
+    is_standard_conditional = ("UNet2DModel" in target_str or "UNet2DConditionModel" in target_str) and getattr(
+        args.dataset, "num_classes", None
+    )
 
     do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional)
 
@@ -71,13 +84,22 @@ def generate_image_batch(
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
 
         with torch.no_grad():
-            if args.use_small_loop:
+            if hasattr(unet, "reasoning_step"):
+                noise_pred = unet(
+                    latent_model_input,
+                    t,
+                    class_labels=class_input,
+                    encoder_hidden_states=class_input,
+                    attention_mask=mask_input,
+                ).sample
+
+            elif args.use_small_loop:
+                # 2. Old procedural logic (Maintains 100% backward compatibility)
                 from trm_utils import deep_recursion
 
                 y = unet.y_init.expand(latent_model_input.shape[0], -1, -1, -1).to(device)
                 z = unet.z_init.expand(latent_model_input.shape[0], -1, -1, -1).to(device)
 
-                # Fixed: Now accurately applying N_supervision updates to y and z!
                 for _ in range(args.N_supervision):
                     noise_pred, y, z = deep_recursion(
                         unet, latent_model_input, y, z, t, class_input, mask_input, args.n, args.T

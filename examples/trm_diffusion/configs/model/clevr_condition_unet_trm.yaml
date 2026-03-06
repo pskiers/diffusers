@@ -1,11 +1,18 @@
-_target_: models.UnifiedConditionUNet
-condition_mode: "sequence"
-raw_dim: 55  # relative
-sample_size: 32
-in_channels: 12
-out_channels: 8
-layers_per_block: 1
-block_out_channels: [128, 128]
-down_block_types: ["CrossAttnDownBlock2D", "DownBlock2D"]
-up_block_types: ["UpBlock2D", "CrossAttnUpBlock2D"]
-cross_attention_dim: 512
+_target_: trm_models.StandardTRM
+state_channels: 4
+resolution: 32
+n: 6
+T: 3
+n_sup: 4
+core_model:
+  _target_: models.UnifiedConditionUNet
+  condition_mode: "sequence"
+  raw_dim: 55  # relative
+  sample_size: 32
+  in_channels: 12
+  out_channels: 8
+  layers_per_block: 1
+  block_out_channels: [128, 128]
+  down_block_types: ["CrossAttnDownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "CrossAttnUpBlock2D"]
+  cross_attention_dim: 512

@@ -2,7 +2,6 @@ import sys
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from model_utils import trunc_normal_init_
 import os
 import math
 import shutil
@@ -119,7 +118,6 @@ def main(args: DictConfig):
 
     train_dl, eval_dl = get_dataloaders(args)
     model = instantiate(args.model, _convert_="all")
-    model_cls = type(model)
 
     # Enable xformers
     if args.enable_xformers_memory_efficient_attention:
@@ -141,15 +139,20 @@ def main(args: DictConfig):
     # 3. EMA & Custom Checkpoint Hooks
     # ---------------------------------------------------------
     ema_model = None
+
+    # Safely target the core model if it's wrapped
+    unet_for_ema = model.core_model if hasattr(model, "core_model") else model
+    model_cls_for_ema = type(unet_for_ema)
+
     if args.use_ema:
         ema_model = EMAModel(
-            model.parameters(),
+            unet_for_ema.parameters(),
             decay=args.ema_max_decay,
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=model_cls,
-            model_config=model.config,
+            model_cls=model_cls_for_ema,
+            model_config=unet_for_ema.config,
         )
 
     # `accelerate` custom saving & loading hooks
@@ -160,14 +163,16 @@ def main(args: DictConfig):
                 if args.use_ema:
                     ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
                 for i, m in enumerate(models):
-                    m.save_pretrained(os.path.join(output_dir, "unet"))
-                    weights.pop()  # pop weight so it's not saved twice
+                    # Unwrap our custom TRM classes before saving
+                    m_to_save = m.core_model if hasattr(m, "core_model") else m
+                    m_to_save.save_pretrained(os.path.join(output_dir, "unet"))
+                    weights.pop()
 
         def load_model_hook(models, input_dir):
             for _ in range(len(models)):
                 m = models.pop()
+                m_to_load = m.core_model if hasattr(m, "core_model") else m
 
-                # --- 1. Load EMA Weights (if using EMA) ---
                 if args.use_ema:
                     ema_dir = os.path.join(input_dir, "unet_ema")
                     sf_path = os.path.join(ema_dir, "diffusion_pytorch_model.safetensors")
@@ -180,16 +185,12 @@ def main(args: DictConfig):
                     else:
                         raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
 
-                    # Temporarily load translated EMA weights into the main model
-                    load_with_backward_compatibility(m, ema_state_dict)
-
-                    # Snap those translated weights into the EMA wrapper
-                    new_ema = EMAModel(m.parameters(), model_cls=model_cls, model_config=m.config)
+                    load_with_backward_compatibility(m_to_load, ema_state_dict)
+                    new_ema = EMAModel(m_to_load.parameters(), model_cls=type(m_to_load), model_config=m_to_load.config)
                     ema_model.load_state_dict(new_ema.state_dict())
                     ema_model.to(accelerator.device)
                     del new_ema
 
-                # --- 2. Load Main UNet Weights ---
                 unet_dir = os.path.join(input_dir, "unet")
                 sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
                 bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
@@ -201,36 +202,13 @@ def main(args: DictConfig):
                 else:
                     raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
 
-                # Overwrite the main model with the actual step weights
-                load_with_backward_compatibility(m, state_dict)
+                load_with_backward_compatibility(m_to_load, state_dict)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    # Save initial reasoning tokens for small loop
-    if args.use_small_loop:
-        sample_size = args.dataset.resolution if args.dataset.vae_name is None else args.dataset.resolution // 8
-        y_path = os.path.join(args.output_dir, "y_init.pt")
-        z_path = os.path.join(args.output_dir, "z_init.pt")
+    # Note: The manual anchor generation block that was here has been completely deleted!
 
-        # If the files exist (e.g., resuming), load them and overwrite the factory's random ones
-        if os.path.exists(y_path) and os.path.exists(z_path):
-            logger.info("Loading existing small loop anchor tokens (y_init.pt, z_init.pt)")
-            model.y_init = torch.load(y_path, map_location="cpu")
-            model.z_init = torch.load(z_path, map_location="cpu")
-        # Otherwise, save the factory's freshly generated ones for future resumes
-        elif accelerator.is_main_process:
-            logger.info("Generating new small loop anchor tokens")
-            model.y_init = trunc_normal_init_(
-                torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1
-            )
-            model.z_init = trunc_normal_init_(
-                torch.empty((1, args.dataset.input_channels, sample_size, sample_size), dtype=torch.float32), std=1
-            )
-            if accelerator.is_main_process:
-                os.makedirs(args.output_dir, exist_ok=True)
-                torch.save(model.y_init, y_path)
-                torch.save(model.z_init, z_path)
     # ---------------------------------------------------------
     # 4. Optimizers, Schedulers, and Trackers
     # ---------------------------------------------------------
@@ -247,7 +225,9 @@ def main(args: DictConfig):
         prediction_type=args.prediction_type,
     )
 
-    mult = args.N_supervision if args.use_small_loop else 1
+    # Safely get n_sup for the scheduler multiplication
+    mult = getattr(args.model, "n_sup", 1) if args.use_small_loop else 1
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -352,16 +332,34 @@ def main(args: DictConfig):
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-            # Forward & Backward Pass
+            # --- FORWARD & BACKWARD PASS ROUTING ---
             with accelerator.accumulate(model):
-                if args.use_small_loop:
-                    base_model = accelerator.unwrap_model(model)
+                base_model = accelerator.unwrap_model(model)
+
+                # ROUTE 1: New Object-Oriented TRM Models
+                if hasattr(base_model, "reasoning_step"):
+                    y, z = base_model.get_initial_states(bsz)
+                    y, z = y.to(model.device), z.to(model.device)
+
+                    for _ in range(base_model.n_sup):
+                        model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
+                        loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
+
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+
+                # ROUTE 2: Old Procedural TRM Logic (Backward Compatibility)
+                elif args.use_small_loop:
                     y = torch.cat([base_model.y_init for _ in range(bsz)], dim=0).to(model.device)
                     z = torch.cat([base_model.z_init for _ in range(bsz)], dim=0).to(model.device)
 
                     for _ in range(args.N_supervision):
                         model_output, y, z = deep_recursion(
-                            model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                            base_model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
                         )
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
@@ -371,6 +369,8 @@ def main(args: DictConfig):
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad()
+
+                # ROUTE 3: Standard Non-Recursive Models
                 else:
                     model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
                     loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
@@ -446,14 +446,23 @@ def main(args: DictConfig):
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
+            # --- VALIDATION PASS ROUTING ---
             with torch.no_grad():
-                if args.use_small_loop:
-                    base_model = accelerator.unwrap_model(model)
+                base_model = accelerator.unwrap_model(model)
+
+                # ROUTE 1: New Object-Oriented TRM Models
+                if hasattr(base_model, "reasoning_step"):
+                    model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
+
+                # ROUTE 2: Old Procedural TRM Logic
+                elif args.use_small_loop:
                     y = torch.cat([base_model.y_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
                     z = torch.cat([base_model.z_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
                     model_output, _, _ = deep_recursion(
-                        model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                        base_model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
                     )
+
+                # ROUTE 3: Standard Non-Recursive Models
                 else:
                     model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
 
@@ -480,17 +489,18 @@ def main(args: DictConfig):
             )
 
         if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):
-            # Save standard diffusers pipeline to output_dir
             unet = accelerator.unwrap_model(model)
-            if args.use_ema:
-                ema_model.store(unet.parameters())
-                ema_model.copy_to(unet.parameters())
+            unet_to_save = unet.core_model if hasattr(unet, "core_model") else unet
 
-            pipeline = diffusers.DDPMPipeline(unet=unet, scheduler=noise_scheduler)
+            if args.use_ema:
+                ema_model.store(unet_to_save.parameters())
+                ema_model.copy_to(unet_to_save.parameters())
+
+            pipeline = diffusers.DDPMPipeline(unet=unet_to_save, scheduler=noise_scheduler)
             pipeline.save_pretrained(args.output_dir)
 
             if args.use_ema:
-                ema_model.restore(unet.parameters())
+                ema_model.restore(unet_to_save.parameters())
 
             if args.push_to_hub:
                 upload_folder(

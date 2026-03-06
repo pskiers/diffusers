@@ -1,14 +1,21 @@
-_target_: conditional_dit_model.UnifiedConditionDiT
-condition_mode: "sequence"
-raw_dim: 55  # absolute
-sample_size: 32
+_target_: trm_models.StandardTRM
+state_channels: 4
+resolution: 32
+n: 6
+T: 3
+n_sup: 4
+core_model:
+  _target_: conditional_dit_model.UnifiedConditionDiT
+  condition_mode: "sequence"
+  raw_dim: 55  # absolute
+  sample_size: 32
 
-in_channels: 12
-out_channels: 8
+  in_channels: 12
+  out_channels: 8
 
-num_layers: 2
-patch_size: 2
-attention_head_dim: 64 # 768 hidden / 12 heads
-num_attention_heads: 12
-cross_attention_dim: 1024
-activation_fn: "gelu-approximate"
+  num_layers: 2
+  patch_size: 2
+  attention_head_dim: 64 # 768 hidden / 12 heads
+  num_attention_heads: 12
+  cross_attention_dim: 1024
+  activation_fn: "gelu-approximate"

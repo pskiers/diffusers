@@ -17,7 +17,7 @@ from hydra.utils import instantiate
 from safetensors.torch import load_file
 
 from eval_utils import generate_image_batch
-from backward_compatibility import load_with_backward_compatibility
+from model_utils import load_with_backward_compatibility
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -65,7 +65,6 @@ def main(args: DictConfig):
     sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
     bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
 
-    # Load raw state dict from disk
     if os.path.exists(sf_path):
         raw_state_dict = load_file(sf_path)
     elif os.path.exists(bin_path):
@@ -73,18 +72,11 @@ def main(args: DictConfig):
     else:
         raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
 
-    # Pass it through our translator
-    load_with_backward_compatibility(unet, raw_state_dict, logger)
+    # FIX: Safely point to the core model if the wrapper exists
+    unet_to_load = unet.core_model if hasattr(unet, "core_model") else unet
 
-    if args.use_small_loop:
-        y_path = os.path.join(args.output_dir, "y_init.pt")
-        z_path = os.path.join(args.output_dir, "z_init.pt")
-
-        if not os.path.exists(y_path) or not os.path.exists(z_path):
-            raise FileNotFoundError(f"TRM anchors (y_init.pt / z_init.pt) not found in {args.output_dir}. Did the training script save them?")
-
-        unet.y_init = torch.load(y_path, map_location="cpu")
-        unet.z_init = torch.load(z_path, map_location="cpu")
+    # Pass the core model through your translator
+    load_with_backward_compatibility(unet_to_load, raw_state_dict, logger)
 
     unet.eval()
     unet = accelerator.prepare(unet)
@@ -125,7 +117,7 @@ def main(args: DictConfig):
     # Create/overwrite the JSONL file for this specific GPU process
     metadata_path = output_dir / f"metadata_rank{process_index}.jsonl"
     with open(metadata_path, "w") as f:
-        pass # Just to clear the file if it already exists from an old run
+        pass  # Just to clear the file if it already exists from an old run
 
     for b_idx in tqdm(range(num_batches), disable=not accelerator.is_local_main_process):
         current_bsz = min(batch_size, num_per_gpu - (b_idx * batch_size))
