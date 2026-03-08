@@ -1,5 +1,4 @@
-_target_: trm_models.StandardTRM
-state_channels: 4
+_target_: trm_models.DiTTRMv2
 resolution: 32
 n: 6
 T: 3
@@ -10,8 +9,8 @@ core_model:
   raw_dim: 55  # absolute
   sample_size: 32
 
-  in_channels: 12
-  out_channels: 8
+  in_channels: 4
+  out_channels: 4
 
   num_layers: 2
   patch_size: 2

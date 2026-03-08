@@ -342,8 +342,9 @@ def main(args: DictConfig):
                     y, z = y.to(model.device), z.to(model.device)
 
                     for _ in range(base_model.n_sup):
-                        model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
-                        loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
+                        with accelerator.autocast():
+                            model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
+                            loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
@@ -452,7 +453,8 @@ def main(args: DictConfig):
 
                 # ROUTE 1: New Object-Oriented TRM Models
                 if hasattr(base_model, "reasoning_step"):
-                    model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
+                    with accelerator.autocast():
+                        model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
 
                 # ROUTE 2: Old Procedural TRM Logic
                 elif args.use_small_loop:

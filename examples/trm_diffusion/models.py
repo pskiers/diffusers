@@ -102,11 +102,14 @@ class UnifiedConditionDiT(Transformer2DModel):
         # Configure norm and cross-attention based on mode
         is_adaln = condition_mode == "class_adaln"
 
-        # We need num_classes + 1 to safely handle your CFG label dropout token!
-        num_embeds_ada_norm = num_classes + 1 if is_adaln else None
-        norm_type = "ada_norm_zero" if is_adaln else "layer_norm"
+        # FIX: DiTs ALWAYS require ada_norm_zero to process the diffusion timestep.
+        norm_type = "ada_norm_zero"
 
-        # In adaLN mode, we strip out cross-attention entirely to save compute.
+        # If class_adaln, we need embeddings for all classes + 1 dropout token.
+        # Otherwise, we just need 1 dummy embedding to carry the timestep.
+        num_embeds_ada_norm = num_classes + 1 if is_adaln else 1
+
+        # In adaLN mode, strip out cross-attention. Otherwise, use it.
         actual_cross_attn_dim = None if is_adaln else cross_attention_dim
 
         # Call parent explicitly
@@ -124,7 +127,6 @@ class UnifiedConditionDiT(Transformer2DModel):
             norm_type=norm_type,
         )
 
-        # Restore consistent naming here
         if self.config.condition_mode == "class":
             self.condition_projector = nn.Embedding(self.config.num_classes + 1, self.config.cross_attention_dim)
         elif self.config.condition_mode == "sequence":
@@ -144,7 +146,9 @@ class UnifiedConditionDiT(Transformer2DModel):
         Generic forward pass matching your custom UNet signature.
         """
         encoder_hidden_states = None
-        class_labels = None
+
+        # Default dummy class_labels to carry the timestep through the adaLN block
+        class_labels = torch.zeros((sample.shape[0],), dtype=torch.long, device=sample.device)
 
         if condition_tensors is not None:
             if self.config.condition_mode == "class":
@@ -152,8 +156,13 @@ class UnifiedConditionDiT(Transformer2DModel):
             elif self.config.condition_mode == "sequence":
                 encoder_hidden_states = self.condition_projector(condition_tensors)
             elif self.config.condition_mode == "class_adaln":
-                # Diffusers adaLN natively expects the integer tensors passed to `class_labels`
+                # Override the dummy labels with the actual condition labels
                 class_labels = condition_tensors
+        elif self.config.condition_mode == "class_adaln":
+            # Unconditional inference fallback for class_adaln
+            class_labels = torch.full(
+                (sample.shape[0],), self.config.num_classes, dtype=torch.long, device=sample.device
+            )
 
         return super().forward(
             hidden_states=sample,
@@ -163,3 +172,12 @@ class UnifiedConditionDiT(Transformer2DModel):
             encoder_attention_mask=attention_mask,
             **kwargs,
         )
+
+    @classmethod
+    def from_config(cls, config, **kwargs):
+        """
+        Bypass the buggy diffusers class remapping logic for custom classes.
+        This forces diffusers to instantiate THIS class during EMA saving/loading.
+        """
+        init_dict, unused_kwargs, hidden_config_dict = cls.extract_init_dict(config, **kwargs)
+        return cls(**init_dict)

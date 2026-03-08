@@ -6,6 +6,17 @@ def get_model_output(model, x, timesteps, conditions=None, masks=None):
     Helper function to cleanly route the forward pass
     based on whether we have conditions and/or masks.
     """
+    if not torch.is_tensor(timesteps):
+        timesteps = torch.tensor([timesteps], dtype=torch.long, device=x.device)
+    else:
+        if timesteps.ndim == 0:
+            timesteps = timesteps.unsqueeze(0)
+        # Force the tensor onto the correct device!
+        timesteps = timesteps.to(x.device)
+
+    # Expand to match batch size if a single timestep was passed
+    if timesteps.shape[0] != x.shape[0]:
+        timesteps = timesteps.expand(x.shape[0])
     kwargs = {}
     if conditions is not None:
         # Handle potential DDP/Accelerate wrappers gracefully

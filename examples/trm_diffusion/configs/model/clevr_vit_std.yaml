@@ -1,4 +1,4 @@
-_target_: conditional_dit_model.UnifiedConditionDiT
+_target_: models.UnifiedConditionDiT
 condition_mode: "sequence"
 raw_dim: 55  # absolute
 sample_size: 32
