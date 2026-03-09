@@ -12,6 +12,7 @@ cd diffusers
 git checkout pskiers/trm-diffusion
 pip install .
 pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 ```
 
 Then cd in the example folder  and run

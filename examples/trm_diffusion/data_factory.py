@@ -80,14 +80,14 @@ def get_dataloaders(args):
             split="train",
             mode=args.dataset.dataset_mode,
             image_size=args.dataset.resolution,
-            download=False,
+            download=True,
         )
         eval_ds = CLEVRHybridDataset(
             root_dir=args.dataset.train_data_dir,
             split="validation",
             mode=args.dataset.dataset_mode,
             image_size=args.dataset.resolution,
-            download=False,
+            download=True,
         )
         train_ds.set_transform(train_augmentations)
         eval_ds.set_transform(eval_augmentations)
