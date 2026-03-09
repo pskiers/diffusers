@@ -43,7 +43,7 @@ def run_script(script_name, output_dir, extra_args):
     shutil.rmtree(output_dir, ignore_errors=True)
 
 
-# # Standard UNet diffusion
+# Standard UNet diffusion
 def test_unconditional_standard_cifar():
     run_script("train.py", "test-cifar100-standard", ["experiment=uncond_cifar100_std"])
 
@@ -60,7 +60,7 @@ def test_clevr_standard():
     run_script("train.py", "test-clevr-standard", ["experiment=clevr_relative_std"])
 
 
-# # TRM Diffusion v1 UNet
+# TRM Diffusion v1 UNet
 def test_unconditional_trm_v1_cifar():
     run_script("train.py", "test-cifar100-small", ["experiment=uncond_cifar100_trm"])
 
@@ -141,3 +141,58 @@ def test_cond_imagenet_vit_trm_v2():
 
 def test_cond_clevr_vit_trm_v2():
     run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_vit_trm_v2"])
+
+
+# TRM Diffusion v3 UNet (Concatenated States)
+def test_cond_cifar_unet_trm_v3():
+    run_script(
+        "train.py",
+        "test-cifar100-cond-v3",
+        ["experiment=cond_cifar100_trm", "model=unet2d_trm_v2", "model._target_=trm_models.UNetTRMv3"],
+    )
+
+
+def test_cond_imagenet_unet_trm_v3():
+    run_script(
+        "train.py",
+        "test-imagenet-cond-v3",
+        ["experiment=cond_imgnet_trm", "model=imagenet_condition_unet_trm_v2", "model._target_=trm_models.UNetTRMv3"],
+    )
+
+
+def test_cond_clevr_unet_trm_v3():
+    run_script(
+        "train.py",
+        "test-clevr-v3",
+        ["experiment=clevr_relative_trm", "model=clevr_condition_unet_trm_v2", "model._target_=trm_models.UNetTRMv3"],
+    )
+
+
+# TRM Diffusion v3 ViT/DiT (Concatenated States)
+def test_cond_cifar_vit_trm_v3():
+    run_script(
+        "train.py",
+        "test-cifar100-cond-v3",
+        [
+            "experiment=cond_cifar100_trm",
+            "model=cifar100_vit_trm_v2",
+            "~model.core_model.num_class_embeds",
+            "model._target_=trm_models.DiTTRMv3",
+        ],
+    )
+
+
+def test_cond_imagenet_vit_trm_v3():
+    run_script(
+        "train.py",
+        "test-imagenet-cond-v3",
+        ["experiment=cond_imgnet_trm", "model=imagenet_vit_trm_v2", "model._target_=trm_models.DiTTRMv3"],
+    )
+
+
+def test_cond_clevr_vit_trm_v3():
+    run_script(
+        "train.py",
+        "test-clevr-v3",
+        ["experiment=clevr_relative_trm", "model=clevr_vit_trm_v2", "model._target_=trm_models.DiTTRMv3"],
+    )
