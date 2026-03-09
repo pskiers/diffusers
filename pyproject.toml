@@ -27,3 +27,18 @@ skip-magic-trailing-comma = false
 
 # Like Black, automatically detect the appropriate line ending.
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+markers = [
+    "v1: marks tests for the TRM v1 architecture",
+    "v2: marks tests for the TRM v2 architecture",
+    "v3: marks tests for the TRM v3 architecture",
+    "v4: marks tests for the TRM v4 architecture",
+    "v5: marks tests for the TRM v5 architecture",
+    "unet: marks tests that use standard UNet models",
+    "vit: marks tests that use ViT/DiT transformer models",
+    "trm: marks tests that use TRM models",
+    "cifar100: marks tests that use the CIFAR-100 dataset",
+    "imagenet: marks tests that use the ImageNet dataset",
+    "clevr: marks tests that use the CLEVR dataset"
+]

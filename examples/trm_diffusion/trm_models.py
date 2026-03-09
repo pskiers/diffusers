@@ -88,9 +88,7 @@ class StandardTRM(BaseIterativeModel):
         return TRMOutput(sample=model_output)
 
 
-# =========================================================================
-# UNET SPECIFIC MODEL
-# =========================================================================
+# V2: TRM exactly as in the og paper. Addition instead of concat, single output, no x for y prediction, in high dim latent
 class UNetTRMv2(BaseIterativeModel):
     """High-Dimensional Additive TRM specialized for UNet architectures."""
 
@@ -151,9 +149,6 @@ class UNetTRMv2(BaseIterativeModel):
         return TRMOutput(sample=model_output)
 
 
-# =========================================================================
-# DIT SPECIFIC MODEL
-# =========================================================================
 class DiTTRMv2(BaseIterativeModel):
     """High-Dimensional Additive TRM specialized for DiT architectures."""
 
@@ -360,6 +355,7 @@ class DiTTRMv2(BaseIterativeModel):
         return TRMOutput(sample=model_output)
 
 
+# V3: Go back to concat. Still single output, no x for y prediction, in high dim latent
 class UNetTRMv3(UNetTRMv2):
     """High-Dimensional Concatenated TRM inherited from UNetTRMv2."""
 
@@ -367,26 +363,17 @@ class UNetTRMv3(UNetTRMv2):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
 
         dim = self.core_model.conv_in.out_channels
-        # Attached to the WRAPPER, not the core_model, to protect Diffusers config
         self.fusion = nn.Conv2d(3 * dim, dim, kernel_size=1, device=self.device, dtype=self.core_model.dtype)
-
-        with torch.no_grad():
-            eye = torch.eye(dim, device=self.device, dtype=self.core_model.dtype).view(dim, dim, 1, 1)
-            self.fusion.weight[:, :dim].copy_(eye)
-            self.fusion.weight[:, dim:2*dim].copy_(eye)
-            self.fusion.weight[:, 2*dim:].copy_(eye)
-            self.fusion.weight.data /= 3.0
-            nn.init.zeros_(self.fusion.bias)
 
     def _latent_recursion(self, x_high, y, z, timesteps, conditions, masks):
         zeros = torch.zeros_like(x_high)
 
         for _ in range(self.n):
             z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
-            z = z + get_model_output(self.core_model, z_in, timesteps, conditions, masks)
+            z = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
 
         y_in = self.fusion(torch.cat([zeros, y, z], dim=1))
-        y = y + get_model_output(self.core_model, y_in, timesteps, conditions, masks)
+        y = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
 
         return y, z
 
@@ -398,16 +385,50 @@ class DiTTRMv3(DiTTRMv2):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
 
         dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
-        # Attached to the WRAPPER, not the core_model
         self.fusion = nn.Linear(3 * dim, dim, device=self.device, dtype=self.core_model.dtype)
 
-        with torch.no_grad():
-            eye = torch.eye(dim, device=self.device, dtype=self.core_model.dtype)
-            self.fusion.weight[:, :dim].copy_(eye)
-            self.fusion.weight[:, dim:2*dim].copy_(eye)
-            self.fusion.weight[:, 2*dim:].copy_(eye)
-            self.fusion.weight.data /= 3.0
-            nn.init.zeros_(self.fusion.bias)
+    def _latent_recursion(self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs):
+        zeros = torch.zeros_like(x_high)
+
+        for _ in range(self.n):
+            z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
+            z = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+
+        y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
+        y = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+
+        return y, z
+
+
+# V4: Go back to concat and 2 outputs for y and z. Still no x for y prediction, in high dim latent
+class UNetTRMv4(UNetTRMv2):
+    def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
+        dim = self.core_model.conv_in.out_channels
+        self.fusion = nn.Conv2d(3 * dim, dim, kernel_size=1, device=self.device)
+        self.out_proj = nn.Conv2d(dim, 2 * dim, kernel_size=1, device=self.device)
+
+    def _latent_recursion(self, x_high, y, z, timesteps, conditions, masks):
+        zeros = torch.zeros_like(x_high)
+
+        for _ in range(self.n):
+            z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
+            out = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
+            _, z = self.out_proj(out).chunk(2, dim=1)
+
+        y_in = self.fusion(torch.cat([zeros, y, z], dim=1))
+        out = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
+        y, _ = self.out_proj(out).chunk(2, dim=1)
+
+        return y, z
+
+
+class DiTTRMv4(DiTTRMv2):
+    def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
+        dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
+        self.fusion = nn.Linear(3 * dim, dim, device=self.device)
+        self.out_proj = nn.Linear(dim, 2 * dim, device=self.device)
 
     def _latent_recursion(self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs):
         zeros = torch.zeros_like(x_high)
@@ -415,10 +436,53 @@ class DiTTRMv3(DiTTRMv2):
         for _ in range(self.n):
             z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
             out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
-            z = z + out
+            _, z = self.out_proj(out).chunk(2, dim=-1)
 
         y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
         out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
-        y = y + out
+        y, _ = self.out_proj(out).chunk(2, dim=-1)
+
+        return y, z
+
+
+# V5: Go back to concat and 2 outputs for y and z and x for y prediction, but in high dim latent
+class UNetTRMv5(UNetTRMv2):
+    def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
+        dim = self.core_model.conv_in.out_channels
+        self.fusion = nn.Conv2d(3 * dim, dim, kernel_size=1, device=self.device)
+        self.out_proj = nn.Conv2d(dim, 2 * dim, kernel_size=1, device=self.device)
+
+    def _latent_recursion(self, x_high, y, z, timesteps, conditions, masks):
+        for _ in range(self.n):
+            z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
+            out = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
+            _, z = self.out_proj(out).chunk(2, dim=1)
+
+        # x_high is passed instead of zeros!
+        y_in = self.fusion(torch.cat([x_high, y, z], dim=1))
+        out = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
+        y, _ = self.out_proj(out).chunk(2, dim=1)
+
+        return y, z
+
+
+class DiTTRMv5(DiTTRMv2):
+    def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
+        dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
+        self.fusion = nn.Linear(3 * dim, dim, device=self.device)
+        self.out_proj = nn.Linear(dim, 2 * dim, device=self.device)
+
+    def _latent_recursion(self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs):
+        for _ in range(self.n):
+            z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
+            out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            _, z = self.out_proj(out).chunk(2, dim=-1)
+
+        # x_high is passed instead of zeros!
+        y_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
+        out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+        y, _ = self.out_proj(out).chunk(2, dim=-1)
 
         return y, z
