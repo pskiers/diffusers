@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - override /dataset: sokoban
+  - override /model: sokoban_unet_cond
+
+dataset:
+  k: 1
+  concat_conditioning: true
+  train_data_dir: "/home/gosia/STUDIA/DYPLOM/reasoning-diffusion/12-12-4"
+  eval_data_dir: "/home/gosia/STUDIA/DYPLOM/reasoning-diffusion/12-12-4-test"
+
+output_dir: "sokoban-cond-k1-standard"
+train_batch_size: 64
+eval_batch_size: 64
+num_epochs: 1000
+save_model_epochs: 50
+save_images_epochs: 10
+
+cfg_drop_rate: 0
+guidance_scale: 0
+rescale_betas_zero_snr: true
+clip_sample_range: 1.0

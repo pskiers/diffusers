@@ -4,9 +4,10 @@ from torchvision import transforms
 from datasets import load_dataset
 from data_utils import LimitedLoader
 from clevr_dataset import CLEVRHybridDataset
+from sokoban.sokoban_dataset import SokobanBitDataset, SokobanDataset
 
 
-def get_dataloaders(args):
+def get_dataloaders(args, device="cpu", weight_dtype=torch.float32):
     """
     Factory function to return standardized dataloaders.
     Always yields batches with keys: 'images', 'conditions', 'masks'.
@@ -92,6 +93,39 @@ def get_dataloaders(args):
         train_ds.set_transform(train_augmentations)
         eval_ds.set_transform(eval_augmentations)
 
+    elif args.dataset.dataset_type == "sokoban":
+        k = getattr(args.dataset, "k", 0)
+        if hasattr(k, '__iter__') and not isinstance(k, str):    # multi-k conditioning
+            k = list(k)
+        num_bits = args.dataset.input_channels
+        eval_data_dir = getattr(args.dataset, "eval_data_dir", args.dataset.train_data_dir)
+
+        raw_train_ds = SokobanDataset(
+            data_path=args.dataset.train_data_dir,
+            encoding="bits",
+            k=k,
+        )
+        raw_eval_ds = SokobanDataset(
+            data_path=eval_data_dir,
+            encoding="bits",
+            k=k,
+        )
+        clip_sample_range = getattr(args, 'clip_sample_range', 1.0)
+        train_ds = SokobanBitDataset(
+            raw_train_ds,
+            num_bits,
+            clip_sample_range=clip_sample_range,
+            weight_dtype=weight_dtype,
+            device=device
+        )
+        eval_ds = SokobanBitDataset(
+            raw_eval_ds,
+            num_bits,
+            clip_sample_range=clip_sample_range,
+            weight_dtype=weight_dtype,
+            device=device
+        )
+
     else:
         raise ValueError(f"Unknown dataset_type: {args.dataset.dataset_type}")
 
@@ -111,6 +145,12 @@ def get_dataloaders(args):
             batch["masks"] = torch.stack([ex["masks"] for ex in examples])
         else:
             batch["masks"] = None
+
+        # sokoban k-conditioning
+        if "class_labels" in examples[0]:
+            batch["class_labels"] = torch.tensor([ex["class_labels"] for ex in examples], dtype=torch.long)
+        else:
+            batch["class_labels"] = None
 
         return batch
 

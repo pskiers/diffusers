@@ -1,0 +1,25 @@
+dataset_type: "sokoban"
+dataset_name: null
+dataset_config_name: null
+train_data_dir: "/path/to/sokoban/train/12-12-4"
+eval_data_dir: "/path/to/sokoban/eval/12-12-4-test"
+test_split_name: null
+image_key: null
+class_key: null
+num_classes: null
+
+k: 0 # 0 = unconditional, >0 = conditional (k steps ahead)
+concat_conditioning: false # true when k > 0 (image concat along channel dim)
+class_conditional: false # true when using multi-k with class labels
+num_boxes: 4 # number of boxes on the board
+
+# Sokoban evaluation settings
+n_images_to_eval: 20 # number of conditioning images to evaluate
+n_images_per_conditioning: 16 # images generated per conditioning
+n_images_to_log: 16 # images to visually log
+
+resolution: 12
+center_crop: false
+random_flip: false
+vae_name: null
+input_channels: 3 # num_bits = 3 (encodes 7 Sokoban cell states)

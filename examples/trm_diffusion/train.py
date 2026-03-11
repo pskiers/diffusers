@@ -39,6 +39,7 @@ from model_utils import extract_into_tensor, load_with_backward_compatibility
 from trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save
 from data_utils import SafeIterator
+from sokoban.ddpm_scheduler import DDPMScheduler as SokobanDDPMScheduler
 
 # Will error if the minimal version of diffusers is not installed.
 check_min_version("0.34.0.dev0")
@@ -105,6 +106,12 @@ def main(args: DictConfig):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     # ---------------------------------------------------------
     # 2. Initialize VAE, Data, and Model
     # ---------------------------------------------------------
@@ -117,7 +124,7 @@ def main(args: DictConfig):
         vae.eval()
         vae_scaling_factor = vae.config.scaling_factor
 
-    train_dl, eval_dl = get_dataloaders(args)
+    train_dl, eval_dl = get_dataloaders(args, device=accelerator.device, weight_dtype=weight_dtype)
     model = instantiate(args.model, _convert_="all")
 
     # Enable xformers
@@ -279,15 +286,9 @@ def main(args: DictConfig):
             config=tracker_config,
             init_kwargs={"wandb": {"name": args.output_dir}} if args.logger == "wandb" else {},
         )
-    if accelerator.is_main_process:
+    elif accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
         accelerator.init_trackers(run)
-
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # ---------------------------------------------------------
     # 5. Resume from Checkpoint Logic
@@ -341,6 +342,7 @@ def main(args: DictConfig):
             clean_images = batch["images"]
             cond = batch["conditions"].to(model.device) if batch["conditions"] is not None else None
             mask = batch["masks"].to(model.device) if batch["masks"] is not None else None
+            class_labels = batch["class_labels"].to(model.device) if batch.get("class_labels") is not None else None
 
             # CFG Label Dropout
             if cond is not None and args.cfg_drop_rate > 0:
@@ -360,6 +362,16 @@ def main(args: DictConfig):
                 0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
+
+            # Sokoban conditioning
+            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
+                noisy_images = torch.cat([cond, noisy_images], dim=1)
+                cond = class_labels  # k
+
+            # Sokoban conditioning (guided gradient)
+            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
+                noisy_images = torch.cat([cond, noisy_images], dim=1)
+                cond = class_labels  # k
 
             # --- FORWARD & BACKWARD PASS ROUTING ---
             with accelerator.accumulate(model):
@@ -408,12 +420,15 @@ def main(args: DictConfig):
 
                 # ROUTE 3: Standard Non-Recursive Models
                 else:
-                    model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
-                    loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
+                    with accelerator.autocast():
+                        model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
+                        loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                     accelerator.backward(loss)
+
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
@@ -470,6 +485,7 @@ def main(args: DictConfig):
             clean_images = batch["images"].to(device=accelerator.device, dtype=weight_dtype)
             cond = batch["conditions"].to(model.device) if batch["conditions"] is not None else None
             mask = batch["masks"].to(model.device) if batch["masks"] is not None else None
+            class_labels = batch["class_labels"].to(model.device) if batch.get("class_labels") is not None else None
 
             if vae is not None:
                 clean_images = clean_images.to(dtype=vae.dtype)
@@ -483,6 +499,16 @@ def main(args: DictConfig):
                 0, noise_scheduler.config.num_train_timesteps, (clean_images.shape[0],), device=clean_images.device
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
+
+            # Sokoban conditioning
+            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
+                noisy_images = torch.cat([cond, noisy_images], dim=1)
+                cond = class_labels
+
+            # Sokoban conditioning
+            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
+                noisy_images = torch.cat([cond, noisy_images], dim=1)
+                cond = class_labels
 
             # --- VALIDATION PASS ROUTING ---
             with torch.no_grad():
@@ -524,6 +550,7 @@ def main(args: DictConfig):
                 vae,
                 vae_scaling_factor,
                 weight_dtype,
+                eval_dl=eval_dl,
             )
 
         if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):

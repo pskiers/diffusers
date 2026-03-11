@@ -1,11 +1,21 @@
 import math
 import torch
 import wandb
+import logging
+import numpy as np
 from tqdm.auto import tqdm
 from torchvision.utils import make_grid
 from diffusers.utils import is_accelerate_version
 from diffusers import DDPMPipeline
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import sokoban.environment.utils as sokoban_utils
 from trm_utils import get_model_output
+from sokoban.evaluate_sokoban import boards_from_bit_images, boards_from_normalized_tensor, compute_sokoban_metrics
+
+logger = logging.getLogger(__name__)
 
 
 def generate_image_batch(
@@ -19,8 +29,16 @@ def generate_image_batch(
     device,
     weight_dtype=torch.float32,
     show_progress=True,
+    prompt=None,
+    class_labels=None,
+    cond_fn=None,
 ):
-    """The unified core engine for generating a batch of images from latents."""
+    """The unified core engine for generating a batch of images from latents.
+    :params:
+        prompt: Optionaly for sokoban, for channel-concat conditioning
+        class_labels: Optionaly for sokoban, for multi-k distance labels
+        cond_fn: Optionaly for sokoban, gradient for gradient-guided sampling.
+    """
     sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
 
     # 1. Base Noise
@@ -55,9 +73,16 @@ def generate_image_batch(
         args.dataset, "num_classes", None
     )
 
+    is_concat_conditional = prompt is not None
+
     do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional)
 
-    if is_unified_class or is_standard_conditional:
+    if is_concat_conditional:
+        metadata = [{"type": "concat_conditional"} for _ in range(bsz)]
+        if class_labels is not None:
+            conds = class_labels.to(device)
+
+    elif is_unified_class or is_standard_conditional:
         conds = torch.randint(0, args.dataset.num_classes, [bsz], generator=generator, device=device)
         metadata = [{"class_label": int(c.item())} for c in conds]
         if do_cfg:
@@ -84,6 +109,14 @@ def generate_image_batch(
         latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
         latent_model_input_cast = latent_model_input.to(weight_dtype)
+
+        if is_concat_conditional:
+            prompt_input = torch.cat([prompt] * 2) if do_cfg else prompt
+            latent_model_input = torch.cat([prompt_input, latent_model_input], dim=1)
+
+        if is_concat_conditional:
+            prompt_input = torch.cat([prompt] * 2) if do_cfg else prompt
+            latent_model_input = torch.cat([prompt_input, latent_model_input], dim=1)
 
         class_input = torch.cat([conds, unconds]) if do_cfg else conds
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
@@ -117,7 +150,25 @@ def generate_image_batch(
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
+        # Sokoban custom DDPMScheduler
+        scheduler_output = scheduler.step(noise_pred, t, latents, generator=generator)
+        if (
+            hasattr(scheduler_output, 'variance_with_noise')
+            and scheduler_output.variance_with_noise is not None
+            and not (isinstance(scheduler_output.variance_with_noise, (int, float))
+                     and scheduler_output.variance_with_noise == 0)
+        ):
+            model_mean = scheduler_output.prev_sample
+            variance_with_noise = scheduler_output.variance_with_noise
+            variance = scheduler_output.variance
+
+            if cond_fn is not None:
+                gradient = cond_fn(latents, t)
+                model_mean = model_mean + (variance * gradient)
+
+            latents = model_mean + variance_with_noise
+        else:
+            latents = scheduler_output.prev_sample
 
     # 4. VAE Decoding & Clamping
     if vae is not None:
@@ -150,6 +201,8 @@ def evaluate_and_save(
     vae=None,
     vae_scaling_factor=1.0,
     weight_dtype=torch.float32,
+    eval_dl=None,
+    cond_fn=None,
 ):
     """Wrapper that calls the generator and pushes the outputs to W&B/Tensorboard."""
     unet = accelerator.unwrap_model(model)
@@ -162,37 +215,42 @@ def evaluate_and_save(
     noise_scheduler.set_timesteps(args.ddpm_num_inference_steps)
     generator = torch.Generator(device=unet.device).manual_seed(0)
 
-    # --- Use the Shared Engine ---
-    images, _ = generate_image_batch(
-        unet=unet,
-        scheduler=noise_scheduler,
-        vae=vae,
-        vae_scaling_factor=vae_scaling_factor,
-        args=args,
-        bsz=args.eval_batch_size,
-        generator=generator,
-        device=unet.device,
-        weight_dtype=weight_dtype,
-        show_progress=accelerator.is_local_main_process,
-    )
+    is_sokoban = getattr(args.dataset, 'dataset_type', None) == 'sokoban'
 
-    images = images.cpu().float()
+    if is_sokoban:
+        _evaluate_sokoban(unet, noise_scheduler, args, accelerator, epoch, global_step,
+                               generator, weight_dtype, eval_dl, cond_fn=cond_fn)
+    else:
+        images, _ = generate_image_batch(
+            unet=unet,
+            scheduler=noise_scheduler,
+            vae=vae,
+            vae_scaling_factor=vae_scaling_factor,
+            args=args,
+            bsz=args.eval_batch_size,
+            generator=generator,
+            device=unet.device,
+            weight_dtype=weight_dtype,
+            show_progress=accelerator.is_local_main_process,
+        )
 
-    # Log Images
-    images_processed = (images * 255).round().numpy().astype("uint8")
-    if args.logger == "tensorboard":
-        tracker = (
-            accelerator.get_tracker("tensorboard", unwrap=True)
-            if is_accelerate_version(">=", "0.17.0.dev0")
-            else accelerator.get_tracker("tensorboard")
-        )
-        tracker.add_images("test_samples", images_processed, epoch)
-    elif args.logger == "wandb":
-        n_cols = math.ceil(math.sqrt(args.eval_batch_size) * 1.5)
-        image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=True)
-        accelerator.get_tracker("wandb").log(
-            {"test_samples": wandb.Image(image_grid), "epoch": epoch}, step=global_step
-        )
+        images = images.cpu().float()
+
+        # Log Images
+        images_processed = (images * 255).round().numpy().astype("uint8")
+        if args.logger == "tensorboard":
+            tracker = (
+                accelerator.get_tracker("tensorboard", unwrap=True)
+                if is_accelerate_version(">=", "0.17.0.dev0")
+                else accelerator.get_tracker("tensorboard")
+            )
+            tracker.add_images("test_samples", images_processed, epoch)
+        elif args.logger == "wandb":
+            n_cols = math.ceil(math.sqrt(args.eval_batch_size) * 1.5)
+            image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=True)
+            accelerator.get_tracker("wandb").log(
+                {"test_samples": wandb.Image(image_grid), "epoch": epoch}, step=global_step
+            )
 
     # Save Pipeline
     if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
@@ -201,3 +259,147 @@ def evaluate_and_save(
 
     if args.use_ema:
         ema_model.restore(ema_target.parameters())
+
+
+@torch.no_grad()
+def _evaluate_sokoban(
+    unet, noise_scheduler, args, accelerator, epoch, global_step,
+    generator, weight_dtype, eval_dl, cond_fn=None,
+):
+    n_images_to_eval = getattr(args.dataset, 'n_images_to_eval', 20)
+    n_images_per_conditioning = getattr(args.dataset, 'n_images_per_conditioning', 16)
+    n_images_to_log = getattr(args.dataset, 'n_images_to_log', 16)
+    is_conditional = getattr(args.dataset, 'concat_conditioning', False)
+    is_class_conditional = getattr(args.dataset, 'class_conditional', False)
+    num_boxes = getattr(args.dataset, 'num_boxes', 4)
+    num_bits = args.dataset.input_channels
+
+    all_gen_boards = []
+    all_cond_boards = []
+    all_target_boards = []
+    log_images = []
+
+    if eval_dl is None:
+        return
+
+    eval_iter = iter(eval_dl)
+    count = 0
+    pbar = tqdm(total=n_images_to_eval, desc="Sokoban eval", disable=not accelerator.is_local_main_process)
+
+    while count < n_images_to_eval:
+        try:
+            batch = next(eval_iter)
+        except StopIteration:
+            break
+
+        if is_conditional:
+            cond_img = batch["conditions"][:1]  #(1, C, H, W)
+            target_img = batch["images"][:1]  #(1, C, H, W)
+
+            prompt = cond_img.repeat(n_images_per_conditioning, 1, 1, 1).to(unet.device, dtype=weight_dtype)
+
+            class_labels = None
+            if is_class_conditional and batch.get("class_labels") is not None:
+                class_labels = batch["class_labels"][:1].repeat(n_images_per_conditioning).to(unet.device)
+
+            bsz = n_images_per_conditioning
+        else:
+            prompt = None
+            class_labels = None
+            bsz = n_images_per_conditioning
+            target_img = batch["images"][:1]
+
+        images, _ = generate_image_batch(
+            unet=unet,
+            scheduler=noise_scheduler,
+            vae=None,
+            vae_scaling_factor=1.0,
+            args=args,
+            bsz=bsz,
+            generator=generator,
+            device=unet.device,
+            weight_dtype=weight_dtype,
+            show_progress=False,
+            prompt=prompt,
+            class_labels=class_labels,
+            cond_fn=cond_fn,
+        )
+
+        # Generated images to integer boards
+        gen_boards = boards_from_bit_images(images.cpu(), num_bits)
+        all_gen_boards.append(gen_boards)
+
+        # Target images to integer boards
+        if is_conditional:
+            cond_boards = boards_from_normalized_tensor(cond_img.cpu().float(), num_bits)
+            target_board = boards_from_normalized_tensor(target_img.cpu().float(), num_bits)
+            all_cond_boards.extend([cond_boards[0]] * n_images_per_conditioning)
+            all_target_boards.extend([target_board[0]] * n_images_per_conditioning)
+
+            if count < n_images_to_log:
+                log_images.append((cond_boards[0], gen_boards[0]))
+        else:
+            if count < n_images_to_log:
+                log_images.append((None, gen_boards[0]))
+
+        count += 1
+        pbar.update(1)
+
+    pbar.close()
+
+    if not all_gen_boards:
+        return
+
+    all_gen_boards = np.concatenate(all_gen_boards, axis=0)
+    all_cond_boards = np.array(all_cond_boards) if all_cond_boards else None
+    all_target_boards = np.array(all_target_boards) if all_target_boards else None
+
+    metrics = compute_sokoban_metrics(
+        all_gen_boards,
+        conditioning_boards=all_cond_boards,
+        target_boards=all_target_boards,
+        n_images_per_conditioning=n_images_per_conditioning,
+        num_boxes=num_boxes,
+    )
+
+    log_dict = {**metrics, "epoch": epoch}
+    accelerator.log(log_dict, step=global_step)
+    logger.info(f"Sokoban metrics at step {global_step}: {metrics}")
+
+    if args.logger == "wandb" and log_images:
+        wandb_images = []
+        for i, (cond_board, gen_board) in enumerate(log_images):
+            if i >= n_images_to_log:
+                break
+            fig, axs = plt.subplots(1, 2 if cond_board is not None else 1, figsize=(8, 4))
+            if cond_board is not None:
+                axs[0].imshow(sokoban_utils.render(cond_board).astype(np.uint8))
+                axs[0].set_title("Input")
+                axs[0].axis("off")
+                axs[1].imshow(sokoban_utils.render(gen_board).astype(np.uint8))
+                axs[1].set_title("Generated")
+                axs[1].axis("off")
+            else:
+                if not isinstance(axs, np.ndarray):
+                    axs = [axs]
+                axs[0].imshow(sokoban_utils.render(gen_board).astype(np.uint8))
+                axs[0].set_title("Generated")
+                axs[0].axis("off")
+            plt.tight_layout()
+            wandb_images.append(wandb.Image(fig))
+            plt.close(fig)
+
+        accelerator.get_tracker("wandb").log(
+            {"sokoban/visual_samples": wandb_images}, step=global_step
+        )
+
+    rendered = []
+    for board in all_gen_boards[:min(16, len(all_gen_boards))]:
+        rgb = sokoban_utils.render(board).astype(np.float32) / 255.0
+        rendered.append(torch.from_numpy(rgb).permute(2, 0, 1))
+    if rendered:
+        grid = make_grid(torch.stack(rendered), nrow=4, padding=2, normalize=True)
+        if args.logger == "wandb":
+            accelerator.get_tracker("wandb").log(
+                {"sokoban/board_grid": wandb.Image(grid), "epoch": epoch}, step=global_step
+            )

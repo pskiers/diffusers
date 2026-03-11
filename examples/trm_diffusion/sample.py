@@ -18,6 +18,9 @@ from safetensors.torch import load_file
 
 from eval_utils import generate_image_batch
 from model_utils import load_with_backward_compatibility
+from data_factory import get_dataloaders
+from sokoban.ddpm_scheduler import DDPMScheduler as SokobanDDPMScheduler
+from sokoban.evaluate_sokoban import boards_from_bit_images, boards_from_normalized_tensor, compute_sokoban_metrics
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -114,10 +117,20 @@ def main(args: DictConfig):
         vae.eval()
         vae_scaling_factor = vae.config.scaling_factor
 
+    is_sokoban = getattr(args.dataset, 'dataset_type', None) == 'sokoban'
+
     SchedulerClass = DDIMScheduler if args.use_ddim else DDPMScheduler
     scheduler_kwargs = {"num_train_timesteps": args.ddpm_num_steps, "beta_schedule": args.ddpm_beta_schedule}
     if "prediction_type" in SchedulerClass.__init__.__code__.co_varnames:
         scheduler_kwargs["prediction_type"] = args.prediction_type
+    if hasattr(args, 'rescale_betas_zero_snr'):
+        scheduler_kwargs["rescale_betas_zero_snr"] = args.rescale_betas_zero_snr
+    if hasattr(args, 'clip_sample_range'):
+        scheduler_kwargs["clip_sample_range"] = args.clip_sample_range
+
+    # For Sokoban: DDPMScheduler (guided sampling)
+    if is_sokoban and not args.use_ddim:
+        SchedulerClass = SokobanDDPMScheduler
 
     scheduler = SchedulerClass(**scheduler_kwargs)
     scheduler.set_timesteps(args.ddpm_num_inference_steps)
@@ -135,6 +148,19 @@ def main(args: DictConfig):
 
     generator = torch.Generator(device=accelerator.device).manual_seed(process_index)
 
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Sokoban conditional
+    prompt_iterator = None
+    is_concat_cond = getattr(args.dataset, 'concat_conditioning', False)
+    if is_sokoban and is_concat_cond:
+        _, eval_dl = get_dataloaders(args, device=accelerator.device, weight_dtype=weight_dtype)
+        prompt_iterator = iter(eval_dl)
+
     # 4. The Generation Loop
     logger.info(f"Generating {num_per_gpu} samples on process {process_index}...")
 
@@ -145,6 +171,25 @@ def main(args: DictConfig):
 
     for b_idx in tqdm(range(num_batches), disable=not accelerator.is_local_main_process):
         current_bsz = min(batch_size, num_per_gpu - (b_idx * batch_size))
+
+        # Sokoban conditional
+        prompt = None
+        class_labels = None
+        if prompt_iterator is not None:
+            is_class_conditional = getattr(args.dataset, 'class_conditional', False)
+
+            cond_batch = next(prompt_iterator, None)
+            if cond_batch is not None and cond_batch.get("conditions") is not None:
+                cond_imgs = cond_batch["conditions"]
+                if cond_imgs.shape[0] >= current_bsz:
+                    prompt = cond_imgs[:current_bsz].to(accelerator.device, dtype=torch.float32)
+                else:
+                    repeats = math.ceil(current_bsz / cond_imgs.shape[0])
+                    prompt = cond_imgs.repeat(repeats, 1, 1, 1)[:current_bsz].to(accelerator.device, dtype=torch.float32)
+
+                # Get class_labels for multi-k conditional sokoban
+                if is_class_conditional and cond_batch.get("class_labels") is not None:
+                    class_labels = cond_batch["class_labels"][:1].repeat(current_bsz).to(accelerator.device)
 
         # --- Call the Shared Engine ---
         images, metadata = generate_image_batch(
@@ -158,7 +203,30 @@ def main(args: DictConfig):
             device=accelerator.device,
             weight_dtype=weight_dtype,
             show_progress=True,  # Disable inner progress bar to prevent terminal spam
+            prompt=prompt,
+            class_labels=class_labels,
         )
+
+        if is_sokoban:
+            num_bits = args.dataset.input_channels
+            gen_boards = boards_from_bit_images(images.cpu(), num_bits)
+
+            boards_path = output_dir / f"boards_rank{process_index}.npy"
+            if b_idx == 0:
+                all_boards = gen_boards
+            else:
+                all_boards = np.concatenate([all_boards, gen_boards], axis=0)
+            np.save(boards_path, all_boards)
+
+            # Track conditioning boards for conditional metrics
+            if is_concat_cond and prompt is not None:
+                cond_boards = boards_from_bit_images(
+                    (prompt.cpu().float() / 2 + 0.5).clamp(0, 1), num_bits
+                )
+                if b_idx == 0:
+                    all_cond_boards = cond_boards
+                else:
+                    all_cond_boards = np.concatenate([all_cond_boards, cond_boards], axis=0)
 
         # Format and save to disk
         images = images.cpu().permute(0, 2, 3, 1).numpy()
@@ -174,6 +242,21 @@ def main(args: DictConfig):
 
                 meta["file_name"] = filename
                 f.write(json.dumps(meta) + "\n")
+
+    if is_sokoban and 'all_boards' in dir():
+        num_boxes = getattr(args.dataset, 'num_boxes', 4)
+        cond_boards_final = all_cond_boards if (is_concat_cond and 'all_cond_boards' in dir()) else None
+        sokoban_metrics = compute_sokoban_metrics(
+            all_boards,
+            conditioning_boards=cond_boards_final,
+            num_boxes=num_boxes,
+        )
+        logger.info(f"Sokoban sampling metrics (rank {process_index}): {sokoban_metrics}")
+
+        metrics_path = output_dir / f"sokoban_metrics_rank{process_index}.json"
+        with open(metrics_path, "w") as f:
+            json.dump({k: float(v) for k, v in sokoban_metrics.items()}, f, indent=2)
+        logger.info(f"Sokoban metrics saved to {metrics_path}")
 
 
 if __name__ == "__main__":

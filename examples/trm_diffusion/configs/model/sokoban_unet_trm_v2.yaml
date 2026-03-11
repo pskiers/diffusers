@@ -1,0 +1,22 @@
+_target_: trm_models.UNetTRMv2
+resolution: 12
+n: 6
+T: 3
+n_sup: 4
+core_model:
+  _target_: diffusers.UNet2DModel
+  sample_size: 12
+  in_channels: 3 # num_bits (projected to high-dim internally)
+  out_channels: 3 # num_bits
+  block_out_channels: [128, 256, 384]
+  down_block_types:
+    - "DownBlock2D"
+    - "AttnDownBlock2D"
+    - "AttnDownBlock2D"
+  up_block_types:
+    - "AttnUpBlock2D"
+    - "AttnUpBlock2D"
+    - "UpBlock2D"
+  attention_head_dim: 64
+  dropout: 0.1
+  layers_per_block: 1

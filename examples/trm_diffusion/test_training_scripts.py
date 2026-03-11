@@ -539,3 +539,129 @@ def test_cond_clevr_ratatouille_dit_residual():
     run_script(
         "train.py", "test-clevr-rat-dit-res", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_dit_residual"]
     )
+
+# Sokoban
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.standard
+def test_sokoban_uncond_standard():
+    run_script("train.py", "test-sokoban-uncond-std", ["experiment=sokoban_uncond_std"])
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.standard
+def test_sokoban_cond_standard():
+    run_script("train.py", "test-sokoban-cond-std", ["experiment=sokoban_cond_std"])
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_sokoban_uncond_trm_v1():
+    run_script(
+        "train.py",
+        "test-sokoban-uncond-trm-v1",
+        ["experiment=sokoban_uncond_trm", "model=sokoban_unet_trm"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_sokoban_cond_trm_v1():
+    run_script(
+        "train.py",
+        "test-sokoban-cond-trm-v1",
+        ["experiment=sokoban_cond_trm", "model=sokoban_unet_cond_trm"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v2
+def test_sokoban_uncond_trm_v2():
+    run_script("train.py", "test-sokoban-uncond-trm-v2", ["experiment=sokoban_uncond_trm"])
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v2
+def test_sokoban_cond_trm_v2():
+    run_script("train.py", "test-sokoban-cond-trm-v2", ["experiment=sokoban_cond_trm"])
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v3
+def test_sokoban_uncond_trm_v3():
+    run_script(
+        "train.py",
+        "test-sokoban-uncond-trm-v3",
+        ["experiment=sokoban_uncond_trm", "model=sokoban_unet_trm_v2", "model._target_=trm_models.UNetTRMv3"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v3
+def test_sokoban_cond_trm_v3():
+    run_script(
+        "train.py",
+        "test-sokoban-cond-trm-v3",
+        ["experiment=sokoban_cond_trm", "model=sokoban_unet_cond_trm_v2", "model._target_=trm_models.UNetTRMv3"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v4
+def test_sokoban_uncond_trm_v4():
+    run_script(
+        "train.py",
+        "test-sokoban-uncond-trm-v4",
+        ["experiment=sokoban_uncond_trm", "model=sokoban_unet_trm_v2", "model._target_=trm_models.UNetTRMv4"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v4
+def test_sokoban_cond_trm_v4():
+    run_script(
+        "train.py",
+        "test-sokoban-cond-trm-v4",
+        ["experiment=sokoban_cond_trm", "model=sokoban_unet_cond_trm_v2", "model._target_=trm_models.UNetTRMv4"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v5
+def test_sokoban_uncond_trm_v5():
+    run_script(
+        "train.py",
+        "test-sokoban-uncond-trm-v5",
+        ["experiment=sokoban_uncond_trm", "model=sokoban_unet_trm_v2", "model._target_=trm_models.UNetTRMv5"],
+    )
+
+
+@pytest.mark.sokoban
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v5
+def test_sokoban_cond_trm_v5():
+    run_script(
+        "train.py",
+        "test-sokoban-cond-trm-v5",
+        ["experiment=sokoban_cond_trm", "model=sokoban_unet_cond_trm_v2", "model._target_=trm_models.UNetTRMv5"],
+    )
