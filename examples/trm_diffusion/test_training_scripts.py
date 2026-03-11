@@ -43,177 +43,177 @@ def run_script(script_name, output_dir, extra_args):
     shutil.rmtree(output_dir, ignore_errors=True)
 
 
-# # Standard UNet diffusion
-# @pytest.mark.cifar100
-# @pytest.mark.unet
-# @pytest.mark.standard
-# def test_unconditional_standard_cifar():
-#     run_script("train.py", "test-cifar100-standard", ["experiment=uncond_cifar100_std"])
+# Standard UNet diffusion
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.standard
+def test_unconditional_standard_cifar():
+    run_script("train.py", "test-cifar100-standard", ["experiment=uncond_cifar100_std"])
 
 
-# @pytest.mark.cifar100
-# @pytest.mark.unet
-# @pytest.mark.standard
-# def test_conditional_standard_cifar():
-#     run_script("train.py", "test-cifar100-cond", ["experiment=cond_cifar100_std"])
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.standard
+def test_conditional_standard_cifar():
+    run_script("train.py", "test-cifar100-cond", ["experiment=cond_cifar100_std"])
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.unet
-# @pytest.mark.standard
-# def test_conditional_standard_imagenet():
-#     run_script("train.py", "test-imagenet-cond", ["experiment=cond_imgnet_std"])
+@pytest.mark.imagenet
+@pytest.mark.unet
+@pytest.mark.standard
+def test_conditional_standard_imagenet():
+    run_script("train.py", "test-imagenet-cond", ["experiment=cond_imgnet_std"])
 
 
-# @pytest.mark.clevr
-# @pytest.mark.unet
-# @pytest.mark.standard
-# def test_clevr_standard():
-#     run_script("train.py", "test-clevr-standard", ["experiment=clevr_relative_std"])
+@pytest.mark.clevr
+@pytest.mark.unet
+@pytest.mark.standard
+def test_clevr_standard():
+    run_script("train.py", "test-clevr-standard", ["experiment=clevr_relative_std"])
 
 
-# # TRM Diffusion v1 UNet
-# @pytest.mark.cifar100
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_unconditional_trm_v1_cifar():
-#     run_script("train.py", "test-cifar100-small", ["experiment=uncond_cifar100_trm"])
+# TRM Diffusion v1 UNet
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_unconditional_trm_v1_cifar():
+    run_script("train.py", "test-cifar100-small", ["experiment=uncond_cifar100_trm"])
 
 
-# @pytest.mark.cifar100
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_conditional_trm_v1_cifar():
-#     run_script("train.py", "test-cifar100-cond-small", ["experiment=cond_cifar100_trm"])
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_conditional_trm_v1_cifar():
+    run_script("train.py", "test-cifar100-cond-small", ["experiment=cond_cifar100_trm"])
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_conditional_trm_v1_imagenet():
-#     run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm"])
+@pytest.mark.imagenet
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_conditional_trm_v1_imagenet():
+    run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm"])
 
 
-# @pytest.mark.clevr
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_clevr_trm_v1():
-#     run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm"])
+@pytest.mark.clevr
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v1
+def test_clevr_trm_v1():
+    run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm"])
 
 
-# # Standard ViT diffusion
-# @pytest.mark.cifar100
-# @pytest.mark.vit
-# @pytest.mark.standard
-# def test_cond_cifar_vit_std():
-#     run_script(
-#         "train.py",
-#         "test-cifar100-cond",
-#         ["experiment=cond_cifar100_std", "model=cifar100_vit_std", "~model.num_class_embeds", "model.num_classes=100"],
-#     )
+# Standard ViT diffusion
+@pytest.mark.cifar100
+@pytest.mark.vit
+@pytest.mark.standard
+def test_cond_cifar_vit_std():
+    run_script(
+        "train.py",
+        "test-cifar100-cond",
+        ["experiment=cond_cifar100_std", "model=cifar100_vit_std", "~model.num_class_embeds", "model.num_classes=100"],
+    )
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.vit
-# @pytest.mark.standard
-# def test_cond_imagenet_vit_std():
-#     run_script("train.py", "test-imagenet-cond", ["experiment=cond_imgnet_std", "model=imagenet_vit_std"])
+@pytest.mark.imagenet
+@pytest.mark.vit
+@pytest.mark.standard
+def test_cond_imagenet_vit_std():
+    run_script("train.py", "test-imagenet-cond", ["experiment=cond_imgnet_std", "model=imagenet_vit_std"])
 
 
-# @pytest.mark.clevr
-# @pytest.mark.vit
-# @pytest.mark.standard
-# def test_cond_clevr_vit_std():
-#     run_script("train.py", "test-clevr-standard", ["experiment=clevr_relative_std", "model=clevr_vit_std"])
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.standard
+def test_cond_clevr_vit_std():
+    run_script("train.py", "test-clevr-standard", ["experiment=clevr_relative_std", "model=clevr_vit_std"])
 
 
-# # TRM Diffusion v1 ViT
-# @pytest.mark.cifar100
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_cond_cifar_vit_trm():
-#     run_script(
-#         "train.py",
-#         "test-cifar100-cond-small",
-#         ["experiment=cond_cifar100_trm", "model=cifar100_vit_trm", "~model.core_model.num_class_embeds"],
-#     )
+# TRM Diffusion v1 ViT
+@pytest.mark.cifar100
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v1
+def test_cond_cifar_vit_trm():
+    run_script(
+        "train.py",
+        "test-cifar100-cond-small",
+        ["experiment=cond_cifar100_trm", "model=cifar100_vit_trm", "~model.core_model.num_class_embeds"],
+    )
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_cond_imagenet_vit_trm():
-#     run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_vit_trm"])
+@pytest.mark.imagenet
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v1
+def test_cond_imagenet_vit_trm():
+    run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_vit_trm"])
 
 
-# @pytest.mark.clevr
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v1
-# def test_cond_clevr_vit_trm():
-#     run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_vit_trm"])
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v1
+def test_cond_clevr_vit_trm():
+    run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_vit_trm"])
 
 
-# # TRM Diffusion v2 UNet
-# @pytest.mark.cifar100
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_cifar_unet_trm_v2():
-#     run_script("train.py", "test-cifar100-cond-small", ["experiment=cond_cifar100_trm", "model=unet2d_trm_v2"])
+# TRM Diffusion v2 UNet
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_cifar_unet_trm_v2():
+    run_script("train.py", "test-cifar100-cond-small", ["experiment=cond_cifar100_trm", "model=unet2d_trm_v2"])
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_imagenet_unet_trm_v2():
-#     run_script(
-#         "train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_condition_unet_trm_v2"]
-#     )
+@pytest.mark.imagenet
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_imagenet_unet_trm_v2():
+    run_script(
+        "train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_condition_unet_trm_v2"]
+    )
 
 
-# @pytest.mark.clevr
-# @pytest.mark.unet
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_clevr_unet_trm_v2():
-#     run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_condition_unet_trm_v2"])
+@pytest.mark.clevr
+@pytest.mark.unet
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_clevr_unet_trm_v2():
+    run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_condition_unet_trm_v2"])
 
 
-# # TRM Diffusion v2 ViT
-# @pytest.mark.cifar100
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_cifar_vit_trm_v2():
-#     run_script(
-#         "train.py",
-#         "test-cifar100-cond-small",
-#         ["experiment=cond_cifar100_trm", "model=cifar100_vit_trm_v2", "~model.core_model.num_class_embeds"],
-#     )
+# TRM Diffusion v2 ViT
+@pytest.mark.cifar100
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_cifar_vit_trm_v2():
+    run_script(
+        "train.py",
+        "test-cifar100-cond-small",
+        ["experiment=cond_cifar100_trm", "model=cifar100_vit_trm_v2", "~model.core_model.num_class_embeds"],
+    )
 
 
-# @pytest.mark.imagenet
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_imagenet_vit_trm_v2():
-#     run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_vit_trm_v2"])
+@pytest.mark.imagenet
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_imagenet_vit_trm_v2():
+    run_script("train.py", "test-imagenet-cond-small", ["experiment=cond_imgnet_trm", "model=imagenet_vit_trm_v2"])
 
 
-# @pytest.mark.clevr
-# @pytest.mark.vit
-# @pytest.mark.trm
-# @pytest.mark.v2
-# def test_cond_clevr_vit_trm_v2():
-#     run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_vit_trm_v2"])
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.trm
+@pytest.mark.v2
+def test_cond_clevr_vit_trm_v2():
+    run_script("train.py", "test-clevr-small", ["experiment=clevr_relative_trm", "model=clevr_vit_trm_v2"])
 
 
 # TRM Diffusion v3 UNet
