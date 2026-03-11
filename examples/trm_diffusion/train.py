@@ -274,6 +274,7 @@ def main(args: DictConfig):
         model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dl, eval_dl, lr_scheduler
         )
+
     if args.use_ema:
         ema_model.to(accelerator.device)
 

@@ -32,13 +32,13 @@ class SokobanBitDataset(Dataset):
         if "state" in item:
             result["conditions"] = self._board_to_tensor(item["state"])
 
-        if "distance_label" in item:
+        if "distance_label" in item and item["distance_label"] is not None:
             result["class_labels"] = item["distance_label"]
 
         return result
 
     def _board_to_tensor(self, board_np):
-        board_tensor = torch.from_numpy(board_np).unsqueeze(0)
+        board_tensor = torch.from_numpy(board_np).unsqueeze(0).to(self.device)
         images = int2bits(board_tensor, self.num_bits, self.device, self.weight_dtype)
         images = (images * 2 - 1.0) * self.clip_sample_range
         images = images.squeeze(0).permute(2, 0, 1)  #(num_bits, H, W)
@@ -91,7 +91,7 @@ class SokobanDataset(Dataset):
 
         # If k is a list, sample a random value from the list
         k = random.choice(self.k) if isinstance(self.k, list) else self.k
-        k_label = self.k_label[k] if isinstance(self.k, list) else 0
+        k_label = self.k_label[k] if isinstance(self.k, list) else None
 
         # Get the actual board index from valid_indices
         board_idx = self.valid_indices[k][idx]
