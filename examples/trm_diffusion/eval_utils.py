@@ -148,8 +148,9 @@ def evaluate_and_save(
     """Wrapper that calls the generator and pushes the outputs to W&B/Tensorboard."""
     unet = accelerator.unwrap_model(model)
     if args.use_ema:
-        ema_model.store(unet.parameters())
-        ema_model.copy_to(unet.parameters())
+        ema_target = unet.core_model if hasattr(unet, "get_trainable_modules") else unet
+        ema_model.store(ema_target.parameters())
+        ema_model.copy_to(ema_target.parameters())
 
     unet.eval()
     noise_scheduler.set_timesteps(args.ddpm_num_inference_steps)
@@ -193,4 +194,4 @@ def evaluate_and_save(
         pipeline.save_pretrained(args.output_dir)
 
     if args.use_ema:
-        ema_model.restore(unet.parameters())
+        ema_model.restore(ema_target.parameters())

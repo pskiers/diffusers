@@ -1,4 +1,5 @@
 import sys
+from xml.parsers.expat import model
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -130,8 +131,12 @@ def main(args: DictConfig):
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if hasattr(model, "get_trainable_modules"):
+        total_params = sum(p.numel() for m in model.get_trainable_modules().values() for p in m.parameters())
+        trainable_params = sum(p.numel() for m in model.get_trainable_modules().values() for p in m.parameters() if p.requires_grad)
+    else:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total number of parameters: {total_params}")
     logger.info(f"Number of trainable parameters: {trainable_params}")
 
@@ -155,54 +160,61 @@ def main(args: DictConfig):
             model_config=unet_for_ema.config,
         )
 
-    # `accelerate` custom saving & loading hooks
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
                     ema_model.save_pretrained(os.path.join(output_dir, "unet_ema"))
-                for i, m in enumerate(models):
-                    # Unwrap our custom TRM classes before saving
-                    m_to_save = m.core_model if hasattr(m, "core_model") else m
-                    m_to_save.save_pretrained(os.path.join(output_dir, "unet"))
-                    weights.pop()
+
+                # ROUTE A: New Strategy
+                if hasattr(model, "get_trainable_modules"):
+                    model.save(output_dir)
+                    while len(weights) > 0: weights.pop() # Prevent duplicate saving
+                # ROUTE B: Legacy Modules
+                else:
+                    for i, m in enumerate(models):
+                        m_to_save = m.core_model if hasattr(m, "core_model") else m
+                        m_to_save.save_pretrained(os.path.join(output_dir, "unet"))
+                        weights.pop()
 
         def load_model_hook(models, input_dir):
-            for _ in range(len(models)):
-                m = models.pop()
-                m_to_load = m.core_model if hasattr(m, "core_model") else m
+            if args.use_ema:
+                ema_dir = os.path.join(input_dir, "unet_ema")
+                sf_path = os.path.join(ema_dir, "diffusion_pytorch_model.safetensors")
+                bin_path = os.path.join(ema_dir, "diffusion_pytorch_model.bin")
 
-                if args.use_ema:
-                    ema_dir = os.path.join(input_dir, "unet_ema")
-                    sf_path = os.path.join(ema_dir, "diffusion_pytorch_model.safetensors")
-                    bin_path = os.path.join(ema_dir, "diffusion_pytorch_model.bin")
+                if os.path.exists(sf_path): ema_state_dict = load_file(sf_path)
+                elif os.path.exists(bin_path): ema_state_dict = torch.load(bin_path, map_location="cpu")
+                else: raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
 
-                    if os.path.exists(sf_path):
-                        ema_state_dict = load_file(sf_path)
-                    elif os.path.exists(bin_path):
-                        ema_state_dict = torch.load(bin_path, map_location="cpu")
-                    else:
-                        raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
-
-                    load_with_backward_compatibility(m_to_load, ema_state_dict)
-                    new_ema = EMAModel(m_to_load.parameters(), model_cls=type(m_to_load), model_config=m_to_load.config)
-                    ema_model.load_state_dict(new_ema.state_dict())
-                    ema_model.to(accelerator.device)
-                    del new_ema
-
-                unet_dir = os.path.join(input_dir, "unet")
-                sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
-                bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
-
-                if os.path.exists(sf_path):
-                    state_dict = load_file(sf_path)
-                elif os.path.exists(bin_path):
-                    state_dict = torch.load(bin_path, map_location="cpu")
+                if hasattr(model, "get_trainable_modules"):
+                    m_to_load = model.core_model.module if hasattr(model.core_model, "module") else model.core_model
                 else:
-                    raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
+                    m = models[0]
+                    m_to_load = m.core_model if hasattr(m, "core_model") else m
 
-                load_with_backward_compatibility(m_to_load, state_dict)
+                load_with_backward_compatibility(m_to_load, ema_state_dict)
+                new_ema = EMAModel(m_to_load.parameters(), model_cls=type(m_to_load), model_config=m_to_load.config)
+                ema_model.load_state_dict(new_ema.state_dict())
+                ema_model.to(accelerator.device)
+                del new_ema
+
+            if hasattr(model, "get_trainable_modules"):
+                model.load(input_dir)
+                while len(models) > 0: models.pop()
+            else:
+                for _ in range(len(models)):
+                    m = models.pop()
+                    m_to_load = m.core_model if hasattr(m, "core_model") else m
+                    unet_dir = os.path.join(input_dir, "unet")
+                    sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
+                    bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
+
+                    if os.path.exists(sf_path): state_dict = load_file(sf_path)
+                    elif os.path.exists(bin_path): state_dict = torch.load(bin_path, map_location="cpu")
+                    else: raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
+
+                    load_with_backward_compatibility(m_to_load, state_dict)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -212,32 +224,36 @@ def main(args: DictConfig):
     # ---------------------------------------------------------
     # 4. Optimizers, Schedulers, and Trackers
     # ---------------------------------------------------------
+    if hasattr(model, "get_trainable_modules"):
+        params = []
+        for m in model.get_trainable_modules().values():
+            params.extend(m.parameters())
+    else:
+        params = model.parameters()
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=args.ddpm_num_steps,
-        beta_schedule=args.ddpm_beta_schedule,
-        prediction_type=args.prediction_type,
+        params, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay, eps=args.adam_epsilon,
     )
 
-    # Safely get n_sup for the scheduler multiplication
-    mult = getattr(args.model, "n_sup", 1) if args.use_small_loop else 1
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule, prediction_type=args.prediction_type,
+    )
+
+    mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
+        args.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * mult,
         num_training_steps=len(train_dl) * args.num_epochs * mult,
     )
 
-    model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dl, eval_dl, lr_scheduler
-    )
+    if hasattr(model, "get_trainable_modules"):
+        optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(optimizer, train_dl, eval_dl, lr_scheduler)
+        prepared_modules = {name: accelerator.prepare(m) for name, m in model.get_trainable_modules().items()}
+        model.update_modules(prepared_modules)
+    else:
+        model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(model, optimizer, train_dl, eval_dl, lr_scheduler)
     if args.use_ema:
         ema_model.to(accelerator.device)
 
@@ -342,13 +358,19 @@ def main(args: DictConfig):
                     y, z = y.to(model.device), z.to(model.device)
 
                     for _ in range(base_model.n_sup):
-                        with accelerator.autocast():
-                            model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
-                            loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
+                        # with accelerator.autocast():
+                        model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
+                        loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                            if hasattr(base_model, "get_trainable_modules"):
+                                params_to_clip = []
+                                for m in base_model.get_trainable_modules().values():
+                                    params_to_clip.extend(m.parameters())
+                                accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                            else:
+                                accelerator.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad()
@@ -386,7 +408,8 @@ def main(args: DictConfig):
             # Sync & Checkpoint
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_model.step(model.parameters())
+                    ema_target = model.core_model if hasattr(model, "get_trainable_modules") else model
+                    ema_model.step(ema_target.parameters())
                 progress_bar.update(1)
                 global_step += 1
 
@@ -453,8 +476,7 @@ def main(args: DictConfig):
 
                 # ROUTE 1: New Object-Oriented TRM Models
                 if hasattr(base_model, "reasoning_step"):
-                    with accelerator.autocast():
-                        model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
+                    model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
 
                 # ROUTE 2: Old Procedural TRM Logic
                 elif args.use_small_loop:

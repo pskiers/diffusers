@@ -40,5 +40,6 @@ markers = [
     "trm: marks tests that use TRM models",
     "cifar100: marks tests that use the CIFAR-100 dataset",
     "imagenet: marks tests that use the ImageNet dataset",
-    "clevr: marks tests that use the CLEVR dataset"
+    "clevr: marks tests that use the CLEVR dataset",
+    "standard: marks tests that use standard diffusion"
 ]
