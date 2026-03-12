@@ -32,3 +32,4 @@ flash_attn
 einops
 timm
 sentencepiece
+adam-atan2-pytorch

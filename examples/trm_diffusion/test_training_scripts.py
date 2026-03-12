@@ -28,8 +28,8 @@ def run_script(script_name, output_dir, extra_args):
         "logger=wandb",
         "gradient_accumulation_steps=1",
         "use_ema=true",
-        "learning_rate=1e-4",
-        "lr_warmup_steps=1",
+        "optimizer.lr=1e-4",
+        "lr_scheduler.warmup_steps=1",
     ]
 
     cmd_initial = base_cmd + extra_args + ["num_epochs=2"]

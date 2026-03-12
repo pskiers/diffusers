@@ -242,13 +242,7 @@ def main(args: DictConfig):
     else:
         params = model.parameters()
 
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    optimizer = instantiate(args.optimizer, params=params)
 
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=args.ddpm_num_steps,
@@ -259,9 +253,9 @@ def main(args: DictConfig):
     mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler,
+        args.lr_scheduler.name,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * mult,
+        num_warmup_steps=args.lr_scheduler.warmup_steps * args.gradient_accumulation_steps * mult,
         num_training_steps=len(train_dl) * args.num_epochs * mult,
     )
 
