@@ -133,7 +133,9 @@ def main(args: DictConfig):
 
     if hasattr(model, "get_trainable_modules"):
         total_params = sum(p.numel() for m in model.get_trainable_modules().values() for p in m.parameters())
-        trainable_params = sum(p.numel() for m in model.get_trainable_modules().values() for p in m.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for m in model.get_trainable_modules().values() for p in m.parameters() if p.requires_grad
+        )
     else:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -161,6 +163,7 @@ def main(args: DictConfig):
         )
 
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
@@ -169,7 +172,8 @@ def main(args: DictConfig):
                 # ROUTE A: New Strategy
                 if hasattr(model, "get_trainable_modules"):
                     model.save(output_dir)
-                    while len(weights) > 0: weights.pop() # Prevent duplicate saving
+                    while len(weights) > 0:
+                        weights.pop()  # Prevent duplicate saving
                 # ROUTE B: Legacy Modules
                 else:
                     for i, m in enumerate(models):
@@ -183,9 +187,12 @@ def main(args: DictConfig):
                 sf_path = os.path.join(ema_dir, "diffusion_pytorch_model.safetensors")
                 bin_path = os.path.join(ema_dir, "diffusion_pytorch_model.bin")
 
-                if os.path.exists(sf_path): ema_state_dict = load_file(sf_path)
-                elif os.path.exists(bin_path): ema_state_dict = torch.load(bin_path, map_location="cpu")
-                else: raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
+                if os.path.exists(sf_path):
+                    ema_state_dict = load_file(sf_path)
+                elif os.path.exists(bin_path):
+                    ema_state_dict = torch.load(bin_path, map_location="cpu")
+                else:
+                    raise FileNotFoundError(f"Could not find EMA weights in {ema_dir}")
 
                 if hasattr(model, "get_trainable_modules"):
                     m_to_load = model.core_model.module if hasattr(model.core_model, "module") else model.core_model
@@ -201,7 +208,8 @@ def main(args: DictConfig):
 
             if hasattr(model, "get_trainable_modules"):
                 model.load(input_dir)
-                while len(models) > 0: models.pop()
+                while len(models) > 0:
+                    models.pop()
             else:
                 for _ in range(len(models)):
                     m = models.pop()
@@ -210,9 +218,12 @@ def main(args: DictConfig):
                     sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
                     bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
 
-                    if os.path.exists(sf_path): state_dict = load_file(sf_path)
-                    elif os.path.exists(bin_path): state_dict = torch.load(bin_path, map_location="cpu")
-                    else: raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
+                    if os.path.exists(sf_path):
+                        state_dict = load_file(sf_path)
+                    elif os.path.exists(bin_path):
+                        state_dict = torch.load(bin_path, map_location="cpu")
+                    else:
+                        raise FileNotFoundError(f"Could not find model weights in {unet_dir}")
 
                     load_with_backward_compatibility(m_to_load, state_dict)
 
@@ -232,18 +243,24 @@ def main(args: DictConfig):
         params = model.parameters()
 
     optimizer = torch.optim.AdamW(
-        params, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay, eps=args.adam_epsilon,
+        params,
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
     )
 
     noise_scheduler = DDPMScheduler(
-        num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule, prediction_type=args.prediction_type,
+        num_train_timesteps=args.ddpm_num_steps,
+        beta_schedule=args.ddpm_beta_schedule,
+        prediction_type=args.prediction_type,
     )
 
     mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler, optimizer=optimizer,
+        args.lr_scheduler,
+        optimizer=optimizer,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * mult,
         num_training_steps=len(train_dl) * args.num_epochs * mult,
     )
@@ -253,7 +270,9 @@ def main(args: DictConfig):
         prepared_modules = {name: accelerator.prepare(m) for name, m in model.get_trainable_modules().items()}
         model.update_modules(prepared_modules)
     else:
-        model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(model, optimizer, train_dl, eval_dl, lr_scheduler)
+        model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dl, eval_dl, lr_scheduler
+        )
     if args.use_ema:
         ema_model.to(accelerator.device)
 
