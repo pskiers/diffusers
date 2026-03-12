@@ -48,7 +48,8 @@ class BaseIterativeStrategy:
 
     def update_modules(self, prepared_modules):
         """Injects the wrapped modules back into the strategy."""
-        self.core_model = prepared_modules["core_model"]
+        if "core_model" in prepared_modules:
+            self.core_model = prepared_modules["core_model"]
 
     def train(self):
         for m in self.get_trainable_modules().values():
@@ -133,8 +134,46 @@ class StandardTRM(BaseIterativeStrategy):
         return TRMOutput(sample=model_output)
 
 
+class ExtraModulesMixin:
+    """Handles Accelerate prep and I/O natively for auxiliary layers"""
+
+    @property
+    def _extra_modules(self):
+        return ["fusion", "out_proj", "norm_y", "norm_z"]
+
+    def get_trainable_modules(self):
+        modules = super().get_trainable_modules() if hasattr(super(), "get_trainable_modules") else {}
+        for attr in self._extra_modules:
+            if hasattr(self, attr):
+                modules[attr] = getattr(self, attr)
+        return modules
+
+    def update_modules(self, prepared_modules):
+        if hasattr(super(), "update_modules"):
+            super().update_modules(prepared_modules)
+        for attr in self._extra_modules:
+            if attr in prepared_modules:
+                setattr(self, attr, prepared_modules[attr])
+
+    def save(self, output_dir):
+        if hasattr(super(), "save"):
+            super().save(output_dir)
+        for attr in self._extra_modules:
+            if hasattr(self, attr):
+                m = unwrap_model(getattr(self, attr))
+                torch.save(m.state_dict(), os.path.join(output_dir, f"{attr}.pt"))
+
+    def load(self, input_dir):
+        if hasattr(super(), "load"):
+            super().load(input_dir)
+        for attr in self._extra_modules:
+            if hasattr(self, attr) and os.path.exists(os.path.join(input_dir, f"{attr}.pt")):
+                m = unwrap_model(getattr(self, attr))
+                m.load_state_dict(torch.load(os.path.join(input_dir, f"{attr}.pt"), map_location="cpu"))
+
+
 # V2: TRM exactly as in the og paper. Addition instead of concat, single output, no x for y prediction, in high dim latent
-class UNetTRMv2(BaseIterativeStrategy):
+class UNetTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
     """High-Dimensional Additive TRM specialized for UNet architectures."""
 
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
@@ -144,6 +183,9 @@ class UNetTRMv2(BaseIterativeStrategy):
         dim = core_model.conv_in.out_channels
         state_shape = (dim, resolution, resolution)
         super().__init__(core_model, state_shape, n, T, n_sup)
+
+        self.norm_y = nn.GroupNorm(32, dim)
+        self.norm_z = nn.GroupNorm(32, dim)
 
     @property
     def _core(self):
@@ -162,10 +204,12 @@ class UNetTRMv2(BaseIterativeStrategy):
         for _ in range(self.n):
             with autocast_ctx:
                 z_out = get_model_output(self.core_model, x_high + y + z, timesteps, conditions, masks)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)  # Force state to remain FP32
 
         with autocast_ctx:
             y_out = get_model_output(self.core_model, y + z, timesteps, conditions, masks)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
@@ -226,7 +270,7 @@ class UNetTRMv2(BaseIterativeStrategy):
         return TRMOutput(sample=model_output)
 
 
-class DiTTRMv2(BaseIterativeStrategy):
+class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
     """High-Dimensional Additive TRM specialized for DiT architectures."""
 
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
@@ -241,13 +285,18 @@ class DiTTRMv2(BaseIterativeStrategy):
         state_shape = (self.h_p * self.w_p, dim)
         super().__init__(core_model, state_shape, n, T, n_sup)
 
+        self.norm_y = nn.LayerNorm(dim)
+        self.norm_z = nn.LayerNorm(dim)
+
     @property
     def _core(self):
         return self.core_model.module if hasattr(self.core_model, "module") else self.core_model
 
     def get_trainable_modules(self):
         """Expose all manual DiT submodules so Accelerate can wrap them with DDP."""
-        modules = {}
+        modules = super().get_trainable_modules()
+        if "core_model" in modules:
+            del modules["core_model"] # Prevent full DDP wrapping on DiT
         core = self._core
 
         # The definitive list of every possible nn.Module across all Diffusers Transformer2D configs
@@ -282,6 +331,7 @@ class DiTTRMv2(BaseIterativeStrategy):
 
     def update_modules(self, prepared_modules):
         """Re-inject the DDP-wrapped modules back into the DiT core."""
+        super().update_modules(prepared_modules)
         core = self._core
 
         possible_modules = [
@@ -319,6 +369,8 @@ class DiTTRMv2(BaseIterativeStrategy):
 
         # 1. Unwrap
         for name, module in self.get_trainable_modules().items():
+            if name in self._extra_modules:
+                continue # Let ExtraModulesMixin handle norm_y, etc.
             original_modules[name] = module
             unwrapped = unwrap_model(module)
             if name.startswith("transformer_block_"):
@@ -328,9 +380,7 @@ class DiTTRMv2(BaseIterativeStrategy):
                 setattr(core, name, unwrapped)
 
         # 2. Save
-        os.makedirs(output_dir, exist_ok=True)
-        core.save_pretrained(os.path.join(output_dir, "unet"))
-        torch.save({"y_init": self.y_init, "z_init": self.z_init}, os.path.join(output_dir, "strategy_state.pt"))
+        super().save(output_dir)
 
         # 3. Restore DDP Wrappers for continued training
         for name, module in original_modules.items():
@@ -400,10 +450,12 @@ class DiTTRMv2(BaseIterativeStrategy):
                 z_out = self._dit_blocks(
                     x_high + y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
                 )
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)  # Force state to remain FP32
 
         with autocast_ctx:
             y_out = self._dit_blocks(y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
@@ -530,47 +582,10 @@ class DiTTRMv2(BaseIterativeStrategy):
         return TRMOutput(sample=model_output)
 
 
-class ExtraModulesMixin:
-    """Handles Accelerate prep and I/O natively for auxiliary layers (fusion, out_proj)"""
-
-    def get_trainable_modules(self):
-        modules = super().get_trainable_modules()
-        if hasattr(self, "fusion"):
-            modules["fusion"] = self.fusion
-        if hasattr(self, "out_proj"):
-            modules["out_proj"] = self.out_proj
-        return modules
-
-    def update_modules(self, prepared_modules):
-        super().update_modules(prepared_modules)
-        if "fusion" in prepared_modules:
-            self.fusion = prepared_modules["fusion"]
-        if "out_proj" in prepared_modules:
-            self.out_proj = prepared_modules["out_proj"]
-
-    def save(self, output_dir):
-        super().save(output_dir)
-        if hasattr(self, "fusion"):
-            m = self.fusion.module if hasattr(self.fusion, "module") else self.fusion
-            torch.save(m.state_dict(), os.path.join(output_dir, "fusion.pt"))
-        if hasattr(self, "out_proj"):
-            m = self.out_proj.module if hasattr(self.out_proj, "module") else self.out_proj
-            torch.save(m.state_dict(), os.path.join(output_dir, "out_proj.pt"))
-
-    def load(self, input_dir):
-        super().load(input_dir)
-        if hasattr(self, "fusion") and os.path.exists(os.path.join(input_dir, "fusion.pt")):
-            m = self.fusion.module if hasattr(self.fusion, "module") else self.fusion
-            m.load_state_dict(torch.load(os.path.join(input_dir, "fusion.pt"), map_location="cpu"))
-        if hasattr(self, "out_proj") and os.path.exists(os.path.join(input_dir, "out_proj.pt")):
-            m = self.out_proj.module if hasattr(self.out_proj, "module") else self.out_proj
-            m.load_state_dict(torch.load(os.path.join(input_dir, "out_proj.pt"), map_location="cpu"))
-
-
 # ==========================================
 # V3: Concatenation with Single Output
 # ==========================================
-class UNetTRMv3(ExtraModulesMixin, UNetTRMv2):
+class UNetTRMv3(UNetTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.conv_in.out_channels
@@ -582,16 +597,18 @@ class UNetTRMv3(ExtraModulesMixin, UNetTRMv2):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
                 z_out = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=1))
             y_out = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
 
-class DiTTRMv3(ExtraModulesMixin, DiTTRMv2):
+class DiTTRMv3(DiTTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
@@ -605,11 +622,13 @@ class DiTTRMv3(ExtraModulesMixin, DiTTRMv2):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
                 z_out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
             y_out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            y = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
@@ -617,7 +636,7 @@ class DiTTRMv3(ExtraModulesMixin, DiTTRMv2):
 # ==========================================
 # V4: Concatenation with Two Outputs (y & z)
 # ==========================================
-class UNetTRMv4(ExtraModulesMixin, UNetTRMv2):
+class UNetTRMv4(UNetTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.conv_in.out_channels
@@ -631,17 +650,19 @@ class UNetTRMv4(ExtraModulesMixin, UNetTRMv2):
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
                 out = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
                 _, z_out = self.out_proj(out).chunk(2, dim=1)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=1))
             out = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
             y_out, _ = self.out_proj(out).chunk(2, dim=1)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
 
-class DiTTRMv4(ExtraModulesMixin, DiTTRMv2):
+class DiTTRMv4(DiTTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
@@ -657,12 +678,14 @@ class DiTTRMv4(ExtraModulesMixin, DiTTRMv2):
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
                 out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
             out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
@@ -670,7 +693,7 @@ class DiTTRMv4(ExtraModulesMixin, DiTTRMv2):
 # ==========================================
 # V5: Concatenation + Two Outputs + x_high in y pass
 # ==========================================
-class UNetTRMv5(ExtraModulesMixin, UNetTRMv2):
+class UNetTRMv5(UNetTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.conv_in.out_channels
@@ -683,6 +706,7 @@ class UNetTRMv5(ExtraModulesMixin, UNetTRMv2):
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=1))
                 out = get_model_output(self.core_model, z_in, timesteps, conditions, masks)
                 _, z_out = self.out_proj(out).chunk(2, dim=1)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
@@ -690,11 +714,12 @@ class UNetTRMv5(ExtraModulesMixin, UNetTRMv2):
             y_in = self.fusion(torch.cat([x_high, y, z], dim=1))
             out = get_model_output(self.core_model, y_in, timesteps, conditions, masks)
             y_out, _ = self.out_proj(out).chunk(2, dim=1)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
 
 
-class DiTTRMv5(ExtraModulesMixin, DiTTRMv2):
+class DiTTRMv5(DiTTRMv2):
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, resolution, n, T, n_sup, **kwargs)
         dim = self.core_model.config.num_attention_heads * self.core_model.config.attention_head_dim
@@ -709,6 +734,7 @@ class DiTTRMv5(ExtraModulesMixin, DiTTRMv2):
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
                 out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
+                z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
@@ -716,5 +742,6 @@ class DiTTRMv5(ExtraModulesMixin, DiTTRMv2):
             y_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
             out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
+            y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z

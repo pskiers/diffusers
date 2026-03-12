@@ -3,18 +3,23 @@ import torch
 import re
 
 
-def load_with_backward_compatibility(unet, state_dict, logger=None):
+def load_with_backward_compatibility(unet, state_dict, logger=None, strict=True):
     """
     Translates old checkpoint keys to the new unified model architecture keys.
+    If strict=True, raises a RuntimeError if there are missing or unexpected keys.
     """
 
-    # Regex map: pattern -> replacement
+    # Base rename map for removing DDP and strategy wrappers
     RENAME_MAP = {
         r"^module\.": "",
         r"^unet\.": "",
-        r"(^|\.)projector(\.)": r"\g<1>condition_projector\g<2>",
-        r"(^|\.)class_embedding(\.)": r"\g<1>condition_projector\g<2>",
     }
+
+    # Only map legacy class/sequence embeddings to 'condition_projector' if
+    # the target model actually uses the Unified architecture!
+    if hasattr(unet, "condition_projector"):
+        RENAME_MAP[r"(^|\.)projector(\.)"] = r"\g<1>condition_projector\g<2>"
+        RENAME_MAP[r"(^|\.)class_embedding(\.)"] = r"\g<1>condition_projector\g<2>"
 
     adapted_dict = {}
     for key, value in state_dict.items():
@@ -23,25 +28,33 @@ def load_with_backward_compatibility(unet, state_dict, logger=None):
             new_key = re.sub(pattern, replacement, new_key)
         adapted_dict[new_key] = value
 
-    # strict=False prevents crashing if minor structural parameters differ
+    # We use strict=False internally so we can format our own clean error messages
     missing, unexpected = unet.load_state_dict(adapted_dict, strict=False)
 
+    error_msgs = []
+
     if len(missing) > 0:
+        msg = f"Missing keys when loading checkpoint (showing first 5): {missing[:5]} ... ({len(missing)} total)"
+        error_msgs.append(msg)
         if logger is not None:
-            logger.warning(
-                f"Missing keys when loading checkpoint (showing first 5): {missing[:5]} ... ({len(missing)} total)"
-            )
+            logger.error(msg)
         else:
-            print(f"Missing keys when loading checkpoint (showing first 5): {missing[:5]} ... ({len(missing)} total)")
+            print(msg)
+
     if len(unexpected) > 0:
+        msg1 = f"Unexpected keys in checkpoint (showing first 5): {unexpected[:5]} ... ({len(unexpected)} total)"
+        msg2 = "If these unexpected keys should map to the missing keys, add them to the RENAME_MAP!"
+        error_msgs.extend([msg1, msg2])
         if logger is not None:
-            logger.warning(
-                f"Unexpected keys in checkpoint (showing first 5): {unexpected[:5]} ... ({len(unexpected)} total)"
-            )
-            logger.warning("If these unexpected keys should map to the missing keys, add them to the RENAME_MAP!")
+            logger.error(msg1)
+            logger.error(msg2)
         else:
-            print(f"Unexpected keys in checkpoint (showing first 5): {unexpected[:5]} ... ({len(unexpected)} total)")
-            print("If these unexpected keys should map to the missing keys, add them to the RENAME_MAP!")
+            print(msg1)
+            print(msg2)
+
+    # Crash the script if strict mode is enabled and there's a mismatch
+    if strict and (len(missing) > 0 or len(unexpected) > 0):
+        raise RuntimeError("State dict mismatch detected! Strict mode is ON.\n" + "\n".join(error_msgs))
 
 
 def extract_into_tensor(arr, timesteps, broadcast_shape):

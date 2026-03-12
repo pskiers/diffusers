@@ -79,8 +79,18 @@ def main(args: DictConfig):
     load_with_backward_compatibility(unet_to_load, raw_state_dict, logger)
 
     unet.eval()
-    unet = accelerator.prepare(unet)
-    unet = accelerator.unwrap_model(unet)  # Safely unwrap it once before the loop starts!
+
+    # 1. Safely move the core model to the GPU
+    if hasattr(unet, "core_model"):
+        unet.core_model.to(accelerator.device)
+    else:
+        unet.to(accelerator.device)
+
+    # 2. Safely move any extra Mixin layers (norm_y, fusion, etc.) to the GPU
+    if hasattr(unet, "get_trainable_modules"):
+        for m in unet.get_trainable_modules().values():
+            if isinstance(m, torch.nn.Module):
+                m.to(accelerator.device)
 
     # 2. Load VAE and Scheduler
     vae, vae_scaling_factor = None, 1.0
