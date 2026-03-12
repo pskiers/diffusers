@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
+import os
 import contextlib
+from dataclasses import dataclass
 from diffusers.models import UNet2DConditionModel, Transformer2DModel, UNet2DModel
 from diffusers.utils import BaseOutput
-from dataclasses import dataclass
+from accelerate.utils import extract_model_from_parallel as unwrap_model
 from trm_utils import deep_recursion, get_model_output
 from model_utils import load_with_backward_compatibility
 from safetensors.torch import load_file
-import os
 
 
 @dataclass
@@ -243,6 +244,101 @@ class DiTTRMv2(BaseIterativeStrategy):
     @property
     def _core(self):
         return self.core_model.module if hasattr(self.core_model, "module") else self.core_model
+
+    def get_trainable_modules(self):
+        """Expose all manual DiT submodules so Accelerate can wrap them with DDP."""
+        modules = {}
+        core = self._core
+
+        # The definitive list of every possible nn.Module across all Diffusers Transformer2D configs
+        possible_modules = [
+            "time_proj",
+            "time_embedding",
+            "proj",
+            "pos_embed",
+            "condition_projector",
+            "norm_out",
+            "proj_out",
+            "proj_out_1",
+            "proj_out_2",
+            "adaln_single",
+            "caption_projection",
+            "norm",
+            "proj_in",
+            "latent_image_embedding",
+            "out",
+        ]
+
+        for attr in possible_modules:
+            if hasattr(core, attr) and getattr(core, attr) is not None:
+                modules[attr] = getattr(core, attr)
+
+        # Unroll transformer blocks
+        if hasattr(core, "transformer_blocks"):
+            for i, block in enumerate(core.transformer_blocks):
+                modules[f"transformer_block_{i}"] = block
+
+        return modules
+
+    def update_modules(self, prepared_modules):
+        """Re-inject the DDP-wrapped modules back into the DiT core."""
+        core = self._core
+
+        possible_modules = [
+            "time_proj",
+            "time_embedding",
+            "proj",
+            "pos_embed",
+            "condition_projector",
+            "norm_out",
+            "proj_out",
+            "proj_out_1",
+            "proj_out_2",
+            "adaln_single",
+            "caption_projection",
+            "norm",
+            "proj_in",
+            "latent_image_embedding",
+            "out",
+        ]
+
+        for attr in possible_modules:
+            if attr in prepared_modules:
+                setattr(core, attr, prepared_modules[attr])
+
+        if hasattr(core, "transformer_blocks"):
+            for i in range(len(core.transformer_blocks)):
+                if f"transformer_block_{i}" in prepared_modules:
+                    core.transformer_blocks[i] = prepared_modules[f"transformer_block_{i}"]
+
+    def save(self, output_dir):
+        """Temporarily unwrap modules to save cleanly without 'module.' prefixes."""
+
+        core = self._core
+        original_modules = {}
+
+        # 1. Unwrap
+        for name, module in self.get_trainable_modules().items():
+            original_modules[name] = module
+            unwrapped = unwrap_model(module)
+            if name.startswith("transformer_block_"):
+                idx = int(name.split("_")[-1])
+                core.transformer_blocks[idx] = unwrapped
+            else:
+                setattr(core, name, unwrapped)
+
+        # 2. Save
+        os.makedirs(output_dir, exist_ok=True)
+        core.save_pretrained(os.path.join(output_dir, "unet"))
+        torch.save({"y_init": self.y_init, "z_init": self.z_init}, os.path.join(output_dir, "strategy_state.pt"))
+
+        # 3. Restore DDP Wrappers for continued training
+        for name, module in original_modules.items():
+            if name.startswith("transformer_block_"):
+                idx = int(name.split("_")[-1])
+                core.transformer_blocks[idx] = module
+            else:
+                setattr(core, name, module)
 
     def _prepare_conditions(self, conditions, bs, device):
         """Replicates the conditioning override logic from UnifiedConditionDiT."""
