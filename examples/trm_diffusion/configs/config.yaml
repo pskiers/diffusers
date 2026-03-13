@@ -45,7 +45,7 @@ ema_max_decay: 0.9999
 # 6. Saving & Checkpointing
 save_images_epochs: 5
 save_model_epochs: 5
-checkpointing_steps: 1000
+checkpointing_steps: 5000
 checkpoints_total_limit: null
 resume_from_checkpoint: null
 
@@ -56,6 +56,6 @@ use_small_loop: false
 checkpoint_step: "latest"
 checkpoint_path: null
 num_samples: 10000
-sample_batch_size: 64
+sample_batch_size: 100
 vae_batch_size: 64
 use_ddim: false

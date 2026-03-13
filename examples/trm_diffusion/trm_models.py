@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 import contextlib
 from dataclasses import dataclass
 from diffusers.models import UNet2DConditionModel, Transformer2DModel, UNet2DModel
+from diffusers.models.attention import Attention
 from diffusers.utils import BaseOutput
 from accelerate.utils import extract_model_from_parallel as unwrap_model
 from trm_utils import deep_recursion, get_model_output
@@ -16,6 +18,64 @@ class TRMOutput(BaseOutput):
     """Simple dataclass to mimic Diffusers model outputs."""
 
     sample: torch.FloatTensor
+
+
+class FastQKNormProcessor(nn.Module):
+    def __init__(self, head_dim):
+        super().__init__()
+        # THE FIX: Disable learnable weights.
+        # 1. Mathematically enforces bounds so the model can't re-learn the explosion.
+        # 2. Adds zero new parameters, so EMAModel copies perfectly to standard dummy models.
+        self.q_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
+        self.k_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs):
+        residual = hidden_states
+
+        batch_size, sequence_length, _ = hidden_states.shape
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # ---------------------------------------------------------
+        # SAFEGUARD: Ensure mask is 4D for proper SDPA broadcasting
+        # ---------------------------------------------------------
+        if attention_mask is not None and attention_mask.ndim == 3:
+            attention_mask = attention_mask.unsqueeze(2)
+
+        # Apply parameterless norm and cast back to native precision
+        query = self.q_norm(query).to(value.dtype)
+        key = self.k_norm(key).to(value.dtype)
+
+        # Native SDPA
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
 
 
 class BaseIterativeStrategy:
@@ -37,6 +97,23 @@ class BaseIterativeStrategy:
         # Tracked manually rather than as nn.Module buffers
         self.y_init = torch.randn(1, *state_shape)
         self.z_init = torch.randn(1, *state_shape)
+
+        self._inject_qk_norm()
+
+    def _inject_qk_norm(self):
+        """Automatically applies QK-Norm ONLY to Transformer-based models."""
+        core = self.core_model.module if hasattr(self.core_model, "module") else self.core_model
+
+        # SAFEGUARD: Skip QK-Norm for UNets, they don't need it.
+        if not isinstance(core, Transformer2DModel):
+            return
+
+        for name, module in core.named_modules():
+            # Check for Diffusers Attention block
+            if type(module).__name__ == "Attention" and hasattr(module, "set_processor"):
+                head_dim = module.inner_dim // module.heads
+                processor = FastQKNormProcessor(head_dim).to(device=core.device, dtype=core.dtype)
+                module.set_processor(processor)
 
     @property
     def device(self):
