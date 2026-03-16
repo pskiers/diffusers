@@ -28,7 +28,7 @@ def generate_image_batch(
         (bsz, args.dataset.input_channels, sample_size, sample_size),
         generator=generator,
         device=device,
-        dtype=weight_dtype,
+        dtype=torch.float32,
     )
 
     # 2. Build Conditions
@@ -79,6 +79,7 @@ def generate_image_batch(
     for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
         latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+        latent_model_input_cast = latent_model_input.to(weight_dtype)
 
         class_input = torch.cat([conds, unconds]) if do_cfg else conds
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
@@ -86,7 +87,7 @@ def generate_image_batch(
         with torch.no_grad():
             if hasattr(unet, "reasoning_step"):
                 noise_pred = unet(
-                    latent_model_input,
+                    latent_model_input_cast,
                     t,
                     class_labels=class_input,
                     encoder_hidden_states=class_input,
@@ -102,11 +103,12 @@ def generate_image_batch(
 
                 for _ in range(args.N_supervision):
                     noise_pred, y, z = deep_recursion(
-                        unet, latent_model_input, y, z, t, class_input, mask_input, args.n, args.T
+                        unet, latent_model_input_cast, y, z, t, class_input, mask_input, args.n, args.T
                     )
             else:
-                noise_pred = get_model_output(unet, latent_model_input, t, class_input, mask_input)
+                noise_pred = get_model_output(unet, latent_model_input_cast, t, class_input, mask_input)
 
+        noise_pred = noise_pred.to(torch.float32)
         if do_cfg:
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)

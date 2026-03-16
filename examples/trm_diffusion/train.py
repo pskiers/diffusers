@@ -353,13 +353,13 @@ def main(args: DictConfig):
                 with torch.no_grad():
                     clean_images = vae.encode(clean_images).latent_dist.sample() * vae_scaling_factor
 
-            clean_images = clean_images.to(device=accelerator.device, dtype=weight_dtype)
+            clean_images = clean_images.to(device=accelerator.device, dtype=torch.float32)
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
             ).long()
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
 
             # --- FORWARD & BACKWARD PASS ROUTING ---
             with accelerator.accumulate(model):
@@ -476,12 +476,13 @@ def main(args: DictConfig):
                 with torch.no_grad():
                     clean_images = vae.encode(clean_images).latent_dist.sample() * vae_scaling_factor
                 clean_images = clean_images.to(dtype=weight_dtype)
+            clean_images = clean_images.to(device=accelerator.device, dtype=torch.float32)
 
             noise = torch.randn_like(clean_images)
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (clean_images.shape[0],), device=clean_images.device
             ).long()
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
 
             # --- VALIDATION PASS ROUTING ---
             with torch.no_grad():
