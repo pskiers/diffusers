@@ -29,7 +29,9 @@ class FastQKNormProcessor(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
         self.k_norm = nn.RMSNorm(head_dim, elementwise_affine=False)
 
-    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs):
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs
+    ):
         residual = hidden_states
 
         batch_size, sequence_length, _ = hidden_states.shape
@@ -388,7 +390,7 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         """Expose all manual DiT submodules so Accelerate can wrap them with DDP."""
         modules = super().get_trainable_modules()
         if "core_model" in modules:
-            del modules["core_model"] # Prevent full DDP wrapping on DiT
+            del modules["core_model"]  # Prevent full DDP wrapping on DiT
         core = self._core
 
         # The definitive list of every possible nn.Module across all Diffusers Transformer2D configs
@@ -462,7 +464,7 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         # 1. Unwrap
         for name, module in self.get_trainable_modules().items():
             if name in self._extra_modules:
-                continue # Let ExtraModulesMixin handle norm_y, etc.
+                continue  # Let ExtraModulesMixin handle norm_y, etc.
             original_modules[name] = module
             unwrapped = unwrap_model(module)
             if name.startswith("transformer_block_"):
