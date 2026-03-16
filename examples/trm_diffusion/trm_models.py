@@ -369,6 +369,21 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
     def _core(self):
         return self.core_model.module if hasattr(self.core_model, "module") else self.core_model
 
+    @contextlib.contextmanager
+    def _unwrap_first_block(self):
+        """Temporarily unwrap the first transformer block so Diffusers can access .norm1 natively."""
+        core = self._core
+        if not hasattr(core, "transformer_blocks") or len(core.transformer_blocks) == 0:
+            yield
+            return
+
+        original_block = core.transformer_blocks[0]
+        core.transformer_blocks[0] = unwrap_model(original_block)
+        try:
+            yield
+        finally:
+            core.transformer_blocks[0] = original_block
+
     def get_trainable_modules(self):
         """Expose all manual DiT submodules so Accelerate can wrap them with DDP."""
         modules = super().get_trainable_modules()
@@ -577,14 +592,15 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         )
 
         with autocast_ctx:
-            y_final_4ch = self._core._get_output_for_patched_inputs(
-                hidden_states=y_final_high,
-                timestep=ts,
-                class_labels=class_labels,
-                embedded_timestep=embedded_ts,
-                height=self.h_p,
-                width=self.w_p,
-            )
+            with self._unwrap_first_block():
+                y_final_4ch = self._core._get_output_for_patched_inputs(
+                    hidden_states=y_final_high,
+                    timestep=ts,
+                    class_labels=class_labels,
+                    embedded_timestep=embedded_ts,
+                    height=self.h_p,
+                    width=self.w_p,
+                )
         return y_final_4ch, y_next, z_next
 
     def __call__(
@@ -647,14 +663,15 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
             )
 
         with autocast_ctx:
-            model_output = self._core._get_output_for_patched_inputs(
-                hidden_states=y_final_high,
-                timestep=ts,
-                class_labels=class_labels,
-                embedded_timestep=embedded_ts,
-                height=self.h_p,
-                width=self.w_p,
-            )
+            with self._unwrap_first_block():
+                model_output = self._core._get_output_for_patched_inputs(
+                    hidden_states=y_final_high,
+                    timestep=ts,
+                    class_labels=class_labels,
+                    embedded_timestep=embedded_ts,
+                    height=self.h_p,
+                    width=self.w_p,
+                )
 
         return TRMOutput(sample=model_output)
 
