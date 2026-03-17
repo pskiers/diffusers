@@ -1,0 +1,30 @@
+_target_: trm_models.RatatouilleUNetControl
+resolution: 32
+downsample_factor: 2
+n: 6
+T: 3
+n_sup: 4
+
+core_model:
+  _target_: diffusers.UNet2DConditionModel # Massive Painter
+  sample_size: 32
+  in_channels: 4
+  out_channels: 4
+  layers_per_block: 2
+  block_out_channels: [256, 512, 1024]
+  down_block_types: ["DownBlock2D", "AttnDownBlock2D", "DownBlock2D"] # Cross-attention stripped out
+  up_block_types: ["UpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+  cross_attention_dim: 1
+
+thinker_model:
+  _target_: models.UnifiedConditionUNet # Tiny Thinker
+  condition_mode: "class"
+  num_classes: 1000
+  sample_size: 16
+  in_channels: 128
+  out_channels: 128
+  layers_per_block: 1
+  block_out_channels: [128, 128]
+  down_block_types: ["DownBlock2D", "CrossAttnDownBlock2D"]
+  up_block_types: ["CrossAttnUpBlock2D", "UpBlock2D"]
+  cross_attention_dim: 256

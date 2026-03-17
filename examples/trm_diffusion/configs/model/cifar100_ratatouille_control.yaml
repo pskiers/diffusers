@@ -1,0 +1,28 @@
+_target_: trm_models.RatatouilleUNetControl
+resolution: 32
+downsample_factor: 2
+n: 6
+T: 3
+n_sup: 4
+
+core_model:
+  _target_: diffusers.UNet2DConditionModel # Painter
+  sample_size: 32
+  in_channels: 3
+  out_channels: 3
+  layers_per_block: 1
+  block_out_channels: [128, 128, 256, 256, 512, 512]
+  down_block_types: ["DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"]
+  cross_attention_dim: 1 # Ignored, but required by class init
+
+thinker_model:
+  _target_: diffusers.UNet2DModel # Tiny Thinker
+  sample_size: 16
+  in_channels: 64
+  out_channels: 64
+  layers_per_block: 1
+  block_out_channels: [64, 64]
+  down_block_types: ["AttnDownBlock2D", "DownBlock2D"]
+  up_block_types: ["UpBlock2D", "AttnUpBlock2D"]
+  num_class_embeds: 100

@@ -449,3 +449,51 @@ def test_cond_clevr_vit_trm_v5():
         "test-clevr-v5",
         ["experiment=clevr_relative_trm", "model=clevr_vit_trm_v2", "model._target_=trm_models.DiTTRMv5"],
     )
+
+
+# -----------------------------------------------------------------------------------------
+# Ratatouille Decoupled Architecture (Thinker-Painter)
+# -----------------------------------------------------------------------------------------
+
+
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.ratatouille
+def test_cond_cifar_ratatouille_concat():
+    run_script(
+        "train.py", "test-cifar100-rat-concat", ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_concat"]
+    )
+
+
+@pytest.mark.cifar100
+@pytest.mark.unet
+@pytest.mark.ratatouille
+def test_cond_cifar_ratatouille_control():
+    run_script(
+        "train.py", "test-cifar100-rat-control", ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_control"]
+    )
+
+
+@pytest.mark.imagenet
+@pytest.mark.unet
+@pytest.mark.ratatouille
+def test_cond_imagenet_ratatouille_control():
+    run_script(
+        "train.py", "test-imagenet-rat-control", ["experiment=cond_imgnet_trm", "model=imagenet_ratatouille_control"]
+    )
+
+
+@pytest.mark.clevr
+@pytest.mark.unet
+@pytest.mark.ratatouille
+def test_cond_clevr_ratatouille_control():
+    run_script(
+        "train.py", "test-clevr-rat-control", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_control"]
+    )
+
+
+@pytest.mark.clevr
+@pytest.mark.unet
+@pytest.mark.ratatouille
+def test_cond_clevr_ratatouille_concat():
+    run_script("train.py", "test-clevr-rat-concat", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_concat"])

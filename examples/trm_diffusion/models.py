@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 from diffusers import UNet2DConditionModel, Transformer2DModel
 from diffusers.configuration_utils import register_to_config
 
@@ -181,3 +183,125 @@ class UnifiedConditionDiT(Transformer2DModel):
         """
         init_dict, unused_kwargs, hidden_config_dict = cls.extract_init_dict(config, **kwargs)
         return cls(**init_dict)
+
+
+class SpatialEncoder(nn.Module):
+    """
+    Compresses the high-resolution noisy image into a low-dimensional spatial grid.
+    """
+
+    def __init__(self, in_channels, out_channels, factor=4):
+        super().__init__()
+        self.factor = factor
+
+        if factor == 1:
+            self.net = nn.Identity()
+        else:
+            self.net = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=factor, stride=factor, bias=False),
+                nn.GroupNorm(min(32, out_channels), out_channels),
+                nn.SiLU(),
+            )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class AttentiveBridge(nn.Module):
+    """
+    Perceiver IO style readout utilizing Flash Attention via PyTorch SDPA.
+    High-resolution queries pull data from the low-resolution blueprint.
+    """
+
+    def __init__(self, in_channels, out_channels, out_resolution, factor=4, num_heads=4):
+        super().__init__()
+        self.factor = factor
+        self.out_resolution = out_resolution
+
+        if factor == 1:
+            self.net = nn.Identity()
+        else:
+            self.query_dim = out_channels
+            self.num_heads = num_heads
+            self.head_dim = out_channels // num_heads
+            assert self.head_dim * num_heads == out_channels, "out_channels must be divisible by num_heads"
+
+            # Positional queries for the high-res target grid.
+            self.queries = nn.Parameter(
+                torch.randn(1, out_resolution * out_resolution, self.query_dim) / math.sqrt(self.query_dim)
+            )
+
+            # Linear projections
+            self.q_proj = nn.Linear(self.query_dim, self.query_dim)
+            self.k_proj = nn.Linear(in_channels, self.query_dim)
+            self.v_proj = nn.Linear(in_channels, self.query_dim)
+            self.out_proj = nn.Linear(self.query_dim, self.query_dim)
+
+    def forward(self, x_low):
+        if self.factor == 1:
+            return x_low
+
+        B, C, H, W = x_low.shape
+        N_high = self.out_resolution * self.out_resolution
+
+        # 1. Flatten the Thinker's 2D grid: (B, C, H, W) -> (B, N_low, C)
+        x_low_flat = x_low.view(B, C, -1).transpose(1, 2)
+
+        # 2. Project Q, K, V
+        Q_unproj = self.queries.expand(B, -1, -1)
+        Q = self.q_proj(Q_unproj)
+        K = self.k_proj(x_low_flat)
+        V = self.v_proj(x_low_flat)
+
+        # 3. Reshape for SDPA: (B, SeqLen, Heads, HeadDim) -> (B, Heads, SeqLen, HeadDim)
+        Q = Q.view(B, N_high, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 4. Flash Attention. PyTorch automatically uses the optimal backend (FlashAttention-2 if fp16/bf16 on CUDA)
+        attn_out = F.scaled_dot_product_attention(Q, K, V)
+
+        # 5. Reshape back and apply final projection
+        attn_out = attn_out.transpose(1, 2).reshape(B, N_high, self.query_dim)
+        out_flat = self.out_proj(attn_out)
+
+        # 6. Reconstruct the 2D spatial grid for the Painter
+        out_grid = out_flat.transpose(1, 2).view(B, self.query_dim, self.out_resolution, self.out_resolution)
+
+        return out_grid
+
+
+class ConditioningPyramid(nn.Module):
+    """
+    Extracts multi-scale features from a spatial blueprint for ControlNet-style
+    injection into a diffusers UNet.
+    """
+    def __init__(self, in_channels, block_out_channels=(128, 256, 512, 512)):
+        super().__init__()
+
+        self.blocks = nn.ModuleList()
+        current_channels = in_channels
+
+        for i, out_channels in enumerate(block_out_channels):
+            # First block doesn't downsample, just projects.
+            # Subsequent blocks downsample by 2x.
+            stride = 1 if i == 0 else 2
+
+            self.blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(current_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+                )
+            )
+            current_channels = out_channels
+
+    def forward(self, blueprint):
+        residuals = []
+        x = blueprint
+        for block in self.blocks:
+            x = block(x)
+            residuals.append(x)
+
+        # Returns a tuple of feature maps from high-res to low-res
+        return tuple(residuals)

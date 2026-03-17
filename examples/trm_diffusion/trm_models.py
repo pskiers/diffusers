@@ -5,12 +5,12 @@ import os
 import contextlib
 from dataclasses import dataclass
 from diffusers.models import UNet2DConditionModel, Transformer2DModel, UNet2DModel
-from diffusers.models.attention import Attention
 from diffusers.utils import BaseOutput
 from accelerate.utils import extract_model_from_parallel as unwrap_model
 from trm_utils import deep_recursion, get_model_output
 from model_utils import load_with_backward_compatibility
 from safetensors.torch import load_file
+from models import SpatialEncoder, AttentiveBridge, ConditioningPyramid
 
 
 @dataclass
@@ -841,3 +841,145 @@ class DiTTRMv5(DiTTRMv2):
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
+
+
+class BaseRatatouilleUNet(ExtraModulesMixin, BaseIterativeStrategy):
+    """
+    Abstract Base Class for the 'Thinker-Painter' Architecture.
+    Remy (Thinker) does the reasoning; Linguini (Painter/core_model) renders.
+    """
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        if not isinstance(core_model, (UNet2DConditionModel, UNet2DModel)) or not isinstance(
+            thinker_model, (UNet2DConditionModel, UNet2DModel)
+        ):
+            raise ValueError("Ratatouille architecture requires both models to be UNets.")
+
+        self.thinker_model = thinker_model
+        self.painter_dim = core_model.conv_in.out_channels
+        self.thinker_dim = thinker_model.conv_in.out_channels
+
+        low_res = resolution // downsample_factor
+        state_shape = (self.thinker_dim, low_res, low_res)
+
+        super().__init__(core_model, state_shape, n, T, n_sup)
+
+        self.encoder = SpatialEncoder(core_model.in_channels, self.thinker_dim, factor=downsample_factor)
+        self.decoder = AttentiveBridge(self.thinker_dim, self.painter_dim, resolution, factor=downsample_factor)
+
+        self.norm_y = nn.GroupNorm(32, self.thinker_dim)
+        self.norm_z = nn.GroupNorm(32, self.thinker_dim)
+
+    @property
+    def _extra_modules(self):
+        return ["thinker_model", "encoder", "decoder", "norm_y", "norm_z"]
+
+    @contextlib.contextmanager
+    def bypass_projections(self, model):
+        core = model.module if hasattr(model, "module") else model
+        proj_in, proj_out = core.conv_in, core.conv_out
+        core.conv_in, core.conv_out = nn.Identity(), nn.Identity()
+        try:
+            yield proj_in, proj_out
+        finally:
+            core.conv_in, core.conv_out = proj_in, proj_out
+
+    def _latent_recursion(self, x_low, y, z, timesteps, conditions, masks, autocast_ctx):
+        for _ in range(self.n):
+            with autocast_ctx:
+                z_out = get_model_output(self.thinker_model, x_low + y + z, timesteps, conditions, masks)
+                z_out = self.norm_z(z_out)
+            z = z_out.to(torch.float32)
+
+        with autocast_ctx:
+            y_out = get_model_output(self.thinker_model, y + z, timesteps, conditions, masks)
+            y_out = self.norm_y(y_out)
+        y = y_out.to(torch.float32)
+        return y, z
+
+    def _deep_recursion(self, x_low, y, z, timesteps, conditions, masks, autocast_ctx):
+        with torch.no_grad():
+            for _ in range(self.T - 1):
+                y, z = self._latent_recursion(x_low, y, z, timesteps, conditions, masks, autocast_ctx)
+        y_final, z_final = self._latent_recursion(x_low, y, z, timesteps, conditions, masks, autocast_ctx)
+        return y_final, y_final.detach(), z_final.detach()
+
+    def reasoning_step(self, x, y, z, timesteps, conditions=None, masks=None):
+        dtype = x.dtype
+        autocast_ctx = (
+            torch.autocast(device_type=x.device.type, dtype=dtype)
+            if dtype in [torch.float16, torch.bfloat16]
+            else contextlib.nullcontext()
+        )
+
+        # Phase A: Remy Thinks (Operates purely in compressed space)
+        with autocast_ctx:
+            x_for_thinker = self.encoder(x)
+
+        with self.bypass_projections(self.thinker_model) as (proj_in, _):
+            with autocast_ctx:
+                x_low = proj_in(x_for_thinker)
+            x_low = x_low.to(torch.float32)
+            y_final_low, y_next, z_next = self._deep_recursion(x_low, y, z, timesteps, conditions, masks, autocast_ctx)
+
+        # Phase B: Linguini Paints (Delegated to Subclasses)
+        with autocast_ctx:
+            y_final_high = self.decoder(y_final_low)
+            painter_out = self._render_painting(x, y_final_high, timesteps)
+
+        return painter_out, y_next, z_next
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        """To be implemented by subclasses (Concat vs ControlNet)"""
+        raise NotImplementedError
+
+
+class RatatouilleUNetConcat(BaseRatatouilleUNet):
+    """Linguini is controlled via simple Input Concatenation."""
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
+        # Re-initialize the encoder to handle the channel offset caused by concatenation
+        self.encoder = SpatialEncoder(
+            core_model.in_channels - self.painter_dim, self.thinker_dim, factor=downsample_factor
+        )
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        painter_input = torch.cat([x_high, y_final_high], dim=1)
+        # Painter must be completely blind to conditions/text
+        return get_model_output(self.core_model, painter_input, timesteps, conditions=None, masks=None)
+
+
+class RatatouilleUNetControl(BaseRatatouilleUNet):
+    """Linguini is controlled via deep ControlNet-style residual injections."""
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
+
+        # Add the ControlNet pyramid
+        painter_blocks = core_model.config.block_out_channels
+        self.control_pyramid = ConditioningPyramid(self.painter_dim, block_out_channels=painter_blocks)
+
+    @property
+    def _extra_modules(self):
+        # We must extend the parent's extra_modules to include the pyramid
+        base_modules = super()._extra_modules
+        return base_modules + ["control_pyramid"]
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        pyramid_features = self.control_pyramid(y_final_high)
+        down_block_res = list(pyramid_features)
+        mid_block_res = down_block_res.pop(-1)
+
+        # We call the model directly (bypassing get_model_output) so we can explicitly
+        # pass a dummy context to satisfy UNet2DConditionModel's strict signature,
+        # ensuring Linguini remains completely blind to the real conditions.
+        dummy_context = torch.zeros((x_high.shape[0], 1, 1), device=x_high.device, dtype=x_high.dtype)
+
+        return self.core_model(
+            x_high,
+            timesteps,
+            encoder_hidden_states=dummy_context,
+            down_block_additional_residuals=down_block_res,
+            mid_block_additional_residual=mid_block_res
+        ).sample
