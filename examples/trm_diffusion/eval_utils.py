@@ -38,15 +38,19 @@ def generate_image_batch(
     # Safely check condition_mode (handling both old direct models and new wrapped models)
     model_config = getattr(args, "model", {})
 
-    # If using our new OOP wrapper, we need to inspect the inner core_model!
-    core_model_config = getattr(model_config, "core_model", model_config)
+    # If it's a Ratatouille model, the conditions are consumed by the thinker_model
+    if hasattr(model_config, "thinker_model"):
+        condition_target_config = model_config.thinker_model
+    else:
+        # If using our old wrappers, we inspect the inner core_model
+        condition_target_config = getattr(model_config, "core_model", model_config)
 
-    cond_mode = getattr(core_model_config, "condition_mode", None)
+    cond_mode = getattr(condition_target_config, "condition_mode", None)
 
     is_unified_class = cond_mode in ["class", "class_adaln"]
     is_unified_sequence = cond_mode == "sequence"
 
-    target_str = str(getattr(core_model_config, "_target_", ""))
+    target_str = str(getattr(condition_target_config, "_target_", ""))
     is_standard_conditional = ("UNet2DModel" in target_str or "UNet2DConditionModel" in target_str) and getattr(
         args.dataset, "num_classes", None
     )

@@ -864,8 +864,15 @@ class BaseRatatouilleUNet(ExtraModulesMixin, BaseIterativeStrategy):
 
         super().__init__(core_model, state_shape, n, T, n_sup)
 
-        self.encoder = SpatialEncoder(core_model.in_channels, self.thinker_dim, factor=downsample_factor)
-        self.decoder = AttentiveBridge(self.thinker_dim, self.painter_dim, resolution, factor=downsample_factor)
+        self.encoder = SpatialEncoder(
+            in_channels=core_model.config.in_channels, out_channels=self.thinker_dim, factor=downsample_factor
+        )
+        self.decoder = AttentiveBridge(
+            in_channels=self.thinker_dim,
+            out_channels=self.thinker_dim,
+            out_resolution=resolution,
+            factor=downsample_factor,
+        )
 
         self.norm_y = nn.GroupNorm(32, self.thinker_dim)
         self.norm_z = nn.GroupNorm(32, self.thinker_dim)
@@ -929,6 +936,22 @@ class BaseRatatouilleUNet(ExtraModulesMixin, BaseIterativeStrategy):
 
         return painter_out, y_next, z_next
 
+    def __call__(self, sample, timestep, encoder_hidden_states=None, class_labels=None, attention_mask=None, **kwargs):
+        """
+        Inference loop hook for standard Diffusers pipelines.
+        Automatically unrolls the supervision loops and returns the final painting.
+        """
+        bsz = sample.shape[0]
+        y, z = self.get_initial_states(bsz)
+
+        conditions = class_labels if class_labels is not None else encoder_hidden_states
+
+        painter_out = None
+        for _ in range(self.n_sup):
+            painter_out, y, z = self.reasoning_step(sample, y, z, timestep, conditions, attention_mask)
+
+        return TRMOutput(sample=painter_out)
+
     def _render_painting(self, x_high, y_final_high, timesteps):
         """To be implemented by subclasses (Concat vs ControlNet)"""
         raise NotImplementedError
@@ -940,9 +963,8 @@ class RatatouilleUNetConcat(BaseRatatouilleUNet):
     def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
         # Re-initialize the encoder to handle the channel offset caused by concatenation
-        self.encoder = SpatialEncoder(
-            core_model.in_channels - self.painter_dim, self.thinker_dim, factor=downsample_factor
-        )
+        noise_channels = core_model.config.in_channels - self.thinker_dim
+        self.encoder = SpatialEncoder(noise_channels, self.thinker_dim, factor=downsample_factor)
 
     def _render_painting(self, x_high, y_final_high, timesteps):
         painter_input = torch.cat([x_high, y_final_high], dim=1)
@@ -958,7 +980,10 @@ class RatatouilleUNetControl(BaseRatatouilleUNet):
 
         # Add the ControlNet pyramid
         painter_blocks = core_model.config.block_out_channels
-        self.control_pyramid = ConditioningPyramid(self.painter_dim, block_out_channels=painter_blocks)
+        painter_layers = core_model.config.layers_per_block
+        self.control_pyramid = ConditioningPyramid(
+            self.thinker_dim, block_out_channels=painter_blocks, layers_per_block=painter_layers
+        )
 
     @property
     def _extra_modules(self):
@@ -967,13 +992,8 @@ class RatatouilleUNetControl(BaseRatatouilleUNet):
         return base_modules + ["control_pyramid"]
 
     def _render_painting(self, x_high, y_final_high, timesteps):
-        pyramid_features = self.control_pyramid(y_final_high)
-        down_block_res = list(pyramid_features)
-        mid_block_res = down_block_res.pop(-1)
+        down_block_res, mid_block_res = self.control_pyramid(y_final_high)
 
-        # We call the model directly (bypassing get_model_output) so we can explicitly
-        # pass a dummy context to satisfy UNet2DConditionModel's strict signature,
-        # ensuring Linguini remains completely blind to the real conditions.
         dummy_context = torch.zeros((x_high.shape[0], 1, 1), device=x_high.device, dtype=x_high.dtype)
 
         return self.core_model(
@@ -981,5 +1001,5 @@ class RatatouilleUNetControl(BaseRatatouilleUNet):
             timesteps,
             encoder_hidden_states=dummy_context,
             down_block_additional_residuals=down_block_res,
-            mid_block_additional_residual=mid_block_res
+            mid_block_additional_residual=mid_block_res,
         ).sample

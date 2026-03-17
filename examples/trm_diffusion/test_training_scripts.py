@@ -451,17 +451,15 @@ def test_cond_clevr_vit_trm_v5():
     )
 
 
-# -----------------------------------------------------------------------------------------
-# Ratatouille Decoupled Architecture (Thinker-Painter)
-# -----------------------------------------------------------------------------------------
-
-
+# Ratatouille Decoupled Architecture (Thinker-Painter) UNet
 @pytest.mark.cifar100
 @pytest.mark.unet
 @pytest.mark.ratatouille
 def test_cond_cifar_ratatouille_concat():
     run_script(
-        "train.py", "test-cifar100-rat-concat", ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_concat"]
+        "train.py",
+        "test-cifar100-rat-concat",
+        ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_concat", "~model.core_model.num_class_embeds"],
     )
 
 
@@ -470,7 +468,9 @@ def test_cond_cifar_ratatouille_concat():
 @pytest.mark.ratatouille
 def test_cond_cifar_ratatouille_control():
     run_script(
-        "train.py", "test-cifar100-rat-control", ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_control"]
+        "train.py",
+        "test-cifar100-rat-control",
+        ["experiment=cond_cifar100_trm", "model=cifar100_ratatouille_control", "~model.core_model.num_class_embeds"],
     )
 
 

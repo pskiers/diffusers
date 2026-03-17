@@ -274,34 +274,73 @@ class AttentiveBridge(nn.Module):
 class ConditioningPyramid(nn.Module):
     """
     Extracts multi-scale features from a spatial blueprint for ControlNet-style
-    injection into a diffusers UNet.
+    injection. Dynamically unrolls to match the target UNet's exact layer counts.
     """
-    def __init__(self, in_channels, block_out_channels=(128, 256, 512, 512)):
+
+    def __init__(self, in_channels, block_out_channels=(128, 256, 512, 512), layers_per_block=2):
         super().__init__()
+        self.layers_per_block = layers_per_block
+
+        # 1. Match the UNet's initial conv_in
+        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=1)
 
         self.blocks = nn.ModuleList()
-        current_channels = in_channels
+        current_channels = block_out_channels[0]
 
         for i, out_channels in enumerate(block_out_channels):
-            # First block doesn't downsample, just projects.
-            # Subsequent blocks downsample by 2x.
-            stride = 1 if i == 0 else 2
+            block_modules = nn.ModuleList()
 
-            self.blocks.append(
-                nn.Sequential(
-                    nn.Conv2d(current_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            # A. Channel projection if transitioning to wider blocks
+            if current_channels != out_channels:
+                block_modules.append(nn.Conv2d(current_channels, out_channels, kernel_size=1))
+                current_channels = out_channels
+            else:
+                block_modules.append(nn.Identity())
+
+            # B. ResNet equivalents (one for every layer_per_block)
+            for _ in range(layers_per_block):
+                block_modules.append(
+                    nn.Sequential(
+                        nn.Conv2d(current_channels, current_channels, kernel_size=3, padding=1),
+                        nn.GroupNorm(min(32, current_channels), current_channels),
+                        nn.SiLU(),
+                    )
                 )
-            )
-            current_channels = out_channels
+
+            # C. Downsampler (if not the last block)
+            if i < len(block_out_channels) - 1:
+                block_modules.append(nn.Conv2d(current_channels, current_channels, kernel_size=3, stride=2, padding=1))
+
+            self.blocks.append(block_modules)
+
+        # 2. Mid block features
+        self.mid_block = nn.Sequential(
+            nn.Conv2d(current_channels, current_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(32, current_channels), current_channels),
+            nn.SiLU(),
+        )
 
     def forward(self, blueprint):
         residuals = []
-        x = blueprint
-        for block in self.blocks:
-            x = block(x)
-            residuals.append(x)
 
-        # Returns a tuple of feature maps from high-res to low-res
-        return tuple(residuals)
+        # Initial layer
+        x = self.conv_in(blueprint)
+        residuals.append(x)
+
+        # Down blocks
+        for i, block in enumerate(self.blocks):
+            x = block[0](x)  # Project channels
+
+            for j in range(self.layers_per_block):
+                x = x + block[1 + j](x)  # Lightweight residual step
+                residuals.append(x)
+
+            if i < len(self.blocks) - 1:
+                downsampler = block[1 + self.layers_per_block]
+                x = downsampler(x)
+                residuals.append(x)
+
+        # Mid block
+        mid_res = x + self.mid_block(x)
+
+        return residuals, mid_res

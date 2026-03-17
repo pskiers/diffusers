@@ -41,5 +41,6 @@ markers = [
     "cifar100: marks tests that use the CIFAR-100 dataset",
     "imagenet: marks tests that use the ImageNet dataset",
     "clevr: marks tests that use the CLEVR dataset",
-    "standard: marks tests that use standard diffusion"
+    "standard: marks tests that use standard diffusion",
+    "ratatouille: marks test that use the thinker-painter architecture"
 ]
