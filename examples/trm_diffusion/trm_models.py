@@ -251,6 +251,117 @@ class ExtraModulesMixin:
                 m.load_state_dict(torch.load(os.path.join(input_dir, f"{attr}.pt"), map_location="cpu"))
 
 
+class DiTUtilsMixin:
+    """Shared utility methods for processing and DDP-wrapping Diffusers DiTs."""
+
+    modules_for_wrapping = [
+        "time_proj",
+        "time_embedding",
+        "proj",
+        "pos_embed",
+        "condition_projector",
+        "norm_out",
+        "proj_out",
+        "proj_out_1",
+        "proj_out_2",
+        "adaln_single",
+        "caption_projection",
+        "norm",
+        "proj_in",
+        "latent_image_embedding",
+        "out",
+    ]
+
+    @contextlib.contextmanager
+    def _unwrap_first_block(self, model):
+        """Temporarily unwrap the first transformer block so Diffusers can access .norm1 natively."""
+        if not hasattr(model, "transformer_blocks") or len(model.transformer_blocks) == 0:
+            yield
+            return
+        original_block = model.transformer_blocks[0]
+        model.transformer_blocks[0] = unwrap_model(original_block)
+        try:
+            yield
+        finally:
+            model.transformer_blocks[0] = original_block
+
+    def _prepare_conditions(self, conditions, bs, device, model):
+        """Replicates the conditioning override logic from UnifiedConditionDiT."""
+        encoder_hidden_states = None
+        class_labels = torch.zeros((bs,), dtype=torch.long, device=device)
+
+        if not hasattr(model.config, "condition_mode"):
+            return conditions, None
+        if conditions is not None:
+            if model.config.condition_mode == "class":
+                encoder_hidden_states = model.condition_projector(conditions).unsqueeze(1)
+            elif model.config.condition_mode == "sequence":
+                encoder_hidden_states = model.condition_projector(conditions)
+            elif model.config.condition_mode == "class_adaln":
+                class_labels = conditions
+        elif model.config.condition_mode == "class_adaln":
+            class_labels = torch.full((bs,), model.config.num_classes, dtype=torch.long, device=device)
+        return encoder_hidden_states, class_labels
+
+    def _dit_blocks(
+        self,
+        model,
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        class_labels,
+        attention_mask,
+        encoder_attention_mask,
+        cross_attention_kwargs,
+    ):
+        for block in model.transformer_blocks:
+            if torch.is_grad_enabled() and model.gradient_checkpointing:
+                hidden_states = model._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep,
+                    cross_attention_kwargs,
+                    class_labels,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=timestep,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    class_labels=class_labels,
+                )
+        return hidden_states
+
+    def _get_dit_modules(self, model, prefix=""):
+        """Extracts native Diffusers DiT modules for Accelerate DDP wrapping."""
+        modules = {}
+        for attr in self.modules_for_wrapping:
+            if hasattr(model, attr) and getattr(model, attr) is not None:
+                modules[f"{prefix}{attr}"] = getattr(model, attr)
+        if hasattr(model, "transformer_blocks"):
+            for i, block in enumerate(model.transformer_blocks):
+                modules[f"{prefix}transformer_block_{i}"] = block
+        return modules
+
+    def _update_dit_modules(self, model, prepared_modules, prefix=""):
+        """Re-injects DDP-wrapped modules back into the Diffusers DiT."""
+        for attr in self.modules_for_wrapping:
+            key = f"{prefix}{attr}"
+            if key in prepared_modules:
+                setattr(model, attr, prepared_modules[key])
+        if hasattr(model, "transformer_blocks"):
+            for i in range(len(model.transformer_blocks)):
+                key = f"{prefix}transformer_block_{i}"
+                if key in prepared_modules:
+                    model.transformer_blocks[i] = prepared_modules[key]
+
+
 # V2: TRM exactly as in the og paper. Addition instead of concat, single output, no x for y prediction, in high dim latent
 class UNetTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
     """High-Dimensional Additive TRM specialized for UNet architectures."""
@@ -349,7 +460,7 @@ class UNetTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         return TRMOutput(sample=model_output)
 
 
-class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
+class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
     """High-Dimensional Additive TRM specialized for DiT architectures."""
 
     def __init__(self, core_model, resolution, n=6, T=3, n_sup=1, **kwargs):
@@ -371,94 +482,19 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
     def _core(self):
         return self.core_model.module if hasattr(self.core_model, "module") else self.core_model
 
-    @contextlib.contextmanager
-    def _unwrap_first_block(self):
-        """Temporarily unwrap the first transformer block so Diffusers can access .norm1 natively."""
-        core = self._core
-        if not hasattr(core, "transformer_blocks") or len(core.transformer_blocks) == 0:
-            yield
-            return
-
-        original_block = core.transformer_blocks[0]
-        core.transformer_blocks[0] = unwrap_model(original_block)
-        try:
-            yield
-        finally:
-            core.transformer_blocks[0] = original_block
-
     def get_trainable_modules(self):
-        """Expose all manual DiT submodules so Accelerate can wrap them with DDP."""
         modules = super().get_trainable_modules()
         if "core_model" in modules:
             del modules["core_model"]  # Prevent full DDP wrapping on DiT
-        core = self._core
-
-        # The definitive list of every possible nn.Module across all Diffusers Transformer2D configs
-        possible_modules = [
-            "time_proj",
-            "time_embedding",
-            "proj",
-            "pos_embed",
-            "condition_projector",
-            "norm_out",
-            "proj_out",
-            "proj_out_1",
-            "proj_out_2",
-            "adaln_single",
-            "caption_projection",
-            "norm",
-            "proj_in",
-            "latent_image_embedding",
-            "out",
-        ]
-
-        for attr in possible_modules:
-            if hasattr(core, attr) and getattr(core, attr) is not None:
-                modules[attr] = getattr(core, attr)
-
-        # Unroll transformer blocks
-        if hasattr(core, "transformer_blocks"):
-            for i, block in enumerate(core.transformer_blocks):
-                modules[f"transformer_block_{i}"] = block
-
+        modules.update(self._get_dit_modules(self._core))
         return modules
 
     def update_modules(self, prepared_modules):
-        """Re-inject the DDP-wrapped modules back into the DiT core."""
         super().update_modules(prepared_modules)
-        core = self._core
-
-        possible_modules = [
-            "time_proj",
-            "time_embedding",
-            "proj",
-            "pos_embed",
-            "condition_projector",
-            "norm_out",
-            "proj_out",
-            "proj_out_1",
-            "proj_out_2",
-            "adaln_single",
-            "caption_projection",
-            "norm",
-            "proj_in",
-            "latent_image_embedding",
-            "out",
-        ]
-
-        for attr in possible_modules:
-            if attr in prepared_modules:
-                setattr(core, attr, prepared_modules[attr])
-
-        if hasattr(core, "transformer_blocks"):
-            for i in range(len(core.transformer_blocks)):
-                if f"transformer_block_{i}" in prepared_modules:
-                    core.transformer_blocks[i] = prepared_modules[f"transformer_block_{i}"]
+        self._update_dit_modules(self._core, prepared_modules)
 
     def save(self, output_dir):
         """Temporarily unwrap modules to save cleanly without 'module.' prefixes."""
-
-        core = self._core
         original_modules = {}
 
         # 1. Unwrap
@@ -466,75 +502,17 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
             if name in self._extra_modules:
                 continue  # Let ExtraModulesMixin handle norm_y, etc.
             original_modules[name] = module
-            unwrapped = unwrap_model(module)
-            if name.startswith("transformer_block_"):
-                idx = int(name.split("_")[-1])
-                core.transformer_blocks[idx] = unwrapped
-            else:
-                setattr(core, name, unwrapped)
 
-        # 2. Save
+        unwrapped_modules = {k: unwrap_model(v) for k, v in original_modules.items()}
+
+        # Inject unwrapped layers back into Diffusers so it can save cleanly
+        self._update_dit_modules(self._core, unwrapped_modules)
+
+        # 2. Save using base strategy
         super().save(output_dir)
 
         # 3. Restore DDP Wrappers for continued training
-        for name, module in original_modules.items():
-            if name.startswith("transformer_block_"):
-                idx = int(name.split("_")[-1])
-                core.transformer_blocks[idx] = module
-            else:
-                setattr(core, name, module)
-
-    def _prepare_conditions(self, conditions, bs, device):
-        """Replicates the conditioning override logic from UnifiedConditionDiT."""
-        encoder_hidden_states = None
-        class_labels = torch.zeros((bs,), dtype=torch.long, device=device)
-
-        if not hasattr(self._core.config, "condition_mode"):
-            return conditions, None
-        if conditions is not None:
-            if self._core.config.condition_mode == "class":
-                encoder_hidden_states = self._core.condition_projector(conditions).unsqueeze(1)
-            elif self._core.config.condition_mode == "sequence":
-                encoder_hidden_states = self._core.condition_projector(conditions)
-            elif self._core.config.condition_mode == "class_adaln":
-                class_labels = conditions
-        elif self._core.config.condition_mode == "class_adaln":
-            class_labels = torch.full((bs,), self._core.config.num_classes, dtype=torch.long, device=device)
-        return encoder_hidden_states, class_labels
-
-    def _dit_blocks(
-        self,
-        hidden_states,
-        encoder_hidden_states,
-        timestep,
-        class_labels,
-        attention_mask,
-        encoder_attention_mask,
-        cross_attention_kwargs,
-    ):
-        for block in self._core.transformer_blocks:
-            if torch.is_grad_enabled() and self._core.gradient_checkpointing:
-                hidden_states = self._core._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    attention_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    timestep,
-                    cross_attention_kwargs,
-                    class_labels,
-                )
-            else:
-                hidden_states = block(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=timestep,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    class_labels=class_labels,
-                )
-        return hidden_states
+        self._update_dit_modules(self._core, original_modules)
 
     def _latent_recursion(
         self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs, autocast_ctx
@@ -542,13 +520,15 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         for _ in range(self.n):
             with autocast_ctx:
                 z_out = self._dit_blocks(
-                    x_high + y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+                    self._core, x_high + y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
                 )
                 z_out = self.norm_z(z_out)
-            z = z_out.to(torch.float32)  # Force state to remain FP32
+            z = z_out.to(torch.float32)
 
         with autocast_ctx:
-            y_out = self._dit_blocks(y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            y_out = self._dit_blocks(
+                self._core, y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+            )
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
@@ -576,7 +556,9 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
 
         bsz = x.shape[0]
         timestep = self._format_timestep(timesteps, bsz, x.device)
-        encoder_hidden_states, class_labels = self._prepare_conditions(conditions, bs=bsz, device=x.device)
+        encoder_hidden_states, class_labels = self._prepare_conditions(
+            conditions, bs=bsz, device=x.device, model=self._core
+        )
         encoder_attention_mask = masks
 
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
@@ -594,7 +576,7 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         )
 
         with autocast_ctx:
-            with self._unwrap_first_block():
+            with self._unwrap_first_block(self._core):
                 y_final_4ch = self._core._get_output_for_patched_inputs(
                     hidden_states=y_final_high,
                     timestep=ts,
@@ -627,7 +609,9 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
         y, z = self.get_initial_states(bsz)
 
         conditions = class_labels if class_labels is not None else encoder_hidden_states
-        encoder_hidden_states, class_labels = self._prepare_conditions(conditions, bs=bsz, device=sample.device)
+        encoder_hidden_states, class_labels = self._prepare_conditions(
+            conditions, bs=bsz, device=sample.device, model=self._core
+        )
 
         # If train.py passed the sequence mask into attention_mask, reroute it to cross-attention.
         if attention_mask is not None and encoder_attention_mask is None:
@@ -665,7 +649,7 @@ class DiTTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
             )
 
         with autocast_ctx:
-            with self._unwrap_first_block():
+            with self._unwrap_first_block(self._core):
                 model_output = self._core._get_output_for_patched_inputs(
                     hidden_states=y_final_high,
                     timestep=ts,
@@ -717,13 +701,13 @@ class DiTTRMv3(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                z_out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                z_out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
-            y_out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            y_out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
             y = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
@@ -772,14 +756,14 @@ class DiTTRMv4(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
-            out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
@@ -828,7 +812,7 @@ class DiTTRMv5(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                out = self._dit_blocks(z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
@@ -836,7 +820,7 @@ class DiTTRMv5(DiTTRMv2):
         with autocast_ctx:
             # x_high is passed instead of zeros!
             y_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-            out = self._dit_blocks(y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
@@ -1003,3 +987,260 @@ class RatatouilleUNetControl(BaseRatatouilleUNet):
             down_block_additional_residuals=down_block_res,
             mid_block_additional_residual=mid_block_res,
         ).sample
+
+
+class BaseRatatouilleDiT(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
+    """Abstract Base Class for Thinker-Painter Architecture using DiTs."""
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        if not isinstance(core_model, Transformer2DModel) or not isinstance(thinker_model, Transformer2DModel):
+            raise ValueError("RatatouilleDiT requires both models to be Transformer2DModels.")
+
+        self.thinker_model = thinker_model
+        self.painter_dim = core_model.config.in_channels
+        self.thinker_dim = thinker_model.config.in_channels
+        self.painter_hidden_dim = core_model.config.num_attention_heads * core_model.config.attention_head_dim
+        self.thinker_hidden_dim = thinker_model.config.num_attention_heads * thinker_model.config.attention_head_dim
+
+        low_res = resolution // downsample_factor
+        patch_size = getattr(thinker_model.config, "patch_size", 1)
+        self.h_p = low_res // patch_size
+        self.w_p = low_res // patch_size
+
+        state_shape = (self.h_p * self.w_p, self.thinker_hidden_dim)
+        super().__init__(core_model, state_shape, n, T, n_sup)
+
+        self.encoder = SpatialEncoder(self.painter_dim, self.thinker_dim, factor=downsample_factor)
+        self.decoder = AttentiveBridge(self.thinker_dim, self.thinker_dim, resolution, factor=downsample_factor)
+        self.norm_y = nn.LayerNorm(self.thinker_hidden_dim)
+        self.norm_z = nn.LayerNorm(self.thinker_hidden_dim)
+
+    @property
+    def _extra_modules(self):
+        return ["encoder", "decoder", "norm_y", "norm_z"]
+
+    @property
+    def _core(self):
+        return self.core_model.module if hasattr(self.core_model, "module") else self.core_model
+
+    @property
+    def _thinker(self):
+        return self.thinker_model.module if hasattr(self.thinker_model, "module") else self.thinker_model
+
+    # --- DDP UNROLLING ---
+    def get_trainable_modules(self):
+        modules = super().get_trainable_modules()
+        if "core_model" in modules:
+            del modules["core_model"]
+        if "thinker_model" in modules:
+            del modules["thinker_model"]
+
+        # Magically fetch everything using the Mixin
+        modules.update(self._get_dit_modules(self._core, prefix="core_"))
+        modules.update(self._get_dit_modules(self._thinker, prefix="thinker_"))
+        return modules
+
+    def update_modules(self, prepared_modules):
+        super().update_modules(prepared_modules)
+        # Re-inject DDP wrappers
+        self._update_dit_modules(self._core, prepared_modules, prefix="core_")
+        self._update_dit_modules(self._thinker, prepared_modules, prefix="thinker_")
+
+    def save(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        original_modules = {}
+
+        for name, module in self.get_trainable_modules().items():
+            if name in self._extra_modules:
+                m_unwrap = unwrap_model(module)
+                torch.save(m_unwrap.state_dict(), os.path.join(output_dir, f"{name}.pt"))
+            else:
+                original_modules[name] = module
+
+        unwrapped_modules = {k: unwrap_model(v) for k, v in original_modules.items()}
+
+        # Inject unwrapped layers back into Diffusers so it can save cleanly
+        self._update_dit_modules(self._core, unwrapped_modules, prefix="core_")
+        self._update_dit_modules(self._thinker, unwrapped_modules, prefix="thinker_")
+
+        self._core.save_pretrained(os.path.join(output_dir, "unet"))
+        self._thinker.save_pretrained(os.path.join(output_dir, "thinker_model"))
+        torch.save({"y_init": self.y_init, "z_init": self.z_init}, os.path.join(output_dir, "strategy_state.pt"))
+
+        # Restore DDP wrappers to continue training
+        self._update_dit_modules(self._core, original_modules, prefix="core_")
+        self._update_dit_modules(self._thinker, original_modules, prefix="thinker_")
+
+    def load(self, input_dir):
+        super().load(input_dir)
+        thinker_dir = os.path.join(input_dir, "thinker_model")
+        if os.path.exists(thinker_dir):
+            sf_path = os.path.join(thinker_dir, "diffusion_pytorch_model.safetensors")
+            bin_path = os.path.join(thinker_dir, "diffusion_pytorch_model.bin")
+            state_dict = load_file(sf_path) if os.path.exists(sf_path) else torch.load(bin_path, map_location="cpu")
+            load_with_backward_compatibility(self._thinker, state_dict)
+
+    # --- BPTT LOOP ---
+    def _latent_recursion(
+        self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs, autocast_ctx
+    ):
+        for _ in range(self.n):
+            with autocast_ctx:
+                z_out = self._dit_blocks(
+                    self._thinker, x_high + y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+                )
+                z_out = self.norm_z(z_out)
+            z = z_out.to(torch.float32)
+
+        with autocast_ctx:
+            y_out = self._dit_blocks(
+                self._thinker, y + z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+            )
+            y_out = self.norm_y(y_out)
+        y = y_out.to(torch.float32)
+        return y, z
+
+    def _deep_recursion(
+        self, x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs, autocast_ctx
+    ):
+        with torch.no_grad():
+            for _ in range(self.T - 1):
+                y, z = self._latent_recursion(
+                    x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs, autocast_ctx
+                )
+        y_final, z_final = self._latent_recursion(
+            x_high, y, z, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs, autocast_ctx
+        )
+        return y_final, y_final.detach(), z_final.detach()
+
+    def reasoning_step(self, x, y, z, timesteps, conditions=None, masks=None):
+        dtype = x.dtype
+        autocast_ctx = (
+            torch.autocast(device_type=x.device.type, dtype=dtype)
+            if dtype in [torch.float16, torch.bfloat16]
+            else contextlib.nullcontext()
+        )
+
+        bsz = x.shape[0]
+        timestep = self._format_timestep(timesteps, bsz, x.device)
+
+        with autocast_ctx:
+            x_for_thinker = self.encoder(x)
+
+        encoder_hs, class_labels = self._prepare_conditions(conditions, bs=bsz, device=x.device, model=self._thinker)
+        enc_attn_mask = masks
+        if enc_attn_mask is not None and enc_attn_mask.ndim == 2:
+            enc_attn_mask = (1 - enc_attn_mask.to(x.dtype)) * -10000.0
+            enc_attn_mask = enc_attn_mask.unsqueeze(1)
+
+        with autocast_ctx:
+            x_low, encoder_hs, ts, embedded_ts = self._thinker._operate_on_patched_inputs(
+                x_for_thinker, encoder_hs, timestep, None
+            )
+        x_low = x_low.to(torch.float32)
+
+        y_final_low_tokens, y_next, z_next = self._deep_recursion(
+            x_low, y, z, encoder_hs, ts, class_labels, None, enc_attn_mask, None, autocast_ctx
+        )
+
+        with autocast_ctx:
+            with self._unwrap_first_block(self._thinker):
+                y_final_low_2d = self._thinker._get_output_for_patched_inputs(
+                    hidden_states=y_final_low_tokens,
+                    timestep=ts,
+                    class_labels=class_labels,
+                    embedded_timestep=embedded_ts,
+                    height=self.h_p,
+                    width=self.w_p,
+                )
+
+            y_final_high_2d = self.decoder(y_final_low_2d)
+            painter_out = self._render_painting(x, y_final_high_2d, timesteps)
+
+        return painter_out, y_next, z_next
+
+    def __call__(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states=None,
+        class_labels=None,
+        attention_mask=None,
+        encoder_attention_mask=None,
+        **kwargs,
+    ):
+        bsz = sample.shape[0]
+        y, z = self.get_initial_states(bsz)
+        conditions = class_labels if class_labels is not None else encoder_hidden_states
+
+        if attention_mask is not None and encoder_attention_mask is None:
+            encoder_attention_mask = attention_mask
+
+        painter_out = None
+        for _ in range(self.n_sup):
+            painter_out, y, z = self.reasoning_step(sample, y, z, timestep, conditions, encoder_attention_mask)
+
+        return TRMOutput(sample=painter_out)
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        raise NotImplementedError
+
+
+class RatatouilleDiTConcat(BaseRatatouilleDiT):
+    """Linguini is controlled via simple Input Concatenation."""
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
+        noise_channels = core_model.config.in_channels - self.thinker_dim
+        self.encoder = SpatialEncoder(noise_channels, self.thinker_dim, factor=downsample_factor)
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        painter_input = torch.cat([x_high, y_final_high], dim=1)
+        # Linguini is blind. get_model_output will handle default class labels if needed!
+        return get_model_output(self.core_model, painter_input, timesteps, conditions=None, masks=None)
+
+
+class RatatouilleDiTResidual(BaseRatatouilleDiT):
+    """Linguini is controlled via IP-Adapter style direct Token Addition."""
+
+    def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
+        super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
+        # Project from the Decoder's spatial channel dim -> Linguini's inner token dim
+        self.blueprint_proj = nn.Conv2d(self.thinker_dim, self.painter_hidden_dim, kernel_size=1)
+
+    @property
+    def _extra_modules(self):
+        return super()._extra_modules + ["blueprint_proj"]
+
+    def _render_painting(self, x_high, y_final_high, timesteps):
+        # 1. Project blueprint to Linguini's hidden dim and flatten to a sequence of tokens
+        blueprint_tokens = self.blueprint_proj(y_final_high).flatten(2).transpose(1, 2)
+
+        bsz = x_high.shape[0]
+        timestep = self._format_timestep(timesteps, bsz, x_high.device)
+
+        # Linguini is blind to real text, so we generate dummy conditions for AdaLN
+        encoder_hs, class_labels = self._prepare_conditions(None, bs=bsz, device=x_high.device, model=self._core)
+
+        # 2. Patchify the standard noisy image
+        hidden_states, encoder_hs, ts, embedded_ts = self._core._operate_on_patched_inputs(
+            x_high, encoder_hs, timestep, None
+        )
+
+        # 3. T2I-Adapter Injection: Add the blueprint directly to the noisy image tokens!
+        hidden_states = hidden_states + blueprint_tokens
+
+        # 4. Run the deep ViT blocks
+        hidden_states = self._dit_blocks(self._core, hidden_states, encoder_hs, ts, class_labels, None, None, None)
+
+        # 5. Unpatchify back to a standard image
+        with self._unwrap_first_block(self._core):
+            out = self._core._get_output_for_patched_inputs(
+                hidden_states=hidden_states,
+                timestep=ts,
+                class_labels=class_labels,
+                embedded_timestep=embedded_ts,
+                height=x_high.shape[2] // self._core.config.patch_size,
+                width=x_high.shape[3] // self._core.config.patch_size,
+            )
+        return out

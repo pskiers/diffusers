@@ -497,3 +497,45 @@ def test_cond_clevr_ratatouille_control():
 @pytest.mark.ratatouille
 def test_cond_clevr_ratatouille_concat():
     run_script("train.py", "test-clevr-rat-concat", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_concat"])
+
+
+# Ratatouille Decoupled Architecture (Thinker-Painter) ViT / DiT
+@pytest.mark.cifar100
+@pytest.mark.vit
+@pytest.mark.ratatouille
+def test_cond_cifar_ratatouille_dit_concat():
+    run_script(
+        "train.py",
+        "test-cifar100-rat-dit-concat",
+        [
+            "experiment=cond_cifar100_trm",
+            "model=cifar100_ratatouille_dit_concat",
+            "~model.core_model.num_class_embeds",
+            "~model.core_model.num_classes",
+        ],
+    )
+
+
+@pytest.mark.cifar100
+@pytest.mark.vit
+@pytest.mark.ratatouille
+def test_cond_cifar_ratatouille_dit_residual():
+    run_script(
+        "train.py",
+        "test-cifar100-rat-dit-residual",
+        [
+            "experiment=cond_cifar100_trm",
+            "model=cifar100_ratatouille_dit_residual",
+            "~model.core_model.num_class_embeds",
+            "~model.core_model.num_classes",
+        ],
+    )
+
+
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.ratatouille
+def test_cond_clevr_ratatouille_dit_residual():
+    run_script(
+        "train.py", "test-clevr-rat-dit-res", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_dit_residual"]
+    )
