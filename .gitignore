@@ -3,6 +3,7 @@ examples/**/*.jsonl
 examples/**/*.jpg
 examples/**/*.jpeg
 examples/**/*.png
+!examples/trm_diffusion/sokoban/surface/**/*.png
 examples/**/*.safetensors
 examples/**/*.bin
 examples/**/*.pkl

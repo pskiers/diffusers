@@ -35,11 +35,9 @@ from tqdm.auto import tqdm
 
 # Local abstracted modules
 from data_factory import get_dataloaders
-from model_utils import extract_into_tensor, load_with_backward_compatibility
-from trm_utils import get_model_output, deep_recursion
+# CFG Label Dropoutfrom trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save
 from data_utils import SafeIterator
-from sokoban.ddpm_scheduler import DDPMScheduler as SokobanDDPMScheduler
 
 # Will error if the minimal version of diffusers is not installed.
 check_min_version("0.34.0.dev0")
@@ -347,8 +345,12 @@ def main(args: DictConfig):
 
             # CFG Label Dropout
             if cond is not None and args.cfg_drop_rate > 0:
-                drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
-                cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
+                if class_labels is not None:
+                    drop_mask = torch.rand(class_labels.shape, device=class_labels.device) < args.cfg_drop_rate
+                    class_labels = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=class_labels.device, dtype=class_labels.dtype), class_labels)
+                else:
+                    drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
+                    cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
 
             # VAE Encoding & Noise Addition
             if vae is not None:
@@ -365,11 +367,6 @@ def main(args: DictConfig):
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
 
             # Sokoban conditioning
-            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
-                noisy_images = torch.cat([cond, noisy_images], dim=1)
-                cond = class_labels  # k
-
-            # Sokoban conditioning (guided gradient)
             if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
                 noisy_images = torch.cat([cond, noisy_images], dim=1)
                 cond = class_labels  # k
@@ -506,11 +503,6 @@ def main(args: DictConfig):
                 noisy_images = torch.cat([cond, noisy_images], dim=1)
                 cond = class_labels
 
-            # Sokoban conditioning
-            if getattr(args.dataset, 'concat_conditioning', False) and cond is not None:
-                noisy_images = torch.cat([cond, noisy_images], dim=1)
-                cond = class_labels
-
             # --- VALIDATION PASS ROUTING ---
             with torch.no_grad():
                 base_model = accelerator.unwrap_model(model)
@@ -551,7 +543,7 @@ def main(args: DictConfig):
                 vae,
                 vae_scaling_factor,
                 weight_dtype,
-                eval_dl=eval_dl,
+                eval_dataloader=eval_dl
             )
 
         if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):

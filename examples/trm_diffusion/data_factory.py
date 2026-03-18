@@ -95,7 +95,7 @@ def get_dataloaders(args, device="cpu", weight_dtype=torch.float32):
 
     elif args.dataset.dataset_type == "sokoban":
         k = getattr(args.dataset, "k", 0)
-        if hasattr(k, '__iter__') and not isinstance(k, str):    # multi-k conditioning
+        if hasattr(k, '__iter__') and not isinstance(k, str):
             k = list(k)
         num_bits = args.dataset.input_channels
         eval_data_dir = getattr(args.dataset, "eval_data_dir", args.dataset.train_data_dir)
@@ -146,7 +146,6 @@ def get_dataloaders(args, device="cpu", weight_dtype=torch.float32):
         else:
             batch["masks"] = None
 
-        # sokoban k-conditioning
         if "class_labels" in examples[0]:
             batch["class_labels"] = torch.tensor([ex["class_labels"] for ex in examples], dtype=torch.long)
         else:

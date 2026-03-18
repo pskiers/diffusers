@@ -7,11 +7,9 @@ from tqdm.auto import tqdm
 from torchvision.utils import make_grid
 from diffusers.utils import is_accelerate_version
 from diffusers import DDPMPipeline
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-import sokoban.environment.utils as sokoban_utils
+import sokoban.utils as sokoban_utils
 from trm_utils import get_model_output
 from sokoban.evaluate_sokoban import boards_from_bit_images, boards_from_normalized_tensor, compute_sokoban_metrics
 
@@ -29,16 +27,10 @@ def generate_image_batch(
     device,
     weight_dtype=torch.float32,
     show_progress=True,
-    prompt=None,
-    class_labels=None,
-    cond_fn=None,
+    prompt=None,        # sokoban
+    class_labels=None   # sokoban
 ):
-    """The unified core engine for generating a batch of images from latents.
-    :params:
-        prompt: Optionaly for sokoban, for channel-concat conditioning
-        class_labels: Optionaly for sokoban, for multi-k distance labels
-        cond_fn: Optionaly for sokoban, gradient for gradient-guided sampling.
-    """
+    """The unified core engine for generating a batch of images from latents."""
     sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
 
     # 1. Base Noise
@@ -72,15 +64,16 @@ def generate_image_batch(
     is_standard_conditional = ("UNet2DModel" in target_str or "UNet2DConditionModel" in target_str) and getattr(
         args.dataset, "num_classes", None
     )
-
     is_concat_conditional = prompt is not None
 
-    do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional)
+    do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional or is_concat_conditional)
 
     if is_concat_conditional:
         metadata = [{"type": "concat_conditional"} for _ in range(bsz)]
         if class_labels is not None:
             conds = class_labels.to(device)
+            if do_cfg:
+                unconds = torch.full_like(conds, args.dataset.num_classes)
 
     elif is_unified_class or is_standard_conditional:
         conds = torch.randint(0, args.dataset.num_classes, [bsz], generator=generator, device=device)
@@ -108,15 +101,12 @@ def generate_image_batch(
     for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
         latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+        if is_concat_conditional:
+            prompt_input = torch.cat([prompt] * 2) if do_cfg else prompt
+            latent_model_input = torch.cat([prompt_input, latent_model_input], dim=1)
+
         latent_model_input_cast = latent_model_input.to(weight_dtype)
-
-        if is_concat_conditional:
-            prompt_input = torch.cat([prompt] * 2) if do_cfg else prompt
-            latent_model_input = torch.cat([prompt_input, latent_model_input], dim=1)
-
-        if is_concat_conditional:
-            prompt_input = torch.cat([prompt] * 2) if do_cfg else prompt
-            latent_model_input = torch.cat([prompt_input, latent_model_input], dim=1)
 
         class_input = torch.cat([conds, unconds]) if do_cfg else conds
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
@@ -152,23 +142,7 @@ def generate_image_batch(
 
         # Sokoban custom DDPMScheduler
         scheduler_output = scheduler.step(noise_pred, t, latents, generator=generator)
-        if (
-            hasattr(scheduler_output, 'variance_with_noise')
-            and scheduler_output.variance_with_noise is not None
-            and not (isinstance(scheduler_output.variance_with_noise, (int, float))
-                     and scheduler_output.variance_with_noise == 0)
-        ):
-            model_mean = scheduler_output.prev_sample
-            variance_with_noise = scheduler_output.variance_with_noise
-            variance = scheduler_output.variance
-
-            if cond_fn is not None:
-                gradient = cond_fn(latents, t)
-                model_mean = model_mean + (variance * gradient)
-
-            latents = model_mean + variance_with_noise
-        else:
-            latents = scheduler_output.prev_sample
+        latents = scheduler_output.prev_sample
 
     # 4. VAE Decoding & Clamping
     if vae is not None:
@@ -201,8 +175,7 @@ def evaluate_and_save(
     vae=None,
     vae_scaling_factor=1.0,
     weight_dtype=torch.float32,
-    eval_dl=None,
-    cond_fn=None,
+    eval_dataloader=None,
 ):
     """Wrapper that calls the generator and pushes the outputs to W&B/Tensorboard."""
     unet = accelerator.unwrap_model(model)
@@ -218,8 +191,9 @@ def evaluate_and_save(
     is_sokoban = getattr(args.dataset, 'dataset_type', None) == 'sokoban'
 
     if is_sokoban:
-        _evaluate_sokoban(unet, noise_scheduler, args, accelerator, epoch, global_step,
-                               generator, weight_dtype, eval_dl, cond_fn=cond_fn)
+        _evaluate_sokoban(
+            unet, noise_scheduler, args, accelerator, epoch, global_step, generator, weight_dtype, eval_dataloader
+        )
     else:
         images, _ = generate_image_batch(
             unet=unet,
@@ -262,52 +236,36 @@ def evaluate_and_save(
 
 
 @torch.no_grad()
-def _evaluate_sokoban(
-    unet, noise_scheduler, args, accelerator, epoch, global_step,
-    generator, weight_dtype, eval_dl, cond_fn=None,
-):
+def _evaluate_sokoban(unet, noise_scheduler, args, accelerator, epoch, global_step, generator, weight_dtype, eval_dataloader):
+    if eval_dataloader is None:
+        raise AttributeError("Evaluation dataset required for sokoban validation during training")
+
     n_images_to_eval = getattr(args.dataset, 'n_images_to_eval', 20)
-    n_images_per_conditioning = getattr(args.dataset, 'n_images_per_conditioning', 16)
-    n_images_to_log = getattr(args.dataset, 'n_images_to_log', 16)
+    n_images_per_cond = getattr(args.dataset, 'n_images_per_conditioning', 16)
     is_conditional = getattr(args.dataset, 'concat_conditioning', False)
     is_class_conditional = getattr(args.dataset, 'class_conditional', False)
     num_boxes = getattr(args.dataset, 'num_boxes', 4)
-    num_bits = args.dataset.input_channels
 
     all_gen_boards = []
     all_cond_boards = []
     all_target_boards = []
     log_images = []
 
-    if eval_dl is None:
-        return
+    pbar = tqdm(total=n_images_to_eval, desc="Sokoban evaluation", disable=not accelerator.is_local_main_process)
 
-    eval_iter = iter(eval_dl)
-    count = 0
-    pbar = tqdm(total=n_images_to_eval, desc="Sokoban eval", disable=not accelerator.is_local_main_process)
-
-    while count < n_images_to_eval:
+    eval_iter = iter(eval_dataloader)
+    for i in range(n_images_to_eval):
         try:
             batch = next(eval_iter)
         except StopIteration:
             break
 
-        if is_conditional:
-            cond_img = batch["conditions"][:1]  #(1, C, H, W)
-            target_img = batch["images"][:1]  #(1, C, H, W)
+        target_img = batch["images"][:1] if is_conditional else None
+        cond_img = batch["conditions"][:1].to(unet.device, dtype=weight_dtype) if is_conditional else None
+        class_label = batch["class_labels"][:1].to(unet.device, dtype=torch.long) if (is_conditional and is_class_conditional) else None
 
-            prompt = cond_img.repeat(n_images_per_conditioning, 1, 1, 1).to(unet.device, dtype=weight_dtype)
-
-            class_labels = None
-            if is_class_conditional and batch.get("class_labels") is not None:
-                class_labels = batch["class_labels"][:1].repeat(n_images_per_conditioning).to(unet.device)
-
-            bsz = n_images_per_conditioning
-        else:
-            prompt = None
-            class_labels = None
-            bsz = n_images_per_conditioning
-            target_img = batch["images"][:1]
+        prompt = cond_img.repeat(n_images_per_cond, 1, 1, 1) if cond_img is not None else None
+        class_labels = class_label.repeat(n_images_per_cond) if class_label is not None else None
 
         images, _ = generate_image_batch(
             unet=unet,
@@ -315,34 +273,28 @@ def _evaluate_sokoban(
             vae=None,
             vae_scaling_factor=1.0,
             args=args,
-            bsz=bsz,
+            bsz=n_images_per_cond,
             generator=generator,
             device=unet.device,
             weight_dtype=weight_dtype,
             show_progress=False,
             prompt=prompt,
-            class_labels=class_labels,
-            cond_fn=cond_fn,
+            class_labels=class_labels
         )
 
-        # Generated images to integer boards
-        gen_boards = boards_from_bit_images(images.cpu(), num_bits)
+        gen_boards = boards_from_bit_images(images.cpu())
         all_gen_boards.append(gen_boards)
 
-        # Target images to integer boards
         if is_conditional:
-            cond_boards = boards_from_normalized_tensor(cond_img.cpu().float(), num_bits)
-            target_board = boards_from_normalized_tensor(target_img.cpu().float(), num_bits)
-            all_cond_boards.extend([cond_boards[0]] * n_images_per_conditioning)
-            all_target_boards.extend([target_board[0]] * n_images_per_conditioning)
+            cond_board = boards_from_normalized_tensor(cond_img.cpu().float())[0]
+            target_board = boards_from_normalized_tensor(target_img.cpu().float())[0]
+            log_images.append((cond_board, gen_boards[0]))
 
-            if count < n_images_to_log:
-                log_images.append((cond_boards[0], gen_boards[0]))
+            all_cond_boards.extend([cond_board] * n_images_per_cond)
+            all_target_boards.extend([target_board] * n_images_per_cond)
         else:
-            if count < n_images_to_log:
-                log_images.append((None, gen_boards[0]))
+            log_images.append((None, gen_boards[0]))
 
-        count += 1
         pbar.update(1)
 
     pbar.close()
@@ -358,7 +310,7 @@ def _evaluate_sokoban(
         all_gen_boards,
         conditioning_boards=all_cond_boards,
         target_boards=all_target_boards,
-        n_images_per_conditioning=n_images_per_conditioning,
+        n_images_per_conditioning=n_images_per_cond,
         num_boxes=num_boxes,
     )
 
@@ -369,8 +321,6 @@ def _evaluate_sokoban(
     if args.logger == "wandb" and log_images:
         wandb_images = []
         for i, (cond_board, gen_board) in enumerate(log_images):
-            if i >= n_images_to_log:
-                break
             fig, axs = plt.subplots(1, 2 if cond_board is not None else 1, figsize=(8, 4))
             if cond_board is not None:
                 axs[0].imshow(sokoban_utils.render(cond_board).astype(np.uint8))
@@ -392,14 +342,3 @@ def _evaluate_sokoban(
         accelerator.get_tracker("wandb").log(
             {"sokoban/visual_samples": wandb_images}, step=global_step
         )
-
-    rendered = []
-    for board in all_gen_boards[:min(16, len(all_gen_boards))]:
-        rgb = sokoban_utils.render(board).astype(np.float32) / 255.0
-        rendered.append(torch.from_numpy(rgb).permute(2, 0, 1))
-    if rendered:
-        grid = make_grid(torch.stack(rendered), nrow=4, padding=2, normalize=True)
-        if args.logger == "wandb":
-            accelerator.get_tracker("wandb").log(
-                {"sokoban/board_grid": wandb.Image(grid), "epoch": epoch}, step=global_step
-            )

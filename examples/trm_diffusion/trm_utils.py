@@ -43,9 +43,7 @@ def latent_recursion(model, x, y, z, timesteps, conditions=None, masks=None, n=6
         out = get_model_output(model, torch.cat([x, y, z], dim=1), timesteps, conditions, masks)
         _, z = out.chunk(2, dim=1)
 
-    out = get_model_output(
-        model, torch.cat([x, y, z], dim=1), timesteps, conditions, masks
-    ) # @NOTE: Tutaj chyba nie podajemy x, y jest generowane z poprzedniego y i aktualnie wyliczonego z
+    out = get_model_output(model, torch.cat([x, y, z], dim=1), timesteps, conditions, masks)
     y, _ = out.chunk(2, dim=1)
 
     return y, z
