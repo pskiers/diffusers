@@ -1,5 +1,4 @@
 import sys
-from xml.parsers.expat import model
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -35,9 +34,10 @@ from tqdm.auto import tqdm
 
 # Local abstracted modules
 from data_factory import get_dataloaders
-# CFG Label Dropoutfrom trm_utils import get_model_output, deep_recursion
+from trm_utils import get_model_output, deep_recursion
 from eval_utils import evaluate_and_save
 from data_utils import SafeIterator
+from model_utils import extract_into_tensor, load_with_backward_compatibility
 
 # Will error if the minimal version of diffusers is not installed.
 check_min_version("0.34.0.dev0")
@@ -346,11 +346,14 @@ def main(args: DictConfig):
             # CFG Label Dropout
             if cond is not None and args.cfg_drop_rate > 0:
                 if class_labels is not None:
+                    # Multi-k Sokoban: drop the distance class label
                     drop_mask = torch.rand(class_labels.shape, device=class_labels.device) < args.cfg_drop_rate
                     class_labels = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=class_labels.device, dtype=class_labels.dtype), class_labels)
-                else:
+                elif cond.ndim == 1:
+                    # CIFAR / ImageNet: cond holds scalar class IDs
                     drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
-                    cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
+                    cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device, dtype=cond.dtype), cond)
+                # else: image-level concat conditioning (Sokoban single-k) — no CFG dropout supported
 
             # VAE Encoding & Noise Addition
             if vae is not None:

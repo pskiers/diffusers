@@ -13,8 +13,8 @@ output_dir: "sokoban-cond-k1-standard"
 train_batch_size: 64
 eval_batch_size: 64
 num_epochs: 1000
-save_model_epochs: 100
-save_images_epochs: 50
+save_model_epochs: 50
+save_images_epochs: 10
 
 cfg_drop_rate: 0
 guidance_scale: 0

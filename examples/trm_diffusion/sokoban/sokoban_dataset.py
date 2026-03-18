@@ -79,7 +79,8 @@ class SokobanDataset(Dataset):
     def __len__(self) -> int:
         if isinstance(self.k, list):
             return min(len(indices) for indices in self.valid_indices.values())
-        return len(self.valid_indices[self.k])
+        k_key = self.k if self.k is not None else 0
+        return len(self.valid_indices[k_key])
 
     @property
     def num_trajectories(self) -> int:
@@ -120,7 +121,7 @@ class SokobanDataset(Dataset):
             for k_val in self.k:
                 valid_indices[k_val] = []
         else:
-            valid_indices[self.k] = []
+            valid_indices[self.k if self.k is not None else 0] = []
 
         data_dir_files = glob(os.path.join(data_path, "*"))
         for f in tqdm(data_dir_files, total=len(list(data_dir_files)), desc="Loading the data"):
@@ -142,8 +143,9 @@ class SokobanDataset(Dataset):
                             if i + k_val < traj_len:
                                 valid_indices[k_val].append(len(boards))
                     else:
-                        if i + self.k < traj_len:
-                            valid_indices[self.k].append(len(boards))
+                        k_eff = self.k if self.k is not None else 0
+                        if i + k_eff < traj_len:
+                            valid_indices[k_eff].append(len(boards))
 
                 boards.extend(trajectory)
 

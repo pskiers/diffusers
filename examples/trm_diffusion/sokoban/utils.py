@@ -97,7 +97,7 @@ def conditional_is_valid(conditioning: np.ndarray, board: np.ndarray) -> dict:
     should_be_walls = conditioning == FieldStates.WALL.id
     walls_matching = (board[should_be_walls] == FieldStates.WALL.id).all() and (board[~should_be_walls] != FieldStates.WALL.id).all()
 
-    should_be_targets = np.logical_or(np.logical_or(conditioning == FieldStates.BOX_TARGET.id, conditioning == FieldStates.BOX_ON_TARGET.id), conditioning == FieldStates.PLAYER_ON_TARGET)
+    should_be_targets = np.logical_or(np.logical_or(conditioning == FieldStates.BOX_TARGET.id, conditioning == FieldStates.BOX_ON_TARGET.id), conditioning == FieldStates.PLAYER_ON_TARGET.id)
     targets_matching = np.logical_or(np.logical_or(board[should_be_targets] == FieldStates.BOX_TARGET.id, board[should_be_targets] == FieldStates.BOX_ON_TARGET.id),
                                     board[should_be_targets] == FieldStates.PLAYER_ON_TARGET.id).all() and np.logical_and(
                                         np.logical_and(board[~should_be_targets] != FieldStates.BOX_TARGET.id, board[~should_be_targets] != FieldStates.BOX_ON_TARGET.id), board[~should_be_targets] != FieldStates.PLAYER_ON_TARGET.id).all()
