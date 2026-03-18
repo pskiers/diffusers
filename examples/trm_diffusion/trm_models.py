@@ -246,9 +246,16 @@ class ExtraModulesMixin:
         if hasattr(super(), "load"):
             super().load(input_dir)
         for attr in self._extra_modules:
-            if hasattr(self, attr) and os.path.exists(os.path.join(input_dir, f"{attr}.pt")):
-                m = unwrap_model(getattr(self, attr))
-                m.load_state_dict(torch.load(os.path.join(input_dir, f"{attr}.pt"), map_location="cpu"))
+            if not hasattr(self, attr):
+                continue
+            path = os.path.join(input_dir, f"{attr}.pt")
+            m = unwrap_model(getattr(self, attr))
+            if os.path.exists(path):
+                m.load_state_dict(torch.load(path, map_location="cpu"))
+            elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+                # Checkpoint predates this norm layer — replace with Identity to preserve
+                # the original unnormalized dynamics the model was trained with.
+                setattr(self, attr, nn.Identity())
 
 
 class DiTUtilsMixin:
@@ -450,7 +457,7 @@ class UNetTRMv2(ExtraModulesMixin, BaseIterativeStrategy):
             y_high, z_high = self.get_initial_states(bsz)
 
             for _ in range(self.n_sup):
-                y_high, z_high = self._latent_recursion(
+                _, y_high, z_high = self._deep_recursion(
                     x_high, y_high, z_high, timestep, conditions, attention_mask, autocast_ctx
                 )
 

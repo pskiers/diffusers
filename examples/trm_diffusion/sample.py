@@ -61,7 +61,15 @@ def main(args: DictConfig):
     logger.info(f"Instantiating model from config...")
     unet = instantiate(args.model, _convert_="all")
 
-    unet_dir = os.path.join(resolved_ckpt_path, "unet")
+    if hasattr(unet, "load"):
+        logger.info("Loading extra TRM modules and strategy states...")
+        unet.load(resolved_ckpt_path)
+
+    if args.get("use_ema", False):
+        logger.info("Loading EMA weights...")
+        unet_dir = os.path.join(resolved_ckpt_path, "unet_ema")
+    else:
+        unet_dir = os.path.join(resolved_ckpt_path, "unet")
     sf_path = os.path.join(unet_dir, "diffusion_pytorch_model.safetensors")
     bin_path = os.path.join(unet_dir, "diffusion_pytorch_model.bin")
 
@@ -80,17 +88,23 @@ def main(args: DictConfig):
 
     unet.eval()
 
-    # 1. Safely move the core model to the GPU
+    # Determine the correct dtype based on accelerator mixed precision
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    # 1. Safely move the core model to the GPU and CAST the dtype
     if hasattr(unet, "core_model"):
-        unet.core_model.to(accelerator.device)
+        unet.core_model.to(accelerator.device, dtype=weight_dtype)
     else:
-        unet.to(accelerator.device)
+        unet.to(accelerator.device, dtype=weight_dtype)
 
     # 2. Safely move any extra Mixin layers (norm_y, fusion, etc.) to the GPU
     if hasattr(unet, "get_trainable_modules"):
         for m in unet.get_trainable_modules().values():
             if isinstance(m, torch.nn.Module):
-                m.to(accelerator.device)
+                m.to(accelerator.device, dtype=weight_dtype)
 
     # 2. Load VAE and Scheduler
     vae, vae_scaling_factor = None, 1.0
@@ -142,7 +156,7 @@ def main(args: DictConfig):
             bsz=current_bsz,
             generator=generator,
             device=accelerator.device,
-            weight_dtype=torch.float32,
+            weight_dtype=weight_dtype,
             show_progress=True,  # Disable inner progress bar to prevent terminal spam
         )
 
