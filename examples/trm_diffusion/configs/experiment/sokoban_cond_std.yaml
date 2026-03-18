@@ -2,6 +2,7 @@
 defaults:
   - override /dataset: sokoban
   - override /model: sokoban_unet_cond
+  - override /optimizer: adamw
 
 dataset:
   k: 1
@@ -15,6 +16,8 @@ eval_batch_size: 64
 num_epochs: 1000
 save_model_epochs: 50
 save_images_epochs: 10
+
+mixed_precision: "no"
 
 cfg_drop_rate: 0
 guidance_scale: 0

@@ -253,6 +253,7 @@ def main(args: DictConfig):
         num_train_timesteps=args.ddpm_num_steps,
         beta_schedule=args.ddpm_beta_schedule,
         prediction_type=args.prediction_type,
+        rescale_betas_zero_snr=getattr(args, 'rescale_betas_zero_snr', False),
     )
 
     mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
