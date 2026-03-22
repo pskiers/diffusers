@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gpus-per-task=1
-#SBATCH --time=96:00:00
+#SBATCH --time=48:00:00
 
 module load Miniconda3/23.3.1-0
 eval "$(conda shell.bash hook)"

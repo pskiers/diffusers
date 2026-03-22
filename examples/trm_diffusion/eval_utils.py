@@ -267,6 +267,7 @@ def _evaluate_sokoban(unet, noise_scheduler, args, accelerator, epoch, global_st
         prompt = cond_img.repeat(n_images_per_cond, 1, 1, 1) if cond_img is not None else None
         class_labels = class_label.repeat(n_images_per_cond) if class_label is not None else None
 
+        accelerator.log(f"Generating sokoban boards number {i}...")
         images, _ = generate_image_batch(
             unet=unet,
             scheduler=noise_scheduler,
@@ -281,6 +282,7 @@ def _evaluate_sokoban(unet, noise_scheduler, args, accelerator, epoch, global_st
             prompt=prompt,
             class_labels=class_labels
         )
+        accelerator.log(f"Finished generating boards number {i}")
 
         gen_boards = boards_from_bit_images(images.cpu())
         all_gen_boards.append(gen_boards)

@@ -6,16 +6,15 @@ train_batch_size: 64
 eval_batch_size: 64
 rescale_betas_zero_snr: true
 
-n_images_to_eval: 5 # how many images to generate in one eval iteration
-n_images_per_conditioning: 5 # how many images to generate in evaluation based on one conditioning board
-
 dataset:
-  train_data_dir: "/home/gosia/STUDIA/DYPLOM/reasoning-diffusion/12-12-4"
-  eval_data_dir: "/home/gosia/STUDIA/DYPLOM/reasoning-diffusion/12-12-4-test"
+  train_data_dir: "/net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4"
+  eval_data_dir: "/net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4-test"
   resolution: 12
   num_boxes: 4
   input_channels: 3
   clip_sample_range: 1.0
+  n_images_to_eval: 5 # how many images to generate in one eval iteration
+  n_images_per_conditioning: 5 # how many images to generate in evaluation based on one conditioning board
 
 models:
   standard:

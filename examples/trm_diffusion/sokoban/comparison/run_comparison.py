@@ -52,7 +52,7 @@ def submit_slurm_job(model_name, task_name, base_config, task_config, model_conf
 
 
 def main():
-    config_path = "sokoban/comparison/comparison-config.yaml"
+    config_path = "comparison-config.yaml"
     with open(config_path, "r") as f:
         main_config = yaml.safe_load(f)
 
