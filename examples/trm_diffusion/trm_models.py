@@ -176,6 +176,61 @@ class BaseIterativeStrategy:
     def __call__(self, sample, timestep, encoder_hidden_states=None, class_labels=None, attention_mask=None, **kwargs):
         raise NotImplementedError
 
+    def call_with_early_stop(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states=None,
+        class_labels=None,
+        attention_mask=None,
+        threshold=None,
+        alpha_bar=None,
+        **kwargs,
+    ):
+        """
+        Like __call__ but optionally stops early when consecutive predictions converge.
+
+        Stops when:  sqrt((1 - alpha_bar) / alpha_bar) * ||eps_n - eps_{n-1}|| < threshold
+
+        This is the x0-space distance between consecutive noise predictions.
+
+        NOTE: Does NOT apply CFG internally. Pass an already-doubled batch (cond + uncond
+        concatenated) and merge the output yourself, exactly as in the standard denoising loop.
+
+        Args:
+            threshold:  float stopping threshold (x0-space L2 norm, mean over batch).
+                        If None, runs all n_sup steps (no early stopping).
+            alpha_bar:  scheduler's alphas_cumprod[t] at the current timestep.
+                        Required when threshold is not None.
+
+        Returns:
+            (TRMOutput, n_steps_taken)
+        """
+        bsz = sample.shape[0]
+        y, z = self.get_initial_states(bsz)
+        conditions = class_labels if class_labels is not None else encoder_hidden_states
+
+        model_output = None
+        prev_output = None
+        n_taken = 0
+
+        for i in range(self.n_sup):
+            model_output, y, z = self.reasoning_step(sample, y, z, timestep, conditions, attention_mask)
+            n_taken = i + 1
+
+            if threshold is not None and prev_output is not None:
+                if alpha_bar is None:
+                    raise ValueError("alpha_bar is required when threshold is set")
+                ab = alpha_bar.to(model_output.device).float()
+                scale = torch.sqrt((1.0 - ab) / ab.clamp(min=1e-8))
+                diff_norm = (model_output.float() - prev_output).view(bsz, -1).norm(dim=-1).mean()
+                if (scale * diff_norm).item() < threshold:
+                    break
+
+            prev_output = model_output.detach().float()
+
+        return TRMOutput(sample=model_output), n_taken
+
     def _format_timestep(self, timestep, batch_size, device):
         """Ensures timestep is a 1D tensor matching the batch size."""
         if not torch.is_tensor(timestep):
@@ -300,6 +355,8 @@ class DiTUtilsMixin:
         if not hasattr(model.config, "condition_mode"):
             return conditions, None
         if conditions is not None:
+            proj_dtype = next(model.condition_projector.parameters()).dtype
+            conditions = conditions.to(dtype=proj_dtype)
             if model.config.condition_mode == "class":
                 encoder_hidden_states = model.condition_projector(conditions).unsqueeze(1)
             elif model.config.condition_mode == "sequence":
