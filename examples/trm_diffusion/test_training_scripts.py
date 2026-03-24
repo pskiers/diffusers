@@ -535,7 +535,36 @@ def test_cond_cifar_ratatouille_dit_residual():
 @pytest.mark.clevr
 @pytest.mark.vit
 @pytest.mark.ratatouille
+def test_cond_clevr_ratatouille_dit_concat():
+    run_script(
+        "train.py", "test-clevr-rat-dit-concat", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_dit_concat"]
+    )
+
+
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.ratatouille
 def test_cond_clevr_ratatouille_dit_residual():
     run_script(
         "train.py", "test-clevr-rat-dit-res", ["experiment=clevr_relative_trm", "model=clevr_ratatouille_dit_residual"]
+    )
+
+
+@pytest.mark.imagenet
+@pytest.mark.vit
+@pytest.mark.ratatouille
+def test_cond_imagenet_ratatouille_dit_concat():
+    run_script(
+        "train.py",
+        "test-imgnet-rat-dit-concat",
+        ["experiment=cond_imgnet_trm", "model=imagenet_ratatouille_dit_concat"],
+    )
+
+
+@pytest.mark.imagenet
+@pytest.mark.vit
+@pytest.mark.ratatouille
+def test_cond_imagenet_ratatouille_dit_residual():
+    run_script(
+        "train.py", "test-imgnet-rat-dit-res", ["experiment=cond_imgnet_trm", "model=imagenet_ratatouille_dit_residual"]
     )

@@ -1,4 +1,4 @@
-_target_: trm_models.RatatouilleDiTResidual
+_target_: trm_models.RatatouilleDiTConcat
 resolution: 32
 downsample_factor: 2
 n: 6
@@ -10,11 +10,11 @@ core_model:
   condition_mode: "class_adaln"
   num_classes: 100
   sample_size: 32
-  in_channels: 3
+  in_channels: 67 # 3 (noise) + 64 (Remy dim)
   out_channels: 3
   num_layers: 12
   patch_size: 2
-  attention_head_dim: 64
+  attention_head_dim: 64 # 384 hidden / 6 heads
   num_attention_heads: 6
   activation_fn: "gelu-approximate"
 

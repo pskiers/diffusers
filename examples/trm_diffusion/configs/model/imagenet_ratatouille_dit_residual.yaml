@@ -8,23 +8,23 @@ n_sup: 4
 core_model:
   _target_: models.UnifiedConditionDiT # Massive Painter
   condition_mode: "class_adaln"
-  num_classes: 100
+  num_classes: 1000
   sample_size: 32
-  in_channels: 3
-  out_channels: 3
-  num_layers: 12
+  in_channels: 4
+  out_channels: 4
+  num_layers: 28
   patch_size: 2
-  attention_head_dim: 64
-  num_attention_heads: 6
+  attention_head_dim: 72 # 1152 hidden / 16 heads
+  num_attention_heads: 16
   activation_fn: "gelu-approximate"
 
 thinker_model:
   _target_: models.UnifiedConditionDiT # Tiny Thinker
   condition_mode: "class"
-  num_classes: 100
+  num_classes: 1000
   sample_size: 16
-  in_channels: 64
-  out_channels: 64
+  in_channels: 128
+  out_channels: 128
   num_layers: 2
   patch_size: 2
   attention_head_dim: 64

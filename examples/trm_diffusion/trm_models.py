@@ -354,17 +354,21 @@ class DiTUtilsMixin:
 
         if not hasattr(model.config, "condition_mode"):
             return conditions, None
+
         if conditions is not None:
-            proj_dtype = next(model.condition_projector.parameters()).dtype
-            conditions = conditions.to(dtype=proj_dtype)
             if model.config.condition_mode == "class":
-                encoder_hidden_states = model.condition_projector(conditions).unsqueeze(1)
+                # Embeddings STRICTLY require Long tensors
+                encoder_hidden_states = model.condition_projector(conditions.long()).unsqueeze(1)
             elif model.config.condition_mode == "sequence":
-                encoder_hidden_states = model.condition_projector(conditions)
+                # Linear layers STRICTLY require matching float/half precision
+                proj_dtype = next(model.condition_projector.parameters()).dtype
+                encoder_hidden_states = model.condition_projector(conditions.to(dtype=proj_dtype))
             elif model.config.condition_mode == "class_adaln":
-                class_labels = conditions
+                # AdaLN uses native Diffusers embeddings, which require Long tensors
+                class_labels = conditions.long()
         elif model.config.condition_mode == "class_adaln":
             class_labels = torch.full((bs,), model.config.num_classes, dtype=torch.long, device=device)
+
         return encoder_hidden_states, class_labels
 
     def _dit_blocks(
@@ -765,13 +769,17 @@ class DiTTRMv3(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                z_out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                z_out = self._dit_blocks(
+                    self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+                )
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
-            y_out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            y_out = self._dit_blocks(
+                self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+            )
             y = self.norm_y(y_out)
         y = y_out.to(torch.float32)
         return y, z
@@ -820,14 +828,18 @@ class DiTTRMv4(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                out = self._dit_blocks(
+                    self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+                )
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
 
         with autocast_ctx:
             y_in = self.fusion(torch.cat([zeros, y, z], dim=-1))
-            out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            out = self._dit_blocks(
+                self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+            )
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
@@ -876,7 +888,9 @@ class DiTTRMv5(DiTTRMv2):
         for _ in range(self.n):
             with autocast_ctx:
                 z_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-                out = self._dit_blocks(self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+                out = self._dit_blocks(
+                    self._core, z_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+                )
                 _, z_out = self.out_proj(out).chunk(2, dim=-1)
                 z_out = self.norm_z(z_out)
             z = z_out.to(torch.float32)
@@ -884,7 +898,9 @@ class DiTTRMv5(DiTTRMv2):
         with autocast_ctx:
             # x_high is passed instead of zeros!
             y_in = self.fusion(torch.cat([x_high, y, z], dim=-1))
-            out = self._dit_blocks(self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs)
+            out = self._dit_blocks(
+                self._core, y_in, encoder_hs, ts, class_labels, attn_mask, enc_attn_mask, cross_kwargs
+            )
             y_out, _ = self.out_proj(out).chunk(2, dim=-1)
             y_out = self.norm_y(y_out)
         y = y_out.to(torch.float32)
@@ -1269,8 +1285,12 @@ class RatatouilleDiTResidual(BaseRatatouilleDiT):
 
     def __init__(self, core_model, thinker_model, resolution, downsample_factor=4, n=6, T=3, n_sup=1, **kwargs):
         super().__init__(core_model, thinker_model, resolution, downsample_factor, n, T, n_sup, **kwargs)
-        # Project from the Decoder's spatial channel dim -> Linguini's inner token dim
-        self.blueprint_proj = nn.Conv2d(self.thinker_dim, self.painter_hidden_dim, kernel_size=1)
+
+        patch_size = getattr(core_model.config, "patch_size", 1)
+
+        self.blueprint_proj = nn.Conv2d(
+            self.thinker_dim, self.painter_hidden_dim, kernel_size=patch_size, stride=patch_size
+        )
 
     @property
     def _extra_modules(self):

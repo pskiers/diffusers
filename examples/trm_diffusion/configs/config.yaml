@@ -1,5 +1,5 @@
 defaults:
-  - optimizer: adam-atan2
+  - optimizer: adamw
   - lr_scheduler: cosine
   - dataset: cifar100
   - model: unet2d
