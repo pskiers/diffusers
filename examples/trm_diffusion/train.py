@@ -46,6 +46,14 @@ check_min_version("0.34.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 
+def get_n_sup_phase(step, phases, n_sup_phases, default):
+    if not len(phases):
+        return default
+    for phase, n_sup in zip(phases, n_sup_phases):
+        if step < phase:
+            return n_sup
+
+
 def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args):
     if args.prediction_type == "epsilon":
         return F.mse_loss(model_output.float(), noise.float())
@@ -370,11 +378,31 @@ def main(args: DictConfig):
                     y, z = base_model.get_initial_states(bsz)
                     y, z = y.to(model.device), z.to(model.device)
 
-                    for _ in range(base_model.n_sup):
+                    loss_full = None
+
+                    for n_step in range(get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)):
                         # with accelerator.autocast():
                         model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
+                        loss = loss if not args.trm_loss_nsup_decay else loss * (args.trm_loss_nsup_decay**n_step)
 
+                        if args.grad_every_n_sup:
+                            accelerator.backward(loss)
+                            if accelerator.sync_gradients:
+                                if hasattr(base_model, "get_trainable_modules"):
+                                    params_to_clip = []
+                                    for m in base_model.get_trainable_modules().values():
+                                        params_to_clip.extend(m.parameters())
+                                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                                else:
+                                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                            optimizer.step()
+                            lr_scheduler.step()
+                            optimizer.zero_grad()
+                        else:
+                            loss_full = loss_full + loss if loss_full is not None else loss
+
+                    if not args.grad_every_n_sup:
                         accelerator.backward(loss)
                         if accelerator.sync_gradients:
                             if hasattr(base_model, "get_trainable_modules"):

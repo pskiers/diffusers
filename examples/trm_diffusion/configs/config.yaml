@@ -51,6 +51,10 @@ resume_from_checkpoint: null
 
 # 7. "Small Loop" Base Settings
 use_small_loop: false
+grad_every_n_sup: true
+trm_loss_nsup_decay: 0
+phases: []
+n_sup_phases: []
 
 # 8. Sampling Settings
 checkpoint_step: "latest"
