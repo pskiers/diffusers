@@ -33,13 +33,76 @@ MIN_DIST = 0.7  # Minimum distance between objects to avoid overlap
 ORIG_W, ORIG_H = 480, 320
 
 
+def transitive_reduce_direction(adj_lists, n, object_order=None):
+    """
+    Single-pass greedy transitive reduction for one spatial direction.
+
+    The algorithm processes objects in *object_order* and, for each object a,
+    removes any edge a→b that is already reachable via some other object c
+    currently in a's neighbour set.  Because edges removed from c's list
+    (when c is processed earlier) are no longer visible when a is processed,
+    different orderings produce different — but all valid — sparse graphs.
+    This is the source of structural diversity across variants.
+
+    Object indices in the returned edges always refer to the original object
+    numbering, so they remain consistent across variants.
+
+    Args:
+        adj_lists:    list of lists; adj_lists[i] = objects in this direction of i.
+        n:            total number of objects.
+        object_order: permutation of range(n) controlling processing order.
+                      Defaults to natural order [0, 1, …, n-1].
+
+    Returns:
+        List of (a, b) int tuples — the surviving edges.
+    """
+    if object_order is None:
+        object_order = range(n)
+
+    adj_sets = [set(adj_lists[i]) if i < len(adj_lists) else set() for i in range(n)]
+
+    for a in object_order:
+        for b in list(adj_sets[a]):
+            # Drop a→b if any current neighbour c of a can already reach b
+            if any(b in adj_sets[c] for c in adj_sets[a] if c != b):
+                adj_sets[a].discard(b)
+
+    return [(a, b) for a in range(n) for b in adj_sets[a]]
+
+
+def compute_reduced_variants(relationships, n, n_variants):
+    """
+    Pre-compute *n_variants* differently-ordered transitive reductions for both
+    spatial axes (left/right and front/behind).
+
+    Each variant uses an independently shuffled object-processing order, giving
+    a different sparse-but-valid representation of the same scene's geometry.
+
+    Returns:
+        List of (left_edges, front_edges) pairs, one per variant.
+    """
+    variants = []
+    for _ in range(n_variants):
+        order = list(range(n))
+        random.shuffle(order)
+        left_edges = transitive_reduce_direction(relationships["left"], n, order)
+        front_edges = transitive_reduce_direction(relationships["front"], n, order)
+        variants.append((left_edges, front_edges))
+    return variants
+
+
+# ---------------------------------------------------------------------------
+# Scene generation
+# ---------------------------------------------------------------------------
+
+
 def sample_random_scene(num_objects=None, mode="absolute"):
     """
     Generates a random, physically valid scene dictionary.
 
     Args:
         num_objects (int): Number of objects. If None, random (3 to 10).
-        mode (str): "absolute" or "relative".
+        mode (str): "absolute", "relative", or "reduced".
     """
     if num_objects is None:
         num_objects = random.randint(3, 10)
@@ -120,6 +183,48 @@ def make_tensor_from_scene(scene_dict):
     objects = scene_dict["objects"]
     relationships = scene_dict["relationships"]
 
+    # For "reduced" mode, build the 4 relation grids before the per-object loop.
+    #
+    # Step 1 — pick a structural variant (which edges survived the greedy reduction):
+    #   • Dataset path:  one of the pre-computed variants is chosen at random.
+    #   • Eval/sampling: a single variant is computed on-the-fly with a shuffled order.
+    #
+    # Step 2 — on-the-fly complementary assignment:
+    #   For each surviving edge (a, b) in the left axis we toss a coin:
+    #     heads → store as left[a, b]   ("b is left of a")
+    #     tails → store as right[b, a]  (equivalent: "a is right of b")
+    #   Likewise for the front/behind axis.  This forces the model to understand
+    #   both directions rather than always finding information in the same slot.
+    if mode == "reduced":
+        n = len(objects)
+
+        if "reduced_variants" in scene_dict:
+            left_edges, front_edges = random.choice(scene_dict["reduced_variants"])
+        else:
+            order = list(range(n))
+            random.shuffle(order)
+            left_edges = transitive_reduce_direction(relationships["left"], n, order)
+            front_edges = transitive_reduce_direction(relationships["front"], n, order)
+
+        left_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+        right_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+        front_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+        behind_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+
+        for a, b in left_edges:
+            if a < MAX_OBJECTS and b < MAX_OBJECTS:
+                if random.random() < 0.5:
+                    left_g[a, b] = 1.0  # "b is left of a"
+                else:
+                    right_g[b, a] = 1.0  # equivalent: "a is right of b"
+
+        for a, b in front_edges:
+            if a < MAX_OBJECTS and b < MAX_OBJECTS:
+                if random.random() < 0.5:
+                    front_g[a, b] = 1.0  # "b is in front of a"
+                else:
+                    behind_g[b, a] = 1.0  # equivalent: "a is behind b"
+
     obj_vectors = []
 
     for i, obj in enumerate(objects):
@@ -158,10 +263,16 @@ def make_tensor_from_scene(scene_dict):
             rels = rel_grid.flatten()
             full_vec = torch.cat([base, rels])
 
+        elif mode == "reduced":
+            # 4 × MAX_OBJECTS = 40 dims — same shape as "relative" for architecture
+            # compatibility, but sparser and with randomised direction encoding.
+            rels = torch.cat([left_g[i], right_g[i], front_g[i], behind_g[i]])
+            full_vec = torch.cat([base, rels])
+
         obj_vectors.append(full_vec)
 
     # --- 3. Stacking and Padding ---
-    dim = 21 if mode == "absolute" else 55
+    dim = 21 if mode == "absolute" else 55  # "relative" and "reduced" both use 55
 
     padded_objs = torch.zeros((1, MAX_OBJECTS, dim), dtype=torch.float32)
     mask = torch.zeros((1, MAX_OBJECTS), dtype=torch.float32)
@@ -178,10 +289,16 @@ def make_tensor_from_scene(scene_dict):
 class CLEVRHybridDataset(Dataset):
     URL = "https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip"
 
-    def __init__(self, root_dir, split="train", mode="absolute", image_size=256, download=True):
+    def __init__(self, root_dir, split="train", mode="absolute", image_size=256, download=True, n_reduced_samples=16):
         """
         Args:
-            mode (str): "absolute" (uses coordinates) or "relative" (uses relationships)
+            mode (str): "absolute" (uses coordinates), "relative" (full relationships),
+                        or "reduced" (transitively-reduced relationships with randomised
+                        processing order and complementary-direction encoding).
+            n_reduced_samples (int): Number of differently-ordered reductions to
+                        pre-compute per scene when mode="reduced". One is chosen
+                        randomly in each __getitem__ call, followed by an on-the-fly
+                        left↔right / front↔behind coin flip per edge.
         """
         self.root_dir = root_dir
         self.mode = mode
@@ -198,6 +315,14 @@ class CLEVRHybridDataset(Dataset):
         print(f"Loading {mode} scenes from {scene_path}...")
         with open(scene_path, "r") as f:
             self.scenes = json.load(f)["scenes"]
+
+        # Pre-compute reduction variants once so __getitem__ stays cheap:
+        # each call only does a random.choice + a small number of grid writes.
+        if mode == "reduced":
+            print(f"Pre-computing {n_reduced_samples} reduced graph variants " f"for {len(self.scenes)} scenes...")
+            for scene in self.scenes:
+                n = len(scene["objects"])
+                scene["reduced_variants"] = compute_reduced_variants(scene["relationships"], n, n_reduced_samples)
 
         self.image_dir = os.path.join(self.dataset_path, "images", filename_split)
 
