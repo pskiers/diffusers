@@ -9,6 +9,7 @@ import itertools
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
+import random
 from scipy.optimize import linear_sum_assignment
 
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
@@ -153,6 +154,7 @@ def evaluate_model_samples(samples_dir, clevr_dir, limit=None):
     }
 
     loop_limit = limit if limit is not None else len(samples)
+    random.shuffle(samples)
     for i, item in enumerate(tqdm(samples[:loop_limit])):
         img_path = samples_path / item["file_name"]
         raw_image = Image.open(img_path).convert("RGB")

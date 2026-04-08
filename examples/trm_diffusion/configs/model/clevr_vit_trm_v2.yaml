@@ -16,5 +16,5 @@ core_model:
   patch_size: 2
   attention_head_dim: 64 # 768 hidden / 12 heads
   num_attention_heads: 12
-  cross_attention_dim: 1024
+  cross_attention_dim: 512
   activation_fn: "gelu-approximate"

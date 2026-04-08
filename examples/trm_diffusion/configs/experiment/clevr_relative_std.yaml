@@ -8,10 +8,10 @@ dataset:
 
 output_dir: "clevr-standard-att-early-cross-att-relative-fix"
 train_batch_size: 224
-eval_batch_size: 5
+eval_batch_size: 32
 num_epochs: 4000
 save_model_epochs: 5
-save_images_epochs: 1
+save_images_epochs: 5
 
 cfg_drop_rate: 0
 guidance_scale: 0

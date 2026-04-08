@@ -18,7 +18,7 @@ hub_token: null
 # 2. Dataloading & Batching
 train_batch_size: 64
 eval_batch_size: 64
-dataloader_num_workers: 0
+dataloader_num_workers: 8
 epoch_max_batches_train: 1000
 epoch_max_batches_eval: 250
 
@@ -63,3 +63,4 @@ num_samples: 10000
 sample_batch_size: 100
 vae_batch_size: 64
 use_ddim: false
+samples_dir: "samples"

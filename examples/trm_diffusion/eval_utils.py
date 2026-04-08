@@ -19,6 +19,7 @@ def generate_image_batch(
     device,
     weight_dtype=torch.float32,
     show_progress=True,
+    single_scene=True,
 ):
     """The unified core engine for generating a batch of images from latents."""
     sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
@@ -67,8 +68,10 @@ def generate_image_batch(
         from clevr_dataset import sample_random_scene, make_tensor_from_scene
 
         c_list, m_list = [], []
+        scene = sample_random_scene(num_objects=None, mode=args.dataset.dataset_mode)
         for _ in range(bsz):
-            scene = sample_random_scene(num_objects=None, mode=args.dataset.dataset_mode)
+            if not single_scene:
+                scene = sample_random_scene(num_objects=None, mode=args.dataset.dataset_mode)
             c, m = make_tensor_from_scene(scene)
             c_list.append(c)
             m_list.append(m)

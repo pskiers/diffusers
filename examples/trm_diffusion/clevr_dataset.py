@@ -4,6 +4,7 @@ import math
 import random
 import zipfile
 import requests
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -33,7 +34,17 @@ MIN_DIST = 0.7  # Minimum distance between objects to avoid overlap
 ORIG_W, ORIG_H = 480, 320
 
 
-def transitive_reduce_direction(adj_lists, n, object_order=None):
+def _adj_lists_to_matrix(adj_lists, n):
+    """Convert a list-of-lists adjacency representation to a numpy bool matrix."""
+    mat = np.zeros((n, n), dtype=np.bool_)
+    for i, neighbours in enumerate(adj_lists[:n]):
+        for j in neighbours:
+            if j < n:
+                mat[i, j] = True
+    return mat
+
+
+def transitive_reduce_direction(adj_mat, object_order):
     """
     Single-pass greedy transitive reduction for one spatial direction.
 
@@ -48,26 +59,30 @@ def transitive_reduce_direction(adj_lists, n, object_order=None):
     numbering, so they remain consistent across variants.
 
     Args:
-        adj_lists:    list of lists; adj_lists[i] = objects in this direction of i.
-        n:            total number of objects.
+        adj_mat:      numpy bool array (n, n); adj_mat[i, j] = True means j is
+                      in this direction of i.
         object_order: permutation of range(n) controlling processing order.
-                      Defaults to natural order [0, 1, …, n-1].
 
     Returns:
         List of (a, b) int tuples — the surviving edges.
     """
-    if object_order is None:
-        object_order = range(n)
-
-    adj_sets = [set(adj_lists[i]) if i < len(adj_lists) else set() for i in range(n)]
+    mat = adj_mat.copy()
+    n = mat.shape[0]
 
     for a in object_order:
-        for b in list(adj_sets[a]):
-            # Drop a→b if any current neighbour c of a can already reach b
-            if any(b in adj_sets[c] for c in adj_sets[a] if c != b):
-                adj_sets[a].discard(b)
+        if not mat[a].any():
+            continue
+        # Two-hop reachability from a via its current neighbours (vectorised).
+        # two_hop[b] is True if any current neighbour c of a has mat[c, b]=True.
+        two_hop = mat[a] @ mat  # shape (n,), bool
+        # Keep only edges a→b that are NOT reachable via another neighbour.
+        # "Another neighbour" means we must exclude the direct b→b self-loop
+        # that would appear if mat[b, b] were set — it isn't, so mat[a] & two_hop
+        # gives exactly the redundant edges (reachable via at least one c≠b).
+        redundant = mat[a] & two_hop
+        mat[a] &= ~redundant
 
-    return [(a, b) for a in range(n) for b in adj_sets[a]]
+    return [(int(a), int(b)) for a in range(n) for b in range(n) if mat[a, b]]
 
 
 def compute_reduced_variants(relationships, n, n_variants):
@@ -79,16 +94,32 @@ def compute_reduced_variants(relationships, n, n_variants):
     a different sparse-but-valid representation of the same scene's geometry.
 
     Returns:
-        List of (left_edges, front_edges) pairs, one per variant.
+        List of (left_mat, front_mat) pairs of numpy bool (n, n) arrays.
+        Stored as arrays (not edge-tuple lists) to avoid Python GC pressure at
+        training time from millions of small tuple objects.
     """
+    # Build adjacency matrices once — reused across all variants.
+    left_mat = _adj_lists_to_matrix(relationships["left"], n)
+    front_mat = _adj_lists_to_matrix(relationships["front"], n)
+
     variants = []
     for _ in range(n_variants):
         order = list(range(n))
         random.shuffle(order)
-        left_edges = transitive_reduce_direction(relationships["left"], n, order)
-        front_edges = transitive_reduce_direction(relationships["front"], n, order)
-        variants.append((left_edges, front_edges))
+        # transitive_reduce_direction already returns a copy, so each variant
+        # gets its own independent matrix.
+        reduced_left = _edges_to_matrix(transitive_reduce_direction(left_mat, order), n)
+        reduced_front = _edges_to_matrix(transitive_reduce_direction(front_mat, order), n)
+        variants.append((reduced_left, reduced_front))
     return variants
+
+
+def _edges_to_matrix(edges, n):
+    """Convert a list of (a, b) edge tuples back to a numpy bool (n, n) matrix."""
+    mat = np.zeros((n, n), dtype=np.bool_)
+    for a, b in edges:
+        mat[a, b] = True
+    return mat
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +136,7 @@ def sample_random_scene(num_objects=None, mode="absolute"):
         mode (str): "absolute", "relative", or "reduced".
     """
     if num_objects is None:
-        num_objects = random.randint(3, 10)
+        num_objects = random.randint(3, 10)  # TODO change low back to 3
 
     objects = []
     positions = []  # Store (x, y) for distance checks
@@ -199,31 +230,44 @@ def make_tensor_from_scene(scene_dict):
         n = len(objects)
 
         if "reduced_variants" in scene_dict:
-            left_edges, front_edges = random.choice(scene_dict["reduced_variants"])
+            left_mat_r, front_mat_r = random.choice(scene_dict["reduced_variants"])
         else:
             order = list(range(n))
             random.shuffle(order)
-            left_edges = transitive_reduce_direction(relationships["left"], n, order)
-            front_edges = transitive_reduce_direction(relationships["front"], n, order)
+            left_edges = transitive_reduce_direction(_adj_lists_to_matrix(relationships["left"], n), order)
+            front_edges = transitive_reduce_direction(_adj_lists_to_matrix(relationships["front"], n), order)
+            left_mat_r = _edges_to_matrix(left_edges, n)
+            front_mat_r = _edges_to_matrix(front_edges, n)
 
-        left_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
-        right_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
-        front_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
-        behind_g = torch.zeros(MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+        # All 4 grids stacked as (4, MAX_OBJECTS, MAX_OBJECTS) — row i gives row i
+        # of each grid, so per-object slice is rel_flat[i] = 40 dims flat.
+        rel_all = torch.zeros(4, MAX_OBJECTS, MAX_OBJECTS, dtype=torch.float32)
+        left_g, right_g, front_g, behind_g = rel_all[0], rel_all[1], rel_all[2], rel_all[3]
 
-        for a, b in left_edges:
-            if a < MAX_OBJECTS and b < MAX_OBJECTS:
-                if random.random() < 0.5:
-                    left_g[a, b] = 1.0  # "b is left of a"
-                else:
-                    right_g[b, a] = 1.0  # equivalent: "a is right of b"
+        # Vectorised coin flips: for each surviving edge, randomly assign it to
+        # the canonical or complementary slot.
+        left_coords = np.argwhere(left_mat_r)  # (E, 2)
+        if len(left_coords):
+            coins = np.random.random(len(left_coords)) < 0.5
+            for (a, b), heads in zip(left_coords, coins):
+                if a < MAX_OBJECTS and b < MAX_OBJECTS:
+                    if heads:
+                        left_g[a, b] = 1.0   # "b is left of a"
+                    else:
+                        right_g[b, a] = 1.0  # equivalent: "a is right of b"
 
-        for a, b in front_edges:
-            if a < MAX_OBJECTS and b < MAX_OBJECTS:
-                if random.random() < 0.5:
-                    front_g[a, b] = 1.0  # "b is in front of a"
-                else:
-                    behind_g[b, a] = 1.0  # equivalent: "a is behind b"
+        front_coords = np.argwhere(front_mat_r)
+        if len(front_coords):
+            coins = np.random.random(len(front_coords)) < 0.5
+            for (a, b), heads in zip(front_coords, coins):
+                if a < MAX_OBJECTS and b < MAX_OBJECTS:
+                    if heads:
+                        front_g[a, b] = 1.0   # "b is in front of a"
+                    else:
+                        behind_g[b, a] = 1.0  # equivalent: "a is behind b"
+
+        # Pre-flatten to (MAX_OBJECTS, 40): rel_flat[i] = object i's relation row
+        rel_flat = rel_all.permute(1, 0, 2).reshape(MAX_OBJECTS, 4 * MAX_OBJECTS)
 
     obj_vectors = []
 
@@ -266,8 +310,7 @@ def make_tensor_from_scene(scene_dict):
         elif mode == "reduced":
             # 4 × MAX_OBJECTS = 40 dims — same shape as "relative" for architecture
             # compatibility, but sparser and with randomised direction encoding.
-            rels = torch.cat([left_g[i], right_g[i], front_g[i], behind_g[i]])
-            full_vec = torch.cat([base, rels])
+            full_vec = torch.cat([base, rel_flat[i]])
 
         obj_vectors.append(full_vec)
 

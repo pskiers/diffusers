@@ -129,7 +129,7 @@ def main(args: DictConfig):
     batch_size = min(args.sample_batch_size, num_per_gpu)
     num_batches = math.ceil(num_per_gpu / batch_size)
 
-    output_dir = Path(args.output_dir) / "samples"
+    output_dir = Path(args.output_dir) / args.get("samples_dir", "samples")
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +158,7 @@ def main(args: DictConfig):
             device=accelerator.device,
             weight_dtype=weight_dtype,
             show_progress=True,  # Disable inner progress bar to prevent terminal spam
+            single_scene=False,
         )
 
         # Format and save to disk
