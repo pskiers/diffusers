@@ -101,17 +101,19 @@ class UnifiedConditionDiT(Transformer2DModel):
         cross_attention_dim=1024,
         activation_fn="gelu-approximate",
     ):
-        # Configure norm and cross-attention based on mode
-        is_adaln = condition_mode == "class_adaln"
+        # Configure norm and cross-attention based on mode.
+        # "spatial_concat" concatenates the condition map to the noisy input before
+        # patch-embedding, so it also needs no cross-attention.
+        is_adaln = condition_mode in ("class_adaln", "spatial_concat")
 
         # FIX: DiTs ALWAYS require ada_norm_zero to process the diffusion timestep.
         norm_type = "ada_norm_zero"
 
-        # If class_adaln, we need embeddings for all classes + 1 dropout token.
-        # Otherwise, we just need 1 dummy embedding to carry the timestep.
-        num_embeds_ada_norm = num_classes + 1 if is_adaln else 1
+        # class_adaln uses all classes + dropout token; everything else just needs
+        # a single dummy embedding to carry the timestep through adaLN.
+        num_embeds_ada_norm = num_classes + 1 if condition_mode == "class_adaln" else 1
 
-        # In adaLN mode, strip out cross-attention. Otherwise, use it.
+        # In adaLN / spatial_concat mode, strip out cross-attention. Otherwise, use it.
         actual_cross_attn_dim = None if is_adaln else cross_attention_dim
 
         # Call parent explicitly
@@ -140,6 +142,10 @@ class UnifiedConditionDiT(Transformer2DModel):
         elif self.config.condition_mode == "class_adaln":
             # Diffusers handles the adaLN embedding internally, so we don't need a projector
             self.condition_projector = None
+        elif self.config.condition_mode == "spatial_concat":
+            # Condition is a (C, H, W) spatial map concatenated to the noisy input
+            # before patch-embedding; no projector needed.
+            self.condition_projector = None
         else:
             raise ValueError(f"Unknown condition_mode: {self.config.condition_mode}")
 
@@ -160,6 +166,10 @@ class UnifiedConditionDiT(Transformer2DModel):
             elif self.config.condition_mode == "class_adaln":
                 # Override the dummy labels with the actual condition labels
                 class_labels = condition_tensors
+            elif self.config.condition_mode == "spatial_concat":
+                # Concatenate the spatial map to the noisy input before patch-embedding.
+                # condition_tensors: (B, C_mask, H, W); sample: (B, C_noise, H, W)
+                sample = torch.cat([sample, condition_tensors.to(sample.dtype)], dim=1)
         elif self.config.condition_mode == "class_adaln":
             # Unconditional inference fallback for class_adaln
             class_labels = torch.full(

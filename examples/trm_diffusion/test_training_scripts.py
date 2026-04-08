@@ -568,3 +568,11 @@ def test_cond_imagenet_ratatouille_dit_residual():
     run_script(
         "train.py", "test-imgnet-rat-dit-res", ["experiment=cond_imgnet_trm", "model=imagenet_ratatouille_dit_residual"]
     )
+
+
+# Ground-truth spatial mask conditioning experiment
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.mask
+def test_cond_clevr_mask_dit():
+    run_script("train.py", "test-clevr-mask-dit", ["experiment=clevr_mask_experiment"])

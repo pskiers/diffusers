@@ -20,6 +20,7 @@ def generate_image_batch(
     weight_dtype=torch.float32,
     show_progress=True,
     single_scene=True,
+    early_stopping_threshold=None,
 ):
     """The unified core engine for generating a batch of images from latents."""
     sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
@@ -50,6 +51,7 @@ def generate_image_batch(
 
     is_unified_class = cond_mode in ["class", "class_adaln"]
     is_unified_sequence = cond_mode == "sequence"
+    is_unified_spatial = cond_mode == "spatial_concat"
 
     target_str = str(getattr(condition_target_config, "_target_", ""))
     is_standard_conditional = ("UNet2DModel" in target_str or "UNet2DConditionModel" in target_str) and getattr(
@@ -78,11 +80,35 @@ def generate_image_batch(
             metadata.append(scene)
         conds = torch.cat(c_list, dim=0).to(device)
         masks = torch.cat(m_list, dim=0).to(device)
+
+    elif is_unified_spatial:
+        from clevr_dataset import sample_random_scene, make_mask_from_scene
+
+        mask_size = sample_size  # latent resolution (already computed above)
+        scene_ref = None
+        mask_list = []
+        for _ in range(bsz):
+            if single_scene:
+                if scene_ref is None:
+                    scene_ref = sample_random_scene(num_objects=None, mode="relative")
+                scene = scene_ref
+            else:
+                scene = sample_random_scene(num_objects=None, mode="relative")
+            mask_list.append(make_mask_from_scene(scene, mask_size))
+            metadata.append(scene)
+        conds = torch.stack(mask_list).to(device)  # (B, MASK_CHANNELS, H, W)
+
     else:
         # Unconditional fallback
         metadata = [{"class_label": "unconditional"} for _ in range(bsz)]
 
     # 3. The Denoising Loop
+    do_early_stop = (
+        early_stopping_threshold is not None
+        and early_stopping_threshold > 0.0
+        and hasattr(unet, "reasoning_step")
+    )
+
     for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
         latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
@@ -91,8 +117,53 @@ def generate_image_batch(
         class_input = torch.cat([conds, unconds]) if do_cfg else conds
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
 
+        cfg_applied = False
         with torch.no_grad():
-            if hasattr(unet, "reasoning_step"):
+            if do_early_stop:
+                # Per-sample early stopping over n_sup iterations.
+                # CFG is applied inside the loop so convergence is measured on
+                # the post-guidance prediction.
+                t_idx = t.long().cpu().item()
+                alpha_bar = scheduler.alphas_cumprod[t_idx].float().to(device)
+                scale = torch.sqrt((1.0 - alpha_bar) / alpha_bar.clamp(min=1e-8))
+
+                y, z = unet.get_initial_states(latent_model_input_cast.shape[0])
+                final_output = None
+                prev_output  = None
+                converged    = torch.zeros(bsz, dtype=torch.bool, device=device)
+
+                for _ in range(unet.n_sup):
+                    raw, y, z = unet.reasoning_step(
+                        latent_model_input_cast, y, z, t, class_input, mask_input
+                    )
+                    raw = raw.float()
+                    if do_cfg:
+                        cond_p, uncond_p = raw.chunk(2)
+                        merged = uncond_p + args.guidance_scale * (cond_p - uncond_p)
+                    else:
+                        merged = raw
+
+                    not_done = ~converged
+                    if final_output is None:
+                        final_output = merged.clone()
+                    else:
+                        final_output = torch.where(
+                            not_done.view(bsz, 1, 1, 1).expand_as(merged),
+                            merged, final_output,
+                        )
+
+                    if prev_output is not None:
+                        diff = (merged - prev_output).view(bsz, -1).norm(dim=-1)
+                        converged |= (scale * diff < early_stopping_threshold) & not_done
+                        if converged.all():
+                            break
+
+                    prev_output = merged.detach()
+
+                noise_pred = final_output
+                cfg_applied = True  # already merged above
+
+            elif hasattr(unet, "reasoning_step"):
                 noise_pred = unet(
                     latent_model_input_cast,
                     t,
@@ -102,7 +173,6 @@ def generate_image_batch(
                 ).sample
 
             elif args.use_small_loop:
-                # 2. Old procedural logic (Maintains 100% backward compatibility)
                 from trm_utils import deep_recursion
 
                 y = unet.y_init.expand(latent_model_input.shape[0], -1, -1, -1).to(device)
@@ -116,7 +186,7 @@ def generate_image_batch(
                 noise_pred = get_model_output(unet, latent_model_input_cast, t, class_input, mask_input)
 
         noise_pred = noise_pred.to(torch.float32)
-        if do_cfg:
+        if do_cfg and not cfg_applied:
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 

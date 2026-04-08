@@ -16,6 +16,8 @@ def create_dummy_checkpoint(experiment_name, out_dir, ckpt_dir, extra_args=[]):
       ckpt_dir/
         unet/
           diffusion_pytorch_model.safetensors
+        unet_ema/          <- copy so sample.py works with use_ema=true (the global default)
+          diffusion_pytorch_model.safetensors
     """
     GlobalHydra.instance().clear()
 
@@ -25,10 +27,11 @@ def create_dummy_checkpoint(experiment_name, out_dir, ckpt_dir, extra_args=[]):
         cfg = compose(config_name="config", overrides=overrides)
 
     unet = instantiate(cfg.model, _convert_="all")
-    unet_dir = os.path.join(ckpt_dir, "unet")
-
     unet_to_save = unet.core_model if hasattr(unet, "core_model") else unet
-    unet_to_save.save_pretrained(unet_dir)
+
+    unet_to_save.save_pretrained(os.path.join(ckpt_dir, "unet"))
+    # Also save to unet_ema so sample.py works with the global use_ema=true default.
+    unet_to_save.save_pretrained(os.path.join(ckpt_dir, "unet_ema"))
 
     return cfg.dataset.resolution
 
@@ -488,3 +491,10 @@ def test_sample_cond_clevr_vit_trm_v5():
         "clevr_relative_trm",
         ["model=clevr_vit_trm_v2", "model._target_=trm_models.DiTTRMv5"],
     )
+
+
+@pytest.mark.clevr
+@pytest.mark.vit
+@pytest.mark.mask
+def test_cond_clevr_mask_dit():
+    run_sample_test("clevr_mask_experiment")

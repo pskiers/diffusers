@@ -33,6 +33,104 @@ Y_RANGE = (-3.0, 3.0)
 MIN_DIST = 0.7  # Minimum distance between objects to avoid overlap
 ORIG_W, ORIG_H = 480, 320
 
+# Channels: [0:8] color, [8:11] shape, [11:13] material, [13:15] size, [15] presence
+MASK_CHANNELS = 16
+# Physical 3D radii used by CLEVR renderer (in scene units)
+_CLEVR_RADIUS = {"small": 0.35, "large": 0.70}
+
+
+def calibrate_mask_projection(scenes, num_scenes=150):
+    """
+    Fit a 2-D homography H that maps pixel coords (u, v) → 3-D ground-plane
+    coords (x, y) using a subset of real CLEVR scenes.  Returns H_inv, the
+    inverse mapping 3-D → pixel, as a (3, 3) float64 numpy array.
+
+    Used to derive perspective-correct Gaussian blob sizes: an object at a
+    position far from the camera will have a smaller projected radius than one
+    that is close.
+    """
+    import cv2
+
+    uv_pts, xy_pts = [], []
+    for scene in scenes[:num_scenes]:
+        for obj in scene["objects"]:
+            uv_pts.append(obj["pixel_coords"][:2])
+            xy_pts.append(obj["3d_coords"][:2])
+
+    H, _ = cv2.findHomography(
+        np.array(uv_pts, dtype=np.float32),
+        np.array(xy_pts, dtype=np.float32),
+    )
+    return np.linalg.inv(H).astype(np.float64)
+
+
+def _project_3d_to_pixel(x, y, H_inv):
+    """Apply the inverse homography H_inv to a single 3-D ground-plane point."""
+    pt = H_inv @ np.array([x, y, 1.0], dtype=np.float64)
+    return pt[:2] / pt[2]
+
+
+def make_mask_from_scene(scene_dict, mask_size=32, H_inv=None):
+    """
+    Convert a scene dict into a spatial conditioning mask tensor.
+
+    Returns a float32 tensor of shape (MASK_CHANNELS, mask_size, mask_size).
+    Each object is drawn as a soft 2-D Gaussian blob at its projected image
+    position.  The blob sigma is derived from the object's 3-D radius:
+
+    * If H_inv (3×3 inverse homography, 3-D→pixel) is supplied, the 3-D radius
+      is projected to pixel space for a perspective-correct size.
+    * Otherwise (synthetic scenes from sample_random_scene that use a simple
+      linear projection) the radius is scaled analytically.
+
+    Multiple overlapping objects take the per-channel maximum.
+
+    Channel layout
+    --------------
+    0–7  : one-hot color    (8 classes, COLORS order)
+    8–10 : one-hot shape    (3 classes, SHAPES order)
+    11–12: one-hot material (2 classes, MATERIALS order)
+    13–14: one-hot size     (2 classes, SIZES order)
+    15   : presence (1.0 inside every blob)
+    """
+    objects = scene_dict["objects"]
+    mask = torch.zeros(MASK_CHANNELS, mask_size, mask_size, dtype=torch.float32)
+
+    ys = torch.arange(mask_size, dtype=torch.float32)
+    xs = torch.arange(mask_size, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+    for obj in objects:
+        # Blob centre in mask coordinates
+        cx = obj["pixel_coords"][0] / ORIG_W * mask_size
+        cy = obj["pixel_coords"][1] / ORIG_H * mask_size
+
+        r_3d = _CLEVR_RADIUS[obj["size"]]
+
+        if H_inv is not None:
+            # Perspective-correct sigma: project the object edge in 3-D and
+            # measure the resulting pixel displacement.
+            x3, y3 = obj["3d_coords"][0], obj["3d_coords"][1]
+            uv_center = _project_3d_to_pixel(x3, y3, H_inv)
+            uv_edge   = _project_3d_to_pixel(x3 + r_3d, y3, H_inv)
+            r_pix = float(np.linalg.norm(uv_edge - uv_center))
+            # Scale from original pixel space to mask pixel space
+            sigma = max(r_pix / ORIG_W * mask_size, 0.5)
+        else:
+            # Synthetic scenes use a linear projection: pixel ∝ (coord+3)/6.
+            # The projected radius in mask pixels is therefore:
+            sigma = max(r_3d / 6.0 * mask_size, 0.5)
+
+        blob = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma ** 2))
+
+        mask[COLOR2ID[obj["color"]]] = mask[COLOR2ID[obj["color"]]].maximum(blob)
+        mask[8 + SHAPE2ID[obj["shape"]]] = mask[8 + SHAPE2ID[obj["shape"]]].maximum(blob)
+        mask[11 + MAT2ID[obj["material"]]] = mask[11 + MAT2ID[obj["material"]]].maximum(blob)
+        mask[13 + SIZE2ID[obj["size"]]] = mask[13 + SIZE2ID[obj["size"]]].maximum(blob)
+        mask[15] = mask[15].maximum(blob)
+
+    return mask
+
 
 def _adj_lists_to_matrix(adj_lists, n):
     """Convert a list-of-lists adjacency representation to a numpy bool matrix."""
@@ -335,17 +433,18 @@ class CLEVRHybridDataset(Dataset):
     def __init__(self, root_dir, split="train", mode="absolute", image_size=256, download=True, n_reduced_samples=16):
         """
         Args:
-            mode (str): "absolute" (uses coordinates), "relative" (full relationships),
-                        or "reduced" (transitively-reduced relationships with randomised
-                        processing order and complementary-direction encoding).
+            mode (str): "absolute", "relative", "reduced", or "mask".
+                "mask" returns a spatial (MASK_CHANNELS, H, W) conditioning tensor
+                instead of a per-object feature sequence.
             n_reduced_samples (int): Number of differently-ordered reductions to
-                        pre-compute per scene when mode="reduced". One is chosen
-                        randomly in each __getitem__ call, followed by an on-the-fly
-                        left↔right / front↔behind coin flip per edge.
+                pre-compute per scene when mode="reduced". One is chosen
+                randomly in each __getitem__ call, followed by an on-the-fly
+                left↔right / front↔behind coin flip per edge.
         """
         self.root_dir = root_dir
         self.mode = mode
         self.image_size = image_size
+        self.mask_size = image_size // 8  # matches VAE 8× downsampling
         self.dataset_path = os.path.join(root_dir, "CLEVR_v1.0")
 
         if download and not os.path.exists(self.dataset_path):
@@ -358,6 +457,14 @@ class CLEVRHybridDataset(Dataset):
         print(f"Loading {mode} scenes from {scene_path}...")
         with open(scene_path, "r") as f:
             self.scenes = json.load(f)["scenes"]
+
+        # Pre-compute perspective calibration matrix for mask mode.
+        # H_inv maps 3-D ground-plane coords → pixel coords so we can derive
+        # perspective-correct Gaussian blob radii for each object.
+        self.H_inv = None
+        if mode == "mask":
+            print("Calibrating perspective projection for mask generation...")
+            self.H_inv = calibrate_mask_projection(self.scenes)
 
         # Pre-compute reduction variants once so __getitem__ stays cheap:
         # each call only does a random.choice + a small number of grid writes.
@@ -394,6 +501,10 @@ class CLEVRHybridDataset(Dataset):
     def __getitem__(self, idx):
         scene = self.scenes[idx]
         image = Image.open(os.path.join(self.image_dir, scene["image_filename"])).convert("RGB")
+
+        if self.mode == "mask":
+            spatial_mask = make_mask_from_scene(scene, self.mask_size, self.H_inv)
+            return {"images": self.transform(image), "conditions": spatial_mask}
 
         # Temporarily inject the mode so our shared function knows how to process it
         scene["mode"] = self.mode

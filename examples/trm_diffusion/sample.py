@@ -157,8 +157,9 @@ def main(args: DictConfig):
             generator=generator,
             device=accelerator.device,
             weight_dtype=weight_dtype,
-            show_progress=True,  # Disable inner progress bar to prevent terminal spam
             single_scene=False,
+            show_progress=True,
+            early_stopping_threshold=args.get("early_stopping_threshold", None),
         )
 
         # Format and save to disk
