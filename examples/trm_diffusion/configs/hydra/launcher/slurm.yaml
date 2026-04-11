@@ -1,0 +1,15 @@
+# @package hydra.launcher
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+partition: plgrid-gpu-a100
+account: plgdyplomancipw2-gpu-a100
+nodes: 1
+tasks_per_node: 1
+timeout_min: 2880 # 48h
+gpus_per_node: 1
+cpus_per_task: 8
+mem_gb: 32
+setup:
+  - module load Miniconda3/23.3.1-0
+  - eval "$(conda shell.bash hook)"
+  - conda activate /net/tscratch/people/plgmgrzanka/reasoning_diffusion_env

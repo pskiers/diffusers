@@ -1,11 +1,14 @@
 import math
 import torch
 import wandb
+import numpy as np
+import logging
 from tqdm.auto import tqdm
 from torchvision.utils import make_grid
 from diffusers.utils import is_accelerate_version
 from diffusers import DDPMPipeline
 from trm_utils import get_model_output
+from sokoban.sokoban_utils import SokobanSampler
 
 
 def generate_image_batch(
@@ -21,6 +24,8 @@ def generate_image_batch(
     show_progress=True,
     single_scene=True,
     early_stopping_threshold=None,
+    cond_images=None,
+    class_labels=None
 ):
     """The unified core engine for generating a batch of images from latents."""
     sample_size = args.dataset.resolution if vae is None else args.dataset.resolution // 8
@@ -60,7 +65,13 @@ def generate_image_batch(
 
     do_cfg = args.guidance_scale > 1.0 and (is_unified_class or is_standard_conditional)
 
-    if is_unified_class or is_standard_conditional:
+    if class_labels is not None:
+        conds = class_labels
+        metadata = [{"class_label": int(c.item())} for c in conds]
+        if do_cfg and hasattr(args.dataset, "num_classes"):
+            unconds = torch.full_like(conds, args.dataset.num_classes)
+
+    elif is_unified_class or is_standard_conditional:
         conds = torch.randint(0, args.dataset.num_classes, [bsz], generator=generator, device=device)
         metadata = [{"class_label": int(c.item())} for c in conds]
         if do_cfg:
@@ -101,6 +112,7 @@ def generate_image_batch(
     else:
         # Unconditional fallback
         metadata = [{"class_label": "unconditional"} for _ in range(bsz)]
+        do_cfg = False
 
     # 3. The Denoising Loop
     do_early_stop = (
@@ -110,11 +122,16 @@ def generate_image_batch(
     )
 
     for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
-        latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
+        if cond_images is not None:
+            current_latents = torch.cat([latents, cond_images], dim=1) # latents: [B, C_noise, H, W], cond_images: [B, C_cond, H, W]
+        else:
+            current_latents = latents
+
+        latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
         latent_model_input_cast = latent_model_input.to(weight_dtype)
 
-        class_input = torch.cat([conds, unconds]) if do_cfg else conds
+        class_input = torch.cat([conds, unconds]) if do_cfg and conds is not None else conds
         mask_input = torch.cat([masks, masks]) if (do_cfg and masks is not None) else masks
 
         cfg_applied = False
@@ -235,6 +252,18 @@ def evaluate_and_save(
     noise_scheduler.set_timesteps(args.ddpm_num_inference_steps)
     generator = torch.Generator(device=unet.device).manual_seed(0)
 
+    is_sokoban = getattr(args.dataset, 'dataset_type', None) == 'sokoban'
+    sokoban_sampler = None
+    if is_sokoban:
+        sokoban_sampler = SokobanSampler(args)
+
+    current_bsz = args.eval_batch_size
+    cond_images_prompt, class_labels = None, None
+    if sokoban_sampler:
+        cond_images_prompt, class_labels, current_bsz = sokoban_sampler.prepare_for_conditioning(
+            accelerator, weight_dtype, current_bsz
+        )
+
     # --- Use the Shared Engine ---
     images, _ = generate_image_batch(
         unet=unet,
@@ -242,14 +271,32 @@ def evaluate_and_save(
         vae=vae,
         vae_scaling_factor=vae_scaling_factor,
         args=args,
-        bsz=args.eval_batch_size,
+        bsz=current_bsz,
         generator=generator,
         device=unet.device,
         weight_dtype=weight_dtype,
         show_progress=accelerator.is_local_main_process,
+        cond_images=cond_images_prompt,
+        class_labels=class_labels
     )
 
     images = images.cpu().float()
+
+    if sokoban_sampler:
+        # Formatuje do (H, W, C) i przetwarza ewaluację
+        images_np = images.permute(0, 2, 3, 1).numpy()
+        images_np = (images_np * 255).round().astype(np.uint8)
+        sokoban_sampler.register_generated(images_np)
+
+        eval_logger = logging.getLogger(__name__)
+        sokoban_sampler.sampling_evaluation(
+            logger=eval_logger,
+            accelerator=accelerator,
+            global_step=global_step,
+            log_with=args.logger
+        )
+
+        images = sokoban_sampler.render_boards()
 
     # Log Images
     images_processed = (images * 255).round().numpy().astype("uint8")
@@ -261,8 +308,8 @@ def evaluate_and_save(
         )
         tracker.add_images("test_samples", images_processed, epoch)
     elif args.logger == "wandb":
-        n_cols = math.ceil(math.sqrt(args.eval_batch_size) * 1.5)
-        image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=True)
+        n_cols = math.ceil(math.sqrt(current_bsz) * 1.5)
+        image_grid = make_grid(images, nrow=n_cols, padding=2, normalize=(is_sokoban))  # no normalization for sokoban, render already does that
         accelerator.get_tracker("wandb").log(
             {"test_samples": wandb.Image(image_grid), "epoch": epoch}, step=global_step
         )

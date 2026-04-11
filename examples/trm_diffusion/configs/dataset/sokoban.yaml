@@ -1,0 +1,12 @@
+dataset_type: "sokoban"
+train_data_dir: "/net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4"
+eval_data_dir: "/net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4-test"
+resolution: 12
+num_boxes: 4
+input_channels: 3
+n_images_to_eval: 4 # for sampling
+n_images_per_conditioning: 2 # for sampling and training
+max_trajectories: null
+vae_name: null
+center_crop: false
+random_flip: false

@@ -1,0 +1,20 @@
+_target_: trm_models.DiTTRMv2
+resolution: 12
+n: 2
+T: 3
+n_sup: 4
+core_model:
+  _target_: models.UnifiedConditionDiT
+  sample_size: 12
+  out_channels: 3
+  in_channels: ${in_channels}
+  # without condition mode
+
+  num_layers: 3
+  patch_size: 1
+  attention_head_dim: 64
+  num_attention_heads: 3
+  cross_attention_dim: 192 # 3 * 64 = 192
+  activation_fn: "gelu-approximate"
+
+  dropout: 0.1

@@ -1,3 +1,4 @@
+from sokoban.sokoban_dataset import SokobanBitDataset, SokobanDataset
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -92,6 +93,20 @@ def get_dataloaders(args):
         train_ds.set_transform(train_augmentations)
         eval_ds.set_transform(eval_augmentations)
 
+    elif args.dataset.dataset_type == "sokoban":
+        train_base_ds = SokobanDataset(
+            data_path=args.dataset.train_data_dir,
+            k=args.dataset.k,
+            max_trajectories=args.dataset.max_trajectories
+        )
+        eval_base_ds = SokobanDataset(data_path=args.dataset.eval_data_dir, k=args.dataset.k)
+
+        num_bits = args.dataset.input_channels
+        clip_range = getattr(args, "clip_sample_range", 1.0)
+
+        train_ds = SokobanBitDataset(train_base_ds, num_bits=num_bits, clip_sample_range=clip_range)
+        eval_ds = SokobanBitDataset(eval_base_ds, num_bits=num_bits, clip_sample_range=clip_range)
+
     else:
         raise ValueError(f"Unknown dataset_type: {args.dataset.dataset_type}")
 
@@ -111,6 +126,14 @@ def get_dataloaders(args):
             batch["masks"] = torch.stack([ex["masks"] for ex in examples])
         else:
             batch["masks"] = None
+
+        if "class_labels" in examples[0]:
+            if isinstance(examples[0]["class_labels"], torch.Tensor):
+                batch["class_labels"] = torch.stack([ex["class_labels"] for ex in examples])
+            else:
+                batch["class_labels"] = torch.tensor([ex["class_labels"] for ex in examples], dtype=torch.long)
+        else:
+            batch["class_labels"] = None
 
         return batch
 

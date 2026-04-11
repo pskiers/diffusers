@@ -2,7 +2,7 @@ import sys
 from xml.parsers.expat import model
 import hydra
 from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 import os
 import math
 import shutil
@@ -104,6 +104,13 @@ def main(args: DictConfig):
         datasets.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
+    import debugpy
+    #debugpy.listen(("0.0.0.0", 5679))
+    logger.info("⏳ Oczekiwanie na podłączenie debuggera z VS Code (port 5679)...")
+
+    #debugpy.wait_for_client()
+    logger.info("✅ Debugger podłączony, ruszamy dalej!")
+
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -126,6 +133,7 @@ def main(args: DictConfig):
         vae_scaling_factor = vae.config.scaling_factor
 
     train_dl, eval_dl = get_dataloaders(args)
+
     model = instantiate(args.model, _convert_="all")
 
     # Enable xformers
@@ -257,6 +265,7 @@ def main(args: DictConfig):
         beta_schedule=args.ddpm_beta_schedule,
         prediction_type=args.prediction_type,
     )
+    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
     mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
@@ -346,14 +355,28 @@ def main(args: DictConfig):
                     progress_bar.update(1)
                 continue
 
+            batch = {k: v.to(accelerator.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
             clean_images = batch["images"]
             cond = batch["conditions"].to(model.device) if batch["conditions"] is not None else None
             mask = batch["masks"].to(model.device) if batch["masks"] is not None else None
+            class_labels = batch["class_labels"].to(model.device) if batch["class_labels"] is not None else None
+
+            is_concat = getattr(args.dataset, 'concat_conditioning', False)
 
             # CFG Label Dropout
-            if cond is not None and args.cfg_drop_rate > 0:
-                drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
-                cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
+            if args.cfg_drop_rate > 0:
+                if is_concat:   # sokoban: 'cond' has cond img, 'class_labels' has label
+                    drop_mask = torch.rand(clean_images.shape[0], device=clean_images.device) < args.cfg_drop_rate
+                    if class_labels is not None:
+                        class_labels = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=class_labels.device), class_labels)
+                        class_labels = class_labels.long()
+                    if cond is not None:
+                        cond = torch.where(drop_mask.view(-1, 1, 1, 1), torch.zeros_like(cond), cond)
+                else:   # STANDARD (CIFAR/CLEVR): 'cond' has labels
+                    if cond is not None:
+                        drop_mask = torch.rand(cond.shape, device=cond.device) < args.cfg_drop_rate
+                        cond = torch.where(drop_mask, torch.tensor(args.dataset.num_classes, device=cond.device), cond)
 
             # VAE Encoding & Noise Addition
             if vae is not None:
@@ -369,6 +392,13 @@ def main(args: DictConfig):
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
 
+            if is_concat and cond is not None:  # sokoban with conditioning image
+                latent_model_input = torch.cat([noisy_images, cond], dim=1)
+                model_cond = class_labels
+            else:   # standard, cond is labels
+                latent_model_input = noisy_images
+                model_cond = cond
+
             # --- FORWARD & BACKWARD PASS ROUTING ---
             with accelerator.accumulate(model):
                 base_model = accelerator.unwrap_model(model)
@@ -382,7 +412,7 @@ def main(args: DictConfig):
 
                     for n_step in range(get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)):
                         # with accelerator.autocast():
-                        model_output, y, z = base_model.reasoning_step(noisy_images, y, z, timesteps, cond, mask)
+                        model_output, y, z = base_model.reasoning_step(latent_model_input, y, z, timesteps, model_cond, mask)
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
                         loss = loss if not args.trm_loss_nsup_decay else loss * (args.trm_loss_nsup_decay**n_step)
 
@@ -423,7 +453,7 @@ def main(args: DictConfig):
 
                     for _ in range(args.N_supervision):
                         model_output, y, z = deep_recursion(
-                            base_model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                            base_model, latent_model_input, y, z, timesteps, model_cond, mask, args.n, args.T
                         )
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
@@ -436,7 +466,7 @@ def main(args: DictConfig):
 
                 # ROUTE 3: Standard Non-Recursive Models
                 else:
-                    model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
+                    model_output = get_model_output(model, latent_model_input, timesteps, model_cond, mask)
                     loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 
                     accelerator.backward(loss)
@@ -498,6 +528,9 @@ def main(args: DictConfig):
             clean_images = batch["images"].to(device=accelerator.device, dtype=weight_dtype)
             cond = batch["conditions"].to(model.device) if batch["conditions"] is not None else None
             mask = batch["masks"].to(model.device) if batch["masks"] is not None else None
+            class_labels = batch["class_labels"].to(model.device) if batch["class_labels"] is not None else None
+
+            is_concat = getattr(args.dataset, 'concat_conditioning', False)
 
             if vae is not None:
                 clean_images = clean_images.to(dtype=vae.dtype)
@@ -512,25 +545,32 @@ def main(args: DictConfig):
             ).long()
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps).to(weight_dtype)
 
+            if is_concat and cond is not None:
+                latent_model_input = torch.cat([noisy_images, cond], dim=1)
+                model_cond = class_labels
+            else:
+                latent_model_input = noisy_images
+                model_cond = cond
+
             # --- VALIDATION PASS ROUTING ---
             with torch.no_grad():
                 base_model = accelerator.unwrap_model(model)
 
                 # ROUTE 1: New Object-Oriented TRM Models
                 if hasattr(base_model, "reasoning_step"):
-                    model_output = model(noisy_images, timesteps, class_labels=cond, attention_mask=mask).sample
+                    model_output = model(latent_model_input, timesteps, class_labels=model_cond, attention_mask=mask).sample
 
                 # ROUTE 2: Old Procedural TRM Logic
                 elif args.use_small_loop:
                     y = torch.cat([base_model.y_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
                     z = torch.cat([base_model.z_init for _ in range(clean_images.shape[0])], dim=0).to(model.device)
                     model_output, _, _ = deep_recursion(
-                        base_model, noisy_images, y, z, timesteps, cond, mask, args.n, args.T
+                        base_model, latent_model_input, y, z, timesteps, model_cond, mask, args.n, args.T
                     )
 
                 # ROUTE 3: Standard Non-Recursive Models
                 else:
-                    model_output = get_model_output(model, noisy_images, timesteps, cond, mask)
+                    model_output = get_model_output(model, latent_model_input, timesteps, model_cond, mask)
 
                 val_loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
 

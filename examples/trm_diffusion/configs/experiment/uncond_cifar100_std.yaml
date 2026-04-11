@@ -7,4 +7,5 @@ dataset:
   num_classes: null
 
 output_dir: "cifar100-standard-long"
-train_batch_size: 256
+train_batch_size: 20
+num_epochs: 1

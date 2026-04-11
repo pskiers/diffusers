@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - override /hydra/launcher: basic
+  - override /optimizer: adamw
+  - override /dataset: sokoban
+  - override /task: sokoban_uncond
+  - override /model: sokoban_unet_trm
+
+phases: [90000, 180000, 300001] # 0.3*300000, 0.6*300000
+n_sup_phases: [1, 2, 3]
+
+num_epochs: 300
+save_model_epochs: 75
+save_images_epochs: 75
+train_batch_size: 64
+eval_batch_size: 64 # for validation in training
+num_samples: 1000
+rescale_betas_zero_snr: true
+clip_sample_range: 1.0
+resume_from_checkpoint: latest
+
+ddpm_num_inference_steps: 400
+output_dir: /net/tscratch/people/plgmgrzanka/${hydra:runtime.choices.model}-${hydra:runtime.choices.task}

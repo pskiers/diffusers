@@ -4,6 +4,7 @@ defaults:
   - dataset: cifar100
   - model: unet2d
   - _self_
+  - task: null
   - experiment: null
 
 # 1. Core Paths & Logging

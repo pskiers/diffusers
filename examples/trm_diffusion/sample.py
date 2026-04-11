@@ -18,6 +18,8 @@ from safetensors.torch import load_file
 
 from eval_utils import generate_image_batch
 from model_utils import load_with_backward_compatibility
+from sokoban.sokoban_utils import SokobanSampler
+
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -125,15 +127,25 @@ def main(args: DictConfig):
     # 3. Distributed Math & Setup
     world_size = accelerator.num_processes
     process_index = accelerator.process_index
-    num_per_gpu = args.num_samples // world_size
-    batch_size = min(args.sample_batch_size, num_per_gpu)
-    num_batches = math.ceil(num_per_gpu / batch_size)
 
     output_dir = Path(args.output_dir) / args.get("samples_dir", "samples")
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     generator = torch.Generator(device=accelerator.device).manual_seed(process_index)
+
+    sokoban_sampler = SokobanSampler(args) if getattr(args.dataset, 'dataset_type', None) == 'sokoban' else None
+
+    if sokoban_sampler and sokoban_sampler.prompt_iterator is not None: # for conditioning images, batch size must be adjusted
+        total_samples = sokoban_sampler.n_images_to_eval * sokoban_sampler.n_images_per_cond
+        num_per_gpu = total_samples // world_size
+        batch_size = min(args.sample_batch_size, num_per_gpu)
+        batch_size = max(sokoban_sampler.n_images_per_cond, (batch_size // sokoban_sampler.n_images_per_cond) * sokoban_sampler.n_images_per_cond)
+    else:
+        num_per_gpu = args.num_samples // world_size
+        batch_size = min(args.sample_batch_size, num_per_gpu)
+
+    num_batches = math.ceil(num_per_gpu / batch_size)
 
     # 4. The Generation Loop
     logger.info(f"Generating {num_per_gpu} samples on process {process_index}...")
@@ -145,6 +157,10 @@ def main(args: DictConfig):
 
     for b_idx in tqdm(range(num_batches), disable=not accelerator.is_local_main_process):
         current_bsz = min(batch_size, num_per_gpu - (b_idx * batch_size))
+
+        cond_images_prompt, class_labels_prompt = None, None
+        if sokoban_sampler:
+            cond_images_prompt, class_labels_prompt, current_bsz = sokoban_sampler.prepare_for_conditioning(accelerator, weight_dtype, current_bsz)
 
         # --- Call the Shared Engine ---
         images, metadata = generate_image_batch(
@@ -160,23 +176,28 @@ def main(args: DictConfig):
             single_scene=False,
             show_progress=True,
             early_stopping_threshold=args.get("early_stopping_threshold", None),
+            cond_images=cond_images_prompt,
+            class_labels=class_labels_prompt
         )
 
         # Format and save to disk
-        images = images.cpu().permute(0, 2, 3, 1).numpy()
-        images = (images * 255).round().astype(np.uint8)
+        images_np = images.cpu().permute(0, 2, 3, 1).numpy()
+        images_np = (images_np * 255).round().astype(np.uint8)
+
+        if sokoban_sampler:
+            sokoban_sampler.register_generated(images_np)
+            images_np = np.array([sokoban_sampler._render(board) for board in sokoban_sampler.all_gen_boards_list[-1]], dtype=np.uint8)
 
         with open(metadata_path, "a") as f:
-            for i, (img, meta) in enumerate(zip(images, metadata)):
+            for i, (img, meta) in enumerate(zip(images_np, metadata)):
                 global_idx = (process_index * num_per_gpu) + (b_idx * batch_size) + i
                 filename = f"sample_{global_idx:06d}.png"
-
-                img_path = output_dir / filename
-                Image.fromarray(img).save(img_path)
-
+                Image.fromarray(img).save(output_dir / filename)
                 meta["file_name"] = filename
                 f.write(json.dumps(meta) + "\n")
 
+    if sokoban_sampler:
+        sokoban_sampler.sampling_evaluation(logger, process_index, output_dir)
 
 if __name__ == "__main__":
     import sys

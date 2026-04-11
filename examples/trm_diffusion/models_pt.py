@@ -96,6 +96,7 @@ class UnifiedConditionDiT(Transformer2DModel):
         num_classes=1000,
         raw_dim=21,
         # --- Standard Transformer2DModel args ---
+        dropout=0.0,
         sample_size=32,
         in_channels=4,
         out_channels=4,
@@ -134,6 +135,7 @@ class UnifiedConditionDiT(Transformer2DModel):
             activation_fn=activation_fn,
             num_embeds_ada_norm=num_embeds_ada_norm,
             norm_type=norm_type,
+            dropout=dropout
         )
 
         if self.config.condition_mode == "class":

@@ -1,0 +1,4 @@
+multirun/
+outputs/
+wandb/
+__pycache__/
