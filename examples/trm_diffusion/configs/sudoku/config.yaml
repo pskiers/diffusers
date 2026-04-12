@@ -6,6 +6,7 @@ data_dir: "data/sudoku-extreme-1k"
 output_dir: "runs/sudoku_trm"
 num_workers: 4
 mixed_precision: "no"   # "fp16" or "bf16" if your GPU supports it
+resume_from_checkpoint: null   # path to a checkpoint_*.pt file to resume from
 
 model:
   vocab_size: 11    # 0=PAD, 1=blank, 2-10=digits 1-9
@@ -17,6 +18,7 @@ model:
   H_cycles: 3       # macroscopic cycles             (≡ T in diffusion TRM)
   n_sup: 4          # supervision loop depth         (≡ n_sup in diffusion TRM)
   dropout: 0.0
+  num_puzzle_ids: null  # set to a positive int to enable puzzle-identifier embeddings
 
 train:
   lr: 1e-4

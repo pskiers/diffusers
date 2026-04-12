@@ -1,0 +1,13 @@
+# @package _global_
+output_dir: "runs/mnist_sudoku_v0"
+
+model:
+  variant: "v0"
+  kwargs:
+    thinker_hidden: 64
+    thinker_layers: 4
+    bridge_channels: 8
+    painter_channels: [32, 64, 128, 256]
+
+train:
+  sudoku_loss_weight: 0.1

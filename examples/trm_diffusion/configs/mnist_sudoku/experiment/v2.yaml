@@ -1,0 +1,11 @@
+# @package _global_
+output_dir: "runs/mnist_sudoku_v2"
+
+model:
+  variant: "v2"
+  kwargs:
+    enc_out_channels: 16
+    bridge_channels: 8
+    thinker_hidden: 64
+    thinker_layers: 4
+    painter_channels: [32, 64, 128, 256]

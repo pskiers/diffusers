@@ -42,5 +42,6 @@ markers = [
     "imagenet: marks tests that use the ImageNet dataset",
     "clevr: marks tests that use the CLEVR dataset",
     "standard: marks tests that use standard diffusion",
-    "ratatouille: marks test that use the thinker-painter architecture"
+    "ratatouille: marks test that use the thinker-painter architecture",
+    "mask: marks tests that use spatial mask conditioning",
 ]

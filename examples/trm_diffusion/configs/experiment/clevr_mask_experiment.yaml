@@ -1,0 +1,24 @@
+# @package _global_
+# Experiment: ground-truth spatial mask conditioning for CLEVR.
+#
+# The model receives a (16-channel) spatial Gaussian-blob mask encoding
+# object positions, colors, shapes, materials and sizes — bypassing the TRM
+# thinker entirely.  This lets us test whether the painter (DiT) can follow
+# a perfect spatial conditioning signal.
+defaults:
+  - override /dataset: clevr
+  - override /model: clevr_mask_dit
+
+dataset:
+  dataset_mode: "mask"
+
+output_dir: "clevr_mask_dit"
+train_batch_size: 32
+eval_batch_size: 16
+num_epochs: 1000
+save_model_epochs: 5
+save_images_epochs: 5
+
+# No CFG for spatial mask conditioning
+cfg_drop_rate: 0
+guidance_scale: 0

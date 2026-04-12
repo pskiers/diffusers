@@ -55,6 +55,7 @@ grad_every_n_sup: true
 trm_loss_nsup_decay: 0
 phases: []
 n_sup_phases: []
+early_stopping_threshold: null
 
 # 8. Sampling Settings
 checkpoint_step: "latest"

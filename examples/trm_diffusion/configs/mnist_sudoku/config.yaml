@@ -1,0 +1,48 @@
+# Base config for MNIST Sudoku Ratatouille training.
+# Select a model variant with: experiment=v0  (or v1, v2, v3, v4)
+
+defaults:
+  - _self_
+  - experiment: null   # override with: experiment=v0
+
+data:
+  sudoku_dir: "data/sudoku-extreme-1k"
+  mnist_root: "data/mnist"
+  cell_size: 32          # pixel side of each digit cell; grid = 9*cell_size = 288
+
+output_dir: "runs/mnist_sudoku"
+num_workers: 4
+resume_from_checkpoint: null   # path to a checkpoint_*.pt file to resume from
+
+# Sampling settings (used by sample_mnist_sudoku.py)
+checkpoint_path: null
+num_samples: 16
+sample_batch_size: 8
+ddpm_num_inference_steps: 100
+use_ddim: false
+condition_source: "blank"
+mixed_precision: "no"
+
+num_timesteps: 1000
+beta_schedule: "squaredcos_cap_v2"
+
+# Classifier-based digit evaluation during training.
+# Set eval_classifier_path to enable; classifier is trained automatically if absent.
+eval_classifier_path: null    # path to save/load the MNIST cell classifier
+eval_num_ddim_steps: 20       # DDIM steps used for eval sampling
+eval_num_samples: 16          # how many samples to generate for digit eval
+
+model:
+  variant: "v0"    # one of v0..v4
+  kwargs: {}       # model-specific overrides (see experiment configs)
+
+train:
+  lr: 1e-4
+  weight_decay: 0.01
+  batch_size: 32
+  num_steps: 100000
+  warmup_steps: 1000
+  eval_every: 2000
+  save_every: 10000
+  log_every: 100
+  sudoku_loss_weight: 0.0   # weight for sudoku CE loss (V0/V1 only)
