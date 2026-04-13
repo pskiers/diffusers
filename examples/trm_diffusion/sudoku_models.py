@@ -238,6 +238,10 @@ class SudokuTRM(nn.Module):
         """
         Full inference pass.
 
+        Runs n_sup × H_cycles × L_cycles iterations explicitly — no training-
+        specific gradient split.  input_emb is recomputed each n_sup step,
+        matching the training loop.
+
         Args:
             inputs:     (B, 81) long token IDs
             n_sup:      Override number of supervision steps (defaults to self.n_sup)
@@ -246,13 +250,17 @@ class SudokuTRM(nn.Module):
         Returns:
             logits: (B, 81, vocab_size)
         """
-        n_sup     = n_sup if n_sup is not None else self.n_sup
-        input_emb = self.embed(inputs, puzzle_ids=puzzle_ids)
-        z_H, z_L  = self.get_initial_states(inputs.shape[0])
-        z_H       = z_H.to(inputs.device)
-        z_L       = z_L.to(inputs.device)
+        n_sup    = n_sup if n_sup is not None else self.n_sup
+        z_H, z_L = self.get_initial_states(inputs.shape[0])
+        z_H      = z_H.to(inputs.device)
+        z_L      = z_L.to(inputs.device)
 
-        logits = None
         for _ in range(n_sup):
-            logits, z_H, z_L = self.reasoning_step(input_emb, z_H, z_L)
-        return logits
+            # Recompute input_emb each step, consistent with the training loop.
+            input_emb = self.embed(inputs, puzzle_ids=puzzle_ids)
+            for _ in range(self.H_cycles):
+                for _ in range(self.L_cycles):
+                    z_L = self.norm_z_L(self._run_blocks(input_emb + z_H + z_L))
+                z_H = self.norm_z_H(self._run_blocks(z_H + z_L))
+
+        return self.lm_head(self.out_norm(z_H))
