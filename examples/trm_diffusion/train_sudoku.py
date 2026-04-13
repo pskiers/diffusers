@@ -101,13 +101,15 @@ def train_step(
         puzzle_ids = puzzle_ids.to(accelerator.device)
 
     bsz = inputs.shape[0]
-    input_emb = model.embed(inputs, puzzle_ids=puzzle_ids)
     z_H, z_L  = model.get_initial_states(bsz)
     z_H = z_H.to(accelerator.device)
     z_L = z_L.to(accelerator.device)
 
     total_loss_val = 0.0
     for _ in range(model.n_sup):
+        # Recompute input_emb each step so each backward() gets a fresh graph.
+        # The reference does the same: full forward() is called once per step.
+        input_emb = model.embed(inputs, puzzle_ids=puzzle_ids)
         logits, z_H, z_L = model.reasoning_step(input_emb, z_H, z_L)
         step_loss = F.cross_entropy(
             logits.view(-1, model.vocab_size),
