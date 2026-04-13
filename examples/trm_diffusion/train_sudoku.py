@@ -134,7 +134,10 @@ def eval_loop(model: SudokuTRM, dataloader: DataLoader, accelerator: Accelerator
     model.eval()
     all_metrics = {"loss": [], "cell_acc": [], "puzzle_acc": []}
 
-    for batch in tqdm(dataloader, "Evaluating"):
+    max_eval_batches = 10
+    for i, batch in tqdm(enumerate(dataloader), "Evaluating", total=max_eval_batches):
+        if i >= max_eval_batches:
+            break
         inputs  = batch["inputs"].to(accelerator.device)
         labels  = batch["labels"].to(accelerator.device)
         puzzle_ids = batch.get("puzzle_id")
