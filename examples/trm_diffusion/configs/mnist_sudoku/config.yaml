@@ -6,7 +6,7 @@ defaults:
   - experiment: null   # override with: experiment=v0
 
 data:
-  sudoku_dir: "data/sudoku-extreme-1k"
+  sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
   mnist_root: "data/mnist"
   cell_size: 32          # pixel side of each digit cell; grid = 9*cell_size = 288
 
@@ -24,7 +24,7 @@ sample_batch_size: 8
 ddpm_num_inference_steps: 100
 use_ddim: false
 condition_source: "blank"
-mixed_precision: "no"
+mixed_precision: "bf16"
 
 num_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2"
@@ -41,7 +41,7 @@ model:
 
 train:
   lr: 1e-4
-  weight_decay: 0.01
+  weight_decay: 0.1
   batch_size: 32
   num_steps: 100000
   warmup_steps: 1000

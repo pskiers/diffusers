@@ -1,5 +1,5 @@
 """
-train_mnist_sudoku.py – Train a Ratatouille MNIST-Sudoku model.
+train_mnist_sudoku.py – Train a TRM-DiT Ratatouille MNIST-Sudoku model.
 
 Usage:
     python train_mnist_sudoku.py experiment=v0
@@ -7,6 +7,11 @@ Usage:
     accelerate launch --num_processes=2 train_mnist_sudoku.py experiment=v2
 
 The experiment config selects the model variant and any overrides.
+
+Training loop (TRM-aware):
+  Each batch runs model.n_sup backward passes — one per supervision step,
+  matching the SudokuTRM training convention (1 backprop = 1 step).
+  LR is updated before every backprop so each sub-step gets its correct LR.
 """
 
 import inspect
@@ -59,26 +64,19 @@ def get_lr(step: int, warmup: int, total: int, base_lr: float, min_ratio: float 
     return base_lr * (min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
-# ── Noise scheduler helper ─────────────────────────────────────────────────────
+# ── Forward pass (eval only) ──────────────────────────────────────────────────
 
-def add_noise(
-    scheduler: DDPMScheduler,
-    images: torch.Tensor,
-    noise: torch.Tensor,
-    timesteps: torch.Tensor,
-) -> torch.Tensor:
-    return scheduler.add_noise(images, noise, timesteps)
-
-
-# ── Training step ──────────────────────────────────────────────────────────────
-
-def train_step(
+def compute_losses(
     model,
     batch: dict,
     scheduler: DDPMScheduler,
     accelerator: Accelerator,
     sudoku_loss_weight: float = 0.0,
 ) -> dict:
+    """
+    Single forward pass using model.forward() (full inference).
+    Used for eval — no backward.
+    """
     images     = batch["images"].to(accelerator.device)      # (B,1,H,W)
     conditions = batch["conditions"].to(accelerator.device)  # (B,1,H,W)
     solution   = batch["solution"].to(accelerator.device)    # (B,81) long
@@ -87,20 +85,15 @@ def train_step(
     noise     = torch.randn_like(images)
     timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,),
                               device=accelerator.device, dtype=torch.long)
-
-    noisy = add_noise(scheduler, images, noise, timesteps)
+    noisy = scheduler.add_noise(images, noise, timesteps)
 
     noise_pred, sudoku_logits = model(noisy, timesteps, conditions)
 
-    # Ratatouille (diffusion) loss – simple MSE on predicted noise
     diff_loss = F.mse_loss(noise_pred, noise)
 
-    # Optional sudoku CE loss (only for V0 and V1)
     sudoku_loss = torch.tensor(0.0, device=accelerator.device)
     if sudoku_logits is not None and sudoku_loss_weight > 0:
-        # sudoku_logits: (B, N, num_classes) where N = 81 for V0/V1
         B_, N, C = sudoku_logits.shape
-        # solution may have more/fewer positions than logits (V0/V1 always 81)
         sudoku_loss = F.cross_entropy(
             sudoku_logits.reshape(B_ * N, C),
             solution[:, :N].reshape(B_ * N),
@@ -109,10 +102,88 @@ def train_step(
 
     total_loss = diff_loss + sudoku_loss_weight * sudoku_loss
     return {
-        "loss":         total_loss,
-        "diff_loss":    diff_loss,
-        "sudoku_loss":  sudoku_loss,
+        "loss":        total_loss,
+        "diff_loss":   diff_loss,
+        "sudoku_loss": sudoku_loss,
     }
+
+
+# ── Training step (n_sup backward passes) ────────────────────────────────────
+
+def train_step(
+    model,
+    batch: dict,
+    scheduler: DDPMScheduler,
+    accelerator: Accelerator,
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    warmup_steps: int,
+    num_steps: int,
+    base_lr: float,
+    sudoku_loss_weight: float = 0.0,
+) -> tuple[dict, int]:
+    """
+    Run model.n_sup supervision steps, each with its own LR update, backward,
+    and optimizer step.  global_step is incremented once per backprop.
+
+    Returns (mean loss dict, new global_step).
+    """
+    images     = batch["images"].to(accelerator.device)
+    conditions = batch["conditions"].to(accelerator.device)
+    solution   = batch["solution"].to(accelerator.device)
+
+    B = images.shape[0]
+    noise     = torch.randn_like(images)
+    timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,),
+                              device=accelerator.device, dtype=torch.long)
+    noisy = scheduler.add_noise(images, noise, timesteps)
+
+    z_H, z_L = model.get_initial_states(B)
+    z_H = z_H.to(accelerator.device)
+    z_L = z_L.to(accelerator.device)
+
+    total_loss_val   = 0.0
+    last_diff_loss   = 0.0
+    last_sudoku_loss = 0.0
+
+    for _ in range(model.n_sup):
+        # Update LR for this specific backprop step (per-step, not per-batch)
+        lr = get_lr(global_step, warmup_steps, num_steps, base_lr)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+        # reasoning_step re-runs encoder + embed internally for a fresh graph
+        noise_pred, sudoku_logits, z_H, z_L = model.reasoning_step(
+            conditions, noisy, z_H, z_L, timesteps
+        )
+
+        diff_loss = F.mse_loss(noise_pred, noise)
+
+        sudoku_loss = torch.tensor(0.0, device=accelerator.device)
+        if sudoku_logits is not None and sudoku_loss_weight > 0:
+            B_, N, C = sudoku_logits.shape
+            sudoku_loss = F.cross_entropy(
+                sudoku_logits.reshape(B_ * N, C),
+                solution[:, :N].reshape(B_ * N),
+                ignore_index=IGNORE_LABEL_ID,
+            )
+
+        loss = diff_loss + sudoku_loss_weight * sudoku_loss
+        accelerator.backward(loss)
+        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        total_loss_val   += loss.item()
+        last_diff_loss    = diff_loss.item()
+        last_sudoku_loss  = sudoku_loss.item()
+        global_step      += 1
+
+    return {
+        "loss":        total_loss_val / model.n_sup,
+        "diff_loss":   last_diff_loss,
+        "sudoku_loss": last_sudoku_loss,
+    }, global_step
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -128,8 +199,11 @@ def eval_loop(
     model.eval()
     metrics = {"loss": [], "diff_loss": [], "sudoku_loss": []}
 
-    for batch in dataloader:
-        m = train_step(model, batch, scheduler, accelerator, sudoku_loss_weight)
+    max_eval_batches = 10
+    for i, batch in tqdm(enumerate(dataloader), "Evaluating", total=max_eval_batches):
+        if i >= max_eval_batches:
+            break
+        m = compute_losses(model, batch, scheduler, accelerator, sudoku_loss_weight)
         for k in metrics:
             metrics[k].append(m[k].item())
 
@@ -268,17 +342,25 @@ def main(args: DictConfig):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     num_steps    = args.train.num_steps
-    warmup_steps = args.train.get("warmup_steps", 500)
-    eval_every   = args.train.get("eval_every", 1000)
-    save_every   = args.train.get("save_every", 5000)
+    warmup_steps = args.train.get("warmup_steps", 1000)
+    eval_every   = args.train.get("eval_every", 2000)
+    save_every   = args.train.get("save_every", 10000)
     log_every    = args.train.get("log_every", 100)
     sudoku_w     = args.train.get("sudoku_loss_weight", 0.0)
 
+    n_sup       = accelerator.unwrap_model(model).n_sup
     best_loss   = float("inf")
     train_iter  = iter(train_dl)
 
+    # Threshold-based triggers so intervals fire correctly even when n_sup
+    # doesn't divide them evenly (same pattern as train_sudoku.py).
+    next_log  = log_every
+    next_eval = eval_every
+    next_save = save_every
+
     progress_bar = tqdm(
         total=num_steps,
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Training",
     )
@@ -292,43 +374,31 @@ def main(args: DictConfig):
             train_iter = iter(train_dl)
             batch = next(train_iter)
 
-        # LR update
-        lr = get_lr(global_step, warmup_steps, num_steps, args.train.lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        m, global_step = train_step(
+            accelerator.unwrap_model(model),
+            batch, scheduler, accelerator, optimizer,
+            global_step, warmup_steps, num_steps, args.train.lr,
+            sudoku_loss_weight=sudoku_w,
+        )
+        progress_bar.update(n_sup)
 
-        with accelerator.accumulate(model):
-            m = train_step(
-                accelerator.unwrap_model(model),
-                batch,
-                scheduler,
-                accelerator,
-                sudoku_loss_weight=sudoku_w,
-            )
-            accelerator.backward(m["loss"])
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-
-        global_step += 1
-        progress_bar.update(1)
-
-        if global_step % log_every == 0 and accelerator.is_main_process:
+        if global_step >= next_log and accelerator.is_main_process:
+            lr = get_lr(global_step, warmup_steps, num_steps, args.train.lr)
             logger.info(
-                f"step={global_step}  loss={m['loss'].item():.4f}  "
-                f"diff={m['diff_loss'].item():.4f}  "
-                f"sudoku={m['sudoku_loss'].item():.4f}  lr={lr:.2e}"
+                f"step={global_step}  loss={m['loss']:.4f}  "
+                f"diff={m['diff_loss']:.4f}  "
+                f"sudoku={m['sudoku_loss']:.4f}  lr={lr:.2e}"
             )
             if wandb_project:
                 accelerator.log({
-                    "train/loss":        m["loss"].item(),
-                    "train/diff_loss":   m["diff_loss"].item(),
-                    "train/sudoku_loss": m["sudoku_loss"].item(),
+                    "train/loss":        m["loss"],
+                    "train/diff_loss":   m["diff_loss"],
+                    "train/sudoku_loss": m["sudoku_loss"],
                     "train/lr":          lr,
                 }, step=global_step)
+            next_log = global_step + log_every
 
-        if global_step % eval_every == 0:
+        if global_step >= next_eval:
             metrics = eval_loop(
                 accelerator.unwrap_model(model),
                 eval_dl, scheduler, accelerator,
@@ -372,25 +442,30 @@ def main(args: DictConfig):
                         f"puzzle_acc={acc['puzzle_acc']:.4f}"
                     )
                     if wandb_project:
-                        import wandb as _wandb
                         accelerator.log({
                             "eval/cell_acc":   acc["cell_acc"],
                             "eval/puzzle_acc": acc["puzzle_acc"],
                         }, step=global_step)
-                        if _wandb.run is not None:
-                            n_show = min(4, generated.shape[0])
-                            panels = []
-                            for i in range(n_show):
-                                c = conditions[i, 0].cpu().clamp(0, 1).numpy()
-                                g = generated[i, 0].cpu().numpy()
-                                panels.extend([
-                                    _wandb.Image(c, caption=f"cond[{i}]"),
-                                    _wandb.Image(g, caption=f"gen[{i}]"),
-                                ])
-                            _wandb.log({"eval/samples": panels}, step=global_step)
+                        try:
+                            import wandb as _wandb
+                            if _wandb.run is not None:
+                                n_show = min(4, generated.shape[0])
+                                panels = []
+                                for i in range(n_show):
+                                    c = conditions[i, 0].cpu().clamp(0, 1).numpy()
+                                    g = generated[i, 0].cpu().numpy()
+                                    panels.extend([
+                                        _wandb.Image(c, caption=f"cond[{i}]"),
+                                        _wandb.Image(g, caption=f"gen[{i}]"),
+                                    ])
+                                _wandb.log({"eval/samples": panels}, step=global_step)
+                        except ImportError:
+                            pass
+            next_eval = global_step + eval_every
 
-        if global_step % save_every == 0 and accelerator.is_main_process:
+        if global_step >= next_save and accelerator.is_main_process:
             _save(accelerator, model, optimizer, global_step, args.output_dir, f"step-{global_step}")
+            next_save = global_step + save_every
 
     if accelerator.is_main_process:
         _save(accelerator, model, optimizer, global_step, args.output_dir, "final")
