@@ -80,19 +80,17 @@ def train_step(
     batch,
     accelerator: Accelerator,
     optimizer: torch.optim.Optimizer,
-) -> float:
+    global_step: int,
+    warmup_steps: int,
+    num_steps: int,
+    base_lr: float,
+) -> tuple[float, int]:
     """
-    Run n_sup supervision steps, each with its own backward + optimizer update.
+    Run n_sup supervision steps, each with its own LR update, backward, and
+    optimizer update.  global_step is incremented once per backprop (matching
+    the reference which counts one backward pass as one step).
 
-    Mirrors the ACT training loop: the reference model calls backward() and
-    optimizer.step() once per reasoning step.  Here we do the same — n_sup
-    steps, each independently back-propagated and applied.
-
-    Memory is O(1 step) regardless of n_sup because z_H/z_L are detached
-    between steps so each step's graph is independent; calling backward()
-    immediately after each step frees its activations before the next step.
-
-    Returns the mean loss value (float) for logging.
+    Returns (mean_loss, new_global_step).
     """
     inputs  = batch["inputs"].to(accelerator.device)   # (B, 81)
     labels  = batch["labels"].to(accelerator.device)   # (B, 81)
@@ -107,6 +105,11 @@ def train_step(
 
     total_loss_val = 0.0
     for _ in range(model.n_sup):
+        # Update LR for this specific backprop step.
+        lr = get_lr(global_step, warmup_steps, num_steps, base_lr)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
         # Recompute input_emb each step so each backward() gets a fresh graph.
         # The reference does the same: full forward() is called once per step.
         input_emb = model.embed(inputs, puzzle_ids=puzzle_ids)
@@ -121,8 +124,9 @@ def train_step(
         optimizer.step()
         optimizer.zero_grad()
         total_loss_val += step_loss.item()
+        global_step += 1
 
-    return total_loss_val / model.n_sup
+    return total_loss_val / model.n_sup, global_step
 
 
 @torch.no_grad()
@@ -251,11 +255,21 @@ def main(args: DictConfig):
     save_every    = args.train.get("save_every", 5000)
     log_every     = args.train.get("log_every", 100)
 
+    # Each backward pass = 1 step. global_step is advanced inside train_step
+    # (n_sup increments per batch). Use threshold-based triggers so intervals
+    # fire correctly when n_sup doesn't divide them evenly.
+    n_sup = accelerator.unwrap_model(model).n_sup
+
     best_puzzle_acc = 0.0
     train_iter  = iter(train_dl)
 
+    next_log  = log_every
+    next_eval = eval_every
+    next_save = save_every
+
     progress_bar = tqdm(
         total=num_steps,
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Training",
     )
@@ -269,23 +283,21 @@ def main(args: DictConfig):
             train_iter = iter(train_dl)
             batch = next(train_iter)
 
-        # LR update
-        lr = get_lr(global_step, warmup_steps, num_steps, args.train.lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        loss_val, global_step = train_step(
+            accelerator.unwrap_model(model), batch, accelerator, optimizer,
+            global_step, warmup_steps, num_steps, args.train.lr,
+        )
+        progress_bar.update(n_sup)
 
-        loss_val = train_step(accelerator.unwrap_model(model), batch, accelerator, optimizer)
-
-        global_step += 1
-        progress_bar.update(1)
-
-        if global_step % log_every == 0 and accelerator.is_main_process:
+        if global_step >= next_log and accelerator.is_main_process:
+            lr = get_lr(global_step, warmup_steps, num_steps, args.train.lr)
             logger.info(f"step={global_step}  loss={loss_val:.4f}  lr={lr:.2e}")
             if wandb_project:
                 accelerator.log({"train/loss": loss_val, "train/lr": lr}, step=global_step)
+            next_log = global_step + log_every
 
         # ── Evaluation ────────────────────────────────────────────────────────
-        if global_step % eval_every == 0:
+        if global_step >= next_eval:
             metrics = eval_loop(accelerator.unwrap_model(model), eval_dl, accelerator)
             if accelerator.is_main_process:
                 logger.info(
@@ -303,10 +315,12 @@ def main(args: DictConfig):
                 if metrics["puzzle_acc"] > best_puzzle_acc:
                     best_puzzle_acc = metrics["puzzle_acc"]
                     _save(accelerator, model, optimizer, global_step, args.output_dir, "best")
+            next_eval = global_step + eval_every
 
         # ── Checkpoint ────────────────────────────────────────────────────────
-        if global_step % save_every == 0 and accelerator.is_main_process:
+        if global_step >= next_save and accelerator.is_main_process:
             _save(accelerator, model, optimizer, global_step, args.output_dir, f"step-{global_step}")
+            next_save = global_step + save_every
 
     # Final save
     if accelerator.is_main_process:
