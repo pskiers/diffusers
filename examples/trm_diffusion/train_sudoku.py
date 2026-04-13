@@ -75,7 +75,25 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, inputs: torch.Te
 
 # ── Training ───────────────────────────────────────────────────────────────────
 
-def train_step(model: SudokuTRM, batch, accelerator: Accelerator):
+def train_step(
+    model: SudokuTRM,
+    batch,
+    accelerator: Accelerator,
+    optimizer: torch.optim.Optimizer,
+) -> float:
+    """
+    Run n_sup supervision steps, each with its own backward + optimizer update.
+
+    Mirrors the ACT training loop: the reference model calls backward() and
+    optimizer.step() once per reasoning step.  Here we do the same — n_sup
+    steps, each independently back-propagated and applied.
+
+    Memory is O(1 step) regardless of n_sup because z_H/z_L are detached
+    between steps so each step's graph is independent; calling backward()
+    immediately after each step frees its activations before the next step.
+
+    Returns the mean loss value (float) for logging.
+    """
     inputs  = batch["inputs"].to(accelerator.device)   # (B, 81)
     labels  = batch["labels"].to(accelerator.device)   # (B, 81)
     puzzle_ids = batch.get("puzzle_id")
@@ -88,7 +106,7 @@ def train_step(model: SudokuTRM, batch, accelerator: Accelerator):
     z_H = z_H.to(accelerator.device)
     z_L = z_L.to(accelerator.device)
 
-    total_loss = None
+    total_loss_val = 0.0
     for _ in range(model.n_sup):
         logits, z_H, z_L = model.reasoning_step(input_emb, z_H, z_L)
         step_loss = F.cross_entropy(
@@ -96,9 +114,13 @@ def train_step(model: SudokuTRM, batch, accelerator: Accelerator):
             labels.view(-1),
             ignore_index=IGNORE_LABEL_ID,
         )
-        total_loss = step_loss if total_loss is None else total_loss + step_loss
+        accelerator.backward(step_loss)
+        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        total_loss_val += step_loss.item()
 
-    return total_loss, logits.detach(), labels
+    return total_loss_val / model.n_sup
 
 
 @torch.no_grad()
@@ -250,23 +272,15 @@ def main(args: DictConfig):
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        with accelerator.accumulate(model):
-            loss, logits, labels = train_step(
-                accelerator.unwrap_model(model), batch, accelerator
-            )
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+        loss_val = train_step(accelerator.unwrap_model(model), batch, accelerator, optimizer)
 
         global_step += 1
         progress_bar.update(1)
 
         if global_step % log_every == 0 and accelerator.is_main_process:
-            logger.info(f"step={global_step}  loss={loss.item():.4f}  lr={lr:.2e}")
+            logger.info(f"step={global_step}  loss={loss_val:.4f}  lr={lr:.2e}")
             if wandb_project:
-                accelerator.log({"train/loss": loss.item(), "train/lr": lr}, step=global_step)
+                accelerator.log({"train/loss": loss_val, "train/lr": lr}, step=global_step)
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step % eval_every == 0:

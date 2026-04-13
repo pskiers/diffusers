@@ -17,6 +17,7 @@ try:
     from argdantic import ArgParser
 except ImportError:
     ArgParser = None
+    print("WARNING: argdantic not found, CLI will be unavailable. Install with `pip install argdantic`.")
 
 
 # Global list mapping each dihedral transform id to its inverse.

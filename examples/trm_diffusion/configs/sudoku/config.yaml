@@ -5,7 +5,7 @@
 data_dir: "data/sudoku-extreme-1k"
 output_dir: "runs/sudoku_trm"
 num_workers: 4
-mixed_precision: "no"   # "fp16" or "bf16" if your GPU supports it
+mixed_precision: "bf16"  # bfloat16 halves activation memory; use "no" only for debugging
 resume_from_checkpoint: null   # path to a checkpoint_*.pt file to resume from
 
 wandb_project: small-llm-diffusion    # set to a project name to enable wandb logging, e.g. "sudoku-trm"
