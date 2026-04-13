@@ -105,8 +105,16 @@ class SudokuTRM(nn.Module):
         self.vocab_size = vocab_size
 
         # ── Input processing ────────────────────────────────────────────────
+        # Embedding scale: init with std=1/sqrt(d_model), then multiply by
+        # sqrt(d_model) at runtime so per-element std=1.0 — matching the
+        # working TRM reference which uses embed_scale=sqrt(hidden_size).
+        # Without this, input_emb (std≈0.028) is 36× smaller than z_H/z_L
+        # (std≈1.0 after LayerNorm), so the model ignores the puzzle input
+        # after the first reasoning step.
+        self.embed_scale   = math.sqrt(d_model)
+        embed_init_std     = 1.0 / self.embed_scale
         self.embedding     = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, d_model) * embed_init_std)
 
         # ── Optional puzzle-identifier embedding ─────────────────────────────
         # When enabled, a learned per-puzzle offset is added to the input embedding.
@@ -133,7 +141,9 @@ class SudokuTRM(nn.Module):
         self.out_norm = nn.LayerNorm(d_model)
         self.lm_head  = nn.Linear(d_model, vocab_size, bias=False)
 
-        # ── Initial states (zeros, like y_init / z_init in old TRM) ────────
+        # ── Initial states ───────────────────────────────────────────────────
+        # Reference uses trunc_normal(std=1) broadcast across sequence positions.
+        # Keep zeros for now but note they're reset each forward pass anyway.
         self.register_buffer("z_H_init", torch.zeros(1, seq_len, d_model))
         self.register_buffer("z_L_init", torch.zeros(1, seq_len, d_model))
 
@@ -142,8 +152,11 @@ class SudokuTRM(nn.Module):
     # ── Weight initialisation ───────────────────────────────────────────────
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.embedding.weight, std=0.02)
-        nn.init.normal_(self.lm_head.weight,   std=0.02)
+        # Use the same convention as the reference TRM: embed weights at
+        # std=1/sqrt(d_model) so that after the embed_scale multiply the
+        # per-element magnitude matches z_H / z_L (≈1.0 after LayerNorm).
+        nn.init.normal_(self.embedding.weight, std=1.0 / self.embed_scale)
+        nn.init.normal_(self.lm_head.weight,   std=1.0 / self.embed_scale)
         for block in self.blocks:
             for p in block.parameters():
                 if p.dim() > 1:
@@ -160,9 +173,11 @@ class SudokuTRM(nn.Module):
         puzzle_ids: (B,)    long  – per-sample puzzle identifier (optional).
                     Only used when num_puzzle_ids was set at construction time.
         """
-        x = self.embedding(inputs) + self.pos_embedding
+        # Scale by embed_scale (=sqrt(d_model)) so input magnitude ≈ 1.0 per
+        # element, matching z_H / z_L after LayerNorm. The 0.707 factor keeps
+        # variance at 1.0 when summing token + position embeddings.
+        x = self.embed_scale * 0.707106781 * (self.embedding(inputs) + self.pos_embedding)
         if self.puzzle_id_embedding is not None and puzzle_ids is not None:
-            # puzzle_id_embedding is (B, d_model); broadcast across seq_len
             x = x + self.puzzle_id_embedding(puzzle_ids).unsqueeze(1)
         return x
 

@@ -134,12 +134,26 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float, min_r
 
 @hydra.main(version_base=None, config_path="configs/sudoku", config_name="config")
 def main(args: DictConfig):
-    accelerator = Accelerator(mixed_precision=args.get("mixed_precision", "no"))
+    wandb_project = args.get("wandb_project", None)
+    log_with = ["wandb"] if wandb_project else []
+    accelerator = Accelerator(
+        mixed_precision=args.get("mixed_precision", "no"),
+        log_with=log_with,
+    )
     logging.basicConfig(level=logging.INFO)
 
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(args))
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    if wandb_project:
+        run_name = args.get("wandb_run_name", None)
+        init_kwargs = {"wandb": {"name": run_name}} if run_name else {}
+        accelerator.init_trackers(
+            project_name=wandb_project,
+            config=OmegaConf.to_container(args, resolve=True),
+            init_kwargs=init_kwargs,
+        )
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     train_dir = os.path.join(args.data_dir, "train")
@@ -251,6 +265,8 @@ def main(args: DictConfig):
 
         if global_step % log_every == 0 and accelerator.is_main_process:
             logger.info(f"step={global_step}  loss={loss.item():.4f}  lr={lr:.2e}")
+            if wandb_project:
+                accelerator.log({"train/loss": loss.item(), "train/lr": lr}, step=global_step)
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step % eval_every == 0:
@@ -262,6 +278,12 @@ def main(args: DictConfig):
                     f"cell_acc={metrics['cell_acc']*100:.2f}%  "
                     f"puzzle_acc={metrics['puzzle_acc']*100:.2f}%"
                 )
+                if wandb_project:
+                    accelerator.log({
+                        "eval/loss":       metrics["loss"],
+                        "eval/cell_acc":   metrics["cell_acc"],
+                        "eval/puzzle_acc": metrics["puzzle_acc"],
+                    }, step=global_step)
                 if metrics["puzzle_acc"] > best_puzzle_acc:
                     best_puzzle_acc = metrics["puzzle_acc"]
                     _save(accelerator, model, optimizer, global_step, args.output_dir, "best")
@@ -274,6 +296,9 @@ def main(args: DictConfig):
     if accelerator.is_main_process:
         _save(accelerator, model, optimizer, global_step, args.output_dir, "final")
         logger.info(f"Training complete. Best puzzle_acc: {best_puzzle_acc*100:.2f}%")
+
+    if wandb_project:
+        accelerator.end_training()
 
 
 def _save(accelerator, model, optimizer, step, output_dir, tag):

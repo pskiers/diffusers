@@ -154,12 +154,26 @@ def _save(accelerator, model, optimizer, step, output_dir, tag):
 
 @hydra.main(version_base=None, config_path="configs/mnist_sudoku", config_name="config")
 def main(args: DictConfig):
-    accelerator = Accelerator(mixed_precision=args.get("mixed_precision", "no"))
+    wandb_project = args.get("wandb_project", None)
+    log_with = ["wandb"] if wandb_project else []
+    accelerator = Accelerator(
+        mixed_precision=args.get("mixed_precision", "no"),
+        log_with=log_with,
+    )
     logging.basicConfig(level=logging.INFO)
 
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(args))
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    if wandb_project:
+        run_name = args.get("wandb_run_name", None)
+        init_kwargs = {"wandb": {"name": run_name}} if run_name else {}
+        accelerator.init_trackers(
+            project_name=wandb_project,
+            config=OmegaConf.to_container(args, resolve=True),
+            init_kwargs=init_kwargs,
+        )
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     train_dir = os.path.join(args.data.sudoku_dir, "train")
@@ -306,6 +320,13 @@ def main(args: DictConfig):
                 f"diff={m['diff_loss'].item():.4f}  "
                 f"sudoku={m['sudoku_loss'].item():.4f}  lr={lr:.2e}"
             )
+            if wandb_project:
+                accelerator.log({
+                    "train/loss":        m["loss"].item(),
+                    "train/diff_loss":   m["diff_loss"].item(),
+                    "train/sudoku_loss": m["sudoku_loss"].item(),
+                    "train/lr":          lr,
+                }, step=global_step)
 
         if global_step % eval_every == 0:
             metrics = eval_loop(
@@ -320,6 +341,12 @@ def main(args: DictConfig):
                     f"diff={metrics['diff_loss']:.4f}  "
                     f"sudoku={metrics['sudoku_loss']:.4f}"
                 )
+                if wandb_project:
+                    accelerator.log({
+                        "eval/loss":        metrics["loss"],
+                        "eval/diff_loss":   metrics["diff_loss"],
+                        "eval/sudoku_loss": metrics["sudoku_loss"],
+                    }, step=global_step)
                 if metrics["loss"] < best_loss:
                     best_loss = metrics["loss"]
                     _save(accelerator, model, optimizer, global_step, args.output_dir, "best")
@@ -344,6 +371,23 @@ def main(args: DictConfig):
                         f"[eval] cell_acc={acc['cell_acc']:.4f}  "
                         f"puzzle_acc={acc['puzzle_acc']:.4f}"
                     )
+                    if wandb_project:
+                        import wandb as _wandb
+                        accelerator.log({
+                            "eval/cell_acc":   acc["cell_acc"],
+                            "eval/puzzle_acc": acc["puzzle_acc"],
+                        }, step=global_step)
+                        if _wandb.run is not None:
+                            n_show = min(4, generated.shape[0])
+                            panels = []
+                            for i in range(n_show):
+                                c = conditions[i, 0].cpu().clamp(0, 1).numpy()
+                                g = generated[i, 0].cpu().numpy()
+                                panels.extend([
+                                    _wandb.Image(c, caption=f"cond[{i}]"),
+                                    _wandb.Image(g, caption=f"gen[{i}]"),
+                                ])
+                            _wandb.log({"eval/samples": panels}, step=global_step)
 
         if global_step % save_every == 0 and accelerator.is_main_process:
             _save(accelerator, model, optimizer, global_step, args.output_dir, f"step-{global_step}")
@@ -351,6 +395,9 @@ def main(args: DictConfig):
     if accelerator.is_main_process:
         _save(accelerator, model, optimizer, global_step, args.output_dir, "final")
         logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+
+    if wandb_project:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
