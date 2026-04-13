@@ -23,6 +23,9 @@ model:
   dropout: 0.0
   num_puzzle_ids: null  # set to a positive int to enable puzzle-identifier embeddings
 
+use_ema: true
+ema_decay: 0.9999
+
 train:
   lr: 1e-4
   weight_decay: 1.0    # reference uses 1.0; 0.1 allows too much memorization

@@ -44,4 +44,8 @@ markers = [
     "standard: marks tests that use standard diffusion",
     "ratatouille: marks test that use the thinker-painter architecture",
     "mask: marks tests that use spatial mask conditioning",
+    "sudoku: marks tests that use the Sudoku domain",
+    "mnist_sudoku: marks tests that use the MNIST Sudoku domain",
+    "mnist_sudoku_sample: marks tests that sample from models trained on the MNIST Sudoku domain",
+    "mnist_sudoku_eval: marks tests that evaluate models trained on the MNIST Sudoku domain",
 ]

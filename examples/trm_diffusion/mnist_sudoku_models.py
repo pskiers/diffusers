@@ -60,7 +60,7 @@ import torch.nn.functional as F
 from diffusers import UNet2DModel
 
 from models import SpatialEncoder, AttentiveBridge   # reuse from trm pipeline
-from sudoku_models import TransformerBlock
+from sudoku_models import TransformerBlock, RMSNorm
 
 
 # ── Spatial TRM ──────────────────────────────────────────────────────────────────
@@ -112,20 +112,20 @@ class SpatialTRM(nn.Module):
             torch.randn(1, seq_len, d_model) * embed_init_std
         )
 
-        # Shared blocks — same weights for z_L and z_H updates (mirrors SudokuTRM)
+        # Shared blocks — same weights for z_L and z_H updates (mirrors SudokuTRM).
+        # TransformerBlock is now post-norm (RMSNorm after residual) so no
+        # separate norm_z_H / norm_z_L are needed.
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, n_heads, dropout=dropout)
             for _ in range(n_layers)
         ])
 
-        self.norm_z_H = nn.LayerNorm(d_model)
-        self.norm_z_L = nn.LayerNorm(d_model)
-
-        self.out_norm = nn.LayerNorm(d_model)
+        self.out_norm = RMSNorm(d_model)
         self.out_proj = nn.Linear(d_model, out_channels)
 
-        self.register_buffer("z_H_init", torch.zeros(1, seq_len, d_model))
-        self.register_buffer("z_L_init", torch.zeros(1, seq_len, d_model))
+        # Learnable initial states (trunc_normal std=1, same as SudokuTRM).
+        self.z_H_init = nn.Parameter(torch.empty(1, seq_len, d_model))
+        self.z_L_init = nn.Parameter(torch.empty(1, seq_len, d_model))
 
         self._init_weights()
 
@@ -134,7 +134,10 @@ class SpatialTRM(nn.Module):
         if self.input_proj.bias is not None:
             nn.init.zeros_(self.input_proj.bias)
         nn.init.normal_(self.out_proj.weight, std=1.0 / self.embed_scale)
-        nn.init.zeros_(self.out_proj.bias)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+        nn.init.trunc_normal_(self.z_H_init, std=1.0)
+        nn.init.trunc_normal_(self.z_L_init, std=1.0)
         for block in self.blocks:
             for p in block.parameters():
                 if p.dim() > 1:
@@ -180,13 +183,13 @@ class SpatialTRM(nn.Module):
         with torch.no_grad():
             for _ in range(self.H_cycles - 1):
                 for _ in range(self.L_cycles):
-                    z_L = self.norm_z_L(self._run_blocks(input_emb + z_H + z_L))
-                z_H = self.norm_z_H(self._run_blocks(z_H + z_L))
+                    z_L = self._run_blocks(input_emb + z_H + z_L)
+                z_H = self._run_blocks(z_H + z_L)
 
         # Final macro cycle — gradients flow through this into bridge and painter
         for _ in range(self.L_cycles):
-            z_L = self.norm_z_L(self._run_blocks(input_emb + z_H + z_L))
-        z_H = self.norm_z_H(self._run_blocks(z_H + z_L))
+            z_L = self._run_blocks(input_emb + z_H + z_L)
+        z_H = self._run_blocks(z_H + z_L)
 
         return z_H, z_H.detach(), z_L.detach()
 
@@ -350,12 +353,8 @@ class _TRMRatatouilleBase(nn.Module):
             input_emb = self.thinker.embed(enc)
             for _ in range(self.thinker.H_cycles):
                 for _ in range(self.thinker.L_cycles):
-                    z_L = self.thinker.norm_z_L(
-                        self.thinker._run_blocks(input_emb + z_H + z_L)
-                    )
-                z_H = self.thinker.norm_z_H(
-                    self.thinker._run_blocks(z_H + z_L)
-                )
+                    z_L = self.thinker._run_blocks(input_emb + z_H + z_L)
+                z_H = self.thinker._run_blocks(z_H + z_L)
 
         spatial_cond  = self.thinker.decode(z_H)
         bridge_feat   = self.bridge(spatial_cond)

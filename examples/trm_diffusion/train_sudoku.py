@@ -39,6 +39,45 @@ from sudoku_models import SudokuTRM
 logger = get_logger(__name__, log_level="INFO")
 
 
+# ── EMA ────────────────────────────────────────────────────────────────────────
+
+class EMA:
+    """
+    Exponential Moving Average of model parameters.
+
+    Shadow copies are stored in float32 to avoid precision loss during
+    accumulation, regardless of the model's training dtype.
+    """
+
+    def __init__(self, parameters, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow_params = [p.clone().float().detach() for p in parameters]
+
+    def to(self, device):
+        self.shadow_params = [p.to(device) for p in self.shadow_params]
+        return self
+
+    @torch.no_grad()
+    def update(self, parameters):
+        for shadow, param in zip(self.shadow_params, parameters):
+            shadow.mul_(self.decay).add_(param.float().data, alpha=1 - self.decay)
+
+    def copy_to(self, parameters):
+        """Copy EMA shadow weights into model parameters (for eval / saving)."""
+        for shadow, param in zip(self.shadow_params, parameters):
+            param.data.copy_(shadow.to(param.dtype))
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow_params": [p.cpu() for p in self.shadow_params]}
+
+    def load_state_dict(self, state: dict, device=None):
+        self.decay = state["decay"]
+        self.shadow_params = [
+            p.to(device) if device is not None else p
+            for p in state["shadow_params"]
+        ]
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
 def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, inputs: torch.Tensor):
@@ -84,6 +123,7 @@ def train_step(
     warmup_steps: int,
     num_steps: int,
     base_lr: float,
+    ema: EMA | None = None,
 ) -> tuple[float, int]:
     """
     Run n_sup supervision steps, each with its own LR update, backward, and
@@ -123,6 +163,8 @@ def train_step(
         accelerator.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
+        if ema is not None:
+            ema.update(model.parameters())
         total_loss_val += step_loss.item()
         global_step += 1
 
@@ -241,6 +283,17 @@ def main(args: DictConfig):
         model, optimizer, train_dl, eval_dl
     )
 
+    # ── EMA ───────────────────────────────────────────────────────────────────
+    ema = None
+    if args.get("use_ema", True):
+        ema = EMA(
+            accelerator.unwrap_model(model).parameters(),
+            decay=args.get("ema_decay", 0.9999),
+        )
+        ema.to(accelerator.device)
+        if accelerator.is_main_process:
+            logger.info(f"EMA enabled (decay={ema.decay})")
+
     # ── Resume from checkpoint ────────────────────────────────────────────────
     global_step = 0
     resume_path = args.get("resume_from_checkpoint", None)
@@ -249,6 +302,8 @@ def main(args: DictConfig):
         accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         global_step = int(ckpt["step"])
+        if ema is not None and "ema_state" in ckpt and ckpt["ema_state"] is not None:
+            ema.load_state_dict(ckpt["ema_state"], device=accelerator.device)
         logger.info(f"Resumed from {resume_path} at step {global_step}")
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -289,6 +344,7 @@ def main(args: DictConfig):
         loss_val, global_step = train_step(
             accelerator.unwrap_model(model), batch, accelerator, optimizer,
             global_step, warmup_steps, num_steps, args.train.lr,
+            ema=ema,
         )
         progress_bar.update(n_sup)
 
@@ -301,7 +357,14 @@ def main(args: DictConfig):
 
         # ── Evaluation ────────────────────────────────────────────────────────
         if global_step >= next_eval:
-            metrics = eval_loop(accelerator.unwrap_model(model), eval_dl, accelerator)
+            unwrapped = accelerator.unwrap_model(model)
+            if ema is not None:
+                live_params = [p.clone() for p in unwrapped.parameters()]
+                ema.copy_to(unwrapped.parameters())
+            metrics = eval_loop(unwrapped, eval_dl, accelerator)
+            if ema is not None:
+                for p, live in zip(unwrapped.parameters(), live_params):
+                    p.data.copy_(live)
             if accelerator.is_main_process:
                 logger.info(
                     f"[eval] step={global_step} "
@@ -317,28 +380,29 @@ def main(args: DictConfig):
                     }, step=global_step)
                 if metrics["puzzle_acc"] > best_puzzle_acc:
                     best_puzzle_acc = metrics["puzzle_acc"]
-                    _save(accelerator, model, optimizer, global_step, args.output_dir, "best")
+                    _save(accelerator, model, optimizer, global_step, args.output_dir, "best", ema=ema)
             next_eval = global_step + eval_every
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         if global_step >= next_save and accelerator.is_main_process:
-            _save(accelerator, model, optimizer, global_step, args.output_dir, f"step-{global_step}")
+            _save(accelerator, model, optimizer, global_step, args.output_dir, f"step-{global_step}", ema=ema)
             next_save = global_step + save_every
 
     # Final save
     if accelerator.is_main_process:
-        _save(accelerator, model, optimizer, global_step, args.output_dir, "final")
+        _save(accelerator, model, optimizer, global_step, args.output_dir, "final", ema=ema)
         logger.info(f"Training complete. Best puzzle_acc: {best_puzzle_acc*100:.2f}%")
 
     if wandb_project:
         accelerator.end_training()
 
 
-def _save(accelerator, model, optimizer, step, output_dir, tag):
+def _save(accelerator, model, optimizer, step, output_dir, tag, ema=None):
     ckpt = {
         "step":            step,
         "model_state":     accelerator.unwrap_model(model).state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "ema_state":       ema.state_dict() if ema is not None else None,
     }
     path = os.path.join(output_dir, f"checkpoint_{tag}.pt")
     torch.save(ckpt, path)

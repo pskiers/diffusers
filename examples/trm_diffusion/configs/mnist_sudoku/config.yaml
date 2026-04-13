@@ -26,6 +26,9 @@ use_ddim: false
 condition_source: "blank"
 mixed_precision: "bf16"
 
+use_ema: true
+ema_decay: 0.9999
+
 num_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2"
 
