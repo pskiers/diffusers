@@ -207,6 +207,29 @@ def _make_painter(
     )
 
 
+# ── Gradient scaling hook ────────────────────────────────────────────────────────
+
+class _GradScale(torch.autograd.Function):
+    """Pass-through in forward; multiply gradient by `scale` in backward."""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+def _grad_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Scale (or zero) the gradient that flows backward through x."""
+    if scale == 1.0:
+        return x
+    if scale == 0.0:
+        return x.detach()
+    return _GradScale.apply(x, scale)
+
+
 # ── TRM Ratatouille base ─────────────────────────────────────────────────────────
 
 class _TRMRatatouilleBase(nn.Module):
@@ -222,6 +245,12 @@ class _TRMRatatouilleBase(nn.Module):
 
     Training: call reasoning_step in a loop (n_sup times per batch).
     Inference: call forward() — runs the full n_sup × H_cycles × L_cycles loop.
+
+    diff_thinker_weight controls how much diffusion-loss gradient flows back
+    into the thinker through the bridge path:
+      0.0 → thinker trained only on sudoku_loss (bridge sees detached spatial_cond)
+      1.0 → full diffusion gradient reaches thinker (default)
+    The sudoku_loss gradient is always unscaled regardless of this value.
     """
 
     _encoder_sees_noisy: bool = True
@@ -232,12 +261,14 @@ class _TRMRatatouilleBase(nn.Module):
         thinker: SpatialTRM,
         bridge: nn.Module,
         painter: UNet2DModel,
+        diff_thinker_weight: float = 1.0,
     ):
         super().__init__()
         self.encoder = encoder
         self.thinker = thinker
         self.bridge  = bridge
         self.painter = painter
+        self.diff_thinker_weight = diff_thinker_weight
 
     @property
     def n_sup(self) -> int:
@@ -281,7 +312,9 @@ class _TRMRatatouilleBase(nn.Module):
         spatial_tokens, z_H_next, z_L_next = self.thinker.reasoning_step(input_emb, z_H, z_L)
 
         spatial_cond  = self.thinker.decode(spatial_tokens)
-        bridge_feat   = self.bridge(spatial_cond)
+        # Scale (or zero) the diffusion-loss gradient flowing back into the thinker.
+        # sudoku_logits uses the unscaled spatial_cond so its gradient is unaffected.
+        bridge_feat   = self.bridge(_grad_scale(spatial_cond, self.diff_thinker_weight))
         noise_pred    = self.painter(
             torch.cat([noisy, bridge_feat], dim=1), timesteps
         ).sample
@@ -364,6 +397,7 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
         num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
     ):
         grid_size = painter_size // cell_size   # e.g. 144//16 = 9
 
@@ -378,7 +412,8 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
-        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter)
+        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
         self._num_classes = num_classes
 
     def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
@@ -413,6 +448,7 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
         num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
     ):
         grid_size = painter_size // cell_size
 
@@ -427,7 +463,8 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
-        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter)
+        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
         self._num_classes = num_classes
 
     def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
@@ -461,6 +498,7 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
         num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
     ):
         grid_size = painter_size // cell_size
 
@@ -475,7 +513,8 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
-        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter)
+        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
 
 
 # ── V3 ───────────────────────────────────────────────────────────────────────────
@@ -504,6 +543,7 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
         num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
     ):
         grid_size = painter_size // cell_size
 
@@ -518,7 +558,8 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
-        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter)
+        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
 
 
 # ── V4 ───────────────────────────────────────────────────────────────────────────
@@ -550,6 +591,7 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
         num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
     ):
         grid_size = painter_size // compression_factor
 
@@ -572,4 +614,5 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
         )
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
-        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter)
+        super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)

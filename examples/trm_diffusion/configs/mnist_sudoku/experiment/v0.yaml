@@ -12,6 +12,7 @@ model:
     H_cycles: 3
     n_sup: 16
     num_puzzle_ids: 1000   # one embedding per puzzle (dataset has ~1000 puzzles)
+    diff_thinker_weight: 0.0   # 0=TRM trained only on sudoku_loss; 1.0=full diff gradient
     # Encoder / bridge / painter
     enc_channels: 64
     bridge_channels: 16
