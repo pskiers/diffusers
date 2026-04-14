@@ -4,9 +4,14 @@ output_dir: "runs/mnist_sudoku_v3"
 model:
   variant: "v3"
   kwargs:
-    enc_out_channels: 16
+    d_model: 256
+    n_heads: 4
+    n_layers: 2
+    L_cycles: 6
+    H_cycles: 3
+    n_sup: 16
+    num_puzzle_ids: 1000
+    enc_channels: 64
     thinker_out_channels: 64
-    bridge_channels: 8
-    thinker_hidden: 64
-    thinker_layers: 4
-    painter_channels: [32, 64, 128, 256]
+    bridge_channels: 16
+    painter_channels: [64, 128, 256]

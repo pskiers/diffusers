@@ -8,7 +8,7 @@ defaults:
 data:
   sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
   mnist_root: "data/mnist"
-  cell_size: 32          # pixel side of each digit cell; grid = 9*cell_size = 288
+  cell_size: 16          # pixel side of each digit cell; grid = 9*cell_size = 144
 
 output_dir: "runs/mnist_sudoku"
 num_workers: 4
@@ -44,10 +44,10 @@ model:
 
 train:
   lr: 1e-4
-  weight_decay: 0.1
+  weight_decay: 1.0
   batch_size: 32
   num_steps: 100000
-  warmup_steps: 1000
+  warmup_steps: 2000
   eval_every: 2000
   save_every: 10000
   log_every: 100

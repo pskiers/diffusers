@@ -120,6 +120,7 @@ def compute_losses(
     images     = batch["images"].to(accelerator.device)      # (B,1,H,W)
     conditions = batch["conditions"].to(accelerator.device)  # (B,1,H,W)
     solution   = batch["solution"].to(accelerator.device)    # (B,81) long
+    puzzle_ids = batch["puzzle_id"].to(accelerator.device) if "puzzle_id" in batch else None
 
     B = images.shape[0]
     noise     = torch.randn_like(images)
@@ -127,7 +128,7 @@ def compute_losses(
                               device=accelerator.device, dtype=torch.long)
     noisy = scheduler.add_noise(images, noise, timesteps)
 
-    noise_pred, sudoku_logits = model(noisy, timesteps, conditions)
+    noise_pred, sudoku_logits = model(noisy, timesteps, conditions, puzzle_ids=puzzle_ids)
 
     diff_loss = F.mse_loss(noise_pred, noise)
 
@@ -172,6 +173,7 @@ def train_step(
     images     = batch["images"].to(accelerator.device)
     conditions = batch["conditions"].to(accelerator.device)
     solution   = batch["solution"].to(accelerator.device)
+    puzzle_ids = batch["puzzle_id"].to(accelerator.device) if "puzzle_id" in batch else None
 
     B = images.shape[0]
     noise     = torch.randn_like(images)
@@ -195,7 +197,7 @@ def train_step(
 
         # reasoning_step re-runs encoder + embed internally for a fresh graph
         noise_pred, sudoku_logits, z_H, z_L = model.reasoning_step(
-            conditions, noisy, z_H, z_L, timesteps
+            conditions, noisy, z_H, z_L, timesteps, puzzle_ids=puzzle_ids
         )
 
         diff_loss = F.mse_loss(noise_pred, noise)
@@ -367,7 +369,7 @@ def main(args: DictConfig):
         model.parameters(),
         lr=args.train.lr,
         betas=(0.9, 0.95),
-        weight_decay=args.train.get("weight_decay", 0.01),
+        weight_decay=args.train.get("weight_decay", 1.0),
     )
 
     model, optimizer, train_dl, eval_dl = accelerator.prepare(

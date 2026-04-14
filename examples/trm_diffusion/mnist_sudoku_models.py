@@ -51,7 +51,6 @@ Five variants — each removes one training wheel from the previous:
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -60,22 +59,28 @@ import torch.nn.functional as F
 from diffusers import UNet2DModel
 
 from models import SpatialEncoder, AttentiveBridge   # reuse from trm pipeline
-from sudoku_models import TransformerBlock, RMSNorm
+from sudoku_models import SudokuTRM
 
 
 # ── Spatial TRM ──────────────────────────────────────────────────────────────────
 
-class SpatialTRM(nn.Module):
+class SpatialTRM(SudokuTRM):
     """
-    Tiny Recursive Model operating on a compressed 2-D spatial grid.
+    Spatial variant of SudokuTRM — identical internals, spatial I/O.
 
-    Pipeline:
-      embed:  (B, in_c, grid_h, grid_w) → tokens (B, H*W, d_model)
-      TRM:    shared TransformerBlocks iterate z_L (fast) then z_H (slow)
-      decode: tokens → (B, out_c, grid_h, grid_w)
+    Inherits unchanged from SudokuTRM:
+      blocks (SwiGLU + post-norm RMSNorm), rotary_emb (RoPE), out_norm,
+      lm_head (reused as out_proj), z_H_init / z_L_init (trunc_normal std=1),
+      reasoning_step, get_initial_states, count_parameters.
 
-    Recursion is identical to SudokuTRM (L_cycles inner, H_cycles outer,
-    n_sup supervision steps with one backward each).
+    vocab_size=out_channels is passed to the parent so that lm_head has the
+    right output dimension.  The token embedding (nn.Embedding) is replaced
+    in-place by a Conv2d spatial projection — same attribute name, different
+    type.
+
+    embed() mirrors SudokuTRM's: scale + optional puzzle prefix token (RoPE
+    handles positions, no separate 2D learned table needed).
+    decode() reshapes the lm_head output back to (B, out_channels, H, W).
     """
 
     def __init__(
@@ -91,113 +96,64 @@ class SpatialTRM(nn.Module):
         H_cycles: int = 3,
         n_sup: int = 4,
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
-        super().__init__()
-        self.L_cycles    = L_cycles
-        self.H_cycles    = H_cycles
-        self.n_sup       = n_sup
-        self.grid_h      = grid_h
-        self.grid_w      = grid_w
-        seq_len          = grid_h * grid_w
-        self.seq_len     = seq_len
-
-        embed_init_std    = 1.0 / math.sqrt(d_model)
-        self.embed_scale  = math.sqrt(d_model)
-
-        # Project encoded spatial features to d_model token space.
-        # input_proj contains learnable weights — embed() must be re-called on
-        # every n_sup step during training (graph freed after each backward()).
-        self.input_proj    = nn.Conv2d(in_channels, d_model, kernel_size=1)
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, seq_len, d_model) * embed_init_std
+        seq_len = grid_h * grid_w
+        # Parent builds the full TRM stack. vocab_size=out_channels so that
+        # lm_head is Linear(d_model, out_channels) — the desired output shape.
+        super().__init__(
+            vocab_size=out_channels,
+            seq_len=seq_len,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
+        self.grid_h = grid_h
+        self.grid_w = grid_w
 
-        # Shared blocks — same weights for z_L and z_H updates (mirrors SudokuTRM).
-        # TransformerBlock is now post-norm (RMSNorm after residual) so no
-        # separate norm_z_H / norm_z_L are needed.
-        self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, dropout=dropout)
-            for _ in range(n_layers)
-        ])
+        # Replace the token embedding with a Conv2d spatial projection.
+        # Everything else (rotary_emb, blocks, lm_head, z_H/z_L init) is unchanged.
+        self.embedding = nn.Conv2d(in_channels, d_model, kernel_size=1)
+        nn.init.kaiming_normal_(self.embedding.weight, nonlinearity="relu")
+        nn.init.zeros_(self.embedding.bias)
 
-        self.out_norm = RMSNorm(d_model)
-        self.out_proj = nn.Linear(d_model, out_channels)
-
-        # Learnable initial states (trunc_normal std=1, same as SudokuTRM).
-        self.z_H_init = nn.Parameter(torch.empty(1, seq_len, d_model))
-        self.z_L_init = nn.Parameter(torch.empty(1, seq_len, d_model))
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        nn.init.kaiming_normal_(self.input_proj.weight, nonlinearity="relu")
-        if self.input_proj.bias is not None:
-            nn.init.zeros_(self.input_proj.bias)
-        nn.init.normal_(self.out_proj.weight, std=1.0 / self.embed_scale)
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
-        nn.init.trunc_normal_(self.z_H_init, std=1.0)
-        nn.init.trunc_normal_(self.z_L_init, std=1.0)
-        for block in self.blocks:
-            for p in block.parameters():
-                if p.dim() > 1:
-                    nn.init.xavier_uniform_(p)
-
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
+    def embed(self, x: torch.Tensor, puzzle_ids=None) -> torch.Tensor:
         """
-        x: (B, in_channels, grid_h, grid_w) → (B, seq_len, d_model)
+        (B, in_channels, grid_h, grid_w) → (B, [1+]seq_len, d_model)
 
-        Scaling convention from SudokuTRM: embed_scale * 0.707 so that
-        per-element std ≈ 1.0 after summing spatial + positional embeddings.
+        Mirrors SudokuTRM.embed(): embed_scale * projection + optional puzzle
+        prefix token prepended to the sequence (same as SudokuTRM item 6).
+        RoPE in _run_blocks handles positions — no separate 2D table needed.
         """
-        tokens = self.input_proj(x).flatten(2).transpose(1, 2)   # (B, seq, d_model)
-        return self.embed_scale * 0.707106781 * (tokens + self.pos_embedding)
+        tokens = self.embedding(x).flatten(2).transpose(1, 2)   # (B, seq, d_model)
+        tokens = self.embed_scale * tokens
 
-    def get_initial_states(self, bsz: int):
-        z_H = self.z_H_init.expand(bsz, -1, -1).clone()
-        z_L = self.z_L_init.expand(bsz, -1, -1).clone()
-        return z_H, z_L
+        if self.puzzle_id_embedding is not None:
+            if puzzle_ids is None:
+                puzzle_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            puzzle_token = self.puzzle_id_embedding(puzzle_ids).unsqueeze(1)
+            tokens = torch.cat([puzzle_token, tokens], dim=1)
 
-    def _run_blocks(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x)
-        return x
+        return tokens
 
-    def reasoning_step(
-        self,
-        input_emb: torch.Tensor,
-        z_H: torch.Tensor,
-        z_L: torch.Tensor,
-    ):
+    # reasoning_step() is inherited from SudokuTRM unchanged.
+    # It returns (lm_head_output, z_H_det, z_L_det) where lm_head_output is
+    # (B, seq_len, out_channels) — exactly what decode() below expects.
+
+    def decode(self, spatial_tokens: torch.Tensor) -> torch.Tensor:
         """
-        One n_sup supervision step.
+        (B, seq_len, out_channels) → (B, out_channels, grid_h, grid_w)
 
-        (H_cycles-1) macro cycles without gradients, then one final cycle
-        with gradients — identical structure to SudokuTRM.reasoning_step.
-
-        Returns:
-            z_H_grad     – z_H with gradient (for decode → bridge → painter)
-            z_H_detached – state for next n_sup step
-            z_L_detached – state for next n_sup step
+        spatial_tokens is reasoning_step()[0]: lm_head has already been applied,
+        so this is a pure reshape back to a spatial feature map.
         """
-        with torch.no_grad():
-            for _ in range(self.H_cycles - 1):
-                for _ in range(self.L_cycles):
-                    z_L = self._run_blocks(input_emb + z_H + z_L)
-                z_H = self._run_blocks(z_H + z_L)
-
-        # Final macro cycle — gradients flow through this into bridge and painter
-        for _ in range(self.L_cycles):
-            z_L = self._run_blocks(input_emb + z_H + z_L)
-        z_H = self._run_blocks(z_H + z_L)
-
-        return z_H, z_H.detach(), z_L.detach()
-
-    def decode(self, z_H: torch.Tensor) -> torch.Tensor:
-        """(B, seq_len, d_model) → (B, out_channels, grid_h, grid_w)"""
-        B   = z_H.shape[0]
-        out = self.out_proj(self.out_norm(z_H))   # (B, seq, out_channels)
-        return out.transpose(1, 2).reshape(B, -1, self.grid_h, self.grid_w)
+        B = spatial_tokens.shape[0]
+        return spatial_tokens.transpose(1, 2).reshape(B, -1, self.grid_h, self.grid_w)
 
 
 # ── Bilinear bridge (V0–V3) ──────────────────────────────────────────────────────
@@ -230,6 +186,12 @@ def _make_painter(
     bridge_channels: int,
     painter_channels: tuple[int, ...],
 ) -> UNet2DModel:
+    """
+    Build the denoising UNet.  Uses plain conv blocks throughout (no attention)
+    to keep compute O(pixels) rather than O(pixels²).  For a 9×9 grid of
+    independent digits, self-attention across the full image adds little value
+    and dominates wall-clock time.
+    """
     n = len(painter_channels)
     norm_num_groups = 32
     while norm_num_groups > 1 and any(c % norm_num_groups != 0 for c in painter_channels):
@@ -239,12 +201,8 @@ def _make_painter(
         in_channels=1 + bridge_channels,
         out_channels=1,
         block_out_channels=painter_channels,
-        down_block_types=tuple(
-            "DownBlock2D" if i == 0 else "AttnDownBlock2D" for i in range(n)
-        ),
-        up_block_types=tuple(
-            "UpBlock2D" if i == n - 1 else "AttnUpBlock2D" for i in range(n)
-        ),
+        down_block_types=("DownBlock2D",) * n,
+        up_block_types=("UpBlock2D",) * n,
         norm_num_groups=norm_num_groups,
     )
 
@@ -307,6 +265,7 @@ class _TRMRatatouilleBase(nn.Module):
         z_H: torch.Tensor,
         z_L: torch.Tensor,
         timesteps: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
     ):
         """
         One n_sup supervision step.
@@ -318,10 +277,10 @@ class _TRMRatatouilleBase(nn.Module):
         Returns: (noise_pred, sudoku_logits, z_H_next, z_L_next)
         """
         enc       = self.encoder(self._get_encoder_input(condition, noisy))
-        input_emb = self.thinker.embed(enc)
-        z_H_grad, z_H_next, z_L_next = self.thinker.reasoning_step(input_emb, z_H, z_L)
+        input_emb = self.thinker.embed(enc, puzzle_ids=puzzle_ids)
+        spatial_tokens, z_H_next, z_L_next = self.thinker.reasoning_step(input_emb, z_H, z_L)
 
-        spatial_cond  = self.thinker.decode(z_H_grad)
+        spatial_cond  = self.thinker.decode(spatial_tokens)
         bridge_feat   = self.bridge(spatial_cond)
         noise_pred    = self.painter(
             torch.cat([noisy, bridge_feat], dim=1), timesteps
@@ -334,6 +293,7 @@ class _TRMRatatouilleBase(nn.Module):
         noisy_images: torch.Tensor,   # (B, 1, H, W)
         timesteps: torch.Tensor,      # (B,)
         condition: torch.Tensor,      # (B, 1, H, W)
+        puzzle_ids: Optional[torch.Tensor] = None,
     ):
         """
         Full inference: n_sup × H_cycles × L_cycles, single painter pass at end.
@@ -350,13 +310,19 @@ class _TRMRatatouilleBase(nn.Module):
         enc  = self.encoder(self._get_encoder_input(condition, noisy_images))
 
         for _ in range(self.thinker.n_sup):
-            input_emb = self.thinker.embed(enc)
+            input_emb = self.thinker.embed(enc, puzzle_ids=puzzle_ids)
+            T         = input_emb.shape[1]
+            freqs_cis = self.thinker.rotary_emb(T)
             for _ in range(self.thinker.H_cycles):
                 for _ in range(self.thinker.L_cycles):
-                    z_L = self.thinker._run_blocks(input_emb + z_H + z_L)
-                z_H = self.thinker._run_blocks(z_H + z_L)
+                    z_L = self.thinker._run_blocks(input_emb + z_H + z_L, freqs_cis)
+                z_H = self.thinker._run_blocks(z_H + z_L, freqs_cis)
 
-        spatial_cond  = self.thinker.decode(z_H)
+        # Produce spatial tokens the same way reasoning_step() does.
+        spatial_tokens = self.thinker.lm_head(
+            self.thinker.out_norm(z_H[:, self.thinker.puzzle_emb_len:])
+        )
+        spatial_cond  = self.thinker.decode(spatial_tokens)
         bridge_feat   = self.bridge(spatial_cond)
         noise_pred    = self.painter(
             torch.cat([noisy_images, bridge_feat], dim=1), timesteps
@@ -397,8 +363,9 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
-        grid_size = painter_size // cell_size   # e.g. 288//32 = 9
+        grid_size = painter_size // cell_size   # e.g. 144//16 = 9
 
         encoder = SpatialEncoder(1, enc_channels, factor=cell_size)   # 1-ch: condition only
         thinker = SpatialTRM(
@@ -406,6 +373,7 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
             grid_h=grid_size, grid_w=grid_size,
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
@@ -444,6 +412,7 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
         grid_size = painter_size // cell_size
 
@@ -453,6 +422,7 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
             grid_h=grid_size, grid_w=grid_size,
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
@@ -490,6 +460,7 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
         grid_size = painter_size // cell_size
 
@@ -499,6 +470,7 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
             grid_h=grid_size, grid_w=grid_size,
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
@@ -531,6 +503,7 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
         grid_size = painter_size // cell_size
 
@@ -540,6 +513,7 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
             grid_h=grid_size, grid_w=grid_size,
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
@@ -554,14 +528,14 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
     Same as V3 but compression_factor ≠ cell_size → thinker grid ≠ 9×9,
     and uses AttentiveBridge (Perceiver-IO cross-attention) for upsampling.
     Training wheel removed: grid topology uncoupled from puzzle cell structure.
-    Default: compression_factor=16 → 288//16=18×18 thinker grid.
+    Default: compression_factor=16 → 144//16=9×9 thinker grid.
     """
 
     _encoder_sees_noisy = True
 
     def __init__(
         self,
-        painter_size: int = 288,
+        painter_size: int = 144,
         compression_factor: int = 16,
         enc_channels: int = 32,
         thinker_out_channels: int = 64,
@@ -575,6 +549,7 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
         bridge_num_heads: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
     ):
         grid_size = painter_size // compression_factor
 
@@ -584,6 +559,7 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
             grid_h=grid_size, grid_w=grid_size,
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
         )
         # AttentiveBridge: Perceiver-IO cross-attention upsamples low-res thinker
         # output to painter_size × painter_size via learned positional queries.

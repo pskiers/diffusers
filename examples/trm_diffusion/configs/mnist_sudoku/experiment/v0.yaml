@@ -4,10 +4,18 @@ output_dir: "runs/mnist_sudoku_v0"
 model:
   variant: "v0"
   kwargs:
-    thinker_hidden: 64
-    thinker_layers: 4
-    bridge_channels: 8
-    painter_channels: [32, 64, 128, 256]
+    # Thinker: match working SudokuTRM hyperparams
+    d_model: 256
+    n_heads: 4
+    n_layers: 2
+    L_cycles: 6
+    H_cycles: 3
+    n_sup: 16
+    num_puzzle_ids: 1000   # one embedding per puzzle (dataset has ~1000 puzzles)
+    # Encoder / bridge / painter
+    enc_channels: 64
+    bridge_channels: 16
+    painter_channels: [64, 128, 256]
 
 train:
   sudoku_loss_weight: 0.1
