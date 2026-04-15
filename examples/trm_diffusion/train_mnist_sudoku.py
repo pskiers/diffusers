@@ -142,10 +142,23 @@ def compute_losses(
         )
 
     total_loss = diff_loss + sudoku_loss_weight * sudoku_loss
+
+    thinker_cell_acc   = None
+    thinker_puzzle_acc = None
+    if sudoku_logits is not None:
+        B_, N, C = sudoku_logits.shape
+        preds   = sudoku_logits.argmax(dim=-1)   # (B_, N)
+        targets = solution[:B_, :N]              # (B_, N)
+        correct = preds == targets
+        thinker_cell_acc   = correct.float().mean()
+        thinker_puzzle_acc = correct.all(dim=1).float().mean()
+
     return {
-        "loss":        total_loss,
-        "diff_loss":   diff_loss,
-        "sudoku_loss": sudoku_loss,
+        "loss":               total_loss,
+        "diff_loss":          diff_loss,
+        "sudoku_loss":        sudoku_loss,
+        "thinker_cell_acc":   thinker_cell_acc,
+        "thinker_puzzle_acc": thinker_puzzle_acc,
     }
 
 
@@ -242,7 +255,10 @@ def eval_loop(
     sudoku_loss_weight: float = 0.0,
 ) -> dict:
     model.eval()
-    metrics = {"loss": [], "diff_loss": [], "sudoku_loss": []}
+    metrics: dict[str, list] = {
+        "loss": [], "diff_loss": [], "sudoku_loss": [],
+        "thinker_cell_acc": [], "thinker_puzzle_acc": [],
+    }
 
     max_eval_batches = 10
     for i, batch in tqdm(enumerate(dataloader), "Evaluating", total=max_eval_batches):
@@ -250,10 +266,12 @@ def eval_loop(
             break
         m = compute_losses(model, batch, scheduler, accelerator, sudoku_loss_weight)
         for k in metrics:
-            metrics[k].append(m[k].item())
+            val = m.get(k)
+            if val is not None:
+                metrics[k].append(val.item() if torch.is_tensor(val) else float(val))
 
     model.train()
-    return {k: float(np.mean(v)) for k, v in metrics.items()}
+    return {k: float(np.mean(v)) for k, v in metrics.items() if v}
 
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
@@ -472,18 +490,29 @@ def main(args: DictConfig):
                 for p, live in zip(unwrapped.parameters(), live_params):
                     p.data.copy_(live)
             if accelerator.is_main_process:
+                thinker_suffix = ""
+                if "thinker_cell_acc" in metrics:
+                    thinker_suffix = (
+                        f"  thinker_cell={metrics['thinker_cell_acc']:.4f}"
+                        f"  thinker_puzzle={metrics['thinker_puzzle_acc']:.4f}"
+                    )
                 logger.info(
                     f"[eval] step={global_step}  "
                     f"loss={metrics['loss']:.4f}  "
                     f"diff={metrics['diff_loss']:.4f}  "
                     f"sudoku={metrics['sudoku_loss']:.4f}"
+                    + thinker_suffix
                 )
                 if wandb_project:
-                    accelerator.log({
+                    wandb_eval = {
                         "eval/loss":        metrics["loss"],
                         "eval/diff_loss":   metrics["diff_loss"],
                         "eval/sudoku_loss": metrics["sudoku_loss"],
-                    }, step=global_step)
+                    }
+                    if "thinker_cell_acc" in metrics:
+                        wandb_eval["eval/thinker_cell_acc"]   = metrics["thinker_cell_acc"]
+                        wandb_eval["eval/thinker_puzzle_acc"] = metrics["thinker_puzzle_acc"]
+                    accelerator.log(wandb_eval, step=global_step)
                 if metrics["loss"] < best_loss:
                     best_loss = metrics["loss"]
                     _save(accelerator, model, optimizer, global_step, args.output_dir, "best", ema=ema)
@@ -495,6 +524,7 @@ def main(args: DictConfig):
                     eval_batch = next(iter(DataLoader(eval_ds, batch_size=n_eval, shuffle=False)))
                     conditions = eval_batch["conditions"]
                     solutions  = eval_batch["solution"]
+                    puzzle_ids_eval = eval_batch.get("puzzle_id", None)
                     generated  = sample_grids(
                         accelerator.unwrap_model(model),
                         conditions,
@@ -502,6 +532,7 @@ def main(args: DictConfig):
                         beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
                         num_steps=n_steps,
                         device=accelerator.device,
+                        puzzle_ids=puzzle_ids_eval,
                     )
                     acc = evaluate_grids(generated, solutions, classifier, cell_size)
                     logger.info(

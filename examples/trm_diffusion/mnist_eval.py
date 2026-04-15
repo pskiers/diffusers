@@ -181,11 +181,12 @@ def evaluate_grids(
 @torch.no_grad()
 def sample_grids(
     model,
-    conditions:       torch.Tensor,   # (B, 1, H, W)
+    conditions:          torch.Tensor,        # (B, 1, H, W)
     num_train_timesteps: int,
-    beta_schedule:    str,
-    num_steps:        int,
-    device:           torch.device,
+    beta_schedule:       str,
+    num_steps:           int,
+    device:              torch.device,
+    puzzle_ids:          torch.Tensor | None = None,  # (B,) long
 ) -> torch.Tensor:
     """DDIM-sample a batch of grids conditioned on *conditions*.
 
@@ -201,12 +202,14 @@ def sample_grids(
     ddim.set_timesteps(num_steps)
 
     conditions = conditions.to(device)
+    if puzzle_ids is not None:
+        puzzle_ids = puzzle_ids.to(device)
     x = torch.randn_like(conditions)
 
     model.eval()
     for t in ddim.timesteps:
         ts          = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
-        noise_pred, _ = model(x, ts, conditions)
+        noise_pred, _ = model(x, ts, conditions, puzzle_ids=puzzle_ids)
         x           = ddim.step(noise_pred, t, x).prev_sample
 
     return x.clamp(0.0, 1.0)
