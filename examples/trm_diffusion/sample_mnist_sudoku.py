@@ -34,6 +34,16 @@ from mnist_sudoku_models import (
     MNISTRatatouilleV2,
     MNISTRatatouilleV3,
     MNISTRatatouilleV4,
+    MNISTRatatouilleV0Control,
+    MNISTRatatouilleV1Control,
+    MNISTRatatouilleV2Control,
+    MNISTRatatouilleV3Control,
+    MNISTRatatouilleV4Control,
+    MNISTRatatouilleV0SPADE,
+    MNISTRatatouilleV1SPADE,
+    MNISTRatatouilleV2SPADE,
+    MNISTRatatouilleV3SPADE,
+    MNISTRatatouilleV4SPADE,
 )
 
 logger = get_logger(__name__, log_level="INFO")
@@ -44,6 +54,16 @@ MODEL_REGISTRY = {
     "v2": MNISTRatatouilleV2,
     "v3": MNISTRatatouilleV3,
     "v4": MNISTRatatouilleV4,
+    "v0control": MNISTRatatouilleV0Control,
+    "v1control": MNISTRatatouilleV1Control,
+    "v2control": MNISTRatatouilleV2Control,
+    "v3control": MNISTRatatouilleV3Control,
+    "v4control": MNISTRatatouilleV4Control,
+    "v0spade": MNISTRatatouilleV0SPADE,
+    "v1spade": MNISTRatatouilleV1SPADE,
+    "v2spade": MNISTRatatouilleV2SPADE,
+    "v3spade": MNISTRatatouilleV3SPADE,
+    "v4spade": MNISTRatatouilleV4SPADE,
 }
 
 
@@ -93,17 +113,18 @@ def main(args: DictConfig):
     use_ddim = args.sample.get("use_ddim", False)
     num_inference_steps = args.sample.get("num_steps", 100)
 
+    prediction_type = args.get("prediction_type", "epsilon")
     if use_ddim:
         scheduler = DDIMScheduler(
             num_train_timesteps=args.get("num_timesteps", 1000),
             beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
-            prediction_type="epsilon",
+            prediction_type=prediction_type,
         )
     else:
         scheduler = DDPMScheduler(
             num_train_timesteps=args.get("num_timesteps", 1000),
             beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
-            prediction_type="epsilon",
+            prediction_type=prediction_type,
         )
     scheduler.set_timesteps(num_inference_steps)
 

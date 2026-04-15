@@ -189,6 +189,7 @@ def sample_grids(
     beta_schedule:       str,
     num_steps:           int,
     device:              torch.device,
+    prediction_type:     str                = "epsilon",
     puzzle_ids:          torch.Tensor | None = None,   # (B,) long
     solutions:           torch.Tensor | None = None,   # (B, 81) int64 [0-8]
 ) -> dict:
@@ -208,7 +209,7 @@ def sample_grids(
     ddim = DDIMScheduler(
         num_train_timesteps=num_train_timesteps,
         beta_schedule=beta_schedule,
-        prediction_type="epsilon",
+        prediction_type=prediction_type,
     )
     ddim.set_timesteps(num_steps)
 

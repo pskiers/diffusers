@@ -43,6 +43,16 @@ from mnist_sudoku_models import (
     MNISTRatatouilleV2,
     MNISTRatatouilleV3,
     MNISTRatatouilleV4,
+    MNISTRatatouilleV0Control,
+    MNISTRatatouilleV1Control,
+    MNISTRatatouilleV2Control,
+    MNISTRatatouilleV3Control,
+    MNISTRatatouilleV4Control,
+    MNISTRatatouilleV0SPADE,
+    MNISTRatatouilleV1SPADE,
+    MNISTRatatouilleV2SPADE,
+    MNISTRatatouilleV3SPADE,
+    MNISTRatatouilleV4SPADE,
 )
 
 
@@ -94,6 +104,16 @@ MODEL_REGISTRY = {
     "v2": MNISTRatatouilleV2,
     "v3": MNISTRatatouilleV3,
     "v4": MNISTRatatouilleV4,
+    "v0control": MNISTRatatouilleV0Control,
+    "v1control": MNISTRatatouilleV1Control,
+    "v2control": MNISTRatatouilleV2Control,
+    "v3control": MNISTRatatouilleV3Control,
+    "v4control": MNISTRatatouilleV4Control,
+    "v0spade": MNISTRatatouilleV0SPADE,
+    "v1spade": MNISTRatatouilleV1SPADE,
+    "v2spade": MNISTRatatouilleV2SPADE,
+    "v3spade": MNISTRatatouilleV3SPADE,
+    "v4spade": MNISTRatatouilleV4SPADE,
 }
 
 IGNORE_LABEL_ID = -100
@@ -134,7 +154,8 @@ def compute_losses(
 
     noise_pred, sudoku_logits = model(noisy, timesteps, conditions, puzzle_ids=puzzle_ids)
 
-    diff_loss = F.mse_loss(noise_pred, noise)
+    target    = noise if scheduler.config.prediction_type == "epsilon" else images
+    diff_loss = F.mse_loss(noise_pred, target)
 
     sudoku_loss = torch.tensor(0.0, device=accelerator.device)
     if sudoku_logits is not None and sudoku_loss_weight > 0:
@@ -217,7 +238,8 @@ def train_step(
             conditions, noisy, z_H, z_L, timesteps, puzzle_ids=puzzle_ids
         )
 
-        diff_loss = F.mse_loss(noise_pred, noise)
+        target    = noise if scheduler.config.prediction_type == "epsilon" else images
+        diff_loss = F.mse_loss(noise_pred, target)
 
         sudoku_loss = torch.tensor(0.0, device=accelerator.device)
         if sudoku_logits is not None and sudoku_loss_weight > 0:
@@ -385,7 +407,7 @@ def main(args: DictConfig):
     scheduler = DDPMScheduler(
         num_train_timesteps=args.get("num_timesteps", 1000),
         beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
-        prediction_type="epsilon",
+        prediction_type=args.get("prediction_type", "epsilon"),
     )
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
@@ -556,6 +578,7 @@ def main(args: DictConfig):
                             conds,
                             num_train_timesteps=args.get("num_timesteps", 1000),
                             beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
+                            prediction_type=args.get("prediction_type", "epsilon"),
                             num_steps=n_ddim,
                             device=accelerator.device,
                             puzzle_ids=pids,

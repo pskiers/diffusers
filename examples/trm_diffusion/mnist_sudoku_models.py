@@ -57,8 +57,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import UNet2DModel
+from diffusers.models.unets.unet_2d import UNet2DOutput
+from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
-from models import SpatialEncoder, AttentiveBridge   # reuse from trm pipeline
+from models import SpatialEncoder, AttentiveBridge, ConditioningPyramid   # reuse from trm pipeline
 from sudoku_models import SudokuTRM
 
 
@@ -207,6 +209,330 @@ def _make_painter(
     )
 
 
+# ── ControlNet-capable painter ───────────────────────────────────────────────────
+
+class _ControlPainterUNet(UNet2DModel):
+    """UNet2DModel extended with ControlNet-style residual injection.
+
+    Identical to UNet2DModel in every way except forward() accepts
+    down_block_additional_residuals and mid_block_additional_residual, which are
+    added to the skip connections before the up-blocks (standard ControlNet math).
+    """
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        class_labels=None,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        return_dict: bool = True,
+    ):
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep * torch.ones(sample.shape[0], dtype=timestep.dtype, device=timestep.device)
+        t_emb = self.time_proj(timestep).to(dtype=self.dtype)
+        emb = self.time_embedding(t_emb)
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError("class_labels required for class conditioning")
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+            emb = emb + self.class_embedding(class_labels).to(dtype=self.dtype)
+
+        skip_sample = sample
+        sample = self.conv_in(sample)
+
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if hasattr(downsample_block, "skip_conv"):
+                sample, res_samples, skip_sample = downsample_block(
+                    hidden_states=sample, temb=emb, skip_sample=skip_sample
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+            down_block_res_samples += res_samples
+
+        if down_block_additional_residuals is not None:
+            new_down = ()
+            for orig, add in zip(down_block_res_samples, down_block_additional_residuals):
+                new_down += (orig + add,)
+            down_block_res_samples = new_down
+
+        if self.mid_block is not None:
+            sample = self.mid_block(sample, emb)
+
+        if mid_block_additional_residual is not None:
+            sample = sample + mid_block_additional_residual
+
+        skip_sample = None
+        for upsample_block in self.up_blocks:
+            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(upsample_block.resnets)]
+            if hasattr(upsample_block, "skip_conv"):
+                sample, skip_sample = upsample_block(sample, res_samples, emb, skip_sample)
+            else:
+                sample = upsample_block(sample, res_samples, emb)
+
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        if skip_sample is not None:
+            sample += skip_sample
+
+        if self.config.time_embedding_type == "fourier":
+            timestep = timestep.reshape((sample.shape[0], *([1] * len(sample.shape[1:]))))
+            sample = sample / timestep
+
+        if not return_dict:
+            return (sample,)
+        return UNet2DOutput(sample=sample)
+
+
+def _make_painter_control(
+    painter_size: int,
+    painter_channels: tuple[int, ...],
+) -> _ControlPainterUNet:
+    """Build a ControlNet-capable painter UNet (in_channels=1, no bridge concat)."""
+    n = len(painter_channels)
+    norm_num_groups = 32
+    while norm_num_groups > 1 and any(c % norm_num_groups != 0 for c in painter_channels):
+        norm_num_groups //= 2
+    return _ControlPainterUNet(
+        sample_size=painter_size,
+        in_channels=1,
+        out_channels=1,
+        block_out_channels=painter_channels,
+        down_block_types=("DownBlock2D",) * n,
+        up_block_types=("UpBlock2D",) * n,
+        norm_num_groups=norm_num_groups,
+    )
+
+
+# ── SPADE (Spatially Adaptive Normalization) painter ─────────────────────────────
+
+class SPADEGroupNorm(nn.Module):
+    """GroupNorm + spatially adaptive scale/bias from a semantic map.
+
+    h_out = gamma(s) * GroupNorm(h) + beta(s)
+    where gamma, beta are predicted by a small CNN applied to s resized to h's size.
+    """
+
+    def __init__(self, num_groups: int, num_channels: int, sem_channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, num_channels, affine=False)
+        mid = max(num_channels, sem_channels)
+        self.shared     = nn.Sequential(nn.Conv2d(sem_channels, mid, 3, padding=1), nn.SiLU())
+        self.gamma_proj = nn.Conv2d(mid, num_channels, 3, padding=1)
+        self.beta_proj  = nn.Conv2d(mid, num_channels, 3, padding=1)
+
+    def forward(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        h_norm = self.norm(h)
+        s_r    = F.interpolate(s, size=h.shape[-2:], mode="bilinear", align_corners=False)
+        feat   = self.shared(s_r)
+        return self.gamma_proj(feat) * h_norm + self.beta_proj(feat)
+
+
+class SPADEResBlock(nn.Module):
+    """ResNet block with both GroupNorms replaced by SPADE."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        sem_channels: int,
+        temb_channels: int,
+        norm_groups: int = 32,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = SPADEGroupNorm(norm_groups, in_channels, sem_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm2 = SPADEGroupNorm(norm_groups, out_channels, sem_channels)
+        self.conv2 = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+        self.act            = nn.SiLU()
+        self.time_emb_proj  = nn.Sequential(nn.SiLU(), nn.Linear(temb_channels, out_channels))
+        self.conv_shortcut  = (nn.Conv2d(in_channels, out_channels, 1)
+                               if in_channels != out_channels else None)
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.norm1(x, s))
+        h = self.conv1(h)
+        h = h + self.time_emb_proj(temb)[:, :, None, None]
+        h = self.act(self.norm2(h, s))
+        h = self.conv2(h)
+        if self.conv_shortcut is not None:
+            x = self.conv_shortcut(x)
+        return x + h
+
+
+class _SPADEDownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, temb_ch, sem_ch, num_layers, add_downsample, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            SPADEResBlock(in_ch if i == 0 else out_ch, out_ch, sem_ch, temb_ch, norm_groups, dropout)
+            for i in range(num_layers)
+        ])
+        self.downsamplers = (
+            nn.ModuleList([nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)])
+            if add_downsample else None
+        )
+
+    def forward(self, hidden, temb, s):
+        outputs = ()
+        for r in self.resnets:
+            hidden = r(hidden, temb, s);  outputs += (hidden,)
+        if self.downsamplers is not None:
+            for d in self.downsamplers:
+                hidden = d(hidden)
+            outputs += (hidden,)
+        return hidden, outputs
+
+
+class _SPADEMidBlock(nn.Module):
+    def __init__(self, channels, temb_ch, sem_ch, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            SPADEResBlock(channels, channels, sem_ch, temb_ch, norm_groups, dropout)
+            for _ in range(2)   # UNetMidBlock2D default: num_layers=1 → 2 resnets
+        ])
+
+    def forward(self, hidden, temb, s):
+        for r in self.resnets:
+            hidden = r(hidden, temb, s)
+        return hidden
+
+
+class _SPADEUpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, prev_out_ch, temb_ch, sem_ch, num_layers, add_upsample, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList()
+        for i in range(num_layers):
+            # Mirrors diffusers UpBlock2D channel formula exactly
+            res_skip_ch = in_ch if (i == num_layers - 1) else out_ch
+            res_in_ch   = prev_out_ch if i == 0 else out_ch
+            self.resnets.append(
+                SPADEResBlock(res_in_ch + res_skip_ch, out_ch, sem_ch, temb_ch, norm_groups, dropout)
+            )
+        self.upsamplers = (
+            nn.ModuleList([nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            )])
+            if add_upsample else None
+        )
+
+    def forward(self, hidden, res_tuple, temb, s):
+        for r in self.resnets:
+            skip       = res_tuple[-1]
+            res_tuple  = res_tuple[:-1]
+            hidden     = r(torch.cat([hidden, skip], dim=1), temb, s)
+        if self.upsamplers is not None:
+            for up in self.upsamplers:
+                hidden = up(hidden)
+        return hidden
+
+
+class SPADEUNet2D(nn.Module):
+    """UNet2DModel with SPADE normalization throughout.
+
+    Takes an extra semantic map `s` (B, sem_channels, H, W) in forward().
+    Each SPADEGroupNorm bilinearly resizes `s` to the current feature map
+    resolution — no pyramid required.
+
+    Architecturally matches _make_painter_control (in_channels=1, no concat).
+    """
+
+    def __init__(
+        self,
+        painter_size: int,
+        sem_channels: int,
+        block_out_channels: tuple[int, ...] = (32, 64, 128, 256),
+        layers_per_block: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        norm_groups = 32
+        while norm_groups > 1 and any(c % norm_groups != 0 for c in block_out_channels):
+            norm_groups //= 2
+
+        ch0    = block_out_channels[0]
+        temb_ch = ch0 * 4
+
+        self.time_proj      = Timesteps(ch0, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.time_embedding = TimestepEmbedding(ch0, temb_ch)
+        self.conv_in        = nn.Conv2d(1, ch0, 3, padding=1)
+
+        # Down blocks
+        n = len(block_out_channels)
+        self.down_blocks = nn.ModuleList()
+        cur_ch = ch0
+        for i, out_ch in enumerate(block_out_channels):
+            self.down_blocks.append(_SPADEDownBlock(
+                in_ch=cur_ch, out_ch=out_ch, temb_ch=temb_ch, sem_ch=sem_channels,
+                num_layers=layers_per_block, add_downsample=(i < n - 1),
+                norm_groups=norm_groups, dropout=dropout,
+            ))
+            cur_ch = out_ch
+
+        # Mid block
+        self.mid_block = _SPADEMidBlock(
+            channels=cur_ch, temb_ch=temb_ch, sem_ch=sem_channels,
+            norm_groups=norm_groups, dropout=dropout,
+        )
+
+        # Up blocks (mirrors UNet2DModel channel formula)
+        rev = list(reversed(block_out_channels))
+        self.up_blocks = nn.ModuleList()
+        prev_out_ch = rev[0]
+        for i, out_ch in enumerate(rev):
+            in_skip_ch = rev[min(i + 1, n - 1)]
+            self.up_blocks.append(_SPADEUpBlock(
+                in_ch=in_skip_ch, out_ch=out_ch, prev_out_ch=prev_out_ch,
+                temb_ch=temb_ch, sem_ch=sem_channels,
+                num_layers=layers_per_block + 1, add_upsample=(i < n - 1),
+                norm_groups=norm_groups, dropout=dropout,
+            ))
+            prev_out_ch = out_ch
+
+        self.conv_norm_out = nn.GroupNorm(norm_groups, ch0)
+        self.conv_act      = nn.SiLU()
+        self.conv_out      = nn.Conv2d(ch0, 1, 3, padding=1)
+
+    def forward(self, sample: torch.Tensor, timestep, s: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif timestep.ndim == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep * torch.ones(sample.shape[0], dtype=timestep.dtype, device=timestep.device)
+        emb = self.time_embedding(self.time_proj(timestep).to(sample.dtype))
+
+        x = self.conv_in(sample)
+        skips = (x,)
+        for block in self.down_blocks:
+            x, res = block(x, emb, s);  skips += res
+
+        x = self.mid_block(x, emb, s)
+
+        for block in self.up_blocks:
+            n_skip   = len(block.resnets)
+            res_tup  = skips[-n_skip:]
+            skips    = skips[:-n_skip]
+            x = block(x, res_tup, emb, s)
+
+        return self.conv_out(self.conv_act(self.conv_norm_out(x)))
+
+
 # ── Gradient scaling hook ────────────────────────────────────────────────────────
 
 class _GradScale(torch.autograd.Function):
@@ -259,16 +585,26 @@ class _TRMRatatouilleBase(nn.Module):
         self,
         encoder: SpatialEncoder,
         thinker: SpatialTRM,
-        bridge: nn.Module,
-        painter: UNet2DModel,
+        bridge: Optional[nn.Module],   # None for ControlNet variants
+        painter: nn.Module,
         diff_thinker_weight: float = 1.0,
     ):
         super().__init__()
         self.encoder = encoder
         self.thinker = thinker
-        self.bridge  = bridge
+        self.bridge  = bridge          # not registered as submodule when None
         self.painter = painter
         self.diff_thinker_weight = diff_thinker_weight
+
+    def _run_painter(
+        self,
+        noisy: torch.Tensor,
+        spatial_cond_scaled: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inject thinker features into painter. Override for ControlNet."""
+        bridge_feat = self.bridge(spatial_cond_scaled)
+        return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
 
     @property
     def n_sup(self) -> int:
@@ -314,10 +650,9 @@ class _TRMRatatouilleBase(nn.Module):
         spatial_cond  = self.thinker.decode(spatial_tokens)
         # Scale (or zero) the diffusion-loss gradient flowing back into the thinker.
         # sudoku_logits uses the unscaled spatial_cond so its gradient is unaffected.
-        bridge_feat   = self.bridge(_grad_scale(spatial_cond, self.diff_thinker_weight))
-        noise_pred    = self.painter(
-            torch.cat([noisy, bridge_feat], dim=1), timesteps
-        ).sample
+        noise_pred    = self._run_painter(
+            noisy, _grad_scale(spatial_cond, self.diff_thinker_weight), timesteps
+        )
         sudoku_logits = self._compute_sudoku_logits(spatial_cond)
         return noise_pred, sudoku_logits, z_H_next, z_L_next
 
@@ -356,12 +691,94 @@ class _TRMRatatouilleBase(nn.Module):
             self.thinker.out_norm(z_H[:, self.thinker.puzzle_emb_len:])
         )
         spatial_cond  = self.thinker.decode(spatial_tokens)
-        bridge_feat   = self.bridge(spatial_cond)
-        noise_pred    = self.painter(
-            torch.cat([noisy_images, bridge_feat], dim=1), timesteps
-        ).sample
+        noise_pred    = self._run_painter(noisy_images, spatial_cond, timesteps)
         sudoku_logits = self._compute_sudoku_logits(spatial_cond)
         return noise_pred, sudoku_logits
+
+
+# ── ControlNet base ──────────────────────────────────────────────────────────────
+
+class _TRMRatatouilleControlBase(_TRMRatatouilleBase):
+    """
+    Same as _TRMRatatouilleBase but painter conditioning uses ControlNet-style
+    multi-scale residual injection instead of channel concatenation.
+
+    Thinker spatial output is bilinearly upsampled to painter resolution, then
+    processed by ConditioningPyramid which produces per-layer residuals that are
+    added to the UNet's skip connections and mid block.
+
+    The painter is a _ControlPainterUNet with in_channels=1 (noisy only —
+    no bridge channels concatenated).
+    """
+
+    def __init__(
+        self,
+        encoder: SpatialEncoder,
+        thinker: SpatialTRM,
+        painter: _ControlPainterUNet,
+        control_pyramid: ConditioningPyramid,
+        diff_thinker_weight: float = 1.0,
+    ):
+        # bridge=None: this class overrides _run_painter, self.bridge is never called
+        super().__init__(
+            encoder=encoder, thinker=thinker,
+            bridge=None, painter=painter,
+            diff_thinker_weight=diff_thinker_weight,
+        )
+        self.control_pyramid = control_pyramid
+
+    def _run_painter(
+        self,
+        noisy: torch.Tensor,
+        spatial_cond_scaled: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        painter_size = noisy.shape[-1]
+        upsampled = F.interpolate(
+            spatial_cond_scaled, size=painter_size, mode="bilinear", align_corners=False
+        )
+        down_res, mid_res = self.control_pyramid(upsampled)
+        return self.painter(
+            noisy, timesteps,
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        ).sample
+
+
+# ── SPADE base ───────────────────────────────────────────────────────────────────
+
+class _TRMRatatouilleSPADEBase(_TRMRatatouilleBase):
+    """SPADE-conditioned variant: thinker output spatially normalizes every UNet ResBlock.
+
+    Unlike ControlNet (additive residuals), SPADE multiplies and shifts feature
+    map activations at every norm layer — stronger, spatially precise conditioning.
+    The painter is a SPADEUNet2D; no bridge module is used.
+    """
+
+    def __init__(
+        self,
+        encoder: SpatialEncoder,
+        thinker: SpatialTRM,
+        painter: SPADEUNet2D,
+        diff_thinker_weight: float = 1.0,
+    ):
+        super().__init__(
+            encoder=encoder, thinker=thinker,
+            bridge=None, painter=painter,
+            diff_thinker_weight=diff_thinker_weight,
+        )
+
+    def _run_painter(
+        self,
+        noisy: torch.Tensor,
+        spatial_cond_scaled: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        painter_size = noisy.shape[-1]
+        s = F.interpolate(
+            spatial_cond_scaled, size=painter_size, mode="bilinear", align_corners=False
+        )
+        return self.painter(noisy, timesteps, s)
 
 
 # ── V0 ───────────────────────────────────────────────────────────────────────────
@@ -615,4 +1032,427 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
         painter = _make_painter(painter_size, bridge_channels, painter_channels)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V0Control ─────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV0Control(_TRMRatatouilleControlBase):
+    """V0 with ControlNet conditioning: encoder sees CONDITION ONLY, digit logits.
+
+    Thinker output (9×9 × num_classes) is bilinearly upsampled to painter
+    resolution and injected via ConditioningPyramid residuals instead of
+    channel concatenation.  Painter has in_channels=1 (noisy only).
+    """
+
+    _encoder_sees_noisy = False
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        num_classes: int = 9,
+        enc_channels: int = 32,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(1, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=num_classes,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter         = _make_painter_control(painter_size, painter_channels)
+        control_pyramid = ConditioningPyramid(num_classes, block_out_channels=painter_channels, layers_per_block=2)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
+        self._num_classes = num_classes
+
+    def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
+        B = spatial_cond.shape[0]
+        return spatial_cond.permute(0, 2, 3, 1).reshape(B, 81, self._num_classes)
+
+
+# ── V1Control ─────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV1Control(_TRMRatatouilleControlBase):
+    """V1 with ControlNet: encoder sees cat(condition, noisy), digit logits."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        num_classes: int = 9,
+        enc_channels: int = 32,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=num_classes,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter         = _make_painter_control(painter_size, painter_channels)
+        control_pyramid = ConditioningPyramid(num_classes, block_out_channels=painter_channels, layers_per_block=2)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
+        self._num_classes = num_classes
+
+    def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
+        B = spatial_cond.shape[0]
+        return spatial_cond.permute(0, 2, 3, 1).reshape(B, 81, self._num_classes)
+
+
+# ── V2Control ─────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV2Control(_TRMRatatouilleControlBase):
+    """V2 with ControlNet: encoder sees cat(condition, noisy), no sudoku CE loss."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 16,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter         = _make_painter_control(painter_size, painter_channels)
+        control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V3Control ─────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV3Control(_TRMRatatouilleControlBase):
+    """V3 with ControlNet: thinker_out_channels unconstrained (default 64)."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 64,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter         = _make_painter_control(painter_size, painter_channels)
+        control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V4Control ─────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV4Control(_TRMRatatouilleControlBase):
+    """V4 with ControlNet: compression_factor decoupled from cell_size.
+
+    Grid topology is uncoupled from puzzle cell structure; ControlNet pyramid
+    handles the upsampling to painter resolution instead of AttentiveBridge.
+    """
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 144,
+        compression_factor: int = 16,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 64,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // compression_factor
+        encoder = SpatialEncoder(2, enc_channels, factor=compression_factor)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter         = _make_painter_control(painter_size, painter_channels)
+        control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V0SPADE ───────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV0SPADE(_TRMRatatouilleSPADEBase):
+    """V0 with SPADE conditioning: encoder sees CONDITION ONLY, digit logits.
+
+    Each ResBlock in the UNet is normalized by gamma/beta predicted from the
+    thinker's spatial output, providing stronger per-activation conditioning.
+    """
+
+    _encoder_sees_noisy = False
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        num_classes: int = 9,
+        enc_channels: int = 32,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(1, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=num_classes,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter = SPADEUNet2D(painter_size, sem_channels=num_classes,
+                              block_out_channels=painter_channels, dropout=dropout)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
+        self._num_classes = num_classes
+
+    def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
+        B = spatial_cond.shape[0]
+        return spatial_cond.permute(0, 2, 3, 1).reshape(B, 81, self._num_classes)
+
+
+# ── V1SPADE ───────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV1SPADE(_TRMRatatouilleSPADEBase):
+    """V1 with SPADE: encoder sees cat(condition, noisy), digit logits."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        num_classes: int = 9,
+        enc_channels: int = 32,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=num_classes,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter = SPADEUNet2D(painter_size, sem_channels=num_classes,
+                              block_out_channels=painter_channels, dropout=dropout)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
+        self._num_classes = num_classes
+
+    def _compute_sudoku_logits(self, spatial_cond: torch.Tensor) -> torch.Tensor:
+        B = spatial_cond.shape[0]
+        return spatial_cond.permute(0, 2, 3, 1).reshape(B, 81, self._num_classes)
+
+
+# ── V2SPADE ───────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV2SPADE(_TRMRatatouilleSPADEBase):
+    """V2 with SPADE: encoder sees cat(condition, noisy), no sudoku CE loss."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 16,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
+                              block_out_channels=painter_channels, dropout=dropout)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V3SPADE ───────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV3SPADE(_TRMRatatouilleSPADEBase):
+    """V3 with SPADE: thinker_out_channels unconstrained (default 64)."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 64,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
+                              block_out_channels=painter_channels, dropout=dropout)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
+                         diff_thinker_weight=diff_thinker_weight)
+
+
+# ── V4SPADE ───────────────────────────────────────────────────────────────────────
+
+class MNISTRatatouilleV4SPADE(_TRMRatatouilleSPADEBase):
+    """V4 with SPADE: compression_factor decoupled from cell_size."""
+
+    _encoder_sees_noisy = True
+
+    def __init__(
+        self,
+        painter_size: int = 144,
+        compression_factor: int = 16,
+        enc_channels: int = 32,
+        thinker_out_channels: int = 64,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 4,
+        painter_channels: tuple[int, ...] = (32, 64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // compression_factor
+        encoder = SpatialEncoder(2, enc_channels, factor=compression_factor)
+        thinker = SpatialTRM(
+            in_channels=enc_channels, out_channels=thinker_out_channels,
+            grid_h=grid_size, grid_w=grid_size,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+        )
+        painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
+                              block_out_channels=painter_channels, dropout=dropout)
+        super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)

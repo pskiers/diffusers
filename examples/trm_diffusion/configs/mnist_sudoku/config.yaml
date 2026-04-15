@@ -22,6 +22,7 @@ use_ema: true
 ema_decay: 0.9999
 num_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2"
+prediction_type: "epsilon"   # "epsilon" (noise) or "sample" (x0 prediction)
 
 # ── Offline sampling (sample_mnist_sudoku.py) ──────────────────────────────────
 sample:
