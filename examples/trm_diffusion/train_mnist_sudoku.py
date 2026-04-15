@@ -538,7 +538,12 @@ def main(args: DictConfig):
                     n_panels_done   = 0
                     n_done          = 0
 
-                    for eb in DataLoader(eval_ds, batch_size=n_batch, shuffle=False):
+                    for eb in tqdm(
+                        DataLoader(eval_ds, batch_size=n_batch, shuffle=False),
+                        "Sampling for digit-level eval",
+                        disable=not accelerator.is_local_main_process,
+                        total=(n_total + n_batch - 1) // n_batch
+                    ):
                         if n_done >= n_total:
                             break
                         conds = eb["conditions"]

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +231,7 @@ def sample_grids(
     ts_puzzle_acc: list[tuple[int, float]] = []
 
     model.eval()
-    for t in ddim.timesteps:
+    for t in tqdm(ddim.timesteps):
         ts         = torch.full((B,), t, device=device, dtype=torch.long)
         noise_pred, sudoku_logits = model(x, ts, conditions, puzzle_ids=puzzle_ids)
 
