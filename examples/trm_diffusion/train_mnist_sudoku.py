@@ -20,6 +20,7 @@ import math
 import logging
 from pathlib import Path
 
+import wandb
 import hydra
 import numpy as np
 import torch
@@ -31,7 +32,10 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids
+from mnist_eval import (
+    evaluate_grids, load_or_train_classifier, sample_grids,
+    make_panel_image, plot_thinker_ts_curve,
+)
 from mnist_sudoku_dataset import MNISTSudokuDataset
 from mnist_sudoku_models import (
     MNISTRatatouilleV0,
@@ -305,8 +309,10 @@ def main(args: DictConfig):
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if wandb_project:
-        run_name = args.get("wandb_run_name", None)
-        init_kwargs = {"wandb": {"name": run_name}} if run_name else {}
+        # Derive run name from the output_dir leaf (e.g. "runs/mnist_sudoku_v0" → "mnist_sudoku_v0")
+        run_name = Path(args.output_dir).name
+
+        init_kwargs = {"wandb": {"name": run_name, "settings": wandb.Settings(init_timeout=300)}}
         accelerator.init_trackers(
             project_name=wandb_project,
             config=OmegaConf.to_container(args, resolve=True),
@@ -350,7 +356,7 @@ def main(args: DictConfig):
 
     # ── MNIST cell classifier (for digit-level eval) ──────────────────────────
     classifier = None
-    classifier_path = args.get("eval_classifier_path", None)
+    classifier_path = args.train.get("eval_classifier_path", None)
     if classifier_path and accelerator.is_main_process:
         classifier = load_or_train_classifier(
             classifier_path,
@@ -517,48 +523,89 @@ def main(args: DictConfig):
                     best_loss = metrics["loss"]
                     _save(accelerator, model, optimizer, global_step, args.output_dir, "best", ema=ema)
 
-                # Digit-level eval via DDIM sampling + classifier
+                # Digit-level eval via multi-batch DDIM sampling + classifier
                 if classifier is not None:
-                    n_eval    = args.get("eval_num_samples", 16)
-                    n_steps   = args.get("eval_num_ddim_steps", 20)
-                    eval_batch = next(iter(DataLoader(eval_ds, batch_size=n_eval, shuffle=False)))
-                    conditions = eval_batch["conditions"]
-                    solutions  = eval_batch["solution"]
-                    puzzle_ids_eval = eval_batch.get("puzzle_id", None)
-                    generated  = sample_grids(
-                        accelerator.unwrap_model(model),
-                        conditions,
-                        num_train_timesteps=args.get("num_timesteps", 1000),
-                        beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
-                        num_steps=n_steps,
-                        device=accelerator.device,
-                        puzzle_ids=puzzle_ids_eval,
-                    )
-                    acc = evaluate_grids(generated, solutions, classifier, cell_size)
+                    n_total = args.train.get("eval_num_samples",    128)
+                    n_batch = args.train.get("eval_batch_size",      32)
+                    n_ddim  = args.train.get("eval_num_ddim_steps",  20)
+                    n_log   = args.train.get("eval_num_log_images",  10)
+
+                    all_cell_acc    = []
+                    all_puzzle_acc  = []
+                    ts_cell_accs:   dict[int, list[float]] = {}
+                    ts_puzzle_accs: dict[int, list[float]] = {}
+                    panels_list:    list = []
+                    n_panels_done   = 0
+                    n_done          = 0
+
+                    for eb in DataLoader(eval_ds, batch_size=n_batch, shuffle=False):
+                        if n_done >= n_total:
+                            break
+                        conds = eb["conditions"]
+                        sols  = eb["solution"]
+                        pids  = eb.get("puzzle_id", None)
+                        B_cur = conds.shape[0]
+
+                        sr = sample_grids(
+                            accelerator.unwrap_model(model),
+                            conds,
+                            num_train_timesteps=args.get("num_timesteps", 1000),
+                            beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
+                            num_steps=n_ddim,
+                            device=accelerator.device,
+                            puzzle_ids=pids,
+                            solutions=sols,
+                        )
+                        generated = sr["generated"]
+
+                        acc = evaluate_grids(generated, sols, classifier, cell_size)
+                        all_cell_acc.append(acc["cell_acc"])
+                        all_puzzle_acc.append(acc["puzzle_acc"])
+
+                        for t, a in sr.get("ts_cell_acc", []):
+                            ts_cell_accs.setdefault(t, []).append(a)
+                        for t, a in sr.get("ts_puzzle_acc", []):
+                            ts_puzzle_accs.setdefault(t, []).append(a)
+
+                        # Build panel images for the first n_log samples
+                        if wandb_project and n_panels_done < n_log:
+                            n_new     = min(n_log - n_panels_done, B_cur)
+                            tp_all    = sr.get("best_thinker_preds")   # (B, N) cpu int64 or None
+                            tt_all    = sr.get("best_thinker_ts")      # list[int] or None
+                            sols_np   = sols.cpu().numpy()
+                            for i in range(n_new):
+                                tp = tp_all[i].numpy() if tp_all is not None else None
+                                tt = tt_all[i]         if tt_all is not None else None
+                                panel = make_panel_image(
+                                    conds[i], generated[i], sols_np[i],
+                                    thinker_preds=tp, thinker_t=tt,
+                                    img_size=cell_size * 9,
+                                )
+                                panels_list.append(
+                                    wandb.Image(panel, caption=f"sample[{n_done + i}]")
+                                )
+                            n_panels_done += n_new
+
+                        n_done += B_cur
+
+                    mean_cell   = float(np.mean(all_cell_acc))
+                    mean_puzzle = float(np.mean(all_puzzle_acc))
                     logger.info(
-                        f"[eval] cell_acc={acc['cell_acc']:.4f}  "
-                        f"puzzle_acc={acc['puzzle_acc']:.4f}"
+                        f"[eval] cell_acc={mean_cell:.4f}  "
+                        f"puzzle_acc={mean_puzzle:.4f}  "
+                        f"(over {n_done} samples)"
                     )
                     if wandb_project:
-                        accelerator.log({
-                            "eval/cell_acc":   acc["cell_acc"],
-                            "eval/puzzle_acc": acc["puzzle_acc"],
-                        }, step=global_step)
-                        try:
-                            import wandb as _wandb
-                            if _wandb.run is not None:
-                                n_show = min(4, generated.shape[0])
-                                panels = []
-                                for i in range(n_show):
-                                    c = conditions[i, 0].cpu().clamp(0, 1).numpy()
-                                    g = generated[i, 0].cpu().numpy()
-                                    panels.extend([
-                                        _wandb.Image(c, caption=f"cond[{i}]"),
-                                        _wandb.Image(g, caption=f"gen[{i}]"),
-                                    ])
-                                _wandb.log({"eval/samples": panels}, step=global_step)
-                        except ImportError:
-                            pass
+                        wandb_acc: dict = {
+                            "eval/cell_acc":   mean_cell,
+                            "eval/puzzle_acc": mean_puzzle,
+                        }
+                        if panels_list:
+                            wandb_acc["eval/samples"] = panels_list
+                        if ts_cell_accs:
+                            curve = plot_thinker_ts_curve(ts_cell_accs, ts_puzzle_accs)
+                            wandb_acc["eval/thinker_vs_timestep"] = wandb.Image(curve)
+                        accelerator.log(wandb_acc, step=global_step)
             next_eval = global_step + eval_every
 
         if global_step >= next_save and accelerator.is_main_process:

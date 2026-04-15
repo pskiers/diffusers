@@ -62,9 +62,9 @@ def main(args: DictConfig):
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(args))
 
-    checkpoint_path = args.get("checkpoint_path")
+    checkpoint_path = args.sample.get("checkpoint_path")
     if not checkpoint_path:
-        raise ValueError("checkpoint_path must be specified")
+        raise ValueError("checkpoint_path must be specified (set sample.checkpoint_path=...)")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
@@ -90,8 +90,8 @@ def main(args: DictConfig):
     model.eval()
 
     # ── Scheduler ────────────────────────────────────────────────────────────
-    use_ddim = args.get("use_ddim", False)
-    num_inference_steps = args.get("ddpm_num_inference_steps", 100)
+    use_ddim = args.sample.get("use_ddim", False)
+    num_inference_steps = args.sample.get("num_steps", 100)
 
     if use_ddim:
         scheduler = DDIMScheduler(
@@ -108,9 +108,9 @@ def main(args: DictConfig):
     scheduler.set_timesteps(num_inference_steps)
 
     # ── Sampling ─────────────────────────────────────────────────────────────
-    num_samples      = args.get("num_samples", 16)
-    sample_batch_size = args.get("sample_batch_size", 8)
-    output_dir       = Path(args.output_dir) / "samples"
+    num_samples       = args.sample.get("num_samples", 16)
+    sample_batch_size = args.sample.get("batch_size", 8)
+    output_dir        = Path(args.output_dir) / "samples"
 
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def main(args: DictConfig):
         B = min(sample_batch_size, num_samples - generated)
 
         # Condition: all-blank sudoku (zeros) unless a dataset path is given.
-        condition_source = args.get("condition_source", "blank")
+        condition_source = args.sample.get("condition_source", "blank")
         if condition_source == "blank":
             conditions = torch.zeros(B, 1, painter_size, painter_size, device=device)
         else:

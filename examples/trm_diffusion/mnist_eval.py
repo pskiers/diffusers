@@ -6,7 +6,9 @@ Provides:
   train_mnist_classifier   – trains and saves the classifier.
   load_or_train_classifier – loads or trains on demand.
   evaluate_grids           – classifies cells in generated images, returns cell/puzzle acc.
-  sample_grids             – DDIM sampling helper used during training eval.
+  sample_grids             – DDIM sampling with thinker trajectory tracking.
+  make_panel_image         – composites puzzle | [thinker] | model output | true solution.
+  plot_thinker_ts_curve    – plots thinker accuracy vs denoising timestep (mean ± std).
 """
 
 import logging
@@ -186,11 +188,19 @@ def sample_grids(
     beta_schedule:       str,
     num_steps:           int,
     device:              torch.device,
-    puzzle_ids:          torch.Tensor | None = None,  # (B,) long
-) -> torch.Tensor:
-    """DDIM-sample a batch of grids conditioned on *conditions*.
+    puzzle_ids:          torch.Tensor | None = None,   # (B,) long
+    solutions:           torch.Tensor | None = None,   # (B, 81) int64 [0-8]
+) -> dict:
+    """DDIM-sample and collect thinker stats along the denoising trajectory.
 
-    Returns (B, 1, H, W) float32 in [0, 1].
+    Returns dict:
+      'generated'          : (B, 1, H, W) float32 [0, 1]
+      'best_thinker_preds' : (B, N) int64    — thinker argmax at most-confident step
+      'best_thinker_ts'    : list[int] len B — timestep of that prediction
+      'ts_cell_acc'        : list[(t, float)] — per-denoising-step mean cell acc
+      'ts_puzzle_acc'      : list[(t, float)] — per-denoising-step mean puzzle acc
+    The thinker and timestep entries are only present when the model returns sudoku logits.
+    The ts_* entries also require solutions to be provided.
     """
     from diffusers import DDIMScheduler
 
@@ -204,12 +214,181 @@ def sample_grids(
     conditions = conditions.to(device)
     if puzzle_ids is not None:
         puzzle_ids = puzzle_ids.to(device)
+    if solutions is not None:
+        solutions = solutions.to(device)
+    B = conditions.shape[0]
     x = torch.randn_like(conditions)
+
+    # Lazy-initialised on first encounter of sudoku_logits
+    has_logits   = False
+    best_conf    = None
+    best_preds   = None
+    best_ts_vals = None
+    N_logits     = None
+
+    ts_cell_acc:   list[tuple[int, float]] = []
+    ts_puzzle_acc: list[tuple[int, float]] = []
 
     model.eval()
     for t in ddim.timesteps:
-        ts          = torch.full((x.shape[0],), t, device=device, dtype=torch.long)
-        noise_pred, _ = model(x, ts, conditions, puzzle_ids=puzzle_ids)
-        x           = ddim.step(noise_pred, t, x).prev_sample
+        ts         = torch.full((B,), t, device=device, dtype=torch.long)
+        noise_pred, sudoku_logits = model(x, ts, conditions, puzzle_ids=puzzle_ids)
 
-    return x.clamp(0.0, 1.0)
+        if sudoku_logits is not None:
+            if not has_logits:
+                has_logits   = True
+                N_logits     = sudoku_logits.shape[1]
+                best_conf    = torch.full((B,), -1e9, device=device)
+                best_preds   = torch.zeros(B, N_logits, dtype=torch.long, device=device)
+                best_ts_vals = torch.zeros(B, dtype=torch.long, device=device)
+
+            preds = sudoku_logits.argmax(dim=-1)                              # (B, N)
+            probs = torch.softmax(sudoku_logits.float(), dim=-1)              # (B, N, C)
+            conf  = probs.max(dim=-1).values.mean(dim=-1)                     # (B,)
+
+            update       = conf > best_conf
+            best_conf    = torch.where(update, conf, best_conf)
+            best_preds   = torch.where(
+                update.unsqueeze(-1).expand_as(best_preds), preds, best_preds
+            )
+            best_ts_vals = torch.where(
+                update,
+                torch.full((B,), int(t), device=device, dtype=torch.long),
+                best_ts_vals,
+            )
+
+            if solutions is not None:
+                tgts    = solutions[:B, :N_logits]
+                correct = preds == tgts
+                ts_cell_acc.append((int(t),   correct.float().mean().item()))
+                ts_puzzle_acc.append((int(t), correct.all(dim=1).float().mean().item()))
+
+        x = ddim.step(noise_pred, t, x).prev_sample
+
+    result: dict = {"generated": x.clamp(0.0, 1.0)}
+    if has_logits:
+        result["best_thinker_preds"] = best_preds.cpu()
+        result["best_thinker_ts"]    = best_ts_vals.cpu().tolist()
+    if ts_cell_acc:
+        result["ts_cell_acc"]   = ts_cell_acc
+        result["ts_puzzle_acc"] = ts_puzzle_acc
+    return result
+
+
+# ── Visualisation helpers ─────────────────────────────────────────────────────
+
+def _sudoku_grid_img(digits_0idx: np.ndarray, label: str = "", size: int = 144) -> np.ndarray:
+    """Render a 9×9 sudoku digit grid as a (size, size, 3) uint8 RGB numpy array.
+
+    digits_0idx: (81,) int array, values 0-8 (displayed as 1-9).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image as _PILImage
+
+    fig, ax = plt.subplots(figsize=(3, 3), dpi=max(1, size // 3))
+    ax.set_xlim(0, 9)
+    ax.set_ylim(0, 9)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    for i in range(10):
+        lw = 1.5 if i % 3 == 0 else 0.4
+        ax.axhline(i, color="black", linewidth=lw)
+        ax.axvline(i, color="black", linewidth=lw)
+    grid = np.asarray(digits_0idx, dtype=int).reshape(9, 9)
+    fs = max(5, size // 18)
+    for r in range(9):
+        for c in range(9):
+            ax.text(c + 0.5, 8.5 - r, str(grid[r, c] + 1),
+                    ha="center", va="center", fontsize=fs, color="black")
+    top = 0.88 if label else 1.0
+    if label:
+        ax.set_title(label, fontsize=max(5, size // 20), pad=2)
+    fig.subplots_adjust(left=0.01, right=0.99, top=top, bottom=0.01)
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    w, h = fig.canvas.get_width_height()
+    buf = buf.reshape(h, w, 4)[..., :3]
+    img = np.array(_PILImage.fromarray(buf).resize((size, size), _PILImage.LANCZOS))
+    plt.close(fig)
+    return img
+
+
+def _mnist_to_rgb(t: torch.Tensor, size: int = 144) -> np.ndarray:
+    """(1, H, W) float [0,1] grayscale tensor → (size, size, 3) uint8 RGB."""
+    from PIL import Image as _PILImage
+    arr = t.squeeze(0).clamp(0, 1).cpu().float().numpy()
+    arr = (arr * 255).astype(np.uint8)
+    img = _PILImage.fromarray(arr, mode="L").resize((size, size), _PILImage.LANCZOS)
+    return np.stack([np.array(img)] * 3, axis=-1)
+
+
+def make_panel_image(
+    condition:     torch.Tensor,               # (1, H, W) float [0,1]  – puzzle shown to model
+    generated:     torch.Tensor,               # (1, H, W) float [0,1]  – model output
+    solution:      np.ndarray,                 # (81,) int [0-8]         – true solution
+    thinker_preds: np.ndarray | None = None,   # (81,) int [0-8]         – thinker prediction
+    thinker_t:     int | None       = None,    # denoising timestep label
+    img_size:      int              = 144,
+) -> np.ndarray:
+    """Build a horizontal panel image for visual evaluation.
+
+    Layout (width depends on whether thinker is present):
+      puzzle  |  [thinker solution]  |  model output  |  true solution
+
+    Returns (img_size, width, 3) uint8 RGB numpy array.
+    """
+    sep = np.full((img_size, 4, 3), 200, dtype=np.uint8)   # light-gray 4-px separator
+    parts = [_mnist_to_rgb(condition, img_size)]
+    if thinker_preds is not None:
+        label = f"thinker t={thinker_t}" if thinker_t is not None else "thinker"
+        parts += [sep, _sudoku_grid_img(thinker_preds, label=label, size=img_size)]
+    parts += [sep, _mnist_to_rgb(generated, img_size)]
+    parts += [sep, _sudoku_grid_img(solution, label="true", size=img_size)]
+    return np.concatenate(parts, axis=1)
+
+
+def plot_thinker_ts_curve(
+    ts_cell_acc:   dict,   # {t_int: [batch_mean, ...]}
+    ts_puzzle_acc: dict,   # {t_int: [batch_mean, ...]}
+) -> np.ndarray:
+    """Plot thinker cell/puzzle accuracy vs denoising timestep (mean ± std bands).
+
+    ts_cell_acc / ts_puzzle_acc: dicts mapping timestep → list of per-batch means.
+    Returns (H, W, 3) uint8 RGB numpy array suitable for wandb.Image.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ts_sorted  = sorted(ts_cell_acc.keys(), reverse=True)   # high noise → low noise
+    ta         = np.array(ts_sorted, dtype=float)
+    cell_mean  = np.array([np.mean(ts_cell_acc[t])   for t in ts_sorted])
+    cell_std   = np.array([np.std(ts_cell_acc[t])    for t in ts_sorted])
+    puzz_mean  = np.array([np.mean(ts_puzzle_acc[t]) for t in ts_sorted])
+    puzz_std   = np.array([np.std(ts_puzzle_acc[t])  for t in ts_sorted])
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(ta, cell_mean, color="tab:blue",   label="cell acc")
+    ax.fill_between(ta, cell_mean - cell_std, cell_mean + cell_std,
+                    alpha=0.25, color="tab:blue")
+    ax.plot(ta, puzz_mean, color="tab:orange", label="puzzle acc")
+    ax.fill_between(ta, puzz_mean - puzz_std, puzz_mean + puzz_std,
+                    alpha=0.25, color="tab:orange")
+    ax.invert_xaxis()   # left = high noise, right = clean
+    ax.set_xlabel("timestep  (← denoising direction)")
+    ax.set_ylabel("accuracy")
+    ax.set_ylim(0, 1)
+    ax.set_title("Thinker accuracy along denoising trajectory")
+    ax.legend()
+    fig.tight_layout()
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    w, h = fig.canvas.get_width_height()
+    buf = buf.reshape(h, w, 4)[..., :3]
+    plt.close(fig)
+    return buf
