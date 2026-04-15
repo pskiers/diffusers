@@ -584,7 +584,7 @@ def main(args: DictConfig):
                                 panel = make_panel_image(
                                     conds[i], generated[i], sols_np[i],
                                     thinker_preds=tp, thinker_t=tt,
-                                    img_size=cell_size * 9,
+                                    img_size=324,   # 36px per cell → readable digits
                                 )
                                 panels_list.append(
                                     wandb.Image(panel, caption=f"sample[{n_done + i}]")
