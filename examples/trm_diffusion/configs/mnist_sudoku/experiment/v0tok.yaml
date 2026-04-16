@@ -1,8 +1,8 @@
 # @package _global_
-output_dir: "runs/mnist_sudoku_v3"
+output_dir: "runs/mnist_sudoku_v0tok"
 
 model:
-  variant: "v3"
+  variant: "v0tok"
   kwargs:
     d_model: 512
     n_heads: 8
@@ -11,7 +11,9 @@ model:
     H_cycles: 3
     n_sup: 16
     num_puzzle_ids: 1000
-    enc_channels: 64
-    thinker_out_channels: 64
     bridge_channels: 16
     painter_channels: [64, 128, 256]
+    diff_thinker_weight: 1.0
+
+train:
+  sudoku_loss_weight: 1.0

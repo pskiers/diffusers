@@ -163,9 +163,15 @@ class MNISTSudokuDataset(Dataset):
         valid = (labels_tok >= 2) & (labels_tok <= 10)
         solution[valid] = labels_tok[valid] - self.DIGIT_OFFSET  # 0..8
 
+        # Mask given cells (match train_sudoku.py: only predict blank cells)
+        if self.mask_given:
+            given = (inputs_tok >= 2) & (inputs_tok <= 10)
+            solution[given] = -100
+
         return {
-            "images":     torch.from_numpy(image_grid).unsqueeze(0),   # (1,H,W)
-            "conditions": torch.from_numpy(cond_grid).unsqueeze(0),    # (1,H,W)
-            "solution":   torch.from_numpy(solution),                   # (81,)
-            "puzzle_id":  sudoku_item["puzzle_id"],                     # scalar
+            "images":        torch.from_numpy(image_grid).unsqueeze(0),   # (1,H,W)
+            "conditions":    torch.from_numpy(cond_grid).unsqueeze(0),    # (1,H,W)
+            "solution":      torch.from_numpy(solution),                   # (81,)
+            "puzzle_id":     sudoku_item["puzzle_id"],                     # scalar
+            "puzzle_tokens": torch.from_numpy(inputs_tok.copy()),          # (81,) long
         }

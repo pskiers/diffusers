@@ -176,7 +176,7 @@ def evaluate_grids(
     correct    = preds == sol
     cell_acc   = correct.float().mean().item()
     puzzle_acc = correct.all(dim=1).float().mean().item()
-    return {"cell_acc": cell_acc, "puzzle_acc": puzzle_acc}
+    return {"cell_acc": cell_acc, "puzzle_acc": puzzle_acc, "preds": preds.cpu()}
 
 
 # ── DDIM sampling ─────────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ def evaluate_grids(
 @torch.no_grad()
 def sample_grids(
     model,
-    conditions:          torch.Tensor,        # (B, 1, H, W)
+    conditions:          torch.Tensor,        # (B, 1, H, W) or (B, 81) long for token models
     num_train_timesteps: int,
     beta_schedule:       str,
     num_steps:           int,
@@ -192,17 +192,25 @@ def sample_grids(
     prediction_type:     str                = "epsilon",
     puzzle_ids:          torch.Tensor | None = None,   # (B,) long
     solutions:           torch.Tensor | None = None,   # (B, 81) int64 [0-8]
+    painter_size:        int | None         = None,    # required for token-input models
 ) -> dict:
     """DDIM-sample and collect thinker stats along the denoising trajectory.
 
     Returns dict:
-      'generated'          : (B, 1, H, W) float32 [0, 1]
-      'best_thinker_preds' : (B, N) int64    — thinker argmax at most-confident step
-      'best_thinker_ts'    : list[int] len B — timestep of that prediction
-      'ts_cell_acc'        : list[(t, float)] — per-denoising-step mean cell acc
-      'ts_puzzle_acc'      : list[(t, float)] — per-denoising-step mean puzzle acc
-    The thinker and timestep entries are only present when the model returns sudoku logits.
-    The ts_* entries also require solutions to be provided.
+      'generated'                  : (B, 1, H, W) float32 [0, 1]
+      'best_thinker_preds'         : (B, N) int64    — thinker argmax at most-confident step
+      'best_thinker_ts'            : list[int] len B — timestep of that prediction
+      'mean_thinker_preds'         : (B, N) int64    — plurality-vote across all trajectory steps
+      'thinker_deviation_from_best': float           — mean fraction of cells that differ from
+                                                       best_thinker_preds across the trajectory
+      'ts_cell_acc'                : list[(t, float)] — per-denoising-step mean cell acc
+      'ts_puzzle_acc'              : list[(t, float)] — per-denoising-step mean puzzle acc
+      'thinker_cell_acc_best'      : float  — max cell acc over trajectory  (requires solutions)
+      'thinker_cell_acc_mean'      : float  — mean cell acc over trajectory (requires solutions)
+      'thinker_puzzle_acc_best'    : float  — max puzzle acc over trajectory
+      'thinker_puzzle_acc_mean'    : float  — mean puzzle acc over trajectory
+    All thinker/deviation entries are absent when the model returns no sudoku logits.
+    The acc_best/mean entries also require solutions to be provided.
     """
     from diffusers import DDIMScheduler
 
@@ -219,7 +227,10 @@ def sample_grids(
     if solutions is not None:
         solutions = solutions.to(device)
     B = conditions.shape[0]
-    x = torch.randn_like(conditions)
+    if painter_size is not None:
+        x = torch.randn(B, 1, painter_size, painter_size, device=device)
+    else:
+        x = torch.randn_like(conditions)
 
     # Lazy-initialised on first encounter of sudoku_logits
     has_logits   = False
@@ -228,8 +239,9 @@ def sample_grids(
     best_ts_vals = None
     N_logits     = None
 
-    ts_cell_acc:   list[tuple[int, float]] = []
-    ts_puzzle_acc: list[tuple[int, float]] = []
+    ts_cell_acc:    list[tuple[int, float]] = []
+    ts_puzzle_acc:  list[tuple[int, float]] = []
+    all_preds_list: list[torch.Tensor]      = []   # (B, N) per step, stored on CPU
 
     model.eval()
     for t in tqdm(ddim.timesteps):
@@ -245,6 +257,7 @@ def sample_grids(
                 best_ts_vals = torch.zeros(B, dtype=torch.long, device=device)
 
             preds = sudoku_logits.argmax(dim=-1)                              # (B, N)
+            all_preds_list.append(preds.cpu())
             probs = torch.softmax(sudoku_logits.float(), dim=-1)              # (B, N, C)
             conf  = probs.max(dim=-1).values.mean(dim=-1)                     # (B,)
 
@@ -269,8 +282,27 @@ def sample_grids(
 
     result: dict = {"generated": x.clamp(0.0, 1.0)}
     if has_logits:
-        result["best_thinker_preds"] = best_preds.cpu()
+        best_preds_cpu = best_preds.cpu()
+        result["best_thinker_preds"] = best_preds_cpu
         result["best_thinker_ts"]    = best_ts_vals.cpu().tolist()
+
+        if all_preds_list:
+            all_preds = torch.stack(all_preds_list, dim=0)  # (T, B, N) on CPU
+            # Mean Hamming distance from the best-confidence prediction
+            result["thinker_deviation_from_best"] = (
+                (all_preds != best_preds_cpu.unsqueeze(0)).float().mean().item()
+            )
+            # Plurality vote across the trajectory
+            result["mean_thinker_preds"] = torch.mode(all_preds, dim=0).values  # (B, N)
+
+            if ts_cell_acc:
+                cell_vals = [a for _, a in ts_cell_acc]
+                puzz_vals = [a for _, a in ts_puzzle_acc]
+                result["thinker_cell_acc_best"]   = float(max(cell_vals))
+                result["thinker_cell_acc_mean"]   = float(np.mean(cell_vals))
+                result["thinker_puzzle_acc_best"] = float(max(puzz_vals))
+                result["thinker_puzzle_acc_mean"] = float(np.mean(puzz_vals))
+
     if ts_cell_acc:
         result["ts_cell_acc"]   = ts_cell_acc
         result["ts_puzzle_acc"] = ts_puzzle_acc

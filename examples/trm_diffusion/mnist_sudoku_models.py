@@ -1456,3 +1456,87 @@ class MNISTRatatouilleV4SPADE(_TRMRatatouilleSPADEBase):
                               block_out_channels=painter_channels, dropout=dropout)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
+
+
+# ── Token encoder (integer tokens → spatial feature map) ─────────────────────────
+
+class _TokenEncoder(nn.Module):
+    """Converts integer puzzle tokens (B, 81) to a spatial feature map (B, out_channels, 9, 9).
+
+    Acts as a drop-in replacement for SpatialEncoder when the input is discrete
+    tokens rather than pixel images.  The output is compatible with SpatialTRM.embed().
+    """
+
+    def __init__(self, vocab_size: int, out_channels: int, grid_h: int = 9, grid_w: int = 9):
+        super().__init__()
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.embedding = nn.Embedding(vocab_size, out_channels)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """(B, grid_h*grid_w) long → (B, out_channels, grid_h, grid_w)"""
+        B = tokens.shape[0]
+        x = self.embedding(tokens)                             # (B, 81, out_channels)
+        return x.transpose(1, 2).reshape(B, -1, self.grid_h, self.grid_w)
+
+
+# ── V0Tok — integer-token input (no CNN encoder) ─────────────────────────────────
+
+class MNISTRatatouilleV0Tok(MNISTRatatouilleV0):
+    """V0 with direct integer puzzle-token input — no CNN encoder.
+
+    Replaces SpatialEncoder with _TokenEncoder (nn.Embedding-based), exactly
+    matching train_sudoku.py's discrete input representation.  Everything else
+    (SpatialTRM thinker, bridge, painter, sudoku logits, EMA, etc.) is unchanged.
+
+    The dataset must provide "puzzle_tokens" (B, 81) long with values
+    0=PAD, 1=blank, 2-10=given digit.
+
+    token_input=True tells the training loop to pass puzzle_tokens as the
+    condition argument instead of the MNIST image.
+    _encoder_sees_noisy=False ensures _get_encoder_input returns the tokens
+    unchanged (no concatenation with noisy).
+    """
+
+    token_input: bool = True
+    _encoder_sees_noisy = False
+
+    def __init__(
+        self,
+        painter_size: int = 288,
+        cell_size: int = 32,
+        vocab_size: int = 11,      # 0=PAD, 1=blank, 2-10=given digit
+        enc_channels: int = 64,    # embedding dim fed to SpatialTRM
+        num_classes: int = 9,      # thinker output channels = digit classes
+        d_model: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 16,
+        bridge_channels: int = 16,
+        painter_channels: tuple[int, ...] = (64, 128, 256),
+        dropout: float = 0.0,
+        num_puzzle_ids: int | None = None,
+        diff_thinker_weight: float = 1.0,
+    ):
+        grid_size = painter_size // cell_size
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            num_classes=num_classes,
+            enc_channels=enc_channels,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            bridge_channels=bridge_channels,
+            painter_channels=painter_channels,
+            dropout=dropout,
+            num_puzzle_ids=num_puzzle_ids,
+            diff_thinker_weight=diff_thinker_weight,
+        )
+        # Replace CNN encoder with token embedding encoder.
+        self.encoder = _TokenEncoder(vocab_size, enc_channels, grid_h=grid_size, grid_w=grid_size)

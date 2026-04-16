@@ -53,6 +53,7 @@ from mnist_sudoku_models import (
     MNISTRatatouilleV2SPADE,
     MNISTRatatouilleV3SPADE,
     MNISTRatatouilleV4SPADE,
+    MNISTRatatouilleV0Tok,
 )
 
 
@@ -100,6 +101,7 @@ class EMA:
 
 MODEL_REGISTRY = {
     "v0": MNISTRatatouilleV0,
+    "v0tok": MNISTRatatouilleV0Tok,
     "v1": MNISTRatatouilleV1,
     "v2": MNISTRatatouilleV2,
     "v3": MNISTRatatouilleV3,
@@ -117,6 +119,24 @@ MODEL_REGISTRY = {
 }
 
 IGNORE_LABEL_ID = -100
+
+
+def _thinker_params(model) -> list:
+    """Parameters trained primarily by sudoku CE loss."""
+    params = list(model.thinker.parameters())
+    if model.encoder is not None:
+        params += list(model.encoder.parameters())
+    return params
+
+
+def _painter_params(model) -> list:
+    """Parameters trained primarily by diffusion loss."""
+    params = list(model.painter.parameters())
+    if model.bridge is not None:
+        params += list(model.bridge.parameters())
+    if hasattr(model, "control_pyramid"):
+        params += list(model.control_pyramid.parameters())
+    return params
 
 
 # ── LR schedule ───────────────────────────────────────────────────────────────
@@ -142,7 +162,9 @@ def compute_losses(
     Used for eval — no backward.
     """
     images     = batch["images"].to(accelerator.device)      # (B,1,H,W)
-    conditions = batch["conditions"].to(accelerator.device)  # (B,1,H,W)
+    token_input = getattr(model, "token_input", False)
+    conditions  = (batch["puzzle_tokens"].to(accelerator.device)
+                   if token_input else batch["conditions"].to(accelerator.device))
     solution   = batch["solution"].to(accelerator.device)    # (B,81) long
     puzzle_ids = batch["puzzle_id"].to(accelerator.device) if "puzzle_id" in batch else None
 
@@ -191,7 +213,7 @@ def compute_losses(
 
 def train_step(
     model,
-    batch: dict,
+    micro_batches: list[dict],
     scheduler: DDPMScheduler,
     accelerator: Accelerator,
     optimizer: torch.optim.Optimizer,
@@ -203,65 +225,100 @@ def train_step(
     ema: EMA | None = None,
 ) -> tuple[dict, int]:
     """
-    Run model.n_sup supervision steps, each with its own LR update, backward,
-    and optimizer step.  global_step is incremented once per backprop.
+    Run model.n_sup supervision steps with gradient accumulation over
+    len(micro_batches) mini-batches.  Each supervision step:
+      1. Backward through all K mini-batches (loss ÷ K each).
+      2. Clip thinker/encoder and painter/bridge independently.
+      3. Optimizer step + zero_grad.
 
     Returns (mean loss dict, new global_step).
     """
-    images     = batch["images"].to(accelerator.device)
-    conditions = batch["conditions"].to(accelerator.device)
-    solution   = batch["solution"].to(accelerator.device)
-    puzzle_ids = batch["puzzle_id"].to(accelerator.device) if "puzzle_id" in batch else None
+    K           = len(micro_batches)
+    device      = accelerator.device
+    token_input = getattr(model, "token_input", False)
 
-    B = images.shape[0]
-    noise     = torch.randn_like(images)
-    timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (B,),
-                              device=accelerator.device, dtype=torch.long)
-    noisy = scheduler.add_noise(images, noise, timesteps)
-
-    z_H, z_L = model.get_initial_states(B)
-    z_H = z_H.to(accelerator.device)
-    z_L = z_L.to(accelerator.device)
+    # ── Pre-process all mini-batches ─────────────────────────────────────────
+    batch_data  = []
+    state_data  = []
+    for batch in micro_batches:
+        images     = batch["images"].to(device)
+        cond       = (batch["puzzle_tokens"].to(device) if token_input
+                      else batch["conditions"].to(device))
+        solution   = batch["solution"].to(device)
+        puzzle_ids = batch["puzzle_id"].to(device) if "puzzle_id" in batch else None
+        B          = images.shape[0]
+        noise      = torch.randn_like(images)
+        timesteps  = torch.randint(
+            0, scheduler.config.num_train_timesteps, (B,),
+            device=device, dtype=torch.long,
+        )
+        noisy = scheduler.add_noise(images, noise, timesteps)
+        z_H, z_L = model.get_initial_states(B)
+        z_H = z_H.to(device)
+        z_L = z_L.to(device)
+        batch_data.append({
+            "images": images, "cond": cond, "solution": solution,
+            "puzzle_ids": puzzle_ids, "noise": noise,
+            "noisy": noisy, "timesteps": timesteps,
+        })
+        state_data.append([z_H, z_L])
 
     total_loss_val   = 0.0
     last_diff_loss   = 0.0
     last_sudoku_loss = 0.0
 
     for _ in range(model.n_sup):
-        # Update LR for this specific backprop step (per-step, not per-batch)
+        # Update LR for this specific backprop step (per-step, not per-batch).
         lr = get_lr(global_step, warmup_steps, num_steps, base_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # reasoning_step re-runs encoder + embed internally for a fresh graph
-        noise_pred, sudoku_logits, z_H, z_L = model.reasoning_step(
-            conditions, noisy, z_H, z_L, timesteps, puzzle_ids=puzzle_ids
-        )
+        # ── Accumulate gradients over K mini-batches ─────────────────────────
+        step_loss = 0.0
+        for k in range(K):
+            d        = batch_data[k]
+            z_H, z_L = state_data[k]
 
-        target    = noise if scheduler.config.prediction_type == "epsilon" else images
-        diff_loss = F.mse_loss(noise_pred, target)
-
-        sudoku_loss = torch.tensor(0.0, device=accelerator.device)
-        if sudoku_logits is not None and sudoku_loss_weight > 0:
-            B_, N, C = sudoku_logits.shape
-            sudoku_loss = F.cross_entropy(
-                sudoku_logits.reshape(B_ * N, C),
-                solution[:, :N].reshape(B_ * N),
-                ignore_index=IGNORE_LABEL_ID,
+            noise_pred, sudoku_logits, z_H_next, z_L_next = model.reasoning_step(
+                d["cond"], d["noisy"], z_H, z_L, d["timesteps"],
+                puzzle_ids=d["puzzle_ids"],
             )
+            state_data[k] = [z_H_next, z_L_next]
 
-        loss = diff_loss + sudoku_loss_weight * sudoku_loss
-        accelerator.backward(loss)
-        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            target    = d["noise"] if scheduler.config.prediction_type == "epsilon" else d["images"]
+            diff_loss = F.mse_loss(noise_pred, target)
+
+            sudoku_loss = torch.tensor(0.0, device=device)
+            if sudoku_logits is not None and sudoku_loss_weight > 0:
+                B_, N, C = sudoku_logits.shape
+                sudoku_loss = F.cross_entropy(
+                    sudoku_logits.reshape(B_ * N, C),
+                    d["solution"][:, :N].reshape(B_ * N),
+                    ignore_index=IGNORE_LABEL_ID,
+                )
+
+            loss = (diff_loss + sudoku_loss_weight * sudoku_loss) / K
+            accelerator.backward(loss)
+
+            last_diff_loss   = diff_loss.item()
+            last_sudoku_loss = sudoku_loss.item()
+            step_loss       += (diff_loss.item() + sudoku_loss_weight * sudoku_loss.item()) / K
+
+        total_loss_val += step_loss
+
+        # ── Clip thinker and painter independently, then step ────────────────
+        tp = _thinker_params(model)
+        pp = _painter_params(model)
+        if tp:
+            accelerator.clip_grad_norm_(tp, 1.0)
+        if pp:
+            accelerator.clip_grad_norm_(pp, 1.0)
         optimizer.step()
         optimizer.zero_grad()
         if ema is not None:
             ema.update(model.parameters())
 
-        total_loss_val   += loss.item()
-        last_diff_loss    = diff_loss.item()
-        last_sudoku_loss  = sudoku_loss.item()
-        global_step      += 1
+        global_step += 1
 
     return {
         "loss":        total_loss_val / model.n_sup,
@@ -453,9 +510,10 @@ def main(args: DictConfig):
     log_every    = args.train.get("log_every", 100)
     sudoku_w     = args.train.get("sudoku_loss_weight", 0.0)
 
-    n_sup       = accelerator.unwrap_model(model).n_sup
-    best_loss   = float("inf")
-    train_iter  = iter(train_dl)
+    n_sup            = accelerator.unwrap_model(model).n_sup
+    grad_accum_steps = args.get("gradient_accumulation_steps", 1)
+    best_loss        = float("inf")
+    train_iter       = iter(train_dl)
 
     # Threshold-based triggers so intervals fire correctly even when n_sup
     # doesn't divide them evenly (same pattern as train_sudoku.py).
@@ -473,15 +531,18 @@ def main(args: DictConfig):
     while global_step < num_steps:
         model.train()
 
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_dl)
-            batch = next(train_iter)
+        micro_batches = []
+        for _ in range(grad_accum_steps):
+            try:
+                mb = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dl)
+                mb = next(train_iter)
+            micro_batches.append(mb)
 
         m, global_step = train_step(
             accelerator.unwrap_model(model),
-            batch, scheduler, accelerator, optimizer,
+            micro_batches, scheduler, accelerator, optimizer,
             global_step, warmup_steps, num_steps, args.train.lr,
             sudoku_loss_weight=sudoku_w,
             ema=ema,
@@ -525,7 +586,7 @@ def main(args: DictConfig):
                         f"  thinker_puzzle={metrics['thinker_puzzle_acc']:.4f}"
                     )
                 logger.info(
-                    f"[eval] step={global_step}  "
+                    f"[val] step={global_step}  "
                     f"loss={metrics['loss']:.4f}  "
                     f"diff={metrics['diff_loss']:.4f}  "
                     f"sudoku={metrics['sudoku_loss']:.4f}"
@@ -533,13 +594,13 @@ def main(args: DictConfig):
                 )
                 if wandb_project:
                     wandb_eval = {
-                        "eval/loss":        metrics["loss"],
-                        "eval/diff_loss":   metrics["diff_loss"],
-                        "eval/sudoku_loss": metrics["sudoku_loss"],
+                        "val/loss":        metrics["loss"],
+                        "val/diff_loss":   metrics["diff_loss"],
+                        "val/sudoku_loss": metrics["sudoku_loss"],
                     }
                     if "thinker_cell_acc" in metrics:
-                        wandb_eval["eval/thinker_cell_acc"]   = metrics["thinker_cell_acc"]
-                        wandb_eval["eval/thinker_puzzle_acc"] = metrics["thinker_puzzle_acc"]
+                        wandb_eval["val/thinker_cell_acc"]   = metrics["thinker_cell_acc"]
+                        wandb_eval["val/thinker_puzzle_acc"] = metrics["thinker_puzzle_acc"]
                     accelerator.log(wandb_eval, step=global_step)
                 if metrics["loss"] < best_loss:
                     best_loss = metrics["loss"]
@@ -560,6 +621,15 @@ def main(args: DictConfig):
                     n_panels_done   = 0
                     n_done          = 0
 
+                    # New thinker/painter deviation accumulators
+                    all_thinker_cell_best:   list[float] = []
+                    all_thinker_cell_mean:   list[float] = []
+                    all_thinker_puzzle_best: list[float] = []
+                    all_thinker_puzzle_mean: list[float] = []
+                    all_thinker_deviation:   list[float] = []
+                    all_painter_dev_best:    list[float] = []
+                    all_painter_dev_mean:    list[float] = []
+
                     for eb in tqdm(
                         DataLoader(eval_ds, batch_size=n_batch, shuffle=False),
                         "Sampling for digit-level eval",
@@ -573,9 +643,12 @@ def main(args: DictConfig):
                         pids  = eb.get("puzzle_id", None)
                         B_cur = conds.shape[0]
 
+                        token_input = getattr(accelerator.unwrap_model(model), "token_input", False)
+                        conds_for_sample = eb["puzzle_tokens"] if token_input else conds
+
                         sr = sample_grids(
                             accelerator.unwrap_model(model),
-                            conds,
+                            conds_for_sample,
                             num_train_timesteps=args.get("num_timesteps", 1000),
                             beta_schedule=args.get("beta_schedule", "squaredcos_cap_v2"),
                             prediction_type=args.get("prediction_type", "epsilon"),
@@ -583,6 +656,7 @@ def main(args: DictConfig):
                             device=accelerator.device,
                             puzzle_ids=pids,
                             solutions=sols,
+                            painter_size=painter_size if token_input else None,
                         )
                         generated = sr["generated"]
 
@@ -594,6 +668,32 @@ def main(args: DictConfig):
                             ts_cell_accs.setdefault(t, []).append(a)
                         for t, a in sr.get("ts_puzzle_acc", []):
                             ts_puzzle_accs.setdefault(t, []).append(a)
+
+                        # Thinker trajectory scalar metrics
+                        for key, lst in [
+                            ("thinker_cell_acc_best",    all_thinker_cell_best),
+                            ("thinker_cell_acc_mean",    all_thinker_cell_mean),
+                            ("thinker_puzzle_acc_best",  all_thinker_puzzle_best),
+                            ("thinker_puzzle_acc_mean",  all_thinker_puzzle_mean),
+                            ("thinker_deviation_from_best", all_thinker_deviation),
+                        ]:
+                            if key in sr:
+                                lst.append(sr[key])
+
+                        # Painter vs thinker deviation
+                        painter_preds = acc["preds"]                    # (B_cur, 81) cpu int64
+                        best_tp = sr.get("best_thinker_preds")          # (B_cur, N) cpu
+                        mean_tp = sr.get("mean_thinker_preds")          # (B_cur, N) cpu
+                        if best_tp is not None:
+                            N = best_tp.shape[1]
+                            all_painter_dev_best.append(
+                                (painter_preds[:, :N] != best_tp).float().mean().item()
+                            )
+                        if mean_tp is not None:
+                            N = mean_tp.shape[1]
+                            all_painter_dev_mean.append(
+                                (painter_preds[:, :N] != mean_tp).float().mean().item()
+                            )
 
                         # Build panel images for the first n_log samples
                         if wandb_project and n_panels_done < n_log:
@@ -623,11 +723,33 @@ def main(args: DictConfig):
                         f"puzzle_acc={mean_puzzle:.4f}  "
                         f"(over {n_done} samples)"
                     )
+                    if all_thinker_cell_best:
+                        logger.info(
+                            f"[eval] thinker_cell_best={np.mean(all_thinker_cell_best):.4f}  "
+                            f"thinker_cell_mean={np.mean(all_thinker_cell_mean):.4f}  "
+                            f"thinker_puzzle_best={np.mean(all_thinker_puzzle_best):.4f}  "
+                            f"thinker_puzzle_mean={np.mean(all_thinker_puzzle_mean):.4f}  "
+                            f"thinker_dev={np.mean(all_thinker_deviation):.4f}"
+                        )
+                    if all_painter_dev_best:
+                        logger.info(
+                            f"[eval] painter_dev_best_thinker={np.mean(all_painter_dev_best):.4f}  "
+                            f"painter_dev_mean_thinker={np.mean(all_painter_dev_mean):.4f}"
+                        )
                     if wandb_project:
                         wandb_acc: dict = {
                             "eval/cell_acc":   mean_cell,
                             "eval/puzzle_acc": mean_puzzle,
                         }
+                        if all_thinker_cell_best:
+                            wandb_acc["eval/thinker_cell_acc_best"]       = float(np.mean(all_thinker_cell_best))
+                            wandb_acc["eval/thinker_cell_acc_mean"]       = float(np.mean(all_thinker_cell_mean))
+                            wandb_acc["eval/thinker_puzzle_acc_best"]     = float(np.mean(all_thinker_puzzle_best))
+                            wandb_acc["eval/thinker_puzzle_acc_mean"]     = float(np.mean(all_thinker_puzzle_mean))
+                            wandb_acc["eval/thinker_deviation_from_best"] = float(np.mean(all_thinker_deviation))
+                        if all_painter_dev_best:
+                            wandb_acc["eval/painter_dev_from_best_thinker"] = float(np.mean(all_painter_dev_best))
+                            wandb_acc["eval/painter_dev_from_mean_thinker"] = float(np.mean(all_painter_dev_mean))
                         if panels_list:
                             wandb_acc["eval/samples"] = panels_list
                         if ts_cell_accs:

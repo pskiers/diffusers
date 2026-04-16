@@ -5,8 +5,8 @@ model:
   variant: "v0"
   kwargs:
     # Thinker: match working SudokuTRM hyperparams
-    d_model: 256
-    n_heads: 4
+    d_model: 512
+    n_heads: 8
     n_layers: 2
     L_cycles: 6
     H_cycles: 3
@@ -19,4 +19,4 @@ model:
     painter_channels: [64, 128, 256]
 
 train:
-  sudoku_loss_weight: 0.1
+  sudoku_loss_weight: 1.0

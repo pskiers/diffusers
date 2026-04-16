@@ -44,12 +44,14 @@ from mnist_sudoku_models import (
     MNISTRatatouilleV2SPADE,
     MNISTRatatouilleV3SPADE,
     MNISTRatatouilleV4SPADE,
+    MNISTRatatouilleV0Tok,
 )
 
 logger = get_logger(__name__, log_level="INFO")
 
 MODEL_REGISTRY = {
     "v0": MNISTRatatouilleV0,
+    "v0tok": MNISTRatatouilleV0Tok,
     "v1": MNISTRatatouilleV1,
     "v2": MNISTRatatouilleV2,
     "v3": MNISTRatatouilleV3,
