@@ -196,9 +196,20 @@ def compute_losses(
         B_, N, C = sudoku_logits.shape
         preds   = sudoku_logits.argmax(dim=-1)   # (B_, N)
         targets = solution[:B_, :N]              # (B_, N)
-        correct = preds == targets
-        thinker_cell_acc   = correct.float().mean()
+        correct = preds == targets               # (B_, N)
+
+        # Puzzle accuracy: all cells must match.
         thinker_puzzle_acc = correct.all(dim=1).float().mean()
+
+        # Cell accuracy: blank (inferred) cells only.
+        given_m = batch.get("given_mask", None)
+        if given_m is not None:
+            blank = ~given_m.to(accelerator.device)[:B_, :N]  # (B_, N) bool
+            n_blank = blank.sum()
+            thinker_cell_acc = (correct[blank].float().mean()
+                                if n_blank > 0 else correct.float().mean())
+        else:
+            thinker_cell_acc = correct.float().mean()
 
     return {
         "loss":               total_loss,
@@ -638,10 +649,11 @@ def main(args: DictConfig):
                     ):
                         if n_done >= n_total:
                             break
-                        conds = eb["conditions"]
-                        sols  = eb["solution"]
-                        pids  = eb.get("puzzle_id", None)
-                        B_cur = conds.shape[0]
+                        conds       = eb["conditions"]
+                        sols        = eb["solution"]
+                        pids        = eb.get("puzzle_id", None)
+                        given_masks = eb.get("given_mask", None)   # (B, 81) bool
+                        B_cur       = conds.shape[0]
 
                         token_input = getattr(accelerator.unwrap_model(model), "token_input", False)
                         conds_for_sample = eb["puzzle_tokens"] if token_input else conds
@@ -657,10 +669,12 @@ def main(args: DictConfig):
                             puzzle_ids=pids,
                             solutions=sols,
                             painter_size=painter_size if token_input else None,
+                            given_masks=given_masks,
                         )
                         generated = sr["generated"]
 
-                        acc = evaluate_grids(generated, sols, classifier, cell_size)
+                        acc = evaluate_grids(generated, sols, classifier, cell_size,
+                                             given_masks=given_masks)
                         all_cell_acc.append(acc["cell_acc"])
                         all_puzzle_acc.append(acc["puzzle_acc"])
 
@@ -680,20 +694,35 @@ def main(args: DictConfig):
                             if key in sr:
                                 lst.append(sr[key])
 
-                        # Painter vs thinker deviation
+                        # Painter vs thinker deviation — blank cells only.
                         painter_preds = acc["preds"]                    # (B_cur, 81) cpu int64
                         best_tp = sr.get("best_thinker_preds")          # (B_cur, N) cpu
                         mean_tp = sr.get("mean_thinker_preds")          # (B_cur, N) cpu
+                        # blank_sel: (B_cur, N) bool mask for non-given cells, on cpu
+                        if given_masks is not None:
+                            _gm = given_masks[:B_cur]                   # (B_cur, 81)
+                        else:
+                            _gm = None
                         if best_tp is not None:
                             N = best_tp.shape[1]
-                            all_painter_dev_best.append(
-                                (painter_preds[:, :N] != best_tp).float().mean().item()
-                            )
+                            diff = painter_preds[:, :N] != best_tp      # (B_cur, N)
+                            if _gm is not None:
+                                blank = ~_gm[:, :N]
+                                n_b   = blank.sum()
+                                dev   = diff[blank].float().mean().item() if n_b > 0 else diff.float().mean().item()
+                            else:
+                                dev = diff.float().mean().item()
+                            all_painter_dev_best.append(dev)
                         if mean_tp is not None:
                             N = mean_tp.shape[1]
-                            all_painter_dev_mean.append(
-                                (painter_preds[:, :N] != mean_tp).float().mean().item()
-                            )
+                            diff = painter_preds[:, :N] != mean_tp      # (B_cur, N)
+                            if _gm is not None:
+                                blank = ~_gm[:, :N]
+                                n_b   = blank.sum()
+                                dev   = diff[blank].float().mean().item() if n_b > 0 else diff.float().mean().item()
+                            else:
+                                dev = diff.float().mean().item()
+                            all_painter_dev_mean.append(dev)
 
                         # Build panel images for the first n_log samples
                         if wandb_project and n_panels_done < n_log:

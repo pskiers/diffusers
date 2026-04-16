@@ -159,14 +159,17 @@ class MNISTSudokuDataset(Dataset):
 
         # ── Solution class labels (0-based) ──────────────────────────────────
         # Tokens 2-10 → class 0-8; blank/pad cells → -100 (ignored in loss).
+        # Given cells are NOT masked — CE loss trains on all 81 cells so the
+        # thinker learns to carry correct information for given cells (needed
+        # for the painter to reconstruct them).
         solution = np.full(81, fill_value=-100, dtype=np.int64)
         valid = (labels_tok >= 2) & (labels_tok <= 10)
         solution[valid] = labels_tok[valid] - self.DIGIT_OFFSET  # 0..8
 
-        # Mask given cells (match train_sudoku.py: only predict blank cells)
-        if self.mask_given:
-            given = (inputs_tok >= 2) & (inputs_tok <= 10)
-            solution[given] = -100
+        # given_mask: True where a cell is given (visible in puzzle input).
+        # Used by accuracy metrics: cell acc evaluates blank cells only;
+        # puzzle acc evaluates all cells.
+        given_mask = (inputs_tok >= 2) & (inputs_tok <= 10)  # (81,) bool
 
         return {
             "images":        torch.from_numpy(image_grid).unsqueeze(0),   # (1,H,W)
@@ -174,4 +177,5 @@ class MNISTSudokuDataset(Dataset):
             "solution":      torch.from_numpy(solution),                   # (81,)
             "puzzle_id":     sudoku_item["puzzle_id"],                     # scalar
             "puzzle_tokens": torch.from_numpy(inputs_tok.copy()),          # (81,) long
+            "given_mask":    torch.from_numpy(given_mask),                 # (81,) bool
         }

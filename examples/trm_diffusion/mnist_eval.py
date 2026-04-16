@@ -151,14 +151,18 @@ def load_or_train_classifier(
 
 @torch.no_grad()
 def evaluate_grids(
-    images:     torch.Tensor,          # (B, 1, H, W) float32 [0, 1]
-    solutions:  torch.Tensor,          # (B, 81)      int64   [0-8]
-    classifier: MNISTCellClassifier,
-    cell_size:  int,
+    images:      torch.Tensor,               # (B, 1, H, W) float32 [0, 1]
+    solutions:   torch.Tensor,               # (B, 81)      int64   [0-8]
+    classifier:  MNISTCellClassifier,
+    cell_size:   int,
+    given_masks: torch.Tensor | None = None, # (B, 81) bool — True = given cell
 ) -> dict:
     """Classify every cell in *images* and compare to *solutions*.
 
-    Returns {"cell_acc": float, "puzzle_acc": float}.
+    cell_acc   — accuracy on blank (inferred) cells only when given_masks supplied.
+    puzzle_acc — accuracy requiring all 81 cells correct (given + blank).
+
+    Returns {"cell_acc": float, "puzzle_acc": float, "preds": (B,81) cpu int64}.
     """
     device    = next(classifier.parameters()).device
     images    = images.to(device)
@@ -172,10 +176,20 @@ def evaluate_grids(
 
     preds = classifier(cells).argmax(dim=1).reshape(B, 81)
     sol   = solutions.reshape(B, 81)
+    correct = preds == sol                           # (B, 81)
 
-    correct    = preds == sol
-    cell_acc   = correct.float().mean().item()
+    # Puzzle accuracy: every cell must be correct.
     puzzle_acc = correct.all(dim=1).float().mean().item()
+
+    # Cell accuracy: blank cells only.
+    if given_masks is not None:
+        blank   = ~given_masks.to(device)            # (B, 81) bool
+        n_blank = blank.sum()
+        cell_acc = (correct[blank].float().mean().item()
+                    if n_blank > 0 else correct.float().mean().item())
+    else:
+        cell_acc = correct.float().mean().item()
+
     return {"cell_acc": cell_acc, "puzzle_acc": puzzle_acc, "preds": preds.cpu()}
 
 
@@ -184,15 +198,16 @@ def evaluate_grids(
 @torch.no_grad()
 def sample_grids(
     model,
-    conditions:          torch.Tensor,        # (B, 1, H, W) or (B, 81) long for token models
+    conditions:          torch.Tensor,               # (B, 1, H, W) or (B, 81) long for token models
     num_train_timesteps: int,
     beta_schedule:       str,
     num_steps:           int,
     device:              torch.device,
-    prediction_type:     str                = "epsilon",
-    puzzle_ids:          torch.Tensor | None = None,   # (B,) long
-    solutions:           torch.Tensor | None = None,   # (B, 81) int64 [0-8]
-    painter_size:        int | None         = None,    # required for token-input models
+    prediction_type:     str                       = "epsilon",
+    puzzle_ids:          torch.Tensor | None       = None,   # (B,) long
+    solutions:           torch.Tensor | None       = None,   # (B, 81) int64 [0-8]
+    painter_size:        int | None               = None,    # required for token-input models
+    given_masks:         torch.Tensor | None       = None,   # (B, 81) bool — True = given cell
 ) -> dict:
     """DDIM-sample and collect thinker stats along the denoising trajectory.
 
@@ -274,9 +289,23 @@ def sample_grids(
 
             if solutions is not None:
                 tgts    = solutions[:B, :N_logits]
-                correct = preds == tgts
-                ts_cell_acc.append((int(t),   correct.float().mean().item()))
-                ts_puzzle_acc.append((int(t), correct.all(dim=1).float().mean().item()))
+                correct = preds == tgts                        # (B, N)
+
+                # Puzzle accuracy: all cells.
+                puzz_a = correct.all(dim=1).float().mean().item()
+
+                # Cell accuracy: blank cells only.
+                if given_masks is not None:
+                    gm      = given_masks[:B, :N_logits].to(device)  # (B, N)
+                    blank   = ~gm
+                    n_blank = blank.sum()
+                    cell_a  = (correct[blank].float().mean().item()
+                               if n_blank > 0 else correct.float().mean().item())
+                else:
+                    cell_a = correct.float().mean().item()
+
+                ts_cell_acc.append((int(t),   cell_a))
+                ts_puzzle_acc.append((int(t), puzz_a))
 
         x = ddim.step(noise_pred, t, x).prev_sample
 
