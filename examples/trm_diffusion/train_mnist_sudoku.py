@@ -174,10 +174,11 @@ def compute_losses(
                               device=accelerator.device, dtype=torch.long)
     noisy = scheduler.add_noise(images, noise, timesteps)
 
-    noise_pred, sudoku_logits = model(noisy, timesteps, conditions, puzzle_ids=puzzle_ids)
+    with accelerator.autocast():
+        noise_pred, sudoku_logits = model(noisy, timesteps, conditions, puzzle_ids=puzzle_ids)
 
     target    = noise if scheduler.config.prediction_type == "epsilon" else images
-    diff_loss = F.mse_loss(noise_pred, target)
+    diff_loss = F.mse_loss(noise_pred.float(), target)
 
     sudoku_loss = torch.tensor(0.0, device=accelerator.device)
     if sudoku_logits is not None and sudoku_loss_weight > 0:
@@ -290,14 +291,15 @@ def train_step(
             d        = batch_data[k]
             z_H, z_L = state_data[k]
 
-            noise_pred, sudoku_logits, z_H_next, z_L_next = model.reasoning_step(
-                d["cond"], d["noisy"], z_H, z_L, d["timesteps"],
-                puzzle_ids=d["puzzle_ids"],
-            )
+            with accelerator.autocast():
+                noise_pred, sudoku_logits, z_H_next, z_L_next = model.reasoning_step(
+                    d["cond"], d["noisy"], z_H, z_L, d["timesteps"],
+                    puzzle_ids=d["puzzle_ids"],
+                )
             state_data[k] = [z_H_next, z_L_next]
 
             target    = d["noise"] if scheduler.config.prediction_type == "epsilon" else d["images"]
-            diff_loss = F.mse_loss(noise_pred, target)
+            diff_loss = F.mse_loss(noise_pred.float(), target)
 
             sudoku_loss = torch.tensor(0.0, device=device)
             if sudoku_logits is not None and sudoku_loss_weight > 0:
@@ -388,6 +390,10 @@ def _save(accelerator, model, optimizer, step, output_dir, tag, ema=None):
 def main(args: DictConfig):
     wandb_project = args.get("wandb_project", None)
     log_with = ["wandb"] if wandb_project else []
+    # Global hardware settings — set before any CUDA work.
+    torch.set_float32_matmul_precision("high")   # TF32 on Ampere/Hopper for fp32 matmuls
+    torch.backends.cudnn.benchmark = True        # auto-tune conv kernels for fixed input sizes
+
     accelerator = Accelerator(
         mixed_precision=args.get("mixed_precision", "no"),
         log_with=log_with,
@@ -430,18 +436,23 @@ def main(args: DictConfig):
         mask_given=True,
     )
 
+    n_workers = args.get("num_workers", 4)
     train_dl = DataLoader(
         train_ds,
         batch_size=args.train.batch_size,
         shuffle=True,
-        num_workers=args.get("num_workers", 4),
+        num_workers=n_workers,
         drop_last=True,
+        pin_memory=True,
+        persistent_workers=(n_workers > 0),
     )
     eval_dl = DataLoader(
         eval_ds,
         batch_size=args.train.batch_size * 2,
         shuffle=False,
-        num_workers=args.get("num_workers", 4),
+        num_workers=n_workers,
+        pin_memory=True,
+        persistent_workers=(n_workers > 0),
     )
 
     # ── MNIST cell classifier (for digit-level eval) ──────────────────────────
@@ -470,6 +481,27 @@ def main(args: DictConfig):
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Model {variant}: {n_params:,} parameters")
+
+    # ── torch.compile (opt-in) ────────────────────────────────────────────────
+    # Compiles hot submodules before accelerator.prepare so the compiled graph
+    # is on the same device the accelerator will use.  We compile submodules
+    # individually rather than the whole model so that:
+    #   a) state_dict / EMA work on the original nn.Module parameters unaffected;
+    #   b) the Python-level n_sup / H_cycles / L_cycles loops are not traced
+    #      (they create dynamic control flow that defeats fullgraph compilation);
+    #   c) each compiled piece still gets kernel fusion for its own ops.
+    if args.get("compile", False):
+        model.encoder = torch.compile(model.encoder)
+        model.thinker._run_blocks = torch.compile(
+            model.thinker._run_blocks, fullgraph=False
+        )
+        model.painter = torch.compile(model.painter)
+        if model.bridge is not None:
+            model.bridge = torch.compile(model.bridge)
+        if hasattr(model, "control_pyramid"):
+            model.control_pyramid = torch.compile(model.control_pyramid)
+        if accelerator.is_main_process:
+            logger.info("torch.compile applied to encoder, thinker._run_blocks, painter, bridge")
 
     # ── Noise scheduler ───────────────────────────────────────────────────────
     scheduler = DDPMScheduler(

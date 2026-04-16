@@ -187,6 +187,7 @@ def _make_painter(
     painter_size: int,
     bridge_channels: int,
     painter_channels: tuple[int, ...],
+    layers_per_block: int = 2,
 ) -> UNet2DModel:
     """
     Build the denoising UNet.  Uses plain conv blocks throughout (no attention)
@@ -206,6 +207,7 @@ def _make_painter(
         down_block_types=("DownBlock2D",) * n,
         up_block_types=("UpBlock2D",) * n,
         norm_num_groups=norm_num_groups,
+        layers_per_block=layers_per_block,
     )
 
 
@@ -299,6 +301,7 @@ class _ControlPainterUNet(UNet2DModel):
 def _make_painter_control(
     painter_size: int,
     painter_channels: tuple[int, ...],
+    layers_per_block: int = 2,
 ) -> _ControlPainterUNet:
     """Build a ControlNet-capable painter UNet (in_channels=1, no bridge concat)."""
     n = len(painter_channels)
@@ -313,6 +316,7 @@ def _make_painter_control(
         down_block_types=("DownBlock2D",) * n,
         up_block_types=("UpBlock2D",) * n,
         norm_num_groups=norm_num_groups,
+        layers_per_block=layers_per_block,
     )
 
 
@@ -813,6 +817,7 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -827,7 +832,7 @@ class MNISTRatatouilleV0(_TRMRatatouilleBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
-        painter = _make_painter(painter_size, bridge_channels, painter_channels)
+        painter = _make_painter(painter_size, bridge_channels, painter_channels, layers_per_block=painter_layers_per_block)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
@@ -864,6 +869,7 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -878,7 +884,7 @@ class MNISTRatatouilleV1(_TRMRatatouilleBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(num_classes, bridge_channels, painter_size)
-        painter = _make_painter(painter_size, bridge_channels, painter_channels)
+        painter = _make_painter(painter_size, bridge_channels, painter_channels, layers_per_block=painter_layers_per_block)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
@@ -914,6 +920,7 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -928,7 +935,7 @@ class MNISTRatatouilleV2(_TRMRatatouilleBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
-        painter = _make_painter(painter_size, bridge_channels, painter_channels)
+        painter = _make_painter(painter_size, bridge_channels, painter_channels, layers_per_block=painter_layers_per_block)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
@@ -959,6 +966,7 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
         bridge_channels: int = 8,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -973,7 +981,7 @@ class MNISTRatatouilleV3(_TRMRatatouilleBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         bridge  = SpatialBridge(thinker_out_channels, bridge_channels, painter_size)
-        painter = _make_painter(painter_size, bridge_channels, painter_channels)
+        painter = _make_painter(painter_size, bridge_channels, painter_channels, layers_per_block=painter_layers_per_block)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
@@ -1007,6 +1015,7 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
         bridge_num_heads: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1029,7 +1038,7 @@ class MNISTRatatouilleV4(_TRMRatatouilleBase):
             factor=compression_factor,
             num_heads=bridge_num_heads,
         )
-        painter = _make_painter(painter_size, bridge_channels, painter_channels)
+        painter = _make_painter(painter_size, bridge_channels, painter_channels, layers_per_block=painter_layers_per_block)
 
         super().__init__(encoder=encoder, thinker=thinker, bridge=bridge, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
@@ -1061,6 +1070,7 @@ class MNISTRatatouilleV0Control(_TRMRatatouilleControlBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1073,7 +1083,7 @@ class MNISTRatatouilleV0Control(_TRMRatatouilleControlBase):
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
             num_puzzle_ids=num_puzzle_ids,
         )
-        painter         = _make_painter_control(painter_size, painter_channels)
+        painter         = _make_painter_control(painter_size, painter_channels, layers_per_block=painter_layers_per_block)
         control_pyramid = ConditioningPyramid(num_classes, block_out_channels=painter_channels, layers_per_block=2)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
@@ -1105,6 +1115,7 @@ class MNISTRatatouilleV1Control(_TRMRatatouilleControlBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1117,7 +1128,7 @@ class MNISTRatatouilleV1Control(_TRMRatatouilleControlBase):
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
             num_puzzle_ids=num_puzzle_ids,
         )
-        painter         = _make_painter_control(painter_size, painter_channels)
+        painter         = _make_painter_control(painter_size, painter_channels, layers_per_block=painter_layers_per_block)
         control_pyramid = ConditioningPyramid(num_classes, block_out_channels=painter_channels, layers_per_block=2)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
@@ -1149,6 +1160,7 @@ class MNISTRatatouilleV2Control(_TRMRatatouilleControlBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1161,7 +1173,7 @@ class MNISTRatatouilleV2Control(_TRMRatatouilleControlBase):
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
             num_puzzle_ids=num_puzzle_ids,
         )
-        painter         = _make_painter_control(painter_size, painter_channels)
+        painter         = _make_painter_control(painter_size, painter_channels, layers_per_block=painter_layers_per_block)
         control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
@@ -1188,6 +1200,7 @@ class MNISTRatatouilleV3Control(_TRMRatatouilleControlBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1200,7 +1213,7 @@ class MNISTRatatouilleV3Control(_TRMRatatouilleControlBase):
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
             num_puzzle_ids=num_puzzle_ids,
         )
-        painter         = _make_painter_control(painter_size, painter_channels)
+        painter         = _make_painter_control(painter_size, painter_channels, layers_per_block=painter_layers_per_block)
         control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
@@ -1231,6 +1244,7 @@ class MNISTRatatouilleV4Control(_TRMRatatouilleControlBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1243,7 +1257,7 @@ class MNISTRatatouilleV4Control(_TRMRatatouilleControlBase):
             L_cycles=L_cycles, H_cycles=H_cycles, n_sup=n_sup, dropout=dropout,
             num_puzzle_ids=num_puzzle_ids,
         )
-        painter         = _make_painter_control(painter_size, painter_channels)
+        painter         = _make_painter_control(painter_size, painter_channels, layers_per_block=painter_layers_per_block)
         control_pyramid = ConditioningPyramid(thinker_out_channels, block_out_channels=painter_channels, layers_per_block=2)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          control_pyramid=control_pyramid, diff_thinker_weight=diff_thinker_weight)
@@ -1274,6 +1288,7 @@ class MNISTRatatouilleV0SPADE(_TRMRatatouilleSPADEBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1287,7 +1302,8 @@ class MNISTRatatouilleV0SPADE(_TRMRatatouilleSPADEBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         painter = SPADEUNet2D(painter_size, sem_channels=num_classes,
-                              block_out_channels=painter_channels, dropout=dropout)
+                              block_out_channels=painter_channels, dropout=dropout,
+                              layers_per_block=painter_layers_per_block)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
         self._num_classes = num_classes
@@ -1318,6 +1334,7 @@ class MNISTRatatouilleV1SPADE(_TRMRatatouilleSPADEBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1331,7 +1348,8 @@ class MNISTRatatouilleV1SPADE(_TRMRatatouilleSPADEBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         painter = SPADEUNet2D(painter_size, sem_channels=num_classes,
-                              block_out_channels=painter_channels, dropout=dropout)
+                              block_out_channels=painter_channels, dropout=dropout,
+                              layers_per_block=painter_layers_per_block)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
         self._num_classes = num_classes
@@ -1362,6 +1380,7 @@ class MNISTRatatouilleV2SPADE(_TRMRatatouilleSPADEBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1375,7 +1394,8 @@ class MNISTRatatouilleV2SPADE(_TRMRatatouilleSPADEBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
-                              block_out_channels=painter_channels, dropout=dropout)
+                              block_out_channels=painter_channels, dropout=dropout,
+                              layers_per_block=painter_layers_per_block)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
 
@@ -1401,6 +1421,7 @@ class MNISTRatatouilleV3SPADE(_TRMRatatouilleSPADEBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1414,7 +1435,8 @@ class MNISTRatatouilleV3SPADE(_TRMRatatouilleSPADEBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
-                              block_out_channels=painter_channels, dropout=dropout)
+                              block_out_channels=painter_channels, dropout=dropout,
+                              layers_per_block=painter_layers_per_block)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
 
@@ -1440,6 +1462,7 @@ class MNISTRatatouilleV4SPADE(_TRMRatatouilleSPADEBase):
         n_sup: int = 4,
         painter_channels: tuple[int, ...] = (32, 64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1453,7 +1476,8 @@ class MNISTRatatouilleV4SPADE(_TRMRatatouilleSPADEBase):
             num_puzzle_ids=num_puzzle_ids,
         )
         painter = SPADEUNet2D(painter_size, sem_channels=thinker_out_channels,
-                              block_out_channels=painter_channels, dropout=dropout)
+                              block_out_channels=painter_channels, dropout=dropout,
+                              layers_per_block=painter_layers_per_block)
         super().__init__(encoder=encoder, thinker=thinker, painter=painter,
                          diff_thinker_weight=diff_thinker_weight)
 
@@ -1517,6 +1541,7 @@ class MNISTRatatouilleV0Tok(MNISTRatatouilleV0):
         bridge_channels: int = 16,
         painter_channels: tuple[int, ...] = (64, 128, 256),
         dropout: float = 0.0,
+        painter_layers_per_block: int = 2,
         num_puzzle_ids: int | None = None,
         diff_thinker_weight: float = 1.0,
     ):
@@ -1535,6 +1560,7 @@ class MNISTRatatouilleV0Tok(MNISTRatatouilleV0):
             bridge_channels=bridge_channels,
             painter_channels=painter_channels,
             dropout=dropout,
+            painter_layers_per_block=painter_layers_per_block,
             num_puzzle_ids=num_puzzle_ids,
             diff_thinker_weight=diff_thinker_weight,
         )

@@ -14,6 +14,7 @@ output_dir: "runs/mnist_sudoku"   # overridden by each experiment/*.yaml
 
 num_workers: 4
 gradient_accumulation_steps: 1
+compile: false          # set true to enable torch.compile on hot submodules
 resume_from_checkpoint: null
 mixed_precision: "bf16"
 
