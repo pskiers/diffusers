@@ -152,10 +152,11 @@ def train_step(
 
         # Recompute input_emb each step so each backward() gets a fresh graph.
         # The reference does the same: full forward() is called once per step.
-        input_emb = model.embed(inputs, puzzle_ids=puzzle_ids)
-        logits, z_H, z_L = model.reasoning_step(input_emb, z_H, z_L)
+        with accelerator.autocast():
+            input_emb = model.embed(inputs, puzzle_ids=puzzle_ids)
+            logits, z_H, z_L = model.reasoning_step(input_emb, z_H, z_L)
         step_loss = F.cross_entropy(
-            logits.view(-1, model.vocab_size),
+            logits.float().view(-1, model.vocab_size),
             labels.view(-1),
             ignore_index=IGNORE_LABEL_ID,
         )
@@ -186,8 +187,9 @@ def eval_loop(model: SudokuTRM, dataloader: DataLoader, accelerator: Accelerator
         if puzzle_ids is not None:
             puzzle_ids = puzzle_ids.to(accelerator.device)
 
-        logits = model.predict(inputs, puzzle_ids=puzzle_ids)
-        m = compute_metrics(logits, labels, inputs)
+        with accelerator.autocast():
+            logits = model.predict(inputs, puzzle_ids=puzzle_ids)
+        m = compute_metrics(logits.float(), labels, inputs)
         for k, v in m.items():
             all_metrics[k].append(v.item() if torch.is_tensor(v) else v)
 

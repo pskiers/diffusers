@@ -184,7 +184,7 @@ def compute_losses(
     if sudoku_logits is not None and sudoku_loss_weight > 0:
         B_, N, C = sudoku_logits.shape
         sudoku_loss = F.cross_entropy(
-            sudoku_logits.reshape(B_ * N, C),
+            sudoku_logits.float().reshape(B_ * N, C),
             solution[:, :N].reshape(B_ * N),
             ignore_index=IGNORE_LABEL_ID,
         )
@@ -305,7 +305,7 @@ def train_step(
             if sudoku_logits is not None and sudoku_loss_weight > 0:
                 B_, N, C = sudoku_logits.shape
                 sudoku_loss = F.cross_entropy(
-                    sudoku_logits.reshape(B_ * N, C),
+                    sudoku_logits.float().reshape(B_ * N, C),
                     d["solution"][:, :N].reshape(B_ * N),
                     ignore_index=IGNORE_LABEL_ID,
                 )

@@ -51,6 +51,7 @@ Five variants — each removes one training wheel from the previous:
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -120,8 +121,18 @@ class SpatialTRM(SudokuTRM):
 
         # Replace the token embedding with a Conv2d spatial projection.
         # Everything else (rotary_emb, blocks, lm_head, z_H/z_L init) is unchanged.
+        #
+        # IMPORTANT: embed_scale = sqrt(d_model) is applied in embed() just like
+        # SudokuTRM.  For that scaling to produce transformer inputs with std ≈ 1.0,
+        # the Conv2d output (for a unit-std input) must have std = 1/embed_scale.
+        #   std_out = std_w * sqrt(in_channels) * std_in
+        #   => std_w = 1 / (embed_scale * sqrt(in_channels))
+        # Kaiming-relu would give std_w = sqrt(2/in_channels), making the final
+        # token magnitude ~embed_scale * sqrt(2) ≈ 32×, which swamps z_H + z_L and
+        # kills the recurrent mechanism.
+        embed_std = 1.0 / self.embed_scale          # = 1/sqrt(d_model)
         self.embedding = nn.Conv2d(in_channels, d_model, kernel_size=1)
-        nn.init.kaiming_normal_(self.embedding.weight, nonlinearity="relu")
+        nn.init.normal_(self.embedding.weight, std=embed_std / math.sqrt(in_channels))
         nn.init.zeros_(self.embedding.bias)
 
     def embed(self, x: torch.Tensor, puzzle_ids=None) -> torch.Tensor:
