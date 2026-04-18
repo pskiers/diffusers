@@ -539,6 +539,21 @@ def main(cfg: DictConfig):
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Model parameters: {n_params:,}")
 
+    # ── torch.compile (opt-in) ────────────────────────────────────────────────
+    # Compile submodules individually to avoid tracing the Python-level n_sup /
+    # H_cycles / L_cycles loops (dynamic control flow defeats fullgraph compile).
+    # L_level is the hot path: called H_cycles*L_cycles times per sup step.
+    if cfg.get("compile", False):
+        if mode == "sudoku":
+            model.inner.L_level = torch.compile(model.inner.L_level, fullgraph=False)
+        else:
+            model.thinker.inner.L_level = torch.compile(model.thinker.inner.L_level, fullgraph=False)
+            model.painter = torch.compile(model.painter)
+            if model.bridge is not None:
+                model.bridge = torch.compile(model.bridge)
+        if accelerator.is_main_process:
+            logger.info("torch.compile applied")
+
     # ── Optimizers (same structure as pretrain.py create_model) ───────────────
     world_size = accelerator.num_processes
     global_batch_size = cfg.train.batch_size * world_size

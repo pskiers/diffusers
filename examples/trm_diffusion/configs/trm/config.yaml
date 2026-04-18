@@ -11,6 +11,7 @@ defaults:
   - experiment: null
 
 mode: "sudoku"   # "sudoku" | "painter"
+compile: true   # torch.compile hot submodules (L_level, painter, bridge)
 
 output_dir: "runs/trm"
 num_workers: 4
