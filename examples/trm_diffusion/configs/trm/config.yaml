@@ -108,3 +108,11 @@ train:
   log_every: 100
   sudoku_loss_weight: 1.0  # painter mode: thinker CE weight relative to diff loss
   gradient_accumulation_steps: 1  # accumulate over N batches before each optimizer step
+
+  # ── Digit-level sampling eval (painter mode only) ─────────────────────────
+  # Set eval_classifier_path to enable DDIM sampling + digit accuracy metrics.
+  eval_classifier_path: runs/mnist_classifier_cell16.pt   # path to save/load MNIST cell classifier
+  eval_num_samples: 7680        # total samples for digit-level eval
+  eval_batch_size: 384          # batch size for sampling
+  eval_num_ddim_steps: 20      # DDIM denoising steps
+  eval_num_log_images: 10      # panel images to log to wandb

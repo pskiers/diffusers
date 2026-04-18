@@ -5,6 +5,7 @@
 
 mode: "painter"
 output_dir: "runs/trm_v0tok"
+compile: true
 
 use_ema: true
 ema_rate: 0.999

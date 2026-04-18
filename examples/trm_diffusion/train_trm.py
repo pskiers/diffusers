@@ -40,6 +40,10 @@ from tqdm.auto import tqdm
 
 from sudoku_dataset import SudokuDataset, IGNORE_LABEL_ID
 from mnist_sudoku_dataset import MNISTSudokuDataset
+from mnist_eval import (
+    evaluate_grids, load_or_train_classifier, sample_grids,
+    make_panel_image, plot_thinker_ts_curve,
+)
 from trm_wrappers import (
     OriginalTRMSudoku,
     OriginalTRMRatatouilleV0Tok,
@@ -47,6 +51,11 @@ from trm_wrappers import (
     get_non_puzzle_emb_params,
 )
 from models.ema import EMAHelper
+
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -497,6 +506,18 @@ def main(cfg: DictConfig):
         persistent_workers=(n_workers > 0),
     )
 
+    # ── MNIST cell classifier (painter mode, opt-in) ──────────────────────────
+    classifier = None
+    if mode == "painter" and accelerator.is_main_process:
+        classifier_path = cfg.train.get("eval_classifier_path", None)
+        if classifier_path:
+            classifier = load_or_train_classifier(
+                classifier_path,
+                cfg.data.mnist_root,
+                cell_size,
+                accelerator.device,
+            )
+
     # ── Model ─────────────────────────────────────────────────────────────────
     t = cfg.thinker
     thinker_kwargs = dict(
@@ -649,11 +670,17 @@ def main(cfg: DictConfig):
 
             if mode == "sudoku":
                 metrics = eval_sudoku(unwrapped, eval_dl, accelerator, max_batches=100)
-                eval_log = {f"eval/{k}": v for k, v in metrics.items()}
+                val_log = {f"val/{k}": v for k, v in metrics.items()}
             else:
-                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=100)
-                eval_log = {f"eval/{k}" if not k.startswith("eval/") else k: v
-                            for k, v in metrics.items()}
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=10)
+                val_log = {
+                    "val/loss":        metrics.get("loss", 0),
+                    "val/diff_loss":   metrics.get("diff_loss", 0),
+                    "val/sudoku_loss": metrics.get("sudoku_loss", 0),
+                }
+                if "thinker_cell_acc" in metrics:
+                    val_log["val/thinker_cell_acc"]   = metrics["thinker_cell_acc"]
+                    val_log["val/thinker_puzzle_acc"] = metrics["thinker_puzzle_acc"]
 
             if ema_helper is not None:
                 for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
@@ -661,10 +688,168 @@ def main(cfg: DictConfig):
             unwrapped.train()
 
             if accelerator.is_main_process:
-                logger.info(f"[eval] step={global_step}  " +
-                            "  ".join(f"{k}={v:.4f}" for k, v in eval_log.items()))
+                logger.info(f"[val] step={global_step}  " +
+                            "  ".join(f"{k}={v:.4f}" for k, v in val_log.items()))
                 if wandb_project:
-                    accelerator.log(eval_log, step=global_step)
+                    accelerator.log(val_log, step=global_step)
+
+            # ── Digit-level sampling eval (painter mode, main process only) ──
+            if mode == "painter" and accelerator.is_main_process and classifier is not None:
+                n_total = cfg.train.get("eval_num_samples",   128)
+                n_batch = cfg.train.get("eval_batch_size",     32)
+                n_ddim  = cfg.train.get("eval_num_ddim_steps", 20)
+                n_log   = cfg.train.get("eval_num_log_images", 10)
+
+                all_cell_acc:   list[float] = []
+                all_puzzle_acc: list[float] = []
+                ts_cell_accs:   dict[int, list[float]] = {}
+                ts_puzzle_accs: dict[int, list[float]] = {}
+                panels_list:    list = []
+
+                all_thinker_cell_best:   list[float] = []
+                all_thinker_cell_mean:   list[float] = []
+                all_thinker_puzzle_best: list[float] = []
+                all_thinker_puzzle_mean: list[float] = []
+                all_thinker_deviation:   list[float] = []
+                all_painter_dev_best:    list[float] = []
+                all_painter_dev_mean:    list[float] = []
+
+                n_done       = 0
+                n_panels_done = 0
+
+                # Swap in EMA for sampling
+                if ema_helper is not None:
+                    live_params = [p.data.clone() for p in unwrapped.parameters() if p.requires_grad]
+                    ema_helper.ema(unwrapped)
+                unwrapped.eval()
+
+                sample_loader = DataLoader(eval_ds, batch_size=n_batch, shuffle=False)
+                for eb in tqdm(sample_loader, "Sampling for eval",
+                               total=(n_total + n_batch - 1) // n_batch):
+                    if n_done >= n_total:
+                        break
+                    conds       = eb.get("conditions", eb.get("puzzle_tokens"))
+                    sols        = eb["solution"]
+                    pids        = eb.get("puzzle_id", None)
+                    given_masks = eb.get("given_mask", None)
+                    B_cur       = sols.shape[0]
+                    conds_sample = eb["puzzle_tokens"]
+
+                    sr = sample_grids(
+                        unwrapped,
+                        conds_sample,
+                        num_train_timesteps=cfg.num_timesteps,
+                        beta_schedule=cfg.beta_schedule,
+                        prediction_type=cfg.prediction_type,
+                        num_steps=n_ddim,
+                        device=accelerator.device,
+                        puzzle_ids=pids,
+                        solutions=sols,
+                        painter_size=painter_size,
+                        given_masks=given_masks,
+                    )
+                    generated = sr["generated"]
+
+                    acc = evaluate_grids(generated, sols, classifier, cell_size,
+                                        given_masks=given_masks)
+                    all_cell_acc.append(acc["cell_acc"])
+                    all_puzzle_acc.append(acc["puzzle_acc"])
+
+                    for t_step, a in sr.get("ts_cell_acc", []):
+                        ts_cell_accs.setdefault(t_step, []).append(a)
+                    for t_step, a in sr.get("ts_puzzle_acc", []):
+                        ts_puzzle_accs.setdefault(t_step, []).append(a)
+
+                    for key, lst in [
+                        ("thinker_cell_acc_best",    all_thinker_cell_best),
+                        ("thinker_cell_acc_mean",    all_thinker_cell_mean),
+                        ("thinker_puzzle_acc_best",  all_thinker_puzzle_best),
+                        ("thinker_puzzle_acc_mean",  all_thinker_puzzle_mean),
+                        ("thinker_deviation_from_best", all_thinker_deviation),
+                    ]:
+                        if key in sr:
+                            lst.append(sr[key])
+
+                    painter_preds = acc["preds"]
+                    best_tp = sr.get("best_thinker_preds")
+                    mean_tp = sr.get("mean_thinker_preds")
+                    _gm = given_masks[:B_cur] if given_masks is not None else None
+                    for tp, dev_lst in [(best_tp, all_painter_dev_best), (mean_tp, all_painter_dev_mean)]:
+                        if tp is not None:
+                            N   = tp.shape[1]
+                            diff = painter_preds[:, :N] != tp
+                            if _gm is not None:
+                                blank = ~_gm[:, :N]
+                                n_b   = blank.sum()
+                                dev   = diff[blank].float().mean().item() if n_b > 0 else diff.float().mean().item()
+                            else:
+                                dev = diff.float().mean().item()
+                            dev_lst.append(dev)
+
+                    if wandb_project and _wandb is not None and n_panels_done < n_log:
+                        n_new  = min(n_log - n_panels_done, B_cur)
+                        tp_all = sr.get("best_thinker_preds")
+                        tt_all = sr.get("best_thinker_ts")
+                        sols_np = sols.cpu().numpy()
+                        conds_np = conds.cpu()
+                        for i in range(n_new):
+                            tp = tp_all[i].numpy() if tp_all is not None else None
+                            tt = tt_all[i]         if tt_all is not None else None
+                            panel = make_panel_image(
+                                conds_np[i], generated[i], sols_np[i],
+                                thinker_preds=tp, thinker_t=tt,
+                                img_size=324,
+                            )
+                            panels_list.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+                        n_panels_done += n_new
+
+                    n_done += B_cur
+
+                # Restore live weights
+                if ema_helper is not None:
+                    for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
+                        p.data.copy_(live)
+                unwrapped.train()
+
+                mean_cell   = float(np.mean(all_cell_acc))
+                mean_puzzle = float(np.mean(all_puzzle_acc))
+                logger.info(
+                    f"[eval] step={global_step}  cell_acc={mean_cell:.4f}  "
+                    f"puzzle_acc={mean_puzzle:.4f}  (over {n_done} samples)"
+                )
+                if all_thinker_cell_best:
+                    logger.info(
+                        f"[eval] thinker_cell_best={np.mean(all_thinker_cell_best):.4f}  "
+                        f"thinker_cell_mean={np.mean(all_thinker_cell_mean):.4f}  "
+                        f"thinker_puzzle_best={np.mean(all_thinker_puzzle_best):.4f}  "
+                        f"thinker_puzzle_mean={np.mean(all_thinker_puzzle_mean):.4f}  "
+                        f"thinker_dev={np.mean(all_thinker_deviation):.4f}"
+                    )
+                if all_painter_dev_best:
+                    logger.info(
+                        f"[eval] painter_dev_best={np.mean(all_painter_dev_best):.4f}  "
+                        f"painter_dev_mean={np.mean(all_painter_dev_mean):.4f}"
+                    )
+                if wandb_project:
+                    wandb_acc: dict = {
+                        "eval/cell_acc":   mean_cell,
+                        "eval/puzzle_acc": mean_puzzle,
+                    }
+                    if all_thinker_cell_best:
+                        wandb_acc["eval/thinker_cell_acc_best"]       = float(np.mean(all_thinker_cell_best))
+                        wandb_acc["eval/thinker_cell_acc_mean"]       = float(np.mean(all_thinker_cell_mean))
+                        wandb_acc["eval/thinker_puzzle_acc_best"]     = float(np.mean(all_thinker_puzzle_best))
+                        wandb_acc["eval/thinker_puzzle_acc_mean"]     = float(np.mean(all_thinker_puzzle_mean))
+                        wandb_acc["eval/thinker_deviation_from_best"] = float(np.mean(all_thinker_deviation))
+                    if all_painter_dev_best:
+                        wandb_acc["eval/painter_dev_from_best_thinker"] = float(np.mean(all_painter_dev_best))
+                        wandb_acc["eval/painter_dev_from_mean_thinker"] = float(np.mean(all_painter_dev_mean))
+                    if panels_list:
+                        wandb_acc["eval/samples"] = panels_list
+                    if ts_cell_accs:
+                        curve = plot_thinker_ts_curve(ts_cell_accs, ts_puzzle_accs)
+                        wandb_acc["eval/thinker_vs_timestep"] = _wandb.Image(curve)
+                    accelerator.log(wandb_acc, step=global_step)
 
             next_eval = global_step + eval_every
 
