@@ -544,11 +544,10 @@ def main(cfg: DictConfig):
     global_batch_size = cfg.train.batch_size * world_size
     optimizers, base_lrs = build_optimizers(model, cfg, world_size)
 
-    prepared = accelerator.prepare(model, *optimizers, train_dl, eval_dl)
-    model       = prepared[0]
-    optimizers  = list(prepared[1:1 + len(optimizers)])
-    train_dl    = prepared[-2]
-    eval_dl     = prepared[-1]
+    # Don't prepare optimizers — accelerate wraps them in AcceleratedOptimizer
+    # which passes closure to step(), but AdamATan2/SignSGD don't accept it.
+    # We step all optimizers manually so there's no need for the wrapper.
+    model, train_dl, eval_dl = accelerator.prepare(model, train_dl, eval_dl)
 
     # ── EMA — using EMAHelper from models/ema.py, same as pretrain.py ─────────
     ema_helper = None
