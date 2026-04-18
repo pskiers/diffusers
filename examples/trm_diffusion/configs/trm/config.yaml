@@ -18,7 +18,7 @@ mixed_precision: "no"
 resume_from_checkpoint: null
 seed: 0
 
-wandb_project: null   # set to enable wandb logging
+wandb_project: small-llm-diffusion   # set to enable wandb logging
 
 # ── EMA ───────────────────────────────────────────────────────────────────────
 # ema_rate matches the original pretrain.py naming (vs ema_decay in our scripts).

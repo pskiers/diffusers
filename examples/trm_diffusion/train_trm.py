@@ -625,18 +625,25 @@ def main(cfg: DictConfig):
             next_log = global_step + log_every
 
         if global_step >= next_eval:
-            eval_model = unwrapped
+            # Swap in EMA weights for eval, then restore live weights.
+            # Avoids deepcopy (which fails on non-leaf tensors like local_weights).
             if ema_helper is not None:
-                eval_model = ema_helper.ema_copy(unwrapped)
-            eval_model.eval()
+                live_params = [p.data.clone() for p in unwrapped.parameters() if p.requires_grad]
+                ema_helper.ema(unwrapped)
+            unwrapped.eval()
 
             if mode == "sudoku":
-                metrics = eval_sudoku(eval_model, eval_dl, accelerator)
+                metrics = eval_sudoku(unwrapped, eval_dl, accelerator)
                 eval_log = {f"eval/{k}": v for k, v in metrics.items()}
             else:
-                metrics = eval_painter(eval_model, eval_dl, scheduler, accelerator, sudoku_w)
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w)
                 eval_log = {f"eval/{k}" if not k.startswith("eval/") else k: v
                             for k, v in metrics.items()}
+
+            if ema_helper is not None:
+                for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
+                    p.data.copy_(live)
+            unwrapped.train()
 
             if accelerator.is_main_process:
                 logger.info(f"[eval] step={global_step}  " +
@@ -644,8 +651,6 @@ def main(cfg: DictConfig):
                 if wandb_project:
                     accelerator.log(eval_log, step=global_step)
 
-            if ema_helper is not None:
-                del eval_model
             next_eval = global_step + eval_every
 
         if global_step >= next_save and accelerator.is_main_process:
