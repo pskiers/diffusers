@@ -1,0 +1,30 @@
+# @package _global_
+# Standalone Sudoku TRM — reproduces the original TRM README command:
+#
+#   python pretrain.py arch=trm \
+#     data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+#     epochs=50000 eval_interval=5000 \
+#     lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
+#     arch.L_layers=2 arch.H_cycles=3 arch.L_cycles=6 ema=True
+
+mode: "sudoku"
+output_dir: "runs/trm_sudoku"
+
+use_ema: true
+ema_rate: 0.999
+
+thinker:
+  # Match original: enable sparse puzzle embeddings (puzzle_emb_ndim = hidden_size)
+  puzzle_emb_ndim: 512    # = hidden_size; original: ${arch.hidden_size}
+  puzzle_emb_len: 16      # 16 prefix tokens for puzzle embedding
+  halt_exploration_prob: 0.0  # original ACT exploration; set 0.0 to disable
+
+train:
+  lr: 1e-4
+  lr_min_ratio: 1.0       # constant LR after warmup (min_ratio=1.0 disables cosine decay)
+  weight_decay: 1.0
+  puzzle_emb_lr: 1e-4
+  puzzle_emb_weight_decay: 1.0
+  batch_size: 768
+  num_steps: 100000
+  warmup_steps: 2000

@@ -1,0 +1,109 @@
+# Base config for train_trm.py.
+# Select a mode with: experiment=sudoku  or  experiment=v0tok
+#
+# Usage:
+#   python train_trm.py experiment=sudoku
+#   python train_trm.py experiment=v0tok
+#   accelerate launch --num_processes=2 train_trm.py experiment=sudoku
+
+defaults:
+  - _self_
+  - experiment: null
+
+mode: "sudoku"   # "sudoku" | "painter"
+
+output_dir: "runs/trm"
+num_workers: 4
+mixed_precision: "no"
+resume_from_checkpoint: null
+seed: 0
+
+wandb_project: null   # set to enable wandb logging
+
+# ── EMA ───────────────────────────────────────────────────────────────────────
+# ema_rate matches the original pretrain.py naming (vs ema_decay in our scripts).
+use_ema: true
+ema_rate: 0.999    # original default; our old scripts used 0.9999
+
+# ── Thinker ───────────────────────────────────────────────────────────────────
+# All params map directly to TinyRecursiveReasoningModel_ACTV1Config.
+thinker:
+  vocab_size: 11          # 0=PAD, 1=blank, 2-10=digits 1-9
+  seq_len: 81
+  hidden_size: 512        # original: 512
+  n_heads: 8              # original: 8  (= hidden_size // 64)
+  L_layers: 2             # transformer layers per block call
+  L_cycles: 6             # inner iterations per H-cycle
+  H_cycles: 3             # outer macroscopic cycles
+  n_sup: 16               # supervision steps (= halt_max_steps in original)
+  expansion: 4.0          # SwiGLU hidden-dim multiplier; original: 4
+  forward_dtype: "bfloat16"
+  pos_encodings: "rope"   # "rope" | "learned"
+  mlp_t: false            # true = MLP-T block instead of attention
+
+  # ── Puzzle embeddings ──────────────────────────────────────────────────────
+  # The original uses sparse puzzle embeddings trained with a dedicated
+  # SignSGD optimizer (see puzzle_emb_lr / puzzle_emb_weight_decay below).
+  # Set puzzle_emb_ndim=0 to disable (pure AdamW, no SignSGD needed).
+  # To match the original: puzzle_emb_ndim=512, puzzle_emb_len=16.
+  puzzle_emb_ndim: 512          # 0 = disabled; original: hidden_size (512)
+  puzzle_emb_len: 16            # prefix token count; ignored when ndim=0
+  num_puzzle_identifiers: 1000  # unique puzzle IDs; needed when ndim > 0
+  batch_size: 768               # per-GPU batch size; needed by CastedSparseEmbedding
+
+  # ── ACT exploration ────────────────────────────────────────────────────────
+  # 0.0 = fixed n_sup steps, no adaptive halting (what we use).
+  # > 0 = enables the original ACT: the model sometimes runs for a random
+  #       number of steps before halting (original uses 0.1).
+  halt_exploration_prob: 0.0    # original: 0.1
+
+  # ── Freeze weights ─────────────────────────────────────────────────────────
+  # If true, only the puzzle embeddings are trained (SignSGD), all other
+  # parameters are frozen.  Used to fine-tune embeddings on a new puzzle set.
+  freeze_weights: false         # original: false
+
+# ── Painter (painter mode only) ───────────────────────────────────────────────
+painter:
+  bridge_channels: 16
+  painter_channels: [32, 64, 64]
+  painter_layers_per_block: 2
+  diff_thinker_weight: 1.0   # 0=detach thinker from diffusion loss, 1=full grad
+  # Separate AdamW LR/WD for painter+bridge (null = inherit from train.lr / train.weight_decay)
+  lr: 1e-4
+  weight_decay: null
+  # Mixed precision for bridge+UNet only (null=disabled, "bfloat16", "float16").
+  # TRM is unaffected — it manages its own dtype via thinker.forward_dtype.
+  # If using "float16", set mixed_precision="fp16" so accelerate handles GradScaler.
+  dtype: bfloat16
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+data:
+  sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
+  mnist_root: "data/mnist"   # painter mode only
+  cell_size: 16              # painter mode only; grid = 9*cell_size px
+
+# ── Diffusion scheduler (painter mode only) ───────────────────────────────────
+num_timesteps: 100
+beta_schedule: "squaredcos_cap_v2"
+prediction_type: "epsilon"   # "epsilon" (predict noise) or "sample" (predict x0)
+
+# ── Training ──────────────────────────────────────────────────────────────────
+train:
+  lr: 1e-4
+  lr_min_ratio: 0.1       # cosine decay floor as fraction of lr; original: 0.0
+  weight_decay: 1.0       # original: 1.0
+  beta1: 0.9              # AdamW beta1; original uses AdamATan2 with same betas
+  beta2: 0.95             # AdamW beta2
+
+  # Puzzle-embedding optimizer (only used when thinker.puzzle_emb_ndim > 0)
+  puzzle_emb_lr: 1e-4     # SignSGD LR for sparse puzzle embedding
+  puzzle_emb_weight_decay: 1.0
+
+  batch_size: 768         # sudoku default; painter uses 128 (set in v0tok.yaml)
+  num_steps: 50000
+  warmup_steps: 2000
+  eval_every: 1000
+  save_every: 5000
+  log_every: 100
+  sudoku_loss_weight: 1.0  # painter mode: thinker CE weight relative to diff loss
+  gradient_accumulation_steps: 1  # accumulate over N batches before each optimizer step
