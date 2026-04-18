@@ -10,7 +10,7 @@ from accelerate.utils import extract_model_from_parallel as unwrap_model
 from trm_utils import deep_recursion, get_model_output
 from model_utils import load_with_backward_compatibility
 from safetensors.torch import load_file
-from models import SpatialEncoder, AttentiveBridge, ConditioningPyramid
+from models_pt import SpatialEncoder, AttentiveBridge, ConditioningPyramid
 
 
 @dataclass

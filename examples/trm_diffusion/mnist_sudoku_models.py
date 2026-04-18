@@ -61,7 +61,7 @@ from diffusers import UNet2DModel
 from diffusers.models.unets.unet_2d import UNet2DOutput
 from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
-from models import SpatialEncoder, AttentiveBridge, ConditioningPyramid   # reuse from trm pipeline
+from models_pt import SpatialEncoder, AttentiveBridge, ConditioningPyramid   # reuse from trm pipeline
 from sudoku_models import SudokuTRM
 
 
