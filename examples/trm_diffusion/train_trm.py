@@ -592,10 +592,10 @@ def main(cfg: DictConfig):
     )
 
     def _next_batch():
+        nonlocal train_iter
         try:
             return next(train_iter)
         except StopIteration:
-            nonlocal train_iter
             train_iter = iter(train_dl)
             return next(train_iter)
 
