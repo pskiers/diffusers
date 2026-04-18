@@ -218,7 +218,7 @@ def train_step_sudoku(model, micro_batches, accelerator, optimizers, base_lrs, g
 def eval_sudoku(model, dataloader, accelerator, max_batches=10):
     model.eval()
     accum = {"sudoku_loss": [], "cell_acc": [], "puzzle_acc": []}
-    for i, batch in enumerate(dataloader):
+    for i, batch in tqdm(enumerate(dataloader), desc="Evaluating", total=max_batches):
         if i >= max_batches:
             break
         inputs = batch["inputs"].to(accelerator.device)
@@ -633,10 +633,10 @@ def main(cfg: DictConfig):
             unwrapped.eval()
 
             if mode == "sudoku":
-                metrics = eval_sudoku(unwrapped, eval_dl, accelerator)
+                metrics = eval_sudoku(unwrapped, eval_dl, accelerator, max_batches=100)
                 eval_log = {f"eval/{k}": v for k, v in metrics.items()}
             else:
-                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w)
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=100)
                 eval_log = {f"eval/{k}" if not k.startswith("eval/") else k: v
                             for k, v in metrics.items()}
 
