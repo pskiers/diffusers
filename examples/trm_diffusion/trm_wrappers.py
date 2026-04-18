@@ -287,6 +287,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         cell_size: int = 16,
         # --- thinker ---
         vocab_size: int = 11,
+        seq_len: int = 81,
         hidden_size: int = 512,
         n_heads: int = 8,
         L_layers: int = 2,
@@ -326,7 +327,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
 
         self.thinker = OriginalTRMSudoku(
             vocab_size=vocab_size,
-            seq_len=81,
+            seq_len=seq_len,
             hidden_size=hidden_size,
             n_heads=n_heads,
             L_layers=L_layers,
