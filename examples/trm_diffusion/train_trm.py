@@ -909,7 +909,7 @@ def main(cfg: DictConfig):
                 metrics = eval_sudoku(unwrapped, eval_dl, accelerator, max_batches=100)
                 val_log = {f"val/{k}": v for k, v in metrics.items()}
             else:
-                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=10)
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=100)
                 val_log = {
                     "val/loss":        metrics.get("loss", 0),
                     "val/diff_loss":   metrics.get("diff_loss", 0),
