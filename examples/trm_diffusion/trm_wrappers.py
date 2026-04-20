@@ -38,6 +38,7 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 
@@ -50,6 +51,7 @@ from models.recursive_reasoning.trm import (
 )
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from mnist_sudoku_models import SpatialBridge, _make_painter
+from models_pt import SpatialEncoder, AttentiveBridge
 
 
 # ── Sparse puzzle-embedding optimizer factory ──────────────────────────────────
@@ -100,6 +102,35 @@ def get_non_puzzle_emb_params(model: nn.Module) -> list:
         for buf in (emb.local_weights, emb.local_ids, emb.weights):
             exclude_ids.add(id(buf))
     return [p for p in model.parameters() if id(p) not in exclude_ids]
+
+
+# ── Spatial-input TRM inner model ─────────────────────────────────────────────
+
+class _SpatialInputTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
+    """Drop-in replacement for TinyRecursiveReasoningModel_ACTV1_Inner that also
+    accepts pre-computed float embeddings as inputs.
+
+    When batch["inputs"] is a *floating-point* tensor (B, seq_len, hidden_size),
+    the embed_tokens call is skipped and the tensor is used directly as the input
+    injection signal (scaled by embed_scale, plus learned pos enc if configured).
+
+    When batch["inputs"] is an integer tensor the behaviour is identical to the
+    parent class — fully backward-compatible.
+
+    This enables image-conditioned variants (V0–V4) where a CNN encoder computes
+    the input embeddings rather than an nn.Embedding lookup.
+    """
+
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        if input.is_floating_point():
+            # Pre-computed embedding: (B, seq_len, hidden_size)
+            embedding = input.to(self.forward_dtype)
+            if self.config.pos_encodings == "learned":
+                embedding = 0.707106781 * (
+                    embedding + self.embed_pos.embedding_weight.to(self.forward_dtype)
+                )
+            return self.embed_scale * embedding
+        return super()._input_embeddings(input, puzzle_identifiers)
 
 
 # ── Core thinker wrapper ───────────────────────────────────────────────────────
@@ -182,7 +213,7 @@ class OriginalTRMSudoku(nn.Module):
             puzzle_emb_len=effective_puzzle_emb_len,
             no_ACT_continue=True,
         )
-        self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(config)
+        self.inner = _SpatialInputTRMInner(config)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -204,10 +235,14 @@ class OriginalTRMSudoku(nn.Module):
         z_H: torch.Tensor,
         z_L: torch.Tensor,
         puzzle_ids: Optional[torch.Tensor] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
     ):
         """
         One supervision step. Internally runs H_cycles-1 no-grad cycles then
         one full-grad cycle (matching the original training pattern).
+
+        H_cycles / L_cycles: override the config values for this call only.
 
         Returns: (logits, z_H_detached, z_L_detached)
           logits: (B, seq_len, vocab_size) — gradients attached
@@ -215,8 +250,20 @@ class OriginalTRMSudoku(nn.Module):
         bsz = inputs.shape[0]
         if puzzle_ids is None:
             puzzle_ids = torch.zeros(bsz, dtype=torch.int32, device=inputs.device)
-        carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
-        new_carry, logits, _ = self.inner(carry, {"inputs": inputs, "puzzle_identifiers": puzzle_ids})
+
+        orig_H = self.inner.config.H_cycles
+        orig_L = self.inner.config.L_cycles
+        if H_cycles is not None:
+            self.inner.config.H_cycles = H_cycles
+        if L_cycles is not None:
+            self.inner.config.L_cycles = L_cycles
+        try:
+            carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
+            new_carry, logits, _ = self.inner(carry, {"inputs": inputs, "puzzle_identifiers": puzzle_ids})
+        finally:
+            self.inner.config.H_cycles = orig_H
+            self.inner.config.L_cycles = orig_L
+
         return logits, new_carry.z_H, new_carry.z_L
 
     @torch.no_grad()
@@ -320,6 +367,10 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         super().__init__()
         self.diff_thinker_weight = diff_thinker_weight
         self._grid = painter_size // cell_size   # e.g. 144//16 = 9
+        # Thinker vocab uses 0=PAD, 1=blank, 2-10=digits 1-9.
+        # sample_grids compares argmax predictions against raw solution labels (0-8),
+        # so it needs to know to shift by this offset when comparing.
+        self.token_offset = 2
         self._painter_dtype: Optional[torch.dtype] = (
             {"bfloat16": torch.bfloat16, "float16": torch.float16}[painter_dtype]
             if painter_dtype is not None else None
@@ -403,6 +454,8 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         z_L: torch.Tensor,
         timesteps: torch.Tensor,
         puzzle_ids: Optional[torch.Tensor] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
     ):
         """
         One supervision step: thinker → bridge → painter.
@@ -411,10 +464,12 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         through the bridge into the thinker (1.0 = full, 0.0 = detached).
         The sudoku CE loss always flows through unscaled logits.
 
+        H_cycles / L_cycles: override thinker config for this call only.
+
         Returns: (noise_pred, sudoku_logits, z_H_detached, z_L_detached)
         """
         logits, z_H_next, z_L_next = self.thinker.reasoning_step(
-            puzzle_tokens, z_H, z_L, puzzle_ids
+            puzzle_tokens, z_H, z_L, puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles
         )
         # spatial_cond in float for bridge (inner model runs in bf16)
         spatial_cond = self._logits_to_spatial(logits.float())
@@ -458,3 +513,407 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         spatial_cond = self._logits_to_spatial(logits.float())
         noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
         return noise_pred, logits
+
+
+# ── Painter-thinker (V0: image-conditioned) ───────────────────────────────────
+
+class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
+    """
+    Image-conditioned painter-thinker (V0).
+
+    Identical to V0Tok except the thinker receives CNN-encoded puzzle image
+    features instead of discrete puzzle tokens.  A SpatialEncoder + 1×1 Conv2d
+    projects the condition image (B, 1, H, W) to float embeddings
+    (B, 81, hidden_size) which are fed directly to _SpatialInputTRMInner
+    (bypassing embed_tokens).
+
+    token_input = False  → train_trm uses batch["conditions"] not puzzle_tokens
+    token_offset = 0     → logits are already in 0-8 digit space
+    """
+
+    token_input: bool = False
+
+    def __init__(
+        self,
+        # --- painter geometry ---
+        painter_size: int = 144,
+        cell_size: int = 16,
+        # --- thinker ---
+        num_classes: int = 9,
+        seq_len: int = 81,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        L_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 16,
+        expansion: float = 4.0,
+        forward_dtype: str = "bfloat16",
+        mlp_t: bool = False,
+        pos_encodings: str = "rope",
+        halt_exploration_prob: float = 0.0,
+        batch_size: int = 1,
+        freeze_weights: bool = False,
+        # --- image encoder ---
+        enc_channels: int = 32,
+        # --- bridge & painter ---
+        bridge_channels: int = 16,
+        painter_channels: tuple = (32, 64, 128),
+        painter_layers_per_block: int = 1,
+        diff_thinker_weight: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            vocab_size=num_classes,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            n_heads=n_heads,
+            L_layers=L_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            expansion=expansion,
+            forward_dtype=forward_dtype,
+            mlp_t=mlp_t,
+            pos_encodings=pos_encodings,
+            puzzle_emb_ndim=0,
+            halt_exploration_prob=halt_exploration_prob,
+            batch_size=batch_size,
+            freeze_weights=freeze_weights,
+            bridge_channels=bridge_channels,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            diff_thinker_weight=diff_thinker_weight,
+            painter_dtype=painter_dtype,
+        )
+        self.token_offset = 0
+
+        # condition image (B,1,H,W) → (B, enc_channels, grid, grid)
+        self.image_encoder = SpatialEncoder(1, enc_channels, factor=cell_size)
+        # project enc_channels → hidden_size per cell
+        std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(enc_channels))
+        self.enc_proj = nn.Conv2d(enc_channels, hidden_size, 1)
+        nn.init.normal_(self.enc_proj.weight, std=std)
+        nn.init.zeros_(self.enc_proj.bias)
+
+    def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, C, H, W) → float embeddings (B, 81, hidden_size)"""
+        feat = self.image_encoder(x)               # (B, enc_channels, grid, grid)
+        proj = self.enc_proj(feat)                 # (B, hidden_size, grid, grid)
+        return proj.flatten(2).transpose(1, 2)     # (B, 81, hidden_size)
+
+    def _get_enc_emb(
+        self, condition: torch.Tensor, noisy: torch.Tensor
+    ) -> torch.Tensor:
+        """V0: encode condition only.  V1 overrides to use cat(condition, noisy)."""
+        return self._encode_image(condition)
+
+    def reasoning_step(
+        self,
+        condition: torch.Tensor,
+        noisy: torch.Tensor,
+        z_H: torch.Tensor,
+        z_L: torch.Tensor,
+        timesteps: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
+    ):
+        enc_emb = self._get_enc_emb(condition, noisy)
+        return super().reasoning_step(
+            enc_emb, noisy, z_H, z_L, timesteps,
+            puzzle_ids=puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles,
+        )
+
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ):
+        enc_emb = self._get_enc_emb(condition, noisy)
+        bsz = noisy.shape[0]
+        z_H, z_L = self.get_initial_states(bsz)
+        z_H = z_H.to(noisy.device)
+        z_L = z_L.to(noisy.device)
+
+        logits = None
+        for _ in range(self.n_sup):
+            logits, z_H, z_L = self.thinker.reasoning_step(
+                enc_emb, z_H, z_L, puzzle_ids
+            )
+
+        spatial_cond = self._logits_to_spatial(logits.float())
+        noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+        return noise_pred, logits
+
+
+# ── Painter-thinker (V1: image+noisy-conditioned) ────────────────────────────
+
+class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
+    """
+    Same as V0 but the encoder sees cat(condition, noisy_image) (2 channels).
+
+    The thinker reasons from a noisy/corrupted signal, removing the clean-input
+    training wheel present in V0.
+
+    Inherits everything from V0; only differences:
+      - image_encoder uses SpatialEncoder(2, ...) instead of SpatialEncoder(1, ...)
+      - _get_enc_emb concatenates condition + noisy before encoding
+    """
+
+    def __init__(
+        self,
+        # --- painter geometry ---
+        painter_size: int = 144,
+        cell_size: int = 16,
+        # --- thinker ---
+        num_classes: int = 9,
+        seq_len: int = 81,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        L_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 16,
+        expansion: float = 4.0,
+        forward_dtype: str = "bfloat16",
+        mlp_t: bool = False,
+        pos_encodings: str = "rope",
+        halt_exploration_prob: float = 0.0,
+        batch_size: int = 1,
+        freeze_weights: bool = False,
+        # --- image encoder ---
+        enc_channels: int = 32,
+        # --- bridge & painter ---
+        bridge_channels: int = 16,
+        painter_channels: tuple = (32, 64, 128),
+        painter_layers_per_block: int = 1,
+        diff_thinker_weight: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            n_heads=n_heads,
+            L_layers=L_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            expansion=expansion,
+            forward_dtype=forward_dtype,
+            mlp_t=mlp_t,
+            pos_encodings=pos_encodings,
+            halt_exploration_prob=halt_exploration_prob,
+            batch_size=batch_size,
+            freeze_weights=freeze_weights,
+            enc_channels=enc_channels,
+            bridge_channels=bridge_channels,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            diff_thinker_weight=diff_thinker_weight,
+            painter_dtype=painter_dtype,
+        )
+        # Replace 1-channel encoder with 2-channel (condition + noisy)
+        self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+
+    def _get_enc_emb(
+        self, condition: torch.Tensor, noisy: torch.Tensor
+    ) -> torch.Tensor:
+        return self._encode_image(torch.cat([condition, noisy], dim=1))
+
+
+# ── Painter-thinker (V2: no CE supervision) ───────────────────────────────────
+
+class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
+    """
+    Same as V1 but with no sudoku CE loss and unconstrained thinker output channels.
+
+    Training wheel removed: the thinker gets no explicit digit-level supervision.
+    The thinker output is a latent spatial map (thinker_out_channels, 9, 9) which
+    the bridge upsamples to condition the painter, but its CE loss is suppressed by
+    returning None logits so the training loop skips it.
+
+    Use thinker_out_channels=16 (or any value) instead of num_classes=9.
+    """
+
+    def __init__(
+        self,
+        # --- painter geometry ---
+        painter_size: int = 144,
+        cell_size: int = 16,
+        # --- thinker ---
+        thinker_out_channels: int = 16,
+        seq_len: int = 81,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        L_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 16,
+        expansion: float = 4.0,
+        forward_dtype: str = "bfloat16",
+        mlp_t: bool = False,
+        pos_encodings: str = "rope",
+        halt_exploration_prob: float = 0.0,
+        batch_size: int = 1,
+        freeze_weights: bool = False,
+        # --- image encoder ---
+        enc_channels: int = 32,
+        # --- bridge & painter ---
+        bridge_channels: int = 16,
+        painter_channels: tuple = (32, 64, 128),
+        painter_layers_per_block: int = 1,
+        diff_thinker_weight: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            num_classes=thinker_out_channels,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            n_heads=n_heads,
+            L_layers=L_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            expansion=expansion,
+            forward_dtype=forward_dtype,
+            mlp_t=mlp_t,
+            pos_encodings=pos_encodings,
+            halt_exploration_prob=halt_exploration_prob,
+            batch_size=batch_size,
+            freeze_weights=freeze_weights,
+            enc_channels=enc_channels,
+            bridge_channels=bridge_channels,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            diff_thinker_weight=diff_thinker_weight,
+            painter_dtype=painter_dtype,
+        )
+
+    def reasoning_step(self, condition, noisy, z_H, z_L, timesteps,
+                       puzzle_ids=None, H_cycles=None, L_cycles=None):
+        noise_pred, _logits, z_H_next, z_L_next = super().reasoning_step(
+            condition, noisy, z_H, z_L, timesteps,
+            puzzle_ids=puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles,
+        )
+        return noise_pred, None, z_H_next, z_L_next
+
+    def forward(self, noisy, timesteps, condition, puzzle_ids=None):
+        noise_pred, _logits = super().forward(noisy, timesteps, condition, puzzle_ids)
+        return noise_pred, None
+
+
+# ── Painter-thinker (V3: larger latent, same as V2) ───────────────────────────
+
+class OriginalTRMRatatouilleV3(OriginalTRMRatatouilleV2):
+    """
+    Same as V2 but with a larger thinker latent (thinker_out_channels=64).
+
+    The only difference from V2 is the default output dimensionality — the
+    architecture, loss (no CE), and encoder (condition+noisy) are identical.
+    Use this when you want a higher-capacity thinker latent for the bridge.
+    """
+
+    def __init__(self, thinker_out_channels: int = 64, **kwargs):
+        super().__init__(thinker_out_channels=thinker_out_channels, **kwargs)
+
+
+# ── Painter-thinker (V4: AttentiveBridge + decoupled compression factor) ──────
+
+class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
+    """
+    Same as V3 but the thinker grid topology is decoupled from the puzzle cell
+    structure via an independent compression_factor, and SpatialBridge is
+    replaced by AttentiveBridge (Perceiver-IO cross-attention upsampling).
+
+    Key differences from V3:
+      - compression_factor controls encoder downsampling (may differ from cell_size)
+      - thinker seq_len = (painter_size // compression_factor)²
+      - Bridge: AttentiveBridge with learned positional queries upsamples the
+        low-res thinker output to painter_size × painter_size
+      - bridge_num_heads: attention heads in AttentiveBridge
+    """
+
+    def __init__(
+        self,
+        # --- painter geometry ---
+        painter_size: int = 144,
+        cell_size: int = 16,            # only for _run_painter noisy input shape
+        compression_factor: int = 16,   # encoder + thinker grid factor
+        # --- thinker ---
+        thinker_out_channels: int = 64,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        L_layers: int = 2,
+        L_cycles: int = 6,
+        H_cycles: int = 3,
+        n_sup: int = 16,
+        expansion: float = 4.0,
+        forward_dtype: str = "bfloat16",
+        mlp_t: bool = False,
+        pos_encodings: str = "rope",
+        halt_exploration_prob: float = 0.0,
+        batch_size: int = 1,
+        freeze_weights: bool = False,
+        # --- image encoder ---
+        enc_channels: int = 32,
+        # --- bridge & painter ---
+        bridge_channels: int = 16,
+        bridge_num_heads: int = 4,
+        painter_channels: tuple = (32, 64, 128),
+        painter_layers_per_block: int = 1,
+        diff_thinker_weight: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        grid_size = painter_size // compression_factor
+        seq_len   = grid_size * grid_size
+
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            thinker_out_channels=thinker_out_channels,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            n_heads=n_heads,
+            L_layers=L_layers,
+            L_cycles=L_cycles,
+            H_cycles=H_cycles,
+            n_sup=n_sup,
+            expansion=expansion,
+            forward_dtype=forward_dtype,
+            mlp_t=mlp_t,
+            pos_encodings=pos_encodings,
+            halt_exploration_prob=halt_exploration_prob,
+            batch_size=batch_size,
+            freeze_weights=freeze_weights,
+            enc_channels=enc_channels,
+            bridge_channels=bridge_channels,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            diff_thinker_weight=diff_thinker_weight,
+            painter_dtype=painter_dtype,
+        )
+
+        # Thinker grid is compression_factor-based, not cell_size-based
+        self._grid = grid_size
+
+        # Replace 1→2 channel encoder (set by V1) with compression_factor version
+        self.image_encoder = SpatialEncoder(2, enc_channels, factor=compression_factor)
+
+        # Replace SpatialBridge with AttentiveBridge
+        self.bridge = AttentiveBridge(
+            in_channels=thinker_out_channels,
+            out_channels=bridge_channels,
+            out_resolution=painter_size,
+            factor=compression_factor,
+            num_heads=bridge_num_heads,
+        )

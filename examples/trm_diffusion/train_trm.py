@@ -47,6 +47,11 @@ from mnist_eval import (
 from trm_wrappers import (
     OriginalTRMSudoku,
     OriginalTRMRatatouilleV0Tok,
+    OriginalTRMRatatouilleV0,
+    OriginalTRMRatatouilleV1,
+    OriginalTRMRatatouilleV2,
+    OriginalTRMRatatouilleV3,
+    OriginalTRMRatatouilleV4,
     build_puzzle_emb_optimizer,
     get_non_puzzle_emb_params,
 )
@@ -260,11 +265,11 @@ def _make_tok_labels(solution: torch.Tensor) -> torch.Tensor:
 def compute_losses_painter(model, batch, scheduler, accelerator, sudoku_loss_weight) -> dict:
     """Single forward pass (eval). Ported from train_mnist_sudoku.py compute_losses."""
     device = accelerator.device
-    images      = batch["images"].to(device)
-    puzzle_tokens = batch["puzzle_tokens"].to(device)
-    solution    = batch["solution"].to(device)    # (B,81) 0-8 or IGNORE for given
-    given_mask  = batch.get("given_mask")
-    puzzle_ids  = batch["puzzle_id"].to(device) if "puzzle_id" in batch else None
+    images     = batch["images"].to(device)
+    condition  = _get_condition(batch, model, device)
+    solution   = batch["solution"].to(device)    # (B,81) 0-8 or IGNORE for given
+    given_mask = batch.get("given_mask")
+    puzzle_ids = batch["puzzle_id"].to(device) if "puzzle_id" in batch else None
 
     B = images.shape[0]
     noise     = torch.randn_like(images)
@@ -272,18 +277,18 @@ def compute_losses_painter(model, batch, scheduler, accelerator, sudoku_loss_wei
                               device=device, dtype=torch.long)
     noisy = scheduler.add_noise(images, noise, timesteps)
 
-    noise_pred, sudoku_logits = model(noisy, timesteps, puzzle_tokens, puzzle_ids=puzzle_ids)
+    noise_pred, sudoku_logits = model(noisy, timesteps, condition, puzzle_ids=puzzle_ids)
 
     target    = noise if scheduler.config.prediction_type == "epsilon" else images
     diff_loss = F.mse_loss(noise_pred.float(), target)
 
     sudoku_loss = torch.tensor(0.0, device=device)
-    tok_labels  = _make_tok_labels(solution)   # 2-10 / IGNORE_LABEL_ID
+    ce_labels   = _make_ce_labels(solution, model)
     if sudoku_logits is not None and sudoku_loss_weight > 0:
         B_, N, C = sudoku_logits.shape
         sudoku_loss = F.cross_entropy(
             sudoku_logits.float().reshape(B_ * N, C),
-            tok_labels[:, :N].reshape(B_ * N).clamp(min=0),
+            ce_labels[:, :N].reshape(B_ * N).clamp(min=0),
             ignore_index=IGNORE_LABEL_ID,
         )
 
@@ -293,8 +298,8 @@ def compute_losses_painter(model, batch, scheduler, accelerator, sudoku_loss_wei
     thinker_puzzle_acc = None
     if sudoku_logits is not None:
         B_, N, C = sudoku_logits.shape
-        preds   = sudoku_logits.argmax(dim=-1)   # (B_, N) — token space 0-10
-        targets = tok_labels[:B_, :N]            # (B_, N) — token space 2-10 / IGNORE
+        preds   = sudoku_logits.argmax(dim=-1)
+        targets = ce_labels[:B_, :N]
         correct = preds == targets               # (B_, N)
 
         thinker_puzzle_acc = correct.all(dim=1).float().mean()
@@ -343,10 +348,10 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
     # Pre-process: sample noise, build carry state for each micro-batch
     mb_data = []
     for mb in micro_batches:
-        images        = mb["images"].to(device)
-        puzzle_tokens = mb["puzzle_tokens"].to(device)
-        solution      = mb["solution"].to(device)
-        puzzle_ids    = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
+        images     = mb["images"].to(device)
+        condition  = _get_condition(mb, model, device)
+        solution   = mb["solution"].to(device)
+        puzzle_ids = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
 
         bsz   = images.shape[0]
         noise = torch.randn_like(images)
@@ -357,12 +362,12 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
         z_H, z_L = model.get_initial_states(bsz)
 
         mb_data.append({
-            "puzzle_tokens": puzzle_tokens,
-            "tok_labels":    _make_tok_labels(solution),
-            "puzzle_ids":    puzzle_ids,
-            "noisy":         noisy,
-            "timesteps":     timesteps,
-            "target":        target,
+            "condition":  condition,
+            "ce_labels":  _make_ce_labels(solution, model),
+            "puzzle_ids": puzzle_ids,
+            "noisy":      noisy,
+            "timesteps":  timesteps,
+            "target":     target,
             "z_H": z_H.to(device),
             "z_L": z_L.to(device),
         })
@@ -374,7 +379,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
     for _ in range(model.n_sup):
         for d in mb_data:
             noise_pred, logits, d["z_H"], d["z_L"] = model.reasoning_step(
-                d["puzzle_tokens"], d["noisy"], d["z_H"], d["z_L"],
+                d["condition"], d["noisy"], d["z_H"], d["z_L"],
                 d["timesteps"], d["puzzle_ids"],
             )
             diff_loss = F.mse_loss(noise_pred.float(), d["target"])
@@ -384,7 +389,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
                 B_, N, C = logits.shape
                 sudoku_loss = F.cross_entropy(
                     logits.float().reshape(B_ * N, C),
-                    d["tok_labels"][:, :N].reshape(B_ * N).clamp(min=0),
+                    d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
                     ignore_index=IGNORE_LABEL_ID,
                 )
 
@@ -404,6 +409,179 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
     n = model.n_sup * K
     return {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}, lr, global_step
+
+
+def _get_condition(mb: dict, model, device) -> torch.Tensor:
+    """Return the condition tensor for this batch based on model.token_input."""
+    if model.token_input:
+        return mb["puzzle_tokens"].to(device)
+    return mb["conditions"].to(device)
+
+
+def _get_teacher_condition(mb: dict, model, device) -> torch.Tensor:
+    """Teacher-forcing condition: full solution tokens for token models,
+    complete rendered MNIST image for image-conditioned models."""
+    if model.token_input:
+        return _solution_tokens(mb["solution"].to(device))
+    return mb["images"].to(device)
+
+
+def _make_ce_labels(solution: torch.Tensor, model) -> torch.Tensor:
+    """Return CE supervision labels compatible with model output space.
+    Token models: 2-10 (tok_labels).  Image models: 0-8 (raw solution).
+    In both cases IGNORE_LABEL_ID marks given/masked cells."""
+    if model.token_input:
+        return _make_tok_labels(solution)
+    return solution   # already 0-8 with IGNORE_LABEL_ID for given cells
+
+
+def _solution_tokens(solution: torch.Tensor) -> torch.Tensor:
+    """Raw solution (0-8) → full token grid (2-10, no blanks) for painter stage."""
+    return solution.clamp(min=0) + 2
+
+
+def train_step_painter_two_stage(
+    model, micro_batches, scheduler, accelerator, optimizers, base_lrs,
+    global_step, cfg, ema_helper, global_batch_size,
+):
+    """
+    Interleaved two-stage painter training.
+
+    Each tick of the outer n_sup loop does two sequential sub-steps:
+
+      1. Painter sub-step (first ps_n_sup ticks only):
+         Thinker receives the full solution tokens (teacher forcing) so it has
+         a trivial task and the painter learns to reliably follow it.
+         Reduced H_cycles / L_cycles are optional.  Updates all params.
+
+      2. Thinker sub-step (every tick):
+         Thinker receives the real puzzle tokens.  Painter is frozen; only CE
+         loss is computed so diffusion cannot interfere with sudoku reasoning.
+         Updates thinker params only.
+
+    Both stages keep their own carry state (z_H / z_L) that persists across
+    ticks, since they process different inputs.
+    """
+    K       = len(micro_batches)
+    device  = accelerator.device
+    sudoku_w = cfg.train.sudoku_loss_weight
+
+    ps = cfg.get("painter_stage", {})
+    ts = cfg.get("thinker_stage", {})
+    ps_n_sup  = int(ps.get("n_sup",    model.n_sup))
+    ps_H      = ps.get("H_cycles", None)
+    ps_L      = ps.get("L_cycles", None)
+    ts_n_sup  = int(ts.get("n_sup",    model.n_sup))
+
+    # Painter AdamW is always the last optimizer (built by build_optimizers).
+    thinker_opts     = optimizers[:-1]
+    thinker_base_lrs = base_lrs[:-1]
+
+    # Pre-process micro-batches — reused across both stages each tick.
+    mb_data = []
+    for mb in micro_batches:
+        images     = mb["images"].to(device)
+        condition  = _get_condition(mb, model, device)
+        teacher    = _get_teacher_condition(mb, model, device)
+        solution   = mb["solution"].to(device)
+        puzzle_ids = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
+
+        bsz   = images.shape[0]
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,),
+                                  device=device, dtype=torch.long)
+        noisy  = scheduler.add_noise(images, noise, timesteps)
+        target = noise if scheduler.config.prediction_type == "epsilon" else images
+
+        z_H_p, z_L_p = model.get_initial_states(bsz)   # painter-stage carry
+        z_H_t, z_L_t = model.get_initial_states(bsz)   # thinker-stage carry
+
+        mb_data.append({
+            "condition":  condition,
+            "teacher":    teacher,
+            "ce_labels":  _make_ce_labels(solution, model),
+            "puzzle_ids": puzzle_ids,
+            "noisy":      noisy,
+            "timesteps":  timesteps,
+            "target":     target,
+            "z_H_p": z_H_p.to(device), "z_L_p": z_L_p.to(device),
+            "z_H_t": z_H_t.to(device), "z_L_t": z_L_t.to(device),
+        })
+
+    total_diff_loss   = 0.0
+    total_sudoku_loss = 0.0
+    lr = None
+    n_ticks = max(ps_n_sup, ts_n_sup)
+
+    painter_params = model.get_painter_params()
+
+    for tick in range(n_ticks):
+        # ── Painter sub-step (teacher forcing with solution tokens) ──────────
+        if tick < ps_n_sup:
+            for d in mb_data:
+                noise_pred, logits, d["z_H_p"], d["z_L_p"] = model.reasoning_step(
+                    d["teacher"], d["noisy"], d["z_H_p"], d["z_L_p"], d["timesteps"],
+                    d["puzzle_ids"], H_cycles=ps_H, L_cycles=ps_L,
+                )
+                diff_loss = F.mse_loss(noise_pred.float(), d["target"])
+                sudoku_loss = torch.tensor(0.0, device=device)
+                if logits is not None and sudoku_w > 0:
+                    B_, N, C = logits.shape
+                    sudoku_loss = F.cross_entropy(
+                        logits.float().reshape(B_ * N, C),
+                        d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
+                        ignore_index=IGNORE_LABEL_ID,
+                    )
+                step_loss = diff_loss + sudoku_w * sudoku_loss
+                accelerator.backward(step_loss / (global_batch_size * K))
+                total_diff_loss   += diff_loss.item()
+                total_sudoku_loss += sudoku_loss.item()
+
+            accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
+            accelerator.clip_grad_norm_(painter_params, 1.0)
+            lr = _apply_lr_and_step(optimizers, base_lrs, global_step, cfg)
+            _zero_grads(optimizers)
+
+        # ── Thinker sub-step (real puzzle tokens, painter frozen) ────────────
+        if tick < ts_n_sup:
+            for p in painter_params:
+                p.requires_grad_(False)
+
+            for d in mb_data:
+                _, logits, d["z_H_t"], d["z_L_t"] = model.reasoning_step(
+                    d["condition"], d["noisy"], d["z_H_t"], d["z_L_t"], d["timesteps"],
+                    d["puzzle_ids"],
+                )
+                sudoku_loss = torch.tensor(0.0, device=device)
+                if logits is not None and sudoku_w > 0:
+                    B_, N, C = logits.shape
+                    sudoku_loss = F.cross_entropy(
+                        logits.float().reshape(B_ * N, C),
+                        d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
+                        ignore_index=IGNORE_LABEL_ID,
+                    )
+                accelerator.backward(sudoku_loss / (global_batch_size * K))
+                total_sudoku_loss += sudoku_loss.item()
+
+            accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
+            lr_t = _apply_lr_and_step(thinker_opts, thinker_base_lrs, global_step, cfg)
+            lr = lr_t if lr is None else lr
+            for opt in thinker_opts:
+                opt.zero_grad()
+
+            for p in painter_params:
+                p.requires_grad_(True)
+
+        if ema_helper is not None:
+            ema_helper.update(model)
+        global_step += 1
+
+    n_p = ps_n_sup * K or 1
+    n_t = ts_n_sup * K or 1
+    return {
+        "diff_loss":   total_diff_loss   / n_p,
+        "sudoku_loss": total_sudoku_loss / (n_p + n_t),
+    }, lr, global_step
 
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
@@ -541,9 +719,11 @@ def main(cfg: DictConfig):
         freeze_weights=t.freeze_weights,
     )
 
+    painter_variant = cfg.get("painter_variant", "v0tok")
+
     if mode == "sudoku":
         model = OriginalTRMSudoku(**thinker_kwargs)
-    else:
+    elif painter_variant == "v0tok":
         p = cfg.painter
         model = OriginalTRMRatatouilleV0Tok(
             painter_size=painter_size,
@@ -555,6 +735,58 @@ def main(cfg: DictConfig):
             painter_dtype=p.get("dtype", None),
             **thinker_kwargs,
         )
+    else:
+        # Image-conditioned variants: V0, V1, V2
+        # These share a common subset of thinker kwargs (no puzzle embeddings).
+        p = cfg.painter
+        img_thinker_kwargs = dict(
+            seq_len=t.seq_len,
+            hidden_size=t.hidden_size,
+            n_heads=t.n_heads,
+            L_layers=t.L_layers,
+            L_cycles=t.L_cycles,
+            H_cycles=t.H_cycles,
+            n_sup=t.n_sup,
+            expansion=t.expansion,
+            forward_dtype=t.forward_dtype,
+            mlp_t=t.mlp_t,
+            pos_encodings=t.pos_encodings,
+            halt_exploration_prob=t.halt_exploration_prob,
+            batch_size=cfg.train.batch_size,
+            freeze_weights=t.freeze_weights,
+        )
+        img_painter_kwargs = dict(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            enc_channels=p.get("enc_channels", 32),
+            bridge_channels=p.bridge_channels,
+            painter_channels=tuple(p.painter_channels),
+            painter_layers_per_block=p.painter_layers_per_block,
+            diff_thinker_weight=p.diff_thinker_weight,
+            painter_dtype=p.get("dtype", None),
+        )
+        _VARIANT_CLS = {
+            "v0": OriginalTRMRatatouilleV0,
+            "v1": OriginalTRMRatatouilleV1,
+            "v2": OriginalTRMRatatouilleV2,
+            "v3": OriginalTRMRatatouilleV3,
+            "v4": OriginalTRMRatatouilleV4,
+        }
+        cls = _VARIANT_CLS.get(painter_variant)
+        if cls is None:
+            raise ValueError(f"Unknown painter_variant: {painter_variant!r}. "
+                             f"Choose from: v0tok, v0, v1, v2, v3, v4")
+        if painter_variant in ("v2", "v3", "v4"):
+            extra = dict(thinker_out_channels=p.get("thinker_out_channels", 16))
+            if painter_variant == "v4":
+                extra["compression_factor"] = p.get("compression_factor", cell_size)
+                extra["bridge_num_heads"]   = p.get("bridge_num_heads", 4)
+            model = cls(**extra, **img_painter_kwargs, **img_thinker_kwargs)
+        else:
+            model = cls(
+                num_classes=t.get("num_classes", 9),
+                **img_painter_kwargs, **img_thinker_kwargs,
+            )
 
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -645,7 +877,12 @@ def main(cfg: DictConfig):
             )
             log_dict = {"train/loss": loss_val, "train/lr": lr}
         else:
-            losses, lr, global_step = train_step_painter(
+            _painter_step_fn = (
+                train_step_painter_two_stage
+                if cfg.get("painter_stage", None) is not None
+                else train_step_painter
+            )
+            losses, lr, global_step = _painter_step_fn(
                 unwrapped, micro_batches, scheduler, accelerator, optimizers, base_lrs,
                 global_step, cfg, ema_helper, global_batch_size,
             )
@@ -728,12 +965,11 @@ def main(cfg: DictConfig):
                                total=(n_total + n_batch - 1) // n_batch):
                     if n_done >= n_total:
                         break
-                    conds       = eb.get("conditions", eb.get("puzzle_tokens"))
                     sols        = eb["solution"]
                     pids        = eb.get("puzzle_id", None)
                     given_masks = eb.get("given_mask", None)
                     B_cur       = sols.shape[0]
-                    conds_sample = eb["puzzle_tokens"]
+                    conds_sample = _get_condition(eb, unwrapped, "cpu")
 
                     sr = sample_grids(
                         unwrapped,
@@ -791,7 +1027,7 @@ def main(cfg: DictConfig):
                         tp_all = sr.get("best_thinker_preds")
                         tt_all = sr.get("best_thinker_ts")
                         sols_np = sols.cpu().numpy()
-                        conds_np = conds.cpu()
+                        conds_np = conds_sample.cpu()
                         for i in range(n_new):
                             tp = tp_all[i].numpy() if tp_all is not None else None
                             tt = tt_all[i]         if tt_all is not None else None

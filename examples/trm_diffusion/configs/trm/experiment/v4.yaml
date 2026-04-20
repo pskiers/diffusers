@@ -1,0 +1,45 @@
+# @package _global_
+# Painter-thinker V4 — AttentiveBridge + decoupled compression factor.
+# Same as V3 (no CE loss, encoder sees condition+noisy) but:
+#   - compression_factor controls encoder/thinker grid independently of cell_size
+#   - SpatialBridge replaced by AttentiveBridge (Perceiver-IO cross-attention)
+# Default: compression_factor=16 → 9×9 thinker grid (same as V3 at cell_size=16).
+
+mode: "painter"
+painter_variant: "v4"
+output_dir: "runs/trm_v4"
+compile: true
+
+use_ema: true
+ema_rate: 0.999
+
+thinker:
+  n_sup: 16
+  hidden_size: 512
+  halt_exploration_prob: 0.0
+
+painter:
+  enc_channels: 32
+  thinker_out_channels: 64
+  compression_factor: 16   # encoder/thinker grid: 144//16 = 9×9
+  bridge_channels: 16
+  bridge_num_heads: 4
+  painter_channels: [32, 64, 64]
+  painter_layers_per_block: 2
+  diff_thinker_weight: 1.0
+  dtype: bfloat16
+
+data:
+  cell_size: 16
+
+train:
+  lr: 1e-4
+  lr_min_ratio: 1.0
+  weight_decay: 1.0
+  batch_size: 384
+  num_steps: 100000
+  warmup_steps: 2000
+  eval_every: 2000
+  save_every: 10000
+  sudoku_loss_weight: 0.0
+  gradient_accumulation_steps: 2

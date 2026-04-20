@@ -247,6 +247,10 @@ def sample_grids(
     else:
         x = torch.randn_like(conditions)
 
+    # Some models (e.g. token-input TRM) output logits in a shifted token space
+    # where predictions are offset from raw 0-based solution labels.
+    token_offset = getattr(model, "token_offset", 0)
+
     # Lazy-initialised on first encounter of sudoku_logits
     has_logits   = False
     best_conf    = None
@@ -288,7 +292,7 @@ def sample_grids(
             )
 
             if solutions is not None:
-                tgts    = solutions[:B, :N_logits]
+                tgts    = solutions[:B, :N_logits] + token_offset
                 correct = preds == tgts                        # (B, N)
 
                 # Puzzle accuracy: all cells.

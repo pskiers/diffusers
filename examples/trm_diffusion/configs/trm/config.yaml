@@ -86,7 +86,7 @@ data:
 # ── Diffusion scheduler (painter mode only) ───────────────────────────────────
 num_timesteps: 100
 beta_schedule: "squaredcos_cap_v2"
-prediction_type: "epsilon"   # "epsilon" (predict noise) or "sample" (predict x0)
+prediction_type: "sample"   # "epsilon" (predict noise) or "sample" (predict x0)
 
 # ── Training ──────────────────────────────────────────────────────────────────
 train:
