@@ -542,16 +542,19 @@ def train_step_painter_two_stage(
             lr = _apply_lr_and_step(optimizers, base_lrs, global_step, cfg)
             _zero_grads(optimizers)
 
-        # ── Thinker sub-step (real puzzle tokens, painter frozen) ────────────
+        # ── Thinker sub-step (real condition, painter frozen) ───────────────
+        # Full forward pass with painter frozen: diff gradient flows back
+        # through the bridge into the thinker; painter weights don't update.
         if tick < ts_n_sup:
             for p in painter_params:
                 p.requires_grad_(False)
 
             for d in mb_data:
-                _, logits, d["z_H_t"], d["z_L_t"] = model.reasoning_step(
+                noise_pred, logits, d["z_H_t"], d["z_L_t"] = model.reasoning_step(
                     d["condition"], d["noisy"], d["z_H_t"], d["z_L_t"], d["timesteps"],
                     d["puzzle_ids"],
                 )
+                diff_loss = F.mse_loss(noise_pred.float(), d["target"])
                 sudoku_loss = torch.tensor(0.0, device=device)
                 if logits is not None and sudoku_w > 0:
                     B_, N, C = logits.shape
@@ -560,7 +563,8 @@ def train_step_painter_two_stage(
                         d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
                         ignore_index=IGNORE_LABEL_ID,
                     )
-                accelerator.backward(sudoku_loss / (global_batch_size * K))
+                step_loss = diff_loss + sudoku_w * sudoku_loss
+                accelerator.backward(step_loss / (global_batch_size * K))
                 total_sudoku_loss += sudoku_loss.item()
 
             accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
