@@ -138,7 +138,7 @@ def load_or_train_classifier(
 ) -> MNISTCellClassifier:
     """Load classifier from *path* if it exists, otherwise train and save it there."""
     if os.path.exists(path):
-        ckpt  = torch.load(path, map_location=device, weights_only=True)
+        ckpt  = torch.load(path, map_location="cpu", weights_only=False)
         model = MNISTCellClassifier(ckpt.get("cell_size", cell_size)).to(device)
         model.load_state_dict(ckpt["model_state"])
         logger.info(f"Loaded MNIST classifier from {path}")
