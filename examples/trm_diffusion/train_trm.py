@@ -782,10 +782,13 @@ def main(cfg: DictConfig):
                              f"Choose from: v0tok, v0, v1, v2, v3, v4")
         if painter_variant in ("v2", "v3", "v4"):
             extra = dict(thinker_out_channels=p.get("thinker_out_channels", 16))
+            thinker_kw = img_thinker_kwargs
             if painter_variant == "v4":
                 extra["compression_factor"] = p.get("compression_factor", cell_size)
                 extra["bridge_num_heads"]   = p.get("bridge_num_heads", 4)
-            model = cls(**extra, **img_painter_kwargs, **img_thinker_kwargs)
+                # V4 computes seq_len internally from compression_factor
+                thinker_kw = {k: v for k, v in img_thinker_kwargs.items() if k != "seq_len"}
+            model = cls(**extra, **img_painter_kwargs, **thinker_kw)
         else:
             model = cls(
                 num_classes=t.get("num_classes", 9),
