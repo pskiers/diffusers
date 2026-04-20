@@ -14,6 +14,7 @@ use_ema: true
 ema_rate: 0.999
 
 thinker:
+  puzzle_emb_ndim: 0
   num_classes: 9
   n_sup: 16
   hidden_size: 512
