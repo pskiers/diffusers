@@ -244,7 +244,7 @@ class SokobanEvaluator:
             metrics[f"sokoban/validity_{k_metric}_ratio"] = v
 
         try:
-            solvable_results = Parallel(n_jobs=4)(
+            solvable_results = Parallel(n_jobs=4, backend="threading")(
                 delayed(self._is_board_solvable)(board, is_val)
                 for board, is_val in zip(generated_boards, valid_results)
             )
