@@ -1,7 +1,7 @@
 _target_: trm_models.UNetTRMv2
 resolution: 12
-n: 2
-T: 3
+n: 4
+T: 2
 n_sup: 4
 core_model:
   _target_: diffusers.UNet2DModel
