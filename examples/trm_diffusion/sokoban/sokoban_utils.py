@@ -243,18 +243,10 @@ class SokobanEvaluator:
         for k_metric, v in valid_agg.items():
             metrics[f"sokoban/validity_{k_metric}_ratio"] = v
 
-        try:
-            solvable_results = Parallel(n_jobs=4, backend="threading")(
-                delayed(self._is_board_solvable)(board, is_val)
-                for board, is_val in zip(generated_boards, valid_results)
-            )
-        except Exception as e:
-            print(f"Parallel executing failed with ({e}). Changing to sequence processing.")
-
-            solvable_results = [
-                self._is_board_solvable(board, is_val)
-                for board, is_val in zip(generated_boards, valid_results)
-            ]
+        solvable_results = Parallel(n_jobs=8, backend="threading")(
+            delayed(self._is_board_solvable)(board, is_val)
+            for board, is_val in zip(generated_boards, valid_results)
+        )
 
         metrics["sokoban/solvable_in_all_percentage"] = sum(solvable_results) / len(solvable_results) if solvable_results else 0.0
 
@@ -436,10 +428,16 @@ class SokobanEvaluator:
                 queue = deque([player_start])
                 visited_pos.add(player_start)
 
+                max_r, max_c = board.shape
+
                 while queue:
                     r, c = queue.popleft()
                     for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         nr, nc = r + dr, c + dc
+
+                        if nr < 0 or nr >= max_r or nc < 0 or nc >= max_c:
+                            continue
+
                         if (nr, nc) in walls or (nr, nc) in current_boxes_set:
                             continue
                         if (nr, nc) not in visited_pos:
