@@ -506,7 +506,7 @@ class SokobanEvaluator:
             return False
 
         if is_val['is_valid']:
-            return 1.0 if is_solvable(board, max_states=1000) else 0.0
+            return 1.0 if is_solvable(board, max_states=5000) else 0.0
         return 0.0
 
     def _accumulate_metrics(self, metrics):
