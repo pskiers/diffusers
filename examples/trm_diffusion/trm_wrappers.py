@@ -964,6 +964,7 @@ class StandalonePainter(nn.Module):
                  model will run both conditioned and null passes and combine them.
     """
 
+    token_input: bool = False             # uses solution tokens, handled via _get_condition
     has_realsolution_eval: bool = True   # realsolution IS the only conditioning
 
     def __init__(
