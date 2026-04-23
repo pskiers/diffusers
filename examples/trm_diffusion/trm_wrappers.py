@@ -581,12 +581,14 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         # --- image encoder ---
         enc_channels: int = 32,
         # --- bridge & painter ---
+        thinker_out_channels: int = None,   # if > num_classes, expands logits before bridge
         bridge_channels: int = 16,
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
         painter_dtype: Optional[str] = None,
     ):
+        _toc = thinker_out_channels if thinker_out_channels is not None else num_classes
         super().__init__(
             painter_size=painter_size,
             cell_size=cell_size,
@@ -621,6 +623,23 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         self.enc_proj = nn.Conv2d(enc_channels, hidden_size, 1)
         nn.init.normal_(self.enc_proj.weight, std=std)
         nn.init.zeros_(self.enc_proj.bias)
+
+        # Optional expansion: project num_classes → thinker_out_channels before bridge.
+        # CE loss still uses raw num_classes logits; only the bridge sees the expanded map.
+        if _toc != num_classes:
+            self.logit_expand = nn.Linear(num_classes, _toc, bias=False)
+            self.bridge = SpatialBridge(
+                in_channels=_toc,
+                out_channels=bridge_channels,
+                painter_size=painter_size,
+            )
+        else:
+            self.logit_expand = None
+
+    def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.logit_expand is not None:
+            logits = self.logit_expand(logits.float())
+        return super()._logits_to_spatial(logits)
 
     def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
         """(B, C, H, W) → float embeddings (B, 81, hidden_size)"""

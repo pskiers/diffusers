@@ -868,6 +868,7 @@ def main(cfg: DictConfig):
         else:
             model = cls(
                 num_classes=t.get("num_classes", 9),
+                thinker_out_channels=p.get("thinker_out_channels", None),
                 **img_painter_kwargs, **img_thinker_kwargs,
             )
 
