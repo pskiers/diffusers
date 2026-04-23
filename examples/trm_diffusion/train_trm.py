@@ -1013,12 +1013,17 @@ def main(cfg: DictConfig):
                         if key in sr:
                             lst.append(sr[key])
 
+                    token_offset = getattr(unwrapped, "token_offset", 0)
+
+                    # Painter deviation: compare classifier preds (0-8) vs thinker
+                    # preds shifted back to 0-8 space (subtract token_offset).
                     painter_preds = acc["preds"]
                     best_tp = sr.get("best_thinker_preds")
                     mean_tp = sr.get("mean_thinker_preds")
                     _gm = given_masks[:B_cur] if given_masks is not None else None
-                    for tp, dev_lst in [(best_tp, all_painter_dev_best), (mean_tp, all_painter_dev_mean)]:
-                        if tp is not None:
+                    for tp_raw, dev_lst in [(best_tp, all_painter_dev_best), (mean_tp, all_painter_dev_mean)]:
+                        if tp_raw is not None:
+                            tp  = tp_raw - token_offset          # shift to 0-8 space
                             N   = tp.shape[1]
                             diff = painter_preds[:, :N] != tp
                             if _gm is not None:
@@ -1030,16 +1035,20 @@ def main(cfg: DictConfig):
                             dev_lst.append(dev)
 
                     if wandb_project and _wandb is not None and n_panels_done < n_log:
-                        n_new  = min(n_log - n_panels_done, B_cur)
-                        tp_all = sr.get("best_thinker_preds")
-                        tt_all = sr.get("best_thinker_ts")
+                        n_new   = min(n_log - n_panels_done, B_cur)
+                        tp_all  = sr.get("best_thinker_preds")
+                        tt_all  = sr.get("best_thinker_ts")
                         sols_np = sols.cpu().numpy()
-                        conds_np = conds_sample.cpu()
+                        # Always use the visual condition image for panels, even
+                        # for token-input models where conds_sample is integers.
+                        conds_vis = eb["conditions"].cpu()   # (B, 1, H, W) float
                         for i in range(n_new):
-                            tp = tp_all[i].numpy() if tp_all is not None else None
-                            tt = tt_all[i]         if tt_all is not None else None
+                            tp_raw = tp_all[i] if tp_all is not None else None
+                            # Shift thinker preds to 0-8 digit space for rendering
+                            tp = (tp_raw - token_offset).numpy() if tp_raw is not None else None
+                            tt = tt_all[i] if tt_all is not None else None
                             panel = make_panel_image(
-                                conds_np[i], generated[i], sols_np[i],
+                                conds_vis[i], generated[i], sols_np[i],
                                 thinker_preds=tp, thinker_t=tt,
                                 img_size=324,
                             )
