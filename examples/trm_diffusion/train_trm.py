@@ -52,6 +52,7 @@ from trm_wrappers import (
     OriginalTRMRatatouilleV2,
     OriginalTRMRatatouilleV3,
     OriginalTRMRatatouilleV4,
+    StandalonePainter,
     build_puzzle_emb_optimizer,
     get_non_puzzle_emb_params,
 )
@@ -101,9 +102,19 @@ def build_optimizers(model, cfg, world_size: int):
       - freeze_weights: SignSGD for puzzle emb only.
       - Both enabled: SignSGD for puzzle emb + AdamATan2 for thinker rest.
     """
-    t = cfg.thinker
     tr = cfg.train
     p_cfg = cfg.get("painter", None)
+
+    # StandalonePainter has no thinker — one AdamW for all parameters.
+    if isinstance(model, StandalonePainter):
+        raw_lr = getattr(p_cfg, "lr", None) if p_cfg is not None else None
+        raw_wd = getattr(p_cfg, "weight_decay", None) if p_cfg is not None else None
+        painter_lr = tr.lr if raw_lr is None else raw_lr
+        painter_wd = tr.weight_decay if raw_wd is None else raw_wd
+        opt = torch.optim.AdamW(model.parameters(), lr=0, weight_decay=painter_wd)
+        return [opt], [painter_lr]
+
+    t = cfg.thinker
 
     is_painter_model = isinstance(model, OriginalTRMRatatouilleV0Tok)
     thinker_params = model.get_thinker_params() if is_painter_model else list(model.parameters())
@@ -412,10 +423,23 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
 
 def _get_condition(mb: dict, model, device) -> torch.Tensor:
-    """Return the condition tensor for this batch based on model.token_input."""
+    """Return the condition tensor for this batch based on model type."""
+    if isinstance(model, StandalonePainter):
+        return _solution_tokens(mb["solution"].to(device))
     if model.token_input:
         return mb["puzzle_tokens"].to(device)
     return mb["conditions"].to(device)
+
+
+def _get_full_solution_condition(mb: dict, model, device="cpu") -> torch.Tensor:
+    """Return the FULL (unmasked) solution as conditioning — used for realsolution eval.
+
+    V0Tok / StandalonePainter : full solution tokens (2-10, all 81 cells filled).
+    V0 / V1                   : full rendered MNIST image (all cells visible).
+    """
+    if isinstance(model, StandalonePainter) or model.token_input:
+        return _solution_tokens(mb["solution"].to(device))
+    return mb["images"].to(device)
 
 
 def _get_teacher_condition(mb: dict, model, device) -> torch.Tensor:
@@ -588,6 +612,44 @@ def train_step_painter_two_stage(
     }, lr, global_step
 
 
+# ── Standalone painter training step ───────────────────────────────────────────
+
+def train_step_standalone_painter(
+    model, micro_batches, scheduler, accelerator, optimizers, base_lrs,
+    global_step, cfg, ema_helper, global_batch_size,
+):
+    """Single-stage training for StandalonePainter (no thinker)."""
+    K = len(micro_batches)
+    device = accelerator.device
+
+    total_diff_loss = 0.0
+
+    for mb in micro_batches:
+        images         = mb["images"].to(device)
+        solution_tokens = _solution_tokens(mb["solution"].to(device))
+
+        bsz       = images.shape[0]
+        noise     = torch.randn_like(images)
+        timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,),
+                                  device=device, dtype=torch.long)
+        noisy     = scheduler.add_noise(images, noise, timesteps)
+        target    = noise if scheduler.config.prediction_type == "epsilon" else images
+
+        noise_pred, _ = model(noisy, timesteps, solution_tokens)
+        diff_loss = F.mse_loss(noise_pred.float(), target)
+        accelerator.backward(diff_loss / (global_batch_size * K))
+        total_diff_loss += diff_loss.item()
+
+    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+    lr = _apply_lr_and_step(optimizers, base_lrs, global_step, cfg)
+    _zero_grads(optimizers)
+    if ema_helper is not None:
+        ema_helper.update(model)
+    global_step += 1
+
+    return {"diff_loss": total_diff_loss / K}, lr, global_step
+
+
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
 def save_checkpoint(accelerator, model, optimizers, step, output_dir, tag, ema_helper=None):
@@ -606,7 +668,7 @@ def save_checkpoint(accelerator, model, optimizers, step, output_dir, tag, ema_h
 
 @hydra.main(version_base=None, config_path="configs/trm", config_name="config")
 def main(cfg: DictConfig):
-    mode = cfg.mode   # "sudoku" | "painter"
+    mode = cfg.mode   # "sudoku" | "painter" | "standalone_painter"
 
     wandb_project = cfg.get("wandb_project", None)
     log_with = ["wandb"] if wandb_project else []
@@ -688,9 +750,9 @@ def main(cfg: DictConfig):
         persistent_workers=(n_workers > 0),
     )
 
-    # ── MNIST cell classifier (painter mode, opt-in) ──────────────────────────
+    # ── MNIST cell classifier (painter / standalone_painter mode, opt-in) ────
     classifier = None
-    if mode == "painter" and accelerator.is_main_process:
+    if mode in ("painter", "standalone_painter") and accelerator.is_main_process:
         classifier_path = cfg.train.get("eval_classifier_path", None)
         if classifier_path:
             classifier = load_or_train_classifier(
@@ -727,6 +789,19 @@ def main(cfg: DictConfig):
 
     if mode == "sudoku":
         model = OriginalTRMSudoku(**thinker_kwargs)
+    elif mode == "standalone_painter":
+        p = cfg.painter
+        model = StandalonePainter(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            vocab_size=p.get("vocab_size", 11),
+            bridge_channels=p.bridge_channels,
+            painter_channels=tuple(p.painter_channels),
+            painter_layers_per_block=p.painter_layers_per_block,
+            cfg_prob=p.get("cfg_prob", 0.0),
+            cfg_scale=p.get("cfg_scale", 1.0),
+            painter_dtype=p.get("dtype", None),
+        )
     elif painter_variant == "v0tok":
         p = cfg.painter
         model = OriginalTRMRatatouilleV0Tok(
@@ -736,6 +811,7 @@ def main(cfg: DictConfig):
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
             diff_thinker_weight=p.diff_thinker_weight,
+            thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
             painter_dtype=p.get("dtype", None),
             **thinker_kwargs,
         )
@@ -806,6 +882,9 @@ def main(cfg: DictConfig):
     if cfg.get("compile", False):
         if mode == "sudoku":
             model.inner.L_level = torch.compile(model.inner.L_level, fullgraph=False)
+        elif mode == "standalone_painter":
+            model.painter = torch.compile(model.painter)
+            model.bridge  = torch.compile(model.bridge)
         else:
             model.thinker.inner.L_level = torch.compile(model.thinker.inner.L_level, fullgraph=False)
             model.painter = torch.compile(model.painter)
@@ -883,6 +962,13 @@ def main(cfg: DictConfig):
                 global_step, cfg, ema_helper, global_batch_size,
             )
             log_dict = {"train/loss": loss_val, "train/lr": lr}
+        elif mode == "standalone_painter":
+            losses, lr, global_step = train_step_standalone_painter(
+                unwrapped, micro_batches, scheduler, accelerator, optimizers, base_lrs,
+                global_step, cfg, ema_helper, global_batch_size,
+            )
+            log_dict = {f"train/{k}": v for k, v in losses.items()}
+            log_dict["train/lr"] = lr
         else:
             _painter_step_fn = (
                 train_step_painter_two_stage
@@ -915,6 +1001,11 @@ def main(cfg: DictConfig):
             if mode == "sudoku":
                 metrics = eval_sudoku(unwrapped, eval_dl, accelerator, max_batches=100)
                 val_log = {f"val/{k}": v for k, v in metrics.items()}
+            elif mode == "standalone_painter":
+                # eval_painter works for StandalonePainter: _get_condition returns
+                # solution tokens and forward() accepts them natively.
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w=0.0, max_batches=100)
+                val_log = {"val/diff_loss": metrics.get("diff_loss", 0)}
             else:
                 metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=100)
                 val_log = {
@@ -937,8 +1028,8 @@ def main(cfg: DictConfig):
                 if wandb_project:
                     accelerator.log(val_log, step=global_step)
 
-            # ── Digit-level sampling eval (painter mode, main process only) ──
-            if mode == "painter" and accelerator.is_main_process and classifier is not None:
+            # ── Digit-level sampling eval (painter / standalone_painter) ─────
+            if mode in ("painter", "standalone_painter") and accelerator.is_main_process and classifier is not None:
                 n_total = cfg.train.get("eval_num_samples",   128)
                 n_batch = cfg.train.get("eval_batch_size",     32)
                 n_ddim  = cfg.train.get("eval_num_ddim_steps", 20)
@@ -1057,6 +1148,49 @@ def main(cfg: DictConfig):
 
                     n_done += B_cur
 
+                # ── Realsolution eval ─────────────────────────────────────────
+                # For models with digit-level solution conditioning (V0Tok, V0, V1,
+                # StandalonePainter): sample with the full (unmasked) solution as
+                # condition to measure the painter's ceiling performance.
+                all_real_cell_acc:   list[float] = []
+                all_real_puzzle_acc: list[float] = []
+                do_real_eval = getattr(unwrapped, "has_realsolution_eval", False)
+                if do_real_eval:
+                    # Swap in EMA for realsolution sampling (already done above)
+                    unwrapped.eval()
+                    real_loader = DataLoader(
+                        eval_ds, batch_size=n_batch, shuffle=False,
+                        num_workers=cfg.get("num_workers", 4), pin_memory=True,
+                    )
+                    n_real_done = 0
+                    for eb_r in tqdm(real_loader, "Realsolution eval",
+                                     total=(n_total + n_batch - 1) // n_batch):
+                        if n_real_done >= n_total:
+                            break
+                        sols_r       = eb_r["solution"]
+                        pids_r       = eb_r.get("puzzle_id", None)
+                        given_masks_r = eb_r.get("given_mask", None)
+                        full_cond    = _get_full_solution_condition(eb_r, unwrapped)
+                        sr_r = sample_grids(
+                            unwrapped, full_cond,
+                            num_train_timesteps=cfg.num_timesteps,
+                            beta_schedule=cfg.beta_schedule,
+                            prediction_type=cfg.prediction_type,
+                            num_steps=n_ddim,
+                            device=accelerator.device,
+                            puzzle_ids=pids_r,
+                            solutions=sols_r,
+                            painter_size=painter_size,
+                            given_masks=given_masks_r,
+                        )
+                        acc_r = evaluate_grids(
+                            sr_r["generated"], sols_r, classifier, cell_size,
+                            given_masks=given_masks_r,
+                        )
+                        all_real_cell_acc.append(acc_r["cell_acc"])
+                        all_real_puzzle_acc.append(acc_r["puzzle_acc"])
+                        n_real_done += sols_r.shape[0]
+
                 # Restore live weights
                 if ema_helper is not None:
                     for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
@@ -1069,6 +1203,11 @@ def main(cfg: DictConfig):
                     f"[eval] step={global_step}  cell_acc={mean_cell:.4f}  "
                     f"puzzle_acc={mean_puzzle:.4f}  (over {n_done} samples)"
                 )
+                if all_real_cell_acc:
+                    logger.info(
+                        f"[eval] realsol_cell_acc={np.mean(all_real_cell_acc):.4f}  "
+                        f"realsol_puzzle_acc={np.mean(all_real_puzzle_acc):.4f}"
+                    )
                 if all_thinker_cell_best:
                     logger.info(
                         f"[eval] thinker_cell_best={np.mean(all_thinker_cell_best):.4f}  "
@@ -1087,6 +1226,9 @@ def main(cfg: DictConfig):
                         "eval/cell_acc":   mean_cell,
                         "eval/puzzle_acc": mean_puzzle,
                     }
+                    if all_real_cell_acc:
+                        wandb_acc["eval/painter_realsolution_cell_acc"]   = float(np.mean(all_real_cell_acc))
+                        wandb_acc["eval/painter_realsolution_puzzle_acc"] = float(np.mean(all_real_puzzle_acc))
                     if all_thinker_cell_best:
                         wandb_acc["eval/thinker_cell_acc_best"]       = float(np.mean(all_thinker_cell_best))
                         wandb_acc["eval/thinker_cell_acc_mean"]       = float(np.mean(all_thinker_cell_mean))

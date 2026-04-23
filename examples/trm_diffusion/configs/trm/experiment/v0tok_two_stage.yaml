@@ -30,6 +30,7 @@ painter:
   painter_channels: [32, 64, 64]
   painter_layers_per_block: 2
   diff_thinker_weight: 0.0
+  thinker_bridge_mode: logits
 
 data:
   cell_size: 16    # grid = 9*16 = 144 px

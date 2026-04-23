@@ -41,6 +41,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from typing import Optional
 
@@ -326,6 +327,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
     """
 
     token_input: bool = True
+    has_realsolution_eval: bool = True   # eval with full solution tokens as condition
 
     def __init__(
         self,
@@ -356,6 +358,11 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
+        # How thinker logits are converted to spatial conditioning at inference time.
+        #   "logits"  – raw logits (default, matches training with raw logit spatial)
+        #   "onehot"  – argmax → one-hot (matches painter trained on real one-hot solutions)
+        #   "softmax" – softmax probabilities (soft version of onehot)
+        thinker_bridge_mode: str = "logits",
         # Autocast dtype for the bridge + painter UNet.  None = no autocast
         # (painter runs in whatever dtype the tensors arrive in).
         # "bfloat16" is the safe default: same exponent range as float32, so no
@@ -366,6 +373,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
     ):
         super().__init__()
         self.diff_thinker_weight = diff_thinker_weight
+        self.thinker_bridge_mode = thinker_bridge_mode
         self._grid = painter_size // cell_size   # e.g. 144//16 = 9
         # Thinker vocab uses 0=PAD, 1=blank, 2-10=digits 1-9.
         # sample_grids compares argmax predictions against raw solution labels (0-8),
@@ -425,9 +433,24 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         return [p for p in self.parameters() if id(p) not in painter_ids]
 
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
-        """(B, 81, vocab_size) → (B, vocab_size, grid, grid)"""
+        """(B, N, C) logits → (B, C, grid, grid) spatial conditioning.
+
+        Conversion respects self.thinker_bridge_mode:
+          "logits"  – raw float logits (default)
+          "onehot"  – argmax → one-hot
+          "softmax" – softmax probabilities
+        """
         B, _, C = logits.shape
-        return logits.transpose(1, 2).reshape(B, C, self._grid, self._grid)
+        mode = getattr(self, "thinker_bridge_mode", "logits")
+        if mode == "onehot":
+            preds  = logits.argmax(dim=-1)
+            onehot = F.one_hot(preds, num_classes=C).float()
+            return onehot.transpose(1, 2).reshape(B, C, self._grid, self._grid)
+        elif mode == "softmax":
+            probs = logits.float().softmax(dim=-1)
+            return probs.transpose(1, 2).reshape(B, C, self._grid, self._grid)
+        else:
+            return logits.float().transpose(1, 2).reshape(B, C, self._grid, self._grid)
 
     def _run_painter(
         self,
@@ -532,6 +555,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
     """
 
     token_input: bool = False
+    has_realsolution_eval: bool = True   # eval with full MNIST image as condition
 
     def __init__(
         self,
@@ -743,6 +767,8 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
     Use thinker_out_channels=16 (or any value) instead of num_classes=9.
     """
 
+    has_realsolution_eval: bool = False   # latent thinker; no digit-level solution eval
+
     def __init__(
         self,
         # --- painter geometry ---
@@ -917,3 +943,115 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
             factor=compression_factor,
             num_heads=bridge_num_heads,
         )
+
+
+# ── Standalone painter (sanity check: conditioned on real solutions) ───────────
+
+class StandalonePainter(nn.Module):
+    """
+    Pure diffusion painter with NO thinker.
+
+    Condition: full sudoku solution tokens (B, 81) long, 2-10 range (0=PAD,1=blank,
+    2-10=digits).  Converted to one-hot (B, vocab_size, 9, 9) → bridge → painter.
+
+    Used as a sanity check: can the painter reliably render correct MNIST grids
+    when given the perfect solution?  Also sets the upper-bound accuracy ceiling
+    for painter-thinker models.
+
+    Classifier-free guidance (CFG):
+      Training: condition is randomly zeroed out with probability cfg_prob per sample.
+      Inference: set cfg_scale > 1.0 on the model instance before sampling; the
+                 model will run both conditioned and null passes and combine them.
+    """
+
+    has_realsolution_eval: bool = True   # realsolution IS the only conditioning
+
+    def __init__(
+        self,
+        painter_size: int = 144,
+        cell_size: int = 16,
+        vocab_size: int = 11,
+        bridge_channels: int = 16,
+        painter_channels: tuple = (32, 64, 64),
+        painter_layers_per_block: int = 2,
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        super().__init__()
+        self._grid = painter_size // cell_size
+        self.vocab_size = vocab_size
+        self.cfg_prob   = cfg_prob
+        self.cfg_scale  = cfg_scale   # used at inference time; overridable externally
+        self._painter_dtype: Optional[torch.dtype] = (
+            {"bfloat16": torch.bfloat16, "float16": torch.float16}[painter_dtype]
+            if painter_dtype is not None else None
+        )
+        self.bridge = SpatialBridge(
+            in_channels=vocab_size,
+            out_channels=bridge_channels,
+            painter_size=painter_size,
+        )
+        self.painter = _make_painter(
+            painter_size=painter_size,
+            bridge_channels=bridge_channels,
+            painter_channels=tuple(painter_channels),
+            layers_per_block=painter_layers_per_block,
+        )
+
+    @property
+    def n_sup(self) -> int:
+        return 1
+
+    def get_painter_params(self) -> list:
+        return list(self.parameters())
+
+    def get_thinker_params(self) -> list:
+        return []
+
+    def _solution_to_spatial(self, solution_tokens: torch.Tensor) -> torch.Tensor:
+        """(B, 81) long in 2-10 → (B, vocab_size, grid, grid) one-hot float."""
+        B = solution_tokens.shape[0]
+        idx = solution_tokens.clamp(min=0, max=self.vocab_size - 1)
+        onehot = F.one_hot(idx, num_classes=self.vocab_size).float()  # (B, 81, V)
+        return onehot.transpose(1, 2).reshape(B, self.vocab_size, self._grid, self._grid)
+
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: torch.Tensor,          # (B, 81) long solution tokens 2-10
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ):
+        """
+        Training: randomly drops conditioning per sample at rate cfg_prob.
+        Inference (self.training=False, cfg_scale>1): runs conditioned + null
+        passes and combines them for classifier-free guidance.
+        """
+        spatial = self._solution_to_spatial(condition)
+
+        if self.training and self.cfg_prob > 0:
+            drop = torch.rand(spatial.shape[0], 1, 1, 1, device=spatial.device) < self.cfg_prob
+            spatial = spatial * (~drop)
+
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+
+        if not self.training and self.cfg_scale > 1.0:
+            null   = torch.zeros_like(spatial)
+            s_both = torch.cat([spatial, null], dim=0)
+            n_both = noisy.repeat(2, 1, 1, 1)
+            t_both = timesteps.repeat(2)
+            with ctx:
+                bf    = self.bridge(s_both)
+                pred  = self.painter(torch.cat([n_both, bf], dim=1), t_both).sample
+            pred_cond, pred_uncond = pred.chunk(2, dim=0)
+            return pred_uncond + self.cfg_scale * (pred_cond - pred_uncond), None
+
+        with ctx:
+            bridge_feat = self.bridge(spatial)
+            noise_pred  = self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
+        return noise_pred, None
