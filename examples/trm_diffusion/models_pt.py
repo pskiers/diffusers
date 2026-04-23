@@ -195,6 +195,39 @@ class UnifiedConditionDiT(Transformer2DModel):
         return cls(**init_dict)
 
 
+class TimestepMLP(nn.Module):
+    """Sinusoidal timestep embedding followed by a two-layer MLP.
+
+    Produces a continuous embedding of the diffusion timestep.  Initialise
+    the downstream projection weights to zero so the model starts as the
+    identity and gradually learns to use the signal.
+
+    Args:
+        sin_dim:  dimension of the sinusoidal embedding (input to MLP).
+        out_dim:  output dimension (used for FiLM projections / T2 additions).
+    """
+
+    def __init__(self, sin_dim: int = 128, out_dim: int = 256):
+        super().__init__()
+        self.sin_dim = sin_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(sin_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def _sinusoidal(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.sin_dim // 2
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, dtype=torch.float32, device=t.device) / (half - 1)
+        )
+        args = t[:, None].float() * freqs[None]
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self._sinusoidal(t))
+
+
 class SpatialEncoder(nn.Module):
     """
     Compresses the high-resolution noisy image into a low-dimensional spatial grid.

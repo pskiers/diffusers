@@ -69,6 +69,18 @@ painter:
   painter_channels: [32, 64, 64]
   painter_layers_per_block: 2
   diff_thinker_weight: 1.0   # 0=detach thinker from diffusion loss, 1=full grad
+  thinker_bridge_mode: "logits"  # "logits" | "onehot" | "softmax"
+  # Image-encoder size (V0/V1 only)
+  enc_channels: 32
+  thinker_out_channels: null  # null = same as num_classes (no expansion)
+  # Timestep conditioning (V1 only)
+  enc_timestep_cond: false     # FiLM scale+shift on encoder features
+  thinker_timestep_cond: false # T2: broadcast temb added to thinker input tokens
+  temb_dim: 256
+  # CFG (standalone_painter only)
+  cfg_prob: 0.0
+  cfg_scale: 1.0
+  vocab_size: 11
   # Separate AdamW LR/WD for painter+bridge (null = inherit from train.lr / train.weight_decay)
   lr: 1e-4
   weight_decay: null

@@ -52,7 +52,7 @@ from models.recursive_reasoning.trm import (
 )
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from mnist_sudoku_models import SpatialBridge, _make_painter
-from models_pt import SpatialEncoder, AttentiveBridge
+from models_pt import SpatialEncoder, AttentiveBridge, TimestepMLP
 
 
 # ── Sparse puzzle-embedding optimizer factory ──────────────────────────────────
@@ -648,9 +648,11 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         return proj.flatten(2).transpose(1, 2)     # (B, 81, hidden_size)
 
     def _get_enc_emb(
-        self, condition: torch.Tensor, noisy: torch.Tensor
+        self, condition: torch.Tensor, noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """V0: encode condition only.  V1 overrides to use cat(condition, noisy)."""
+        """V0: encode condition only, ignore noisy and timesteps.
+        V1 overrides to use cat(condition, noisy) and optionally the timestep."""
         return self._encode_image(condition)
 
     def reasoning_step(
@@ -664,7 +666,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         H_cycles: Optional[int] = None,
         L_cycles: Optional[int] = None,
     ):
-        enc_emb = self._get_enc_emb(condition, noisy)
+        enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
         return super().reasoning_step(
             enc_emb, noisy, z_H, z_L, timesteps,
             puzzle_ids=puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles,
@@ -677,7 +679,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         condition: torch.Tensor,
         puzzle_ids: Optional[torch.Tensor] = None,
     ):
-        enc_emb = self._get_enc_emb(condition, noisy)
+        enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
         bsz = noisy.shape[0]
         z_H, z_L = self.get_initial_states(bsz)
         z_H = z_H.to(noisy.device)
@@ -731,6 +733,10 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        # --- timestep conditioning (V1-specific) ---
+        enc_timestep_cond: bool = False,     # FiLM scale+shift on encoder features
+        thinker_timestep_cond: bool = False, # T2: broadcast temb added to thinker input tokens
+        temb_dim: int = 256,                 # output dim of the shared TimestepMLP
         # --- bridge & painter ---
         bridge_channels: int = 16,
         painter_channels: tuple = (32, 64, 128),
@@ -766,10 +772,43 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         # Replace 1-channel encoder with 2-channel (condition + noisy)
         self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
 
+        # Timestep conditioning.  Both projections are zero-init so the model
+        # starts as the no-timestep identity and gradually learns to use t.
+        self.enc_timestep_cond     = enc_timestep_cond
+        self.thinker_timestep_cond = thinker_timestep_cond
+        if enc_timestep_cond or thinker_timestep_cond:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=temb_dim)
+        if enc_timestep_cond:
+            self.enc_film = nn.Linear(temb_dim, 2 * enc_channels)
+            nn.init.zeros_(self.enc_film.weight)
+            nn.init.zeros_(self.enc_film.bias)
+        if thinker_timestep_cond:
+            self.thinker_temb_proj = nn.Linear(temb_dim, hidden_size)
+            nn.init.zeros_(self.thinker_temb_proj.weight)
+            nn.init.zeros_(self.thinker_temb_proj.bias)
+
     def _get_enc_emb(
-        self, condition: torch.Tensor, noisy: torch.Tensor
+        self, condition: torch.Tensor, noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self._encode_image(torch.cat([condition, noisy], dim=1))
+        # Compute shared timestep embedding once (if any conditioning is active).
+        temb = None
+        if timesteps is not None and (self.enc_timestep_cond or self.thinker_timestep_cond):
+            temb = self.timestep_mlp(timesteps)
+
+        # Encode cat(condition, noisy) with optional encoder FiLM.
+        feat = self.image_encoder(torch.cat([condition, noisy], dim=1))
+        if temb is not None and self.enc_timestep_cond:
+            scale, shift = self.enc_film(temb).chunk(2, dim=1)  # (B, enc_channels) each
+            feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        proj    = self.enc_proj(feat)
+        enc_emb = proj.flatten(2).transpose(1, 2)          # (B, 81, hidden_size)
+
+        # T2: broadcast timestep embedding into thinker token space.
+        if temb is not None and self.thinker_timestep_cond:
+            enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
+
+        return enc_emb
 
 
 # ── Painter-thinker (V2: no CE supervision) ───────────────────────────────────

@@ -869,6 +869,9 @@ def main(cfg: DictConfig):
             model = cls(
                 num_classes=t.get("num_classes", 9),
                 thinker_out_channels=p.get("thinker_out_channels", None),
+                enc_timestep_cond=p.get("enc_timestep_cond", False),
+                thinker_timestep_cond=p.get("thinker_timestep_cond", False),
+                temb_dim=p.get("temb_dim", 256),
                 **img_painter_kwargs, **img_thinker_kwargs,
             )
 
