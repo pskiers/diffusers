@@ -733,6 +733,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        thinker_out_channels: int = None,
         # --- timestep conditioning (V1-specific) ---
         enc_timestep_cond: bool = False,     # FiLM scale+shift on encoder features
         thinker_timestep_cond: bool = False, # T2: broadcast temb added to thinker input tokens
@@ -748,6 +749,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             painter_size=painter_size,
             cell_size=cell_size,
             num_classes=num_classes,
+            thinker_out_channels=thinker_out_channels,
             seq_len=seq_len,
             hidden_size=hidden_size,
             n_heads=n_heads,
