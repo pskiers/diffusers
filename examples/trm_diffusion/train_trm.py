@@ -1004,7 +1004,7 @@ def main(cfg: DictConfig):
             elif mode == "standalone_painter":
                 # eval_painter works for StandalonePainter: _get_condition returns
                 # solution tokens and forward() accepts them natively.
-                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w=0.0, max_batches=100)
+                metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, 0.0, max_batches=100)
                 val_log = {"val/diff_loss": metrics.get("diff_loss", 0)}
             else:
                 metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, sudoku_w, max_batches=100)
