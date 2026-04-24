@@ -217,6 +217,7 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
 
     classifier = load_or_train_classifier(
         args.classifier_path,
+        mnist_root=args.mnist_root,
         cell_size=args.cell_size,
         device=device,
     )
