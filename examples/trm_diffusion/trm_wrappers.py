@@ -1116,3 +1116,34 @@ class StandalonePainter(nn.Module):
             bridge_feat = self.bridge(spatial)
             noise_pred  = self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
         return noise_pred, None
+
+
+# ── Thinker with frozen painter ───────────────────────────────────────────────
+
+class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
+    """
+    Trains only the thinker; bridge + UNet are loaded from a pretrained
+    StandalonePainter checkpoint and kept frozen throughout.
+
+    Inherits everything from OriginalTRMRatatouilleV0Tok except:
+      - bridge and painter come from a pre-built StandalonePainter (no new weights)
+      - those parameters are frozen (requires_grad=False)
+      - get_painter_params() returns [] so the optimizer never touches them
+
+    Usage:
+      python train_trm.py experiment=thinker_frozen_painter \\
+        painter.painter_checkpoint=runs/standalone_painter/checkpoint_final.pt
+    """
+
+    def __init__(self, painter: StandalonePainter, **thinker_kwargs):
+        super().__init__(**thinker_kwargs)
+        # Replace the freshly-built bridge+painter with the pretrained frozen ones.
+        self.bridge  = painter.bridge
+        self.painter = painter.painter
+        for p in self.bridge.parameters():
+            p.requires_grad_(False)
+        for p in self.painter.parameters():
+            p.requires_grad_(False)
+
+    def get_painter_params(self) -> list:
+        return []  # frozen — excluded from all optimizers
