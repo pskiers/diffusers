@@ -172,16 +172,22 @@ def build_model(args) -> torch.nn.Module:
 
 
 def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: torch.device):
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    # Always start from the live model weights (covers frozen / non-trainable params).
+    model.load_state_dict(ckpt["model_state"])
     if use_ema and ckpt.get("ema_state") is not None:
-        # EMAHelper.state_dict() returns self.shadow: {param_name: tensor}
-        # EMAHelper.ema(model) copies shadow → model params.
-        ema = EMAHelper(mu=0.999)
-        ema.load_state_dict(ckpt["ema_state"])
-        ema.ema(model)
-        print(f"Loaded EMA weights from {path} (step={ckpt.get('step', '?')})")
+        # EMAHelper.state_dict() == self.shadow: {name: tensor} for trainable params only.
+        # Override each matching param directly; silently skip any key mismatches.
+        shadow = ckpt["ema_state"]
+        param_dict = dict(model.named_parameters())
+        n_applied = 0
+        for name, tensor in shadow.items():
+            if name in param_dict:
+                param_dict[name].data.copy_(tensor)
+                n_applied += 1
+        print(f"Loaded EMA weights from {path} (step={ckpt.get('step', '?')}, "
+              f"{n_applied}/{len(shadow)} shadow params applied)")
     else:
-        model.load_state_dict(ckpt["model_state"])
         print(f"Loaded model weights from {path} (step={ckpt.get('step', '?')})")
     model.to(device)
     return model
