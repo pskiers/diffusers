@@ -176,7 +176,7 @@ def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: to
     if use_ema and ckpt.get("ema_state") is not None:
         # EMAHelper.state_dict() returns self.shadow: {param_name: tensor}
         # EMAHelper.ema(model) copies shadow → model params.
-        ema = EMAHelper(model, mu=0.999)
+        ema = EMAHelper(mu=0.999)
         ema.load_state_dict(ckpt["ema_state"])
         ema.ema(model)
         print(f"Loaded EMA weights from {path} (step={ckpt.get('step', '?')})")
