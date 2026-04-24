@@ -601,6 +601,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        enc_hidden_channels: tuple = (16, 32),  # intermediate widths in SpatialEncoder
         # --- bridge & painter ---
         thinker_out_channels: int = None,   # if > num_classes, expands logits before bridge
         bridge_channels: int = 16,
@@ -638,7 +639,8 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         self.token_offset = 0
 
         # condition image (B,1,H,W) → (B, enc_channels, grid, grid)
-        self.image_encoder = SpatialEncoder(1, enc_channels, factor=cell_size)
+        self.image_encoder = SpatialEncoder(1, enc_channels, factor=cell_size,
+                                            hidden_channels=tuple(enc_hidden_channels))
         # project enc_channels → hidden_size per cell
         std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(enc_channels))
         self.enc_proj = nn.Conv2d(enc_channels, hidden_size, 1)
@@ -754,6 +756,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        enc_hidden_channels: tuple = (16, 32),
         thinker_out_channels: int = None,
         # --- timestep conditioning (V1-specific) ---
         enc_timestep_cond: bool = False,     # FiLM scale+shift on encoder features
@@ -771,6 +774,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             cell_size=cell_size,
             num_classes=num_classes,
             thinker_out_channels=thinker_out_channels,
+            enc_hidden_channels=enc_hidden_channels,
             seq_len=seq_len,
             hidden_size=hidden_size,
             n_heads=n_heads,
@@ -793,7 +797,8 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             painter_dtype=painter_dtype,
         )
         # Replace 1-channel encoder with 2-channel (condition + noisy)
-        self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size)
+        self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size,
+                                            hidden_channels=tuple(enc_hidden_channels))
 
         # Timestep conditioning.  Both projections are zero-init so the model
         # starts as the no-timestep identity and gradually learns to use t.
@@ -973,6 +978,7 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        enc_hidden_channels: tuple = (16, 32),
         # --- bridge & painter ---
         bridge_channels: int = 16,
         bridge_num_heads: int = 4,
@@ -1003,6 +1009,7 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
             batch_size=batch_size,
             freeze_weights=freeze_weights,
             enc_channels=enc_channels,
+            enc_hidden_channels=enc_hidden_channels,
             bridge_channels=bridge_channels,
             painter_channels=painter_channels,
             painter_layers_per_block=painter_layers_per_block,
@@ -1014,7 +1021,8 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
         self._grid = grid_size
 
         # Replace 1→2 channel encoder (set by V1) with compression_factor version
-        self.image_encoder = SpatialEncoder(2, enc_channels, factor=compression_factor)
+        self.image_encoder = SpatialEncoder(2, enc_channels, factor=compression_factor,
+                                            hidden_channels=tuple(enc_hidden_channels))
 
         # Replace SpatialBridge with AttentiveBridge
         self.bridge = AttentiveBridge(

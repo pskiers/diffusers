@@ -231,23 +231,54 @@ class TimestepMLP(nn.Module):
 class SpatialEncoder(nn.Module):
     """
     Compresses the high-resolution noisy image into a low-dimensional spatial grid.
+
+    Architecture mirrors the conv backbone of MNISTCellClassifier:
+      Conv(in → hidden[0]) → SiLU → MaxPool2
+      Conv(hidden[0] → hidden[1]) → SiLU → MaxPool2
+      ...
+      AdaptiveAvgPool2d(grid_size)   ← grid_size = input_size // factor
+
+    hidden_channels controls intermediate widths; defaults to [16, 32] which
+    matches the classifier backbone.  out_channels is the final channel count
+    (the last Conv in the stack projects to out_channels).
+
+    factor=1 is a special case: the net is an identity (no downsampling).
     """
 
-    def __init__(self, in_channels, out_channels, factor=4):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        factor: int = 4,
+        hidden_channels: tuple = (16, 32),
+    ):
         super().__init__()
         self.factor = factor
 
         if factor == 1:
             self.net = nn.Identity()
         else:
-            self.net = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=factor, stride=factor, bias=False),
+            layers = []
+            ch = in_channels
+            for h in hidden_channels:
+                layers += [
+                    nn.Conv2d(ch, h, kernel_size=3, padding=1),
+                    nn.SiLU(),
+                    nn.MaxPool2d(2),
+                ]
+                ch = h
+            layers += [
+                nn.Conv2d(ch, out_channels, kernel_size=3, padding=1),
                 nn.GroupNorm(min(32, out_channels), out_channels),
                 nn.SiLU(),
-            )
+            ]
+            self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.factor == 1:
+            return x
+        grid_size = x.shape[-1] // self.factor
+        return nn.functional.adaptive_avg_pool2d(self.net(x), grid_size)
 
 
 class AttentiveBridge(nn.Module):
