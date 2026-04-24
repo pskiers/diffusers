@@ -171,14 +171,23 @@ def build_model(args) -> torch.nn.Module:
     return model
 
 
+def _strip_compiled_prefix(state_dict: dict) -> dict:
+    """Remove '_orig_mod.' prefix inserted by torch.compile on submodules."""
+    out = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("._orig_mod.", ".") if "._orig_mod." in k else k
+        out[new_k] = v
+    return out
+
+
 def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: torch.device):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     # Always start from the live model weights (covers frozen / non-trainable params).
-    model.load_state_dict(ckpt["model_state"])
+    model.load_state_dict(_strip_compiled_prefix(ckpt["model_state"]))
     if use_ema and ckpt.get("ema_state") is not None:
         # EMAHelper.state_dict() == self.shadow: {name: tensor} for trainable params only.
         # Override each matching param directly; silently skip any key mismatches.
-        shadow = ckpt["ema_state"]
+        shadow = _strip_compiled_prefix(ckpt["ema_state"])
         param_dict = dict(model.named_parameters())
         n_applied = 0
         for name, tensor in shadow.items():
