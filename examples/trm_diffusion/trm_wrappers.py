@@ -51,7 +51,10 @@ from models.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1InnerCarry,
 )
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from mnist_sudoku_models import SpatialBridge, _make_painter
+from mnist_sudoku_models import (
+    SpatialBridge, _make_painter,
+    _make_painter_control, ConditioningPyramid, SPADEUNet2D,
+)
 from models_pt import SpatialEncoder, AttentiveBridge, TimestepMLP
 
 
@@ -363,6 +366,11 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         #   "onehot"  – argmax → one-hot (matches painter trained on real one-hot solutions)
         #   "softmax" – softmax probabilities (soft version of onehot)
         thinker_bridge_mode: str = "logits",
+        # Classifier-free guidance.  cfg_prob > 0 randomly zeros the spatial
+        # conditioning during training.  cfg_scale > 1.0 at inference enables
+        # the double-forward CFG pass in forward().
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
         # Autocast dtype for the bridge + painter UNet.  None = no autocast
         # (painter runs in whatever dtype the tensors arrive in).
         # "bfloat16" is the safe default: same exponent range as float32, so no
@@ -374,6 +382,8 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         super().__init__()
         self.diff_thinker_weight = diff_thinker_weight
         self.thinker_bridge_mode = thinker_bridge_mode
+        self.cfg_prob  = cfg_prob
+        self.cfg_scale = cfg_scale
         self._grid = painter_size // cell_size   # e.g. 144//16 = 9
         # Thinker vocab uses 0=PAD, 1=blank, 2-10=digits 1-9.
         # sample_grids compares argmax predictions against raw solution labels (0-8),
@@ -500,13 +510,17 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         if self.diff_thinker_weight == 0.0:
             sc_for_painter = spatial_cond.detach()
         elif self.diff_thinker_weight != 1.0:
-            # Partial gradient: interpolate between detached and full
             sc_for_painter = (
                 self.diff_thinker_weight * spatial_cond
                 + (1.0 - self.diff_thinker_weight) * spatial_cond.detach()
             )
         else:
             sc_for_painter = spatial_cond
+
+        # CFG training dropout: randomly zero conditioning per sample.
+        if self.training and self.cfg_prob > 0:
+            drop = torch.rand(sc_for_painter.shape[0], 1, 1, 1, device=sc_for_painter.device) < self.cfg_prob
+            sc_for_painter = sc_for_painter * (~drop)
 
         noise_pred = self._run_painter(noisy, sc_for_painter, timesteps)
         return noise_pred, logits, z_H_next, z_L_next
@@ -534,7 +548,14 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
             )
 
         spatial_cond = self._logits_to_spatial(logits.float())
-        noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+
+        if not self.training and self.cfg_scale > 1.0:
+            null = torch.zeros_like(spatial_cond)
+            pred_cond   = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_uncond = self._run_painter(noisy, null, timesteps)
+            noise_pred  = pred_uncond + self.cfg_scale * (pred_cond - pred_uncond)
+        else:
+            noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
         return noise_pred, logits
 
 
@@ -1147,3 +1168,179 @@ class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
 
     def get_painter_params(self) -> list:
         return []  # frozen — excluded from all optimizers
+
+
+# ── Standalone SPADE painter ──────────────────────────────────────────────────
+
+class StandalonePainterSPADE(StandalonePainter):
+    """
+    Standalone painter using SPADE conditioning instead of a bridge+concat.
+
+    Solution tokens → one-hot (B, vocab_size, 9, 9) → bilinearly upsampled to
+    painter_size → fed as semantic map `s` to SPADEUNet2D (in_channels=1, no concat).
+    """
+
+    def __init__(
+        self,
+        painter_size: int = 144,
+        cell_size: int = 16,
+        vocab_size: int = 11,
+        painter_channels: tuple = (32, 64, 64),
+        painter_layers_per_block: int = 2,
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        # Use the smallest valid bridge_channels so parent __init__ doesn't crash,
+        # then replace bridge+painter immediately after.
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            vocab_size=vocab_size,
+            bridge_channels=1,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
+            painter_dtype=painter_dtype,
+        )
+        self.painter_size = painter_size
+        # Discard the bridge (unused in SPADE) and replace UNet.
+        del self.bridge
+        self.bridge = None
+        self.painter = SPADEUNet2D(
+            painter_size=painter_size,
+            sem_channels=vocab_size,
+            block_out_channels=tuple(painter_channels),
+            layers_per_block=painter_layers_per_block,
+        )
+
+    def _solution_to_spatial(self, solution_tokens: torch.Tensor) -> torch.Tensor:
+        """(B, 81) long 2-10 → (B, vocab_size, painter_size, painter_size) float upsampled."""
+        spatial = super()._solution_to_spatial(solution_tokens)   # (B, V, grid, grid)
+        return F.interpolate(spatial, size=self.painter_size, mode="bilinear", align_corners=False)
+
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ):
+        s = self._solution_to_spatial(condition)
+
+        if self.training and self.cfg_prob > 0:
+            drop = torch.rand(s.shape[0], 1, 1, 1, device=s.device) < self.cfg_prob
+            s = s * (~drop)
+
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+
+        if not self.training and self.cfg_scale > 1.0:
+            null   = torch.zeros_like(s)
+            s_both = torch.cat([s, null], dim=0)
+            n_both = noisy.repeat(2, 1, 1, 1)
+            t_both = timesteps.repeat(2)
+            with ctx:
+                pred = self.painter(n_both, t_both, s_both)
+            pred_cond, pred_uncond = pred.chunk(2, dim=0)
+            return pred_uncond + self.cfg_scale * (pred_cond - pred_uncond), None
+
+        with ctx:
+            noise_pred = self.painter(noisy, timesteps, s)
+        return noise_pred, None
+
+
+# ── Standalone ControlNet painter ─────────────────────────────────────────────
+
+class StandalonePainterControl(StandalonePainter):
+    """
+    Standalone painter using ControlNet-style residual injection instead of bridge+concat.
+
+    Solution tokens → one-hot (B, vocab_size, 9, 9) → bilinearly upsampled to
+    painter_size → ConditioningPyramid → per-layer residuals injected into
+    _ControlPainterUNet (in_channels=1, no bridge concatenation).
+    """
+
+    def __init__(
+        self,
+        painter_size: int = 144,
+        cell_size: int = 16,
+        vocab_size: int = 11,
+        painter_channels: tuple = (32, 64, 64),
+        painter_layers_per_block: int = 2,
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
+        painter_dtype: Optional[str] = None,
+    ):
+        super().__init__(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            vocab_size=vocab_size,
+            bridge_channels=1,
+            painter_channels=painter_channels,
+            painter_layers_per_block=painter_layers_per_block,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
+            painter_dtype=painter_dtype,
+        )
+        self.painter_size = painter_size
+        del self.bridge
+        self.bridge = None
+        self.painter = _make_painter_control(
+            painter_size=painter_size,
+            painter_channels=tuple(painter_channels),
+            layers_per_block=painter_layers_per_block,
+        )
+        self.control_pyramid = ConditioningPyramid(
+            in_channels=vocab_size,
+            block_out_channels=tuple(painter_channels),
+            layers_per_block=painter_layers_per_block,
+        )
+
+    def _solution_to_spatial(self, solution_tokens: torch.Tensor) -> torch.Tensor:
+        """(B, 81) long 2-10 → (B, vocab_size, painter_size, painter_size) float upsampled."""
+        spatial = super()._solution_to_spatial(solution_tokens)
+        return F.interpolate(spatial, size=self.painter_size, mode="bilinear", align_corners=False)
+
+    def _run_painter_ctrl(self, noisy, s, timesteps):
+        down_res, mid_res = self.control_pyramid(s)
+        return self.painter(
+            noisy, timesteps,
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        ).sample
+
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ):
+        s = self._solution_to_spatial(condition)
+
+        if self.training and self.cfg_prob > 0:
+            drop = torch.rand(s.shape[0], 1, 1, 1, device=s.device) < self.cfg_prob
+            s = s * (~drop)
+
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+
+        if not self.training and self.cfg_scale > 1.0:
+            B = noisy.shape[0]
+            null = torch.zeros_like(s)
+            with ctx:
+                pred_cond   = self._run_painter_ctrl(noisy, s,    timesteps)
+                pred_uncond = self._run_painter_ctrl(noisy, null, timesteps)
+            return pred_uncond + self.cfg_scale * (pred_cond - pred_uncond), None
+
+        with ctx:
+            noise_pred = self._run_painter_ctrl(noisy, s, timesteps)
+        return noise_pred, None

@@ -1,0 +1,36 @@
+# @package _global_
+# Standalone ControlNet painter: solution tokens → one-hot → bilinear upsample →
+# ConditioningPyramid → multi-scale residuals injected into UNet skip connections.
+# No bridge concatenation; painter in_channels=1 (noisy only).
+#
+# Usage:
+#   python train_trm.py experiment=standalone_painter_control
+
+mode: "standalone_painter_control"
+output_dir: "runs/standalone_painter_control"
+compile: true
+
+use_ema: true
+ema_rate: 0.999
+
+painter:
+  vocab_size: 11
+  painter_channels: [32, 64, 64]
+  painter_layers_per_block: 2
+  cfg_prob: 0.0
+  cfg_scale: 1.0
+  dtype: bfloat16
+
+data:
+  cell_size: 16
+
+train:
+  lr: 1e-4
+  lr_min_ratio: 1.0
+  weight_decay: 0.01
+  batch_size: 384
+  num_steps: 100000
+  warmup_steps: 2000
+  eval_every: 2000
+  save_every: 10000
+  gradient_accumulation_steps: 2

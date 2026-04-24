@@ -53,6 +53,8 @@ from trm_wrappers import (
     OriginalTRMRatatouilleV3,
     OriginalTRMRatatouilleV4,
     StandalonePainter,
+    StandalonePainterSPADE,
+    StandalonePainterControl,
     ThinkerWithFrozenPainter,
     build_puzzle_emb_optimizer,
     get_non_puzzle_emb_params,
@@ -66,6 +68,12 @@ except ImportError:
 
 
 logger = get_logger(__name__, log_level="INFO")
+
+_STANDALONE_PAINTER_MODES = (
+    "standalone_painter",
+    "standalone_painter_spade",
+    "standalone_painter_control",
+)
 
 
 # ── LR schedule — copied verbatim from TinyRecursiveModels/pretrain.py ─────────
@@ -754,7 +762,7 @@ def main(cfg: DictConfig):
 
     # ── MNIST cell classifier (painter / standalone_painter mode, opt-in) ────
     classifier = None
-    if mode in ("painter", "standalone_painter", "thinker_frozen_painter") and accelerator.is_main_process:
+    if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter") and accelerator.is_main_process:
         classifier_path = cfg.train.get("eval_classifier_path", None)
         if classifier_path:
             classifier = load_or_train_classifier(
@@ -791,19 +799,24 @@ def main(cfg: DictConfig):
 
     if mode == "sudoku":
         model = OriginalTRMSudoku(**thinker_kwargs)
-    elif mode == "standalone_painter":
+    elif mode in ("standalone_painter", "standalone_painter_spade", "standalone_painter_control"):
         p = cfg.painter
-        model = StandalonePainter(
+        common_kwargs = dict(
             painter_size=painter_size,
             cell_size=cell_size,
             vocab_size=p.get("vocab_size", 11),
-            bridge_channels=p.bridge_channels,
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
             cfg_prob=p.get("cfg_prob", 0.0),
             cfg_scale=p.get("cfg_scale", 1.0),
             painter_dtype=p.get("dtype", None),
         )
+        if mode == "standalone_painter":
+            model = StandalonePainter(bridge_channels=p.bridge_channels, **common_kwargs)
+        elif mode == "standalone_painter_spade":
+            model = StandalonePainterSPADE(**common_kwargs)
+        else:
+            model = StandalonePainterControl(**common_kwargs)
     elif mode == "thinker_frozen_painter":
         p = cfg.painter
         painter_ckpt_path = p.get("painter_checkpoint", None)
@@ -836,6 +849,8 @@ def main(cfg: DictConfig):
             painter_layers_per_block=p.painter_layers_per_block,
             diff_thinker_weight=p.diff_thinker_weight,
             thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
+            cfg_prob=p.get("cfg_prob", 0.0),
+            cfg_scale=p.get("cfg_scale", 1.0),
             painter_dtype=p.get("dtype", None),
             **thinker_kwargs,
         )
@@ -910,9 +925,10 @@ def main(cfg: DictConfig):
     if cfg.get("compile", False):
         if mode == "sudoku":
             model.inner.L_level = torch.compile(model.inner.L_level, fullgraph=False)
-        elif mode in ("standalone_painter", "thinker_frozen_painter"):
+        elif mode in (*_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
             model.painter = torch.compile(model.painter)
-            model.bridge  = torch.compile(model.bridge)
+            if model.bridge is not None:
+                model.bridge = torch.compile(model.bridge)
         else:
             model.thinker.inner.L_level = torch.compile(model.thinker.inner.L_level, fullgraph=False)
             model.painter = torch.compile(model.painter)
@@ -990,7 +1006,7 @@ def main(cfg: DictConfig):
                 global_step, cfg, ema_helper, global_batch_size,
             )
             log_dict = {"train/loss": loss_val, "train/lr": lr}
-        elif mode == "standalone_painter":
+        elif mode in _STANDALONE_PAINTER_MODES:
             losses, lr, global_step = train_step_standalone_painter(
                 unwrapped, micro_batches, scheduler, accelerator, optimizers, base_lrs,
                 global_step, cfg, ema_helper, global_batch_size,
@@ -1036,7 +1052,7 @@ def main(cfg: DictConfig):
             if mode == "sudoku":
                 metrics = eval_sudoku(unwrapped, eval_dl, accelerator, max_batches=100)
                 val_log = {f"val/{k}": v for k, v in metrics.items()}
-            elif mode in ("standalone_painter", "thinker_frozen_painter"):
+            elif mode in (*_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
                 metrics = eval_painter(unwrapped, eval_dl, scheduler, accelerator, 0.0, max_batches=100)
                 val_log = {"val/diff_loss": metrics.get("diff_loss", 0)}
             else:
@@ -1062,7 +1078,7 @@ def main(cfg: DictConfig):
                     accelerator.log(val_log, step=global_step)
 
             # ── Digit-level sampling eval (painter / standalone_painter) ─────
-            if mode in ("painter", "standalone_painter", "thinker_frozen_painter") and accelerator.is_main_process and classifier is not None:
+            if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter") and accelerator.is_main_process and classifier is not None:
                 n_total = cfg.train.get("eval_num_samples",   128)
                 n_batch = cfg.train.get("eval_batch_size",     32)
                 n_ddim  = cfg.train.get("eval_num_ddim_steps", 20)
