@@ -906,14 +906,15 @@ def main(cfg: DictConfig):
                 thinker_kw = {k: v for k, v in img_thinker_kwargs.items() if k != "seq_len"}
             model = cls(**extra, **img_painter_kwargs, **thinker_kw)
         else:
-            model = cls(
+            extra = dict(
                 num_classes=t.get("num_classes", 9),
                 thinker_out_channels=p.get("thinker_out_channels", None),
-                enc_timestep_cond=p.get("enc_timestep_cond", False),
-                thinker_timestep_cond=p.get("thinker_timestep_cond", False),
-                temb_dim=p.get("temb_dim", 256),
-                **img_painter_kwargs, **img_thinker_kwargs,
             )
+            if painter_variant == "v1":
+                extra["enc_timestep_cond"]     = p.get("enc_timestep_cond", False)
+                extra["thinker_timestep_cond"] = p.get("thinker_timestep_cond", False)
+                extra["temb_dim"]              = p.get("temb_dim", 256)
+            model = cls(**extra, **img_painter_kwargs, **img_thinker_kwargs)
 
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
