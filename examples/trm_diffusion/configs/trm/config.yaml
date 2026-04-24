@@ -72,6 +72,7 @@ painter:
   thinker_bridge_mode: "logits"  # "logits" | "onehot" | "softmax"
   # Image-encoder size (V0/V1 only)
   enc_channels: 32
+  enc_hidden_channels: [16, 32]  # intermediate widths in SpatialEncoder conv stack
   thinker_out_channels: null  # null = same as num_classes (no expansion)
   # Timestep conditioning (V1 only)
   enc_timestep_cond: false     # FiLM scale+shift on encoder features

@@ -878,6 +878,7 @@ def main(cfg: DictConfig):
             painter_size=painter_size,
             cell_size=cell_size,
             enc_channels=p.get("enc_channels", 32),
+            enc_hidden_channels=tuple(p.get("enc_hidden_channels", [16, 32])),
             bridge_channels=p.bridge_channels,
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
