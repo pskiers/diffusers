@@ -608,6 +608,9 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
+        thinker_bridge_mode: str = "logits",
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
         painter_dtype: Optional[str] = None,
     ):
         _toc = thinker_out_channels if thinker_out_channels is not None else num_classes
@@ -634,6 +637,9 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
             painter_channels=painter_channels,
             painter_layers_per_block=painter_layers_per_block,
             diff_thinker_weight=diff_thinker_weight,
+            thinker_bridge_mode=thinker_bridge_mode,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
             painter_dtype=painter_dtype,
         )
         self.token_offset = 0
@@ -767,6 +773,9 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
+        thinker_bridge_mode: str = "logits",
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
         painter_dtype: Optional[str] = None,
     ):
         super().__init__(
@@ -794,6 +803,9 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             painter_channels=painter_channels,
             painter_layers_per_block=painter_layers_per_block,
             diff_thinker_weight=diff_thinker_weight,
+            thinker_bridge_mode=thinker_bridge_mode,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
             painter_dtype=painter_dtype,
         )
         # Replace 1-channel encoder with 2-channel (condition + noisy)
@@ -878,11 +890,15 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
         freeze_weights: bool = False,
         # --- image encoder ---
         enc_channels: int = 32,
+        enc_hidden_channels: tuple = (16, 32),
         # --- bridge & painter ---
         bridge_channels: int = 16,
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
+        thinker_bridge_mode: str = "logits",
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
         painter_dtype: Optional[str] = None,
     ):
         super().__init__(
@@ -904,10 +920,14 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
             batch_size=batch_size,
             freeze_weights=freeze_weights,
             enc_channels=enc_channels,
+            enc_hidden_channels=enc_hidden_channels,
             bridge_channels=bridge_channels,
             painter_channels=painter_channels,
             painter_layers_per_block=painter_layers_per_block,
             diff_thinker_weight=diff_thinker_weight,
+            thinker_bridge_mode=thinker_bridge_mode,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
             painter_dtype=painter_dtype,
         )
 
@@ -985,6 +1005,9 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
+        thinker_bridge_mode: str = "logits",
+        cfg_prob: float = 0.0,
+        cfg_scale: float = 1.0,
         painter_dtype: Optional[str] = None,
     ):
         grid_size = painter_size // compression_factor
@@ -1014,6 +1037,9 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
             painter_channels=painter_channels,
             painter_layers_per_block=painter_layers_per_block,
             diff_thinker_weight=diff_thinker_weight,
+            thinker_bridge_mode=thinker_bridge_mode,
+            cfg_prob=cfg_prob,
+            cfg_scale=cfg_scale,
             painter_dtype=painter_dtype,
         )
 

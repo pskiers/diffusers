@@ -924,6 +924,9 @@ def main(cfg: DictConfig):
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
             diff_thinker_weight=p.diff_thinker_weight,
+            thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
+            cfg_prob=p.get("cfg_prob", 0.0),
+            cfg_scale=p.get("cfg_scale", 1.0),
             painter_dtype=p.get("dtype", None),
         )
         _VARIANT_CLS = {
