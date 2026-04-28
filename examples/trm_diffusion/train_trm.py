@@ -362,6 +362,45 @@ def eval_painter(model, dataloader, scheduler, accelerator, sudoku_loss_weight, 
     return {k: float(np.mean(v)) for k, v in metrics.items() if v}
 
 
+def _apply_noisy_swap(images: torch.Tensor, noisy: torch.Tensor,
+                      timesteps: torch.Tensor, scheduler, cfg) -> torch.Tensor:
+    """For eligible samples (timestep in range, random draw < prob), replace
+    x_noisy with a *different* clean image from the batch noised to the same
+    timestep.  Returns a (possibly modified) noisy tensor; original is unchanged
+    for non-eligible samples.
+
+    Config: train.noisy_swap.{prob, t_min, t_max}
+    """
+    swap_cfg = cfg.train.get("noisy_swap", None)
+    if swap_cfg is None:
+        return noisy
+    prob = float(swap_cfg.get("prob", 0.0))
+    if prob <= 0.0:
+        return noisy
+    t_min = int(swap_cfg.get("t_min", 0))
+    t_max = int(swap_cfg.get("t_max", cfg.num_timesteps - 1))
+
+    B = images.shape[0]
+    eligible = ((timesteps >= t_min) & (timesteps <= t_max))
+    draw     = torch.rand(B, device=images.device) < prob
+    swap     = (eligible & draw).nonzero(as_tuple=True)[0]   # indices to swap
+
+    if swap.numel() == 0:
+        return noisy
+
+    noisy = noisy.clone()
+    # Pick a different image for each swap candidate (cyclic shift avoids self-swap)
+    src_idx = (swap + 1) % B
+    alt_images = images[src_idx]                              # different clean images
+    alt_noisy  = scheduler.add_noise(
+        alt_images,
+        torch.randn_like(alt_images),
+        timesteps[swap],                                      # exact same timestep
+    )
+    noisy[swap] = alt_noisy
+    return noisy
+
+
 def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size):
     K = len(micro_batches)
     device = accelerator.device
@@ -380,6 +419,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,),
                                   device=device, dtype=torch.long)
         noisy  = scheduler.add_noise(images, noise, timesteps)
+        noisy  = _apply_noisy_swap(images, noisy, timesteps, scheduler, cfg)
         target = noise if scheduler.config.prediction_type == "epsilon" else images
         z_H, z_L = model.get_initial_states(bsz)
 

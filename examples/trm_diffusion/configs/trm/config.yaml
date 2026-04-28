@@ -122,6 +122,16 @@ train:
   sudoku_loss_weight: 1.0  # painter mode: thinker CE weight relative to diff loss
   gradient_accumulation_steps: 1  # accumulate over N batches before each optimizer step
 
+  # ── Noisy-swap augmentation ────────────────────────────────────────────────
+  # For samples whose timestep falls in [t_min, t_max], randomly replace
+  # x_noisy with a different clean image from the batch noised to the same
+  # timestep.  Forces the painter to rely on conditioning rather than x_noisy.
+  # prob=0.0 disables the augmentation entirely.
+  noisy_swap:
+    prob: 0.0          # per-sample swap probability (0.0 = disabled)
+    t_min: 80          # inclusive lower timestep bound (high-noise region)
+    t_max: 100         # inclusive upper timestep bound
+
   # ── Digit-level sampling eval (painter mode only) ─────────────────────────
   # Set eval_classifier_path to enable DDIM sampling + digit accuracy metrics.
   eval_classifier_path: runs/mnist_classifier_cell16.pt   # path to save/load MNIST cell classifier
