@@ -6,6 +6,11 @@ from diffusers import UNet2DConditionModel, Transformer2DModel
 from diffusers.configuration_utils import register_to_config
 
 
+def strip_compiled_prefix(state_dict: dict) -> dict:
+    """Remove '_orig_mod.' prefix inserted by torch.compile on submodules."""
+    return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+
+
 class UnifiedConditionUNet(UNet2DConditionModel):
     @register_to_config
     def __init__(

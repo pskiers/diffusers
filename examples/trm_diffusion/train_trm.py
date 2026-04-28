@@ -60,6 +60,7 @@ from trm_wrappers import (
     get_non_puzzle_emb_params,
 )
 from models.ema import EMAHelper
+from models_pt import strip_compiled_prefix
 
 try:
     import wandb as _wandb
@@ -831,8 +832,8 @@ def main(cfg: DictConfig):
             painter_layers_per_block=p.painter_layers_per_block,
             painter_dtype=p.get("dtype", None),
         )
-        ckpt = torch.load(painter_ckpt_path, map_location="cpu")
-        frozen_painter.load_state_dict(ckpt["model_state"])
+        ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
+        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
         logger.info(f"Loaded StandalonePainter from {painter_ckpt_path}")
         model = ThinkerWithFrozenPainter(
             painter=frozen_painter,
