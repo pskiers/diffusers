@@ -721,7 +721,13 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
             )
 
         spatial_cond = self._logits_to_spatial(logits.float())
-        noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+        if not self.training and self.cfg_scale > 1.0:
+            null = torch.zeros_like(spatial_cond)
+            pred_cond   = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_uncond = self._run_painter(noisy, null, timesteps)
+            noise_pred  = pred_uncond + self.cfg_scale * (pred_cond - pred_uncond)
+        else:
+            noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
         return noise_pred, logits
 
 

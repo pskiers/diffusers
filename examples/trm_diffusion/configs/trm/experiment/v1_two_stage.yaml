@@ -44,9 +44,12 @@ train:
   gradient_accumulation_steps: 2
 
 painter_stage:
+  freeze_thinker: false  # true = only painter+bridge updated during painter stage
   n_sup: 4
   H_cycles: 1
   L_cycles: 2
+  every: 1
 
 thinker_stage:
   n_sup: 16
+  every: 1

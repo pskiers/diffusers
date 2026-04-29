@@ -46,6 +46,9 @@ painter_stage:
   n_sup: 4
   H_cycles: 1
   L_cycles: 2
+  freeze_thinker: false  # true = only painter+bridge updated during painter stage
+  every: 1               # run painter stage every N global steps (1 = every step)
 
 thinker_stage:
   n_sup: 16
+  every: 1               # run thinker stage every N global steps (e.g. 4 = every 4th step)

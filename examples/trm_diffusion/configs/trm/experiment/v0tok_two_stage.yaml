@@ -52,10 +52,13 @@ train:
 # Reduced H_cycles / L_cycles make the thinker pass cheap — the task is trivial
 # (input = solution) so deep recursion adds no benefit and just slows things down.
 painter_stage:
+  freeze_thinker: false  # true = only painter+bridge updated during painter stage
   n_sup: 4         # painter sub-steps per batch (≤ thinker_stage.n_sup)
   H_cycles: 1      # outer recursion depth during painter stage
   L_cycles: 2      # inner iterations per H-cycle during painter stage
+  every: 1
 
 # Thinker stage: real puzzle tokens, painter frozen, CE loss only.
 thinker_stage:
   n_sup: 16        # thinker sub-steps per batch (matches thinker.n_sup)
+  every: 1

@@ -543,10 +543,16 @@ def train_step_painter_two_stage(
 
     ps = cfg.get("painter_stage", {})
     ts = cfg.get("thinker_stage", {})
-    ps_n_sup  = int(ps.get("n_sup",    model.n_sup))
-    ps_H      = ps.get("H_cycles", None)
-    ps_L      = ps.get("L_cycles", None)
-    ts_n_sup  = int(ts.get("n_sup",    model.n_sup))
+    ps_n_sup          = int(ps.get("n_sup",          model.n_sup))
+    ps_H              = ps.get("H_cycles", None)
+    ps_L              = ps.get("L_cycles", None)
+    ps_freeze_thinker = bool(ps.get("freeze_thinker", False))
+    ps_every          = int(ps.get("every", 1))   # run painter stage every N global steps
+    ts_n_sup          = int(ts.get("n_sup",          model.n_sup))
+    ts_every          = int(ts.get("every", 1))   # run thinker stage every N global steps
+
+    run_painter_stage = (global_step % ps_every == 0)
+    run_thinker_stage = (global_step % ts_every == 0)
 
     # Painter AdamW is always the last optimizer (built by build_optimizers).
     thinker_opts     = optimizers[:-1]
@@ -585,14 +591,26 @@ def train_step_painter_two_stage(
 
     total_diff_loss   = 0.0
     total_sudoku_loss = 0.0
+    n_painter_ticks = 0
+    n_thinker_ticks = 0
     lr = None
-    n_ticks = max(ps_n_sup, ts_n_sup)
+    n_ticks = max(
+        ps_n_sup if run_painter_stage else 0,
+        ts_n_sup if run_thinker_stage else 0,
+    )
 
     painter_params = model.get_painter_params()
+    painter_opts     = optimizers[-1:]
+    painter_base_lrs = base_lrs[-1:]
 
     for tick in range(n_ticks):
         # ── Painter sub-step (teacher forcing with solution tokens) ──────────
-        if tick < ps_n_sup:
+        if run_painter_stage and tick < ps_n_sup:
+            thinker_params = model.get_thinker_params()
+            if ps_freeze_thinker:
+                for p in thinker_params:
+                    p.requires_grad_(False)
+
             for d in mb_data:
                 noise_pred, logits, d["z_H_p"], d["z_L_p"] = model.reasoning_step(
                     d["teacher"], d["noisy"], d["z_H_p"], d["z_L_p"], d["timesteps"],
@@ -600,7 +618,7 @@ def train_step_painter_two_stage(
                 )
                 diff_loss = F.mse_loss(noise_pred.float(), d["target"])
                 sudoku_loss = torch.tensor(0.0, device=device)
-                if logits is not None and sudoku_w > 0:
+                if logits is not None and sudoku_w > 0 and not ps_freeze_thinker:
                     B_, N, C = logits.shape
                     sudoku_loss = F.cross_entropy(
                         logits.float().reshape(B_ * N, C),
@@ -611,16 +629,26 @@ def train_step_painter_two_stage(
                 accelerator.backward(step_loss / (global_batch_size * K))
                 total_diff_loss   += diff_loss.item()
                 total_sudoku_loss += sudoku_loss.item()
+                n_painter_ticks   += 1
 
-            accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
+            if not ps_freeze_thinker:
+                accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
             accelerator.clip_grad_norm_(painter_params, 1.0)
-            lr = _apply_lr_and_step(optimizers, base_lrs, global_step, cfg)
+            lr = _apply_lr_and_step(
+                painter_opts if ps_freeze_thinker else optimizers,
+                painter_base_lrs if ps_freeze_thinker else base_lrs,
+                global_step, cfg,
+            )
             _zero_grads(optimizers)
+
+            if ps_freeze_thinker:
+                for p in thinker_params:
+                    p.requires_grad_(True)
 
         # ── Thinker sub-step (real condition, painter frozen) ───────────────
         # Full forward pass with painter frozen: diff gradient flows back
         # through the bridge into the thinker; painter weights don't update.
-        if tick < ts_n_sup:
+        if run_thinker_stage and tick < ts_n_sup:
             for p in painter_params:
                 p.requires_grad_(False)
 
@@ -641,6 +669,7 @@ def train_step_painter_two_stage(
                 step_loss = diff_loss + sudoku_w * sudoku_loss
                 accelerator.backward(step_loss / (global_batch_size * K))
                 total_sudoku_loss += sudoku_loss.item()
+                n_thinker_ticks   += 1
 
             accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
             lr_t = _apply_lr_and_step(thinker_opts, thinker_base_lrs, global_step, cfg)
@@ -655,11 +684,11 @@ def train_step_painter_two_stage(
             ema_helper.update(model)
         global_step += 1
 
-    n_p = ps_n_sup * K or 1
-    n_t = ts_n_sup * K or 1
+    n_p = n_painter_ticks or 1
+    n_t = (n_painter_ticks + n_thinker_ticks) or 1
     return {
         "diff_loss":   total_diff_loss   / n_p,
-        "sudoku_loss": total_sudoku_loss / (n_p + n_t),
+        "sudoku_loss": total_sudoku_loss / n_t,
     }, lr, global_step
 
 
@@ -799,6 +828,7 @@ def main(cfg: DictConfig):
         num_workers=n_workers,
         pin_memory=True,
         persistent_workers=(n_workers > 0),
+        timeout=120 if n_workers > 0 else 0,  # fail loudly if a worker stalls (e.g. Lustre hang)
     )
 
     # ── MNIST cell classifier (painter / standalone_painter mode, opt-in) ────
