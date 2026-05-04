@@ -137,10 +137,14 @@ def build_model(args) -> torch.nn.Module:
             painter_size=painter_size,
             cell_size=args.cell_size,
             enc_channels=args.enc_channels,
+            enc_hidden_channels=tuple(args.enc_hidden_channels),
             bridge_channels=args.bridge_channels,
             painter_channels=tuple(args.painter_channels),
             painter_layers_per_block=args.painter_layers_per_block,
             diff_thinker_weight=1.0,
+            thinker_bridge_mode=args.thinker_bridge_mode,
+            cfg_prob=0.0,
+            cfg_scale=1.0,
             painter_dtype=args.painter_dtype,
         )
         _VARIANT_CLS = {
@@ -420,6 +424,7 @@ def parse_args():
     p.add_argument("--num_classes",             type=int, default=9)
     p.add_argument("--thinker_out_channels",    type=int, default=None)
     p.add_argument("--enc_channels",            type=int, default=32)
+    p.add_argument("--enc_hidden_channels",     type=int, nargs="+", default=[16, 32])
     p.add_argument("--bridge_channels",         type=int, default=16)
     p.add_argument("--painter_channels",        type=int, nargs="+", default=[32, 64, 64])
     p.add_argument("--painter_layers_per_block", type=int, default=2)
