@@ -195,6 +195,52 @@ def evaluate_grids(
 
 # ── DDIM sampling ─────────────────────────────────────────────────────────────
 
+def _build_denoising_schedule(
+    num_train_timesteps: int,
+    beta_schedule: str,
+    prediction_type: str,
+    num_steps: int,
+    schedule_segments: list[str] | None = None,
+):
+    """Return a list of (timestep: int, DDIMScheduler) pairs for the denoising loop.
+
+    With schedule_segments (e.g. ["10:1", "100:99"]):
+      Each token "N:k" means: use the N-step DDIM schedule and take the next k
+      timesteps from it (continuing from wherever the previous segment left off).
+      Each segment gets its own DDIMScheduler so the correct prev_timestep step
+      size (num_train_timesteps // N) is used for that slice.
+
+    Without schedule_segments: standard single-schedule DDIM with num_steps.
+    """
+    from diffusers import DDIMScheduler
+
+    def _make_ddim(n):
+        s = DDIMScheduler(
+            num_train_timesteps=num_train_timesteps,
+            beta_schedule=beta_schedule,
+            prediction_type=prediction_type,
+        )
+        s.set_timesteps(n)
+        return s
+
+    if not schedule_segments:
+        ddim = _make_ddim(num_steps)
+        return [(int(t), ddim) for t in ddim.timesteps]
+
+    pairs: list[tuple[int, object]] = []
+    last_t = float("inf")
+    for seg in schedule_segments:
+        n_total, n_take = (int(x) for x in seg.split(":"))
+        ddim = _make_ddim(n_total)
+        # Only take timesteps strictly below the last one already processed.
+        ts = [int(t) for t in ddim.timesteps if int(t) < last_t][:n_take]
+        for t in ts:
+            pairs.append((t, ddim))
+        if ts:
+            last_t = ts[-1]
+    return pairs
+
+
 @torch.no_grad()
 def sample_grids(
     model,
@@ -208,6 +254,7 @@ def sample_grids(
     solutions:           torch.Tensor | None       = None,   # (B, 81) int64 [0-8]
     painter_size:        int | None               = None,    # required for token-input models
     given_masks:         torch.Tensor | None       = None,   # (B, 81) bool — True = given cell
+    schedule_segments:   list[str] | None          = None,   # e.g. ["10:1", "100:99"]
 ) -> dict:
     """DDIM-sample and collect thinker stats along the denoising trajectory.
 
@@ -227,14 +274,10 @@ def sample_grids(
     All thinker/deviation entries are absent when the model returns no sudoku logits.
     The acc_best/mean entries also require solutions to be provided.
     """
-    from diffusers import DDIMScheduler
-
-    ddim = DDIMScheduler(
-        num_train_timesteps=num_train_timesteps,
-        beta_schedule=beta_schedule,
-        prediction_type=prediction_type,
+    denoising_schedule = _build_denoising_schedule(
+        num_train_timesteps, beta_schedule, prediction_type,
+        num_steps, schedule_segments,
     )
-    ddim.set_timesteps(num_steps)
 
     conditions = conditions.to(device)
     if puzzle_ids is not None:
@@ -263,7 +306,7 @@ def sample_grids(
     all_preds_list: list[torch.Tensor]      = []   # (B, N) per step, stored on CPU
 
     model.eval()
-    for t in tqdm(ddim.timesteps):
+    for t, active_sched in tqdm(denoising_schedule):
         ts         = torch.full((B,), t, device=device, dtype=torch.long)
         noise_pred, sudoku_logits = model(x, ts, conditions, puzzle_ids=puzzle_ids)
 
@@ -311,7 +354,7 @@ def sample_grids(
                 ts_cell_acc.append((int(t),   cell_a))
                 ts_puzzle_acc.append((int(t), puzz_a))
 
-        x = ddim.step(noise_pred, t, x).prev_sample
+        x = active_sched.step(noise_pred, t, x).prev_sample
 
     result: dict = {"generated": x.clamp(0.0, 1.0)}
     if has_logits:
