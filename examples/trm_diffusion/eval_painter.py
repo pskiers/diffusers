@@ -206,6 +206,7 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
 
     # For DDPM sampling, num_steps equals num_train_timesteps (full chain).
     sample_steps = args.num_train_timesteps if use_ddpm else n_steps
+    schedule_segments = None if (use_ddpm or not args.schedule_segments) else args.schedule_segments
 
     classifier = load_or_train_classifier(
         args.classifier_path,
@@ -261,6 +262,7 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
                 solutions=sols,
                 painter_size=painter_size,
                 given_masks=given_masks,
+                schedule_segments=schedule_segments,
             )
 
         acc = evaluate_grids(sr["generated"], sols, classifier, args.cell_size,
@@ -311,6 +313,7 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
                     solutions=sols,
                     painter_size=painter_size,
                     given_masks=given_masks,
+                    schedule_segments=schedule_segments,
                 )
             acc_r = evaluate_grids(sr_r["generated"], sols, classifier, args.cell_size,
                                    given_masks=given_masks)
@@ -376,7 +379,13 @@ def parse_args():
     p.add_argument("--sampler",    default="ddim", choices=["ddim", "ddpm"],
                    help="ddim = DDIM with --num_steps; ddpm = full DDPM chain")
     p.add_argument("--num_steps",  type=int, default=20,
-                   help="DDIM denoising steps (ignored for ddpm)")
+                   help="DDIM denoising steps (ignored for ddpm and --schedule_segments)")
+    p.add_argument("--schedule_segments", type=str, nargs="+", default=None,
+                   metavar="N:K",
+                   help="Multi-phase DDIM schedule. Each token 'N:K' takes the first K steps "
+                        "from an N-step DDIM schedule, continuing from where the previous "
+                        "segment left off. E.g. '10:1 100:99' does 1 coarse step then 99 fine "
+                        "steps. Overrides --num_steps when set.")
     p.add_argument("--num_samples", type=int, default=512,
                    help="Total samples for eval")
     p.add_argument("--batch_size",  type=int, default=64)
