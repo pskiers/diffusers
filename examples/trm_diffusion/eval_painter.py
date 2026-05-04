@@ -165,11 +165,13 @@ def build_model(args) -> torch.nn.Module:
                 img_thinker_kwargs = {k: v for k, v in img_thinker_kwargs.items() if k != "seq_len"}
             model = cls(**extra, **img_painter_kwargs, **img_thinker_kwargs)
         else:
+            v1_kwargs = {}
+            if args.painter_variant == "v1":
+                v1_kwargs = dict(enc_timestep_cond=False, thinker_timestep_cond=False)
             model = cls(
                 num_classes=args.num_classes,
                 thinker_out_channels=args.thinker_out_channels,
-                enc_timestep_cond=False,
-                thinker_timestep_cond=False,
+                **v1_kwargs,
                 **img_painter_kwargs, **img_thinker_kwargs,
             )
 
