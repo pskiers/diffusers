@@ -1001,7 +1001,12 @@ def main(cfg: DictConfig):
     if cfg.get("compile", False):
         if mode == "sudoku":
             model.inner.L_level = torch.compile(model.inner.L_level, fullgraph=False)
-        elif mode in (*_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
+        elif mode in _STANDALONE_PAINTER_MODES:
+            model.painter = torch.compile(model.painter)
+            if model.bridge is not None:
+                model.bridge = torch.compile(model.bridge)
+        elif mode == "thinker_frozen_painter":
+            model.thinker.inner.L_level = torch.compile(model.thinker.inner.L_level, fullgraph=False)
             model.painter = torch.compile(model.painter)
             if model.bridge is not None:
                 model.bridge = torch.compile(model.bridge)
