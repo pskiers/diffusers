@@ -386,7 +386,7 @@ def _apply_noisy_swap(images: torch.Tensor, noisy: torch.Tensor,
     swap     = (eligible & draw).nonzero(as_tuple=True)[0]   # indices to swap
 
     if swap.numel() == 0:
-        return noisy
+        return noisy, swap
 
     noisy = noisy.clone()
     # Pick a different image for each swap candidate (cyclic shift avoids self-swap)
@@ -398,7 +398,25 @@ def _apply_noisy_swap(images: torch.Tensor, noisy: torch.Tensor,
         timesteps[swap],                                      # exact same timestep
     )
     noisy[swap] = alt_noisy
-    return noisy
+    return noisy, swap
+
+
+def _fix_swap_target(images, noisy, noise, swap, timesteps, scheduler):
+    """For eps prediction, correct the target for swapped samples.
+
+    After noisy[swap] = alt_noisy, the target must be the virtual noise that
+    would denoise alt_noisy toward x_clean_initial (images[swap]):
+        eps* = (x_noisy_swapped - sqrt(alpha_bar_t) * x_clean_initial) / sqrt(1 - alpha_bar_t)
+    For x0 prediction no fix is needed: target = images is already x_clean_initial.
+    """
+    if swap.numel() == 0 or scheduler.config.prediction_type != "epsilon":
+        return noise
+    alpha_bar = scheduler.alphas_cumprod.to(noisy.device)[timesteps[swap]]
+    sqrt_ab   = alpha_bar.sqrt().view(-1, 1, 1, 1)
+    sqrt_1_ab = (1 - alpha_bar).sqrt().view(-1, 1, 1, 1)
+    target = noise.clone()
+    target[swap] = (noisy[swap] - sqrt_ab * images[swap]) / sqrt_1_ab
+    return target
 
 
 def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size):
@@ -419,8 +437,9 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,),
                                   device=device, dtype=torch.long)
         noisy  = scheduler.add_noise(images, noise, timesteps)
-        noisy  = _apply_noisy_swap(images, noisy, timesteps, scheduler, cfg)
+        noisy, swap = _apply_noisy_swap(images, noisy, timesteps, scheduler, cfg)
         target = noise if scheduler.config.prediction_type == "epsilon" else images
+        target = _fix_swap_target(images, noisy, target, swap, timesteps, scheduler)
         z_H, z_L = model.get_initial_states(bsz)
 
         mb_data.append({
@@ -713,7 +732,9 @@ def train_step_standalone_painter(
         timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,),
                                   device=device, dtype=torch.long)
         noisy     = scheduler.add_noise(images, noise, timesteps)
+        noisy, swap = _apply_noisy_swap(images, noisy, timesteps, scheduler, cfg)
         target    = noise if scheduler.config.prediction_type == "epsilon" else images
+        target    = _fix_swap_target(images, noisy, target, swap, timesteps, scheduler)
 
         noise_pred, _ = model(noisy, timesteps, solution_tokens)
         diff_loss = F.mse_loss(noise_pred.float(), target)
