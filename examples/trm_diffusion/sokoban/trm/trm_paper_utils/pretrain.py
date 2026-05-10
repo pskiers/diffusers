@@ -20,10 +20,10 @@ import pydantic
 from omegaconf import DictConfig
 from torch.optim import AdamW
 
-from .puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
-from .utils.functions import load_model_class, get_model_source_path
-from .models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from .models.ema import EMAHelper
+from sokoban.trm.trm_paper_utils.puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from sokoban.trm.trm_paper_utils.utils.functions import load_model_class, get_model_source_path
+from sokoban.trm.trm_paper_utils.models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from sokoban.trm.trm_paper_utils.models.ema import EMAHelper
 
 
 class LossConfig(pydantic.BaseModel):

@@ -7,8 +7,8 @@ import pydantic
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from models.losses import IGNORE_LABEL_ID
-from dataset.common import PuzzleDatasetMetadata
+from sokoban.trm.trm_paper_utils.models.losses import IGNORE_LABEL_ID
+from sokoban.trm.trm_paper_utils.dataset.common import PuzzleDatasetMetadata
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -164,7 +164,7 @@ class PuzzleDataset(IterableDataset):
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
-    
+
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
             total_examples = len(dataset["inputs"])
@@ -174,10 +174,10 @@ class PuzzleDataset(IterableDataset):
             while start_index < total_examples:
                 # Compute indices
                 end_index = min(total_examples, start_index + self.config.global_batch_size)
-                
+
                 local_start = start_index + self.config.rank * self.local_batch_size
                 local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
-                
+
                 # Get batch of examples, and also puzzle IDs
                 puzzle_indices = []
                 puzzle_index = np.searchsorted(dataset["puzzle_indices"], local_start, side="right") - 1
@@ -186,7 +186,7 @@ class PuzzleDataset(IterableDataset):
                         puzzle_index += 1
 
                     puzzle_indices.append(puzzle_index)
-                
+
                 batch = self._collate_batch({
                     "inputs": dataset["inputs"][local_start: local_end],
                     "labels": dataset["labels"][local_start: local_end],
@@ -194,7 +194,7 @@ class PuzzleDataset(IterableDataset):
                 })
 
                 yield set_name, batch, end_index - start_index
-                
+
                 # Advance to next batch
                 start_index += self.config.global_batch_size
 
@@ -208,7 +208,7 @@ class PuzzleDataset(IterableDataset):
 
             group_order = np.concatenate([rng.permutation(dataset["group_indices"].size - 1) for _i in range(self.config.epochs_per_iter)])
             start_index = 0
-            
+
             while start_index < group_order.size:
                 start_index, batch_indices, batch_puzzle_indices = _sample_batch(
                     rng,
@@ -235,13 +235,13 @@ class PuzzleDataset(IterableDataset):
                 })
 
                 yield set_name, batch, global_effective_batch_size
-                
+
     def __iter__(self):
         worker_info = get_worker_info()
         assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."
-        
+
         self._lazy_load_dataset()
-        
+
         # Iterate using specified mode
         if self.config.test_set_mode:
             yield from self._iter_test()
