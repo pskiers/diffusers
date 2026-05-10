@@ -10,3 +10,5 @@ L_cycles: 4
 H_cycles: 3
 n_sup: 16
 diff_thinker_weight: 0.0
+cfg_prob: 0.1
+cfg_scale: 2.0

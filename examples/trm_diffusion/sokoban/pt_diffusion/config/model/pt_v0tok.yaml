@@ -11,3 +11,5 @@ H_cycles: 3
 n_sup: 16
 diff_thinker_weight: 0.0
 thinker_bridge_mode: "onehot"
+cfg_prob: 0.1
+cfg_scale: 2.0

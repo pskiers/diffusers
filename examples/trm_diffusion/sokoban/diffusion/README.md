@@ -20,7 +20,7 @@ There are 12 possible combinations for sokoban task.
 All different versions of sokoban boards generation are defined in `configs/models/sokoban_*`, `configs/tasks/*`, `configs/experiment/sokoban.yaml` and `configs/dataset/sokoban.yaml`
 
 ```bash
-python3 train.py experiemnt=sokoban model= task=
+python3 train.py experiment=sokoban model= task=
 
 ```
 

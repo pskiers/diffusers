@@ -1,0 +1,52 @@
+﻿defaults:
+  - optimizer: adamw
+  - lr_scheduler: cosine
+  - dataset: sokoban
+  - model: pt_v0tok
+  - _self_
+  - experiment: null
+
+# Core paths & logging
+output_dir: "pt-diffusion-output"
+logging_dir: "logs"
+logger: "wandb"
+
+# Dataloading
+train_batch_size: 64
+eval_batch_size: 64
+dataloader_num_workers: 4
+epoch_max_batches_train: 1000
+epoch_max_batches_eval: 250
+
+# Training
+num_epochs: 300
+gradient_accumulation_steps: 1
+mixed_precision: "bf16"
+max_grad_norm: 1.0
+
+# Diffusion
+prediction_type: "sample"
+ddpm_num_steps: 1000
+ddpm_beta_schedule: "linear"
+clip_sample_range: 1.0
+
+# Saving
+save_model_epochs: 20
+save_images_epochs: 20
+
+# Sampling
+ddpm_num_inference_steps: 400
+num_samples: 64
+guidance_scale: 2.0
+
+# Optimization
+compile: false
+
+# Pretrained thinker (for V0TOK)
+pretrained_thinker_path: null
+
+# Thinker optimizer overrides (V1/V2 only, LLM-style)
+thinker_optimizer:
+  lr: 1e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1

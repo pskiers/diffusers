@@ -1,4 +1,4 @@
-from sokoban.diffusion.sokoban_dataset_diffusion import SokobanBitDataset, SokobanDataset
+from sokoban.diffusion.sokoban_dataset_diffusion import SokobanBitDataset, SokobanDataset, GroupBatchSampler
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -97,9 +97,14 @@ def get_dataloaders(args):
         train_base_ds = SokobanDataset(
             data_path=args.dataset.train_data_dir,
             k=args.dataset.k,
-            max_trajectories=args.dataset.max_trajectories
+            max_trajectories=args.dataset.max_trajectories,
+            max_boards=getattr(args.dataset, "max_training_boards", None),
         )
-        eval_base_ds = SokobanDataset(data_path=args.dataset.eval_data_dir, k=args.dataset.k)
+        eval_base_ds = SokobanDataset(
+            data_path=args.dataset.eval_data_dir,
+            k=args.dataset.k,
+            max_boards=getattr(args.dataset, "max_validation_boards", None),
+        )
 
         num_bits = args.dataset.input_channels
         clip_range = getattr(args, "clip_sample_range", 1.0)
@@ -138,22 +143,52 @@ def get_dataloaders(args):
         return batch
 
     # 4. Create standard DataLoaders
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
-    eval_dl = DataLoader(
-        eval_ds,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
+    n_workers = args.dataloader_num_workers
+
+    if args.dataset.dataset_type == "sokoban": # Sokoban uses group-based batch sampling (one board per trajectory per batch)
+        train_sampler = GroupBatchSampler(
+            train_base_ds.group_boundaries, batch_size=args.train_batch_size, drop_last=True,
+        )
+        eval_sampler = GroupBatchSampler(
+            eval_base_ds.group_boundaries, batch_size=args.eval_batch_size, drop_last=True,
+        )
+        train_dl = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            num_workers=n_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=(n_workers > 0),
+        )
+        eval_dl = DataLoader(
+            eval_ds,
+            batch_sampler=eval_sampler,
+            num_workers=n_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=(n_workers > 0),
+        )
+    else:
+        train_dl = DataLoader(
+            train_ds,
+            batch_size=args.train_batch_size,
+            shuffle=True,
+            num_workers=n_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=(n_workers > 0),
+        )
+        eval_dl = DataLoader(
+            eval_ds,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            num_workers=n_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            persistent_workers=(n_workers > 0),
+        )
 
     # 5. Wrap with LimitedLoader
     train_dl = LimitedLoader(train_dl, limit_batches=args.epoch_max_batches_train)

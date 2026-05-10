@@ -1,12 +1,59 @@
 from omegaconf import ListConfig
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 import torch
 import numpy as np
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Iterator
 from tqdm import tqdm
 import joblib
 import os
 from glob import glob
+
+
+class GroupBatchSampler(Sampler[list[int]]):
+    """Batch sampler that picks one random board per trajectory per batch.
+
+    Each batch contains ``batch_size`` samples, each from a different trajectory.
+    Trajectories are shuffled every epoch. When all trajectories are exhausted
+    the iterator ends (one epoch = one pass through all groups).
+    """
+
+    def __init__(
+        self,
+        group_boundaries: list[int],
+        batch_size: int,
+        drop_last: bool = True,
+        seed: int = 0,
+    ):
+        self.group_boundaries = group_boundaries
+        self.n_groups = len(group_boundaries) - 1
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = np.random.default_rng(self.seed + self.epoch)
+        group_order = rng.permutation(self.n_groups)
+
+        batch: list[int] = []
+        for g in group_order:
+            lo = self.group_boundaries[g]
+            hi = self.group_boundaries[g + 1]
+            idx = int(rng.integers(lo, hi))
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+
+        if batch and not self.drop_last:
+            yield batch
+
+        self.epoch += 1
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.n_groups // self.batch_size
+        return (self.n_groups + self.batch_size - 1) // self.batch_size
 
 
 class SokobanBitDataset(Dataset):
@@ -57,6 +104,8 @@ class SokobanDataset(Dataset):
         encoding: str = "bits",
         k: Optional[Union[int, List[int]]] = None,
         max_trajectories: Optional[int] = None,
+        max_boards_per_trajectory: int = 50,
+        max_boards: Optional[int] = None,
     ):
         self.data_path = data_path
         if encoding != "bits":
@@ -75,6 +124,8 @@ class SokobanDataset(Dataset):
             self.k_label = None
 
         self.max_trajectories = max_trajectories
+        self.max_boards_per_trajectory = max_boards_per_trajectory
+        self.max_boards = max_boards
 
         self.boards, self.trajectory_start_idx, self.samples = self._load_boards(data_path)
 
@@ -104,10 +155,12 @@ class SokobanDataset(Dataset):
         boards_list = []
         trajectory_start_idx = []
         samples = []    # (board_idx, target_idx, k_value, k_label)
+        group_boundaries = [0]  # cumulative board count per trajectory
 
         current_global_idx = 0
         trajectories_loaded = 0
 
+        rng = np.random.default_rng(42)
         data_dir_files = glob(os.path.join(data_path, "*"))
 
         for f in tqdm(data_dir_files, total=len(data_dir_files), desc="Loading the data"):
@@ -117,33 +170,45 @@ class SokobanDataset(Dataset):
                 trajectory_np = np.argmax(trajectory, axis=3).astype(np.uint8)
                 traj_len = len(trajectory_np)
 
+                # Subsample: take at most max_boards_per_trajectory boards
+                sample_size = min(self.max_boards_per_trajectory, traj_len)
+                selected_indices = rng.choice(traj_len, size=sample_size, replace=False)
+                selected_indices.sort()
+                trajectory_np = trajectory_np[selected_indices]
+
                 boards_list.append(trajectory_np)
                 trajectory_start_idx.append(current_global_idx)
 
                 if self.k is None or self.k == 0:
-                    for i in range(traj_len):
+                    for i in range(sample_size):
                         samples.append(current_global_idx + i)
                 else:
                     k_values = self.k if isinstance(self.k, list) else [self.k]
 
-                    for i in range(traj_len):
+                    for i in range(sample_size):
                         for k_val in k_values:
-                            if i + k_val < traj_len:
+                            if i + k_val < sample_size:
                                 b_idx = current_global_idx + i
                                 t_idx = current_global_idx + i + k_val
                                 k_lbl = self.k_label[k_val] if self.k_label else None
-                                current_step = i
+                                current_step = int(selected_indices[i])
                                 samples.append((b_idx, t_idx, k_val, k_lbl, current_step))
 
-                current_global_idx += traj_len
+                current_global_idx += sample_size
+                group_boundaries.append(current_global_idx)
                 trajectories_loaded += 1
 
                 if self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories:
                     break
+                if self.max_boards is not None and current_global_idx >= self.max_boards:
+                    break
 
             if self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories:
                 break
+            if self.max_boards is not None and current_global_idx >= self.max_boards:
+                break
 
         final_boards = np.concatenate(boards_list, axis=0)
+        self.group_boundaries = group_boundaries
 
         return final_boards, trajectory_start_idx, samples
