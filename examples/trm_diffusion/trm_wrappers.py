@@ -358,6 +358,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         freeze_weights: bool = False,
         # --- bridge & painter ---
         bridge_channels: int = 16,
+        noisy_channels: int = 1,
         painter_channels: tuple = (32, 64, 128),
         painter_layers_per_block: int = 1,
         diff_thinker_weight: float = 1.0,
@@ -424,6 +425,7 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
             bridge_channels=bridge_channels,
             painter_channels=tuple(painter_channels),
             layers_per_block=painter_layers_per_block,
+            image_channels=noisy_channels,
         )
 
     @property
@@ -586,6 +588,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         # --- thinker ---
         num_classes: int = 9,
         cond_channels: int = 1,
+        noisy_channels: int = 1,
         seq_len: int = 81,
         hidden_size: int = 512,
         n_heads: int = 8,
@@ -619,6 +622,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
             painter_size=painter_size,
             cell_size=cell_size,
             vocab_size=num_classes,
+            noisy_channels=noisy_channels,
             seq_len=seq_len,
             hidden_size=hidden_size,
             n_heads=n_heads,

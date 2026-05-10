@@ -199,6 +199,7 @@ def _make_painter(
     bridge_channels: int,
     painter_channels: tuple[int, ...],
     layers_per_block: int = 2,
+    image_channels: int = 1,
 ) -> UNet2DModel:
     """
     Build the denoising UNet.  Uses plain conv blocks throughout (no attention)
@@ -212,8 +213,8 @@ def _make_painter(
         norm_num_groups //= 2
     return UNet2DModel(
         sample_size=painter_size,
-        in_channels=1 + bridge_channels,
-        out_channels=1,
+        in_channels=image_channels + bridge_channels,
+        out_channels=image_channels,
         block_out_channels=painter_channels,
         down_block_types=("DownBlock2D",) * n,
         up_block_types=("UpBlock2D",) * n,
