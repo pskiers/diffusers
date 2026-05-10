@@ -22,13 +22,13 @@ wandb login
 ```
 
 ```bash
-python3 train_pt.py experiment=sokoban_pt model=pt_v0tok
+python3 sokoban.pt_diffusion.train_pt experiment=sokoban_pt model=pt_v0tok
 ```
 
 ```bash
-python3 train_pt.py experiment=sokoban_pt model=pt_v1
+python3 sokoban.pt_diffusion.train_pt experiment=sokoban_pt model=pt_v1
 ```
 
 ```bash
-python3 train_pt.py experiment=sokoban_pt model=pt_v2
+python3 sokoban.pt_diffusion.train_pt experiment=sokoban_pt model=pt_v2
 ```

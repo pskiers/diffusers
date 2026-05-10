@@ -28,11 +28,11 @@ wandb login
 Run
 
 ```bash
-python3 trm/trm_paper_utils/pretrain.py \
+python3 -m sokoban.trm.trm_paper_utils.pretrain \
   arch=trm \
-  data_paths="[../../data]" \
+  data_paths="[sokoban/data]" \
   evaluators="[]" \
-  epochs=5000 \
+  epochs=1000 \
   eval_interval=100 \
   global_batch_size=128 \
   lr=1e-4 \
@@ -40,8 +40,8 @@ python3 trm/trm_paper_utils/pretrain.py \
   arch.L_cycles=6 \
   arch.L_layers=2 \
   arch.halt_max_steps=16 \
-  eval_save_outputs=[logits] \
-  checkpoint_path="/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints" \
+  +eval_save_outputs=[logits] \
+  +checkpoint_path="/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints" \
   ema=True \
   +run_name="trm_sokoban_baseline" \
   +project_name="Sokoban-TRM"

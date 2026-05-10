@@ -585,6 +585,7 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         cell_size: int = 16,
         # --- thinker ---
         num_classes: int = 9,
+        cond_channels: int = 1,
         seq_len: int = 81,
         hidden_size: int = 512,
         n_heads: int = 8,
@@ -644,12 +645,16 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
         )
         self.token_offset = 0
 
+        self.cond_channels = cond_channels
+
         # condition image (B,1,H,W) → (B, enc_channels, grid, grid)
-        self.image_encoder = SpatialEncoder(1, enc_channels, factor=cell_size,
+        self.image_encoder = SpatialEncoder(cond_channels, enc_channels, factor=cell_size,
                                             hidden_channels=tuple(enc_hidden_channels))
         # project enc_channels → hidden_size per cell
-        std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(enc_channels))
-        self.enc_proj = nn.Conv2d(enc_channels, hidden_size, 1)
+        actual_enc_out = cond_channels if cell_size == 1 else enc_channels
+
+        std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(actual_enc_out))
+        self.enc_proj = nn.Conv2d(actual_enc_out, hidden_size, 1)
         nn.init.normal_(self.enc_proj.weight, std=std)
         nn.init.zeros_(self.enc_proj.bias)
 
@@ -752,6 +757,8 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         cell_size: int = 16,
         # --- thinker ---
         num_classes: int = 9,
+        cond_channels: int = 1,
+        noisy_channels: int = 1,
         seq_len: int = 81,
         hidden_size: int = 512,
         n_heads: int = 8,
@@ -788,6 +795,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             painter_size=painter_size,
             cell_size=cell_size,
             num_classes=num_classes,
+            cond_channels=cond_channels,
             thinker_out_channels=thinker_out_channels,
             enc_hidden_channels=enc_hidden_channels,
             seq_len=seq_len,
@@ -814,9 +822,16 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             cfg_scale=cfg_scale,
             painter_dtype=painter_dtype,
         )
+        total_in_channels = cond_channels + noisy_channels
         # Replace 1-channel encoder with 2-channel (condition + noisy)
-        self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size,
+        self.image_encoder = SpatialEncoder(total_in_channels, enc_channels, factor=cell_size,
                                             hidden_channels=tuple(enc_hidden_channels))
+
+        actual_enc_out = total_in_channels if cell_size == 1 else enc_channels
+        std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(actual_enc_out))
+        self.enc_proj = nn.Conv2d(actual_enc_out, hidden_size, 1)
+        nn.init.normal_(self.enc_proj.weight, std=std)
+        nn.init.zeros_(self.enc_proj.bias)
 
         # Timestep conditioning.  Both projections are zero-init so the model
         # starts as the no-timestep identity and gradually learns to use t.
@@ -825,7 +840,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         if enc_timestep_cond or thinker_timestep_cond:
             self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=temb_dim)
         if enc_timestep_cond:
-            self.enc_film = nn.Linear(temb_dim, 2 * enc_channels)
+            self.enc_film = nn.Linear(temb_dim, 2 * actual_enc_out)
             nn.init.zeros_(self.enc_film.weight)
             nn.init.zeros_(self.enc_film.bias)
         if thinker_timestep_cond:
@@ -880,6 +895,8 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
         cell_size: int = 16,
         # --- thinker ---
         thinker_out_channels: int = 16,
+        cond_channels: int = 1,
+        noisy_channels: int = 1,
         seq_len: int = 81,
         hidden_size: int = 512,
         n_heads: int = 8,
@@ -911,6 +928,8 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
             painter_size=painter_size,
             cell_size=cell_size,
             num_classes=thinker_out_channels,
+            cond_channels=cond_channels,
+            noisy_channels=noisy_channels,
             seq_len=seq_len,
             hidden_size=hidden_size,
             n_heads=n_heads,

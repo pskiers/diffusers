@@ -37,3 +37,4 @@ coolname
 triton
 numba
 pydantic-core
+argdantic

@@ -12,3 +12,6 @@ n_sup: 16
 diff_thinker_weight: 1.0
 cfg_prob: 0.1
 cfg_scale: 2.0
+
+cond_channels: 3
+noisy_channels: 3
