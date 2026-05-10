@@ -216,16 +216,25 @@ def cosine_schedule_with_warmup_lr_lambda(
 
 
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
-    # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
-    # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
 
-    return TrainState(
-        step=0,
-        total_steps=total_steps,
+    # FIX: training step from checkpoint
+    start_step = 0
+    if config.load_checkpoint is not None:
+        basename = os.path.basename(config.load_checkpoint)
+        if "step_" in basename:
+            try:
+                start_step = int(basename.split("step_")[1].split("_")[0])
+                if rank == 0:
+                    print(f"Znaleziono stary checkpoint. Wznawianie paska postępu od kroku: {start_step}")
+            except Exception:
+                pass
 
+    return TrainState(
+        step=start_step,
+        total_steps=total_steps,
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
