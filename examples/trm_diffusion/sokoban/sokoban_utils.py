@@ -15,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 
 from data_factory import get_dataloaders
-from .fields_states import FieldStates
+from sokoban.fields_states import FieldStates
 from diffusers.utils import is_accelerate_version
 
 

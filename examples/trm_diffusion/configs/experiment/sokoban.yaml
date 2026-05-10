@@ -20,4 +20,4 @@ clip_sample_range: 1.0
 resume_from_checkpoint: latest
 
 ddpm_num_inference_steps: 400
-output_dir: /net/tscratch/people/plgmgrzanka/${hydra:runtime.choices.model}-${hydra:runtime.choices.task}
+output_dir: /net/tscratch/people/plgmgrzanka/training-outputs/diffusion/${hydra:runtime.choices.model}-${hydra:runtime.choices.task}

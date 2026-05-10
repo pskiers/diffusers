@@ -33,3 +33,7 @@ einops
 timm
 sentencepiece
 adam-atan2-pytorch
+coolname
+triton
+numba
+pydantic-core

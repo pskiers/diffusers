@@ -17,7 +17,7 @@ from argdantic import ArgParser
 from pydantic import BaseModel
 from typing import Literal
 
-from ..fields_states import FieldStates
+from sokoban.fields_states import FieldStates
 
 
 cli = ArgParser()

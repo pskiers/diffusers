@@ -294,8 +294,15 @@ def main(args: DictConfig):
                     accelerator.backward(loss)
                     if getattr(args, 'max_grad_norm', 0) > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    opt_thinker.step(); sched_thinker.step(); opt_thinker.zero_grad()
-                    opt_painter.step(); sched_painter.step(); opt_painter.zero_grad()
+
+                    opt_thinker.step()
+                    sched_thinker.step()
+                    opt_thinker.zero_grad()
+
+                    opt_painter.step()
+                    sched_painter.step()
+                    opt_painter.zero_grad()
+
                     log_metrics.update({"loss_v1_ce": loss_ce.item(), "loss_v1_mse": loss_mse.item()})
 
                 # =========================================================
@@ -311,9 +318,13 @@ def main(args: DictConfig):
                     x0_pred_stage1, _ = base_model(noisy_images, timesteps, blank_condition)
                     loss_stage1 = F.mse_loss(x0_pred_stage1.float(), clean_images.float())
                     accelerator.backward(loss_stage1)
+
                     if getattr(args, 'max_grad_norm', 0) > 0:
                         accelerator.clip_grad_norm_(base_model.thinker.parameters(), args.max_grad_norm)
-                    opt_thinker.step(); sched_thinker.step(); opt_thinker.zero_grad()
+
+                    opt_thinker.step()
+                    sched_thinker.step()
+                    opt_thinker.zero_grad()
                     opt_all.zero_grad()  # Clear stale thinker grads before Stage 2
 
                     # Stage 2: Całość
@@ -326,7 +337,9 @@ def main(args: DictConfig):
                     accelerator.backward(loss_stage2)
                     if getattr(args, 'max_grad_norm', 0) > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    opt_all.step(); sched_all.step(); opt_all.zero_grad()
+                    opt_all.step()
+                    sched_all.step()
+                    opt_all.zero_grad()
 
                     log_metrics.update({"loss_v2_thinker": loss_stage1.item(), "loss_v2_all": loss_stage2.item()})
 
@@ -376,7 +389,6 @@ def main(args: DictConfig):
                 weight_dtype, is_v0tok,
             )
 
-        # 5. Zapis Modelu
         if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):
             unet = accelerator.unwrap_model(model)
             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")

@@ -7,7 +7,7 @@
   - experiment: null
 
 # Core paths & logging
-output_dir: "pt-diffusion-output"
+output_dir: "/net/tscratch/people/plgmgrzanka/training-outputs/pt_diffusion"
 logging_dir: "logs"
 logger: "wandb"
 

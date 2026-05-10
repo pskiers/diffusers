@@ -28,9 +28,7 @@ wandb login
 Run
 
 ```bash
-cd trm_paper_utils
-
-python3 pretrain.py \
+python3 trm/trm_paper_utils/pretrain.py \
   arch=trm \
   data_paths="[../../data]" \
   evaluators="[]" \
@@ -43,7 +41,7 @@ python3 pretrain.py \
   arch.L_layers=2 \
   arch.halt_max_steps=16 \
   eval_save_outputs=[logits] \
-  checkpoint_path="../outputs/checkpoints" \
+  checkpoint_path="/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints" \
   ema=True \
   +run_name="trm_sokoban_baseline" \
   +project_name="Sokoban-TRM"
@@ -52,12 +50,12 @@ python3 pretrain.py \
 ## Run TRM sampling
 
 ```bash
-python3 sample_trm.py \
+python3 trm/sample_trm.py \
   arch.H_cycles=3 \
   arch.L_cycles=6 \
   arch.L_layers=2 \
   arch.halt_max_steps=16 \
-  +checkpoint_path="../outputs/checkpoints/step_XXXXX" \
-  +output_dir="../outputs/samples" \
+  +checkpoint_path="/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints/step_XXXXX" \
+  +output_dir="/net/tscratch/people/plgmgrzanka/training-outputs/trm/samples" \
   +num_samples=10
 ```

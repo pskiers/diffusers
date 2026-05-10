@@ -8,8 +8,8 @@ import pydantic
 from omegaconf import DictConfig, OmegaConf
 
 from trm_paper_utils.utils.functions import load_model_class
-from ..fields_states import FieldStates
-from ..sokoban_utils import SokobanSampler
+from sokoban.fields_states import FieldStates
+from sokoban.sokoban_utils import SokobanSampler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
