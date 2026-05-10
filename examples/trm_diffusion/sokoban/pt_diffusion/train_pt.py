@@ -245,8 +245,6 @@ def main(args: DictConfig):
         for step, batch in SafeIterator(enumerate(train_dl), logger=logger):
             clean_images = batch["images"].to(accelerator.device, dtype=weight_dtype)
 
-            clean_images = clean_images * 2.0 - 1.0
-
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device).long()
@@ -365,7 +363,6 @@ def main(args: DictConfig):
         val_losses = []
         for val_step, batch in SafeIterator(enumerate(eval_dl), logger=logger):
             clean_images = batch["images"].to(accelerator.device, dtype=weight_dtype)
-            clean_images = clean_images * 2.0 - 1.0
 
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
