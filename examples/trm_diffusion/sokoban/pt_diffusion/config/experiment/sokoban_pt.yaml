@@ -5,17 +5,17 @@ defaults:
   - override /dataset: sokoban
   - override /model: pt_v0tok
 
-num_epochs: 300
+num_epochs: 500
 save_model_epochs: 20
 train_batch_size: 64
 eval_batch_size: 64
 clip_sample_range: 1.0
 
 ddpm_num_inference_steps: 400
-output_dir: /net/tscratch/people/plgmgrzanka/outputs/pt_${hydra:runtime.choices.model}
+output_dir: /net/tscratch/people/plgmgrzanka/training-outputs/pt_diffusion/pt_${hydra:runtime.choices.model}
 
 # For V0Tok, pre-trained Thinker
-pretrained_thinker_path: "/net/tscratch/people/plgmgrzanka/outputs/checkpoints/step_XXXXXX"
+pretrained_thinker_path: "/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints/step_XXXXXX"
 
 # Optimization
 compile: true

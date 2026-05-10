@@ -40,7 +40,6 @@ python3 -m sokoban.trm.trm_paper_utils.pretrain \
   arch.L_cycles=6 \
   arch.L_layers=2 \
   arch.halt_max_steps=16 \
-  +eval_save_outputs=[logits] \
   +checkpoint_path="/net/tscratch/people/plgmgrzanka/training-outputs/trm/checkpoints" \
   ema=True \
   +run_name="trm_sokoban_baseline" \

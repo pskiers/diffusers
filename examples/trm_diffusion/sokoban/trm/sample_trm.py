@@ -39,6 +39,7 @@ class SampleConfig(pydantic.BaseModel):
 
 class DummyDatasetArgs:
     num_boxes = 4
+    resolution = 12
     concat_conditioning = False
 
 class DummyArgs:

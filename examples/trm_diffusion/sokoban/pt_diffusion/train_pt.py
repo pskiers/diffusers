@@ -218,7 +218,13 @@ def main(args: DictConfig):
         logger.info("torch.compile applied to thinker.inner.L_level, painter, bridge")
 
     if accelerator.is_main_process and args.logger == "wandb":
-        accelerator.init_trackers("sokoban-painter-thinker", config=OmegaConf.to_container(args, resolve=True))
+        run_name = getattr(args, "run_name", f"pt_run_{os.environ.get('SLURM_JOB_ID', 'local')}")
+
+        accelerator.init_trackers(
+            "sokoban-painter-thinker",
+            config=OmegaConf.to_container(args, resolve=True),
+            init_kwargs={"wandb": {"name": run_name}}
+        )
 
     weight_dtype = torch.float16 if accelerator.mixed_precision == "fp16" else torch.float32
     num_update_steps_per_epoch = math.ceil(len(train_dl) / args.gradient_accumulation_steps)
@@ -238,6 +244,8 @@ def main(args: DictConfig):
 
         for step, batch in SafeIterator(enumerate(train_dl), logger=logger):
             clean_images = batch["images"].to(accelerator.device, dtype=weight_dtype)
+
+            clean_images = clean_images * 2.0 - 1.0
 
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]
@@ -357,6 +365,7 @@ def main(args: DictConfig):
         val_losses = []
         for val_step, batch in SafeIterator(enumerate(eval_dl), logger=logger):
             clean_images = batch["images"].to(accelerator.device, dtype=weight_dtype)
+            clean_images = clean_images * 2.0 - 1.0
 
             noise = torch.randn_like(clean_images)
             bsz = clean_images.shape[0]

@@ -19,11 +19,15 @@ import hydra
 import pydantic
 from omegaconf import DictConfig
 from torch.optim import AdamW
+from torchvision.utils import make_grid
+import math
 
 from sokoban.trm.trm_paper_utils.puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from sokoban.trm.trm_paper_utils.utils.functions import load_model_class, get_model_source_path
 from sokoban.trm.trm_paper_utils.models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from sokoban.trm.trm_paper_utils.models.ema import EMAHelper
+from sokoban.sokoban_utils import SokobanSampler
+from sokoban.trm.sample_trm import DummyArgs
 
 
 class LossConfig(pydantic.BaseModel):
@@ -382,8 +386,8 @@ def evaluate(
 
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
-            if rank == 0:
-                print(f"Processing batch {processed_batches}: {set_name}")
+            # if rank == 0:
+                # print(f"Processing batch {processed_batches}: {set_name}")
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -401,8 +405,8 @@ def evaluate(
                 if all_finish:
                     break
 
-            if rank == 0:
-                print(f"  Completed inference in {inference_steps} steps")
+            # if rank == 0:
+                # print(f"  Completed inference in {inference_steps} steps")
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -462,6 +466,21 @@ def evaluate(
 
             sokoban_eval_metrics = {f"eval_sokoban/{k.split('/')[-1]}": v for k, v in soko_metrics.items()}
             print("Domain metrics computed successfully.")
+
+            try:
+                sampler = SokobanSampler(DummyArgs())
+
+                sampler.all_gen_boards_list = [eval_subset[:64]]
+                rendered = sampler.render_boards()
+
+                n_cols = math.ceil(math.sqrt(len(eval_subset[:64])) * 1.5)
+                grid = make_grid(rendered, nrow=n_cols, padding=2)
+
+                wandb.log({"sokoban_samples": wandb.Image(grid)}, step=train_state.step)
+                print("WandB images logged successfully.")
+            except Exception as e:
+                print(f"Failed to log images to wandb: {e}")
+            # ---------------------------------------------------
 
         del save_preds
 
