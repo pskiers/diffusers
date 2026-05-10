@@ -7,7 +7,7 @@ import hydra
 import pydantic
 from omegaconf import DictConfig, OmegaConf
 
-from trm_paper_utils.utils.functions import load_model_class
+from sokoban.trm.trm_paper_utils.utils.functions import load_model_class
 from sokoban.fields_states import FieldStates
 from sokoban.sokoban_utils import SokobanSampler
 
