@@ -1,0 +1,12 @@
+_target_: trm_wrappers.OriginalTRMRatatouilleV2
+painter_size: 12
+cell_size: 1
+thinker_out_channels: 8 # Wąskie gardło (Bottleneck)
+seq_len: 144
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 4
+H_cycles: 3
+n_sup: 16
+diff_thinker_weight: 1.0

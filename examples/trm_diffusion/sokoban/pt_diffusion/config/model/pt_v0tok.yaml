@@ -1,0 +1,13 @@
+_target_: trm_wrappers.OriginalTRMRatatouilleV0Tok
+painter_size: 12
+cell_size: 1
+vocab_size: 8
+seq_len: 144
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 4
+H_cycles: 3
+n_sup: 16
+diff_thinker_weight: 0.0
+thinker_bridge_mode: "onehot"

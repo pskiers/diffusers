@@ -1,4 +1,4 @@
-from sokoban.sokoban_dataset import SokobanBitDataset, SokobanDataset
+from sokoban.diffusion.sokoban_dataset_diffusion import SokobanBitDataset, SokobanDataset
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms

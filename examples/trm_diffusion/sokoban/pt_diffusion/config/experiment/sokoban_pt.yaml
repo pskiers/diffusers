@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - override /hydra/launcher: basic
+  - override /optimizer: adamw
+  - override /dataset: sokoban
+  - override /model: pt_v0tok # Domyślnie ładuje V0Tok, zmienimy to z konsoli dla V1/V2
+
+num_epochs: 300
+save_model_epochs: 20
+train_batch_size: 64
+eval_batch_size: 64
+clip_sample_range: 1.0
+
+ddpm_num_inference_steps: 400
+output_dir: /net/tscratch/people/plgmgrzanka/outputs/pt_${hydra:runtime.choices.model}
+
+# Ścieżka do nagiego mózgu wyuczonego w pretrain.py (Wymagane dla V0Tok)
+pretrained_thinker_path: "/net/tscratch/people/plgmgrzanka/outputs/checkpoints/step_XXXXXX"

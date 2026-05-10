@@ -13,22 +13,10 @@ import json
 from collections import deque
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
+
 from data_factory import get_dataloaders
+from .fields_states import FieldStates
 from diffusers.utils import is_accelerate_version
-
-
-class FieldStates(Enum):
-    WALL = (0, "wall.png")
-    FLOOR = (1, "floor.png")
-    BOX_TARGET = (2, "box_target.png")
-    BOX_ON_TARGET = (3, "box_on_target.png")
-    BOX = (4, "box.png")
-    PLAYER = (5, "player.png")
-    PLAYER_ON_TARGET = (6, "player_on_target.png")
-
-    def __init__(self, id: int, asset_file_name: str):
-        self.id = id
-        self.asset_file_name = asset_file_name
 
 
 class SokobanSampler:
@@ -506,7 +494,7 @@ class SokobanEvaluator:
             return False
 
         if is_val['is_valid']:
-            return 1.0 if is_solvable(board, max_states=1000) else 0.0
+            return 1.0 if is_solvable(board, max_states=5000) else 0.0
         return 0.0
 
     def _accumulate_metrics(self, metrics):

@@ -1,0 +1,12 @@
+_target_: trm_wrappers.OriginalTRMRatatouilleV1
+painter_size: 12
+cell_size: 1
+num_classes: 8
+seq_len: 144
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 4
+H_cycles: 3
+n_sup: 16
+diff_thinker_weight: 0.0
