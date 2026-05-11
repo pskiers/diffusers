@@ -475,6 +475,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
     clf_w    = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
     clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
     use_clf  = (clf_w > 0.0 and classifier is not None)
+    cell_size = int(cfg.data.cell_size)
 
     # Pre-process: sample noise, build carry state for each micro-batch
     mb_data = []
@@ -539,7 +540,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
             if use_clf:
                 x0_pred  = _x0_from_noise_pred(noise_pred, d["noisy"], d["timesteps"], scheduler)
                 clf_loss = _classifier_loss_on_x0(
-                    x0_pred, d["solution"], d["timesteps"], model.cell_size, classifier, clf_t_max,
+                    x0_pred, d["solution"], d["timesteps"], cell_size, classifier, clf_t_max,
                 )
                 step_loss      = step_loss + clf_w * clf_loss
                 total_clf_loss += clf_loss.item()
@@ -803,6 +804,7 @@ def train_step_standalone_painter(
     clf_w   = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
     clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
     use_clf = (clf_w > 0.0 and classifier is not None)
+    cell_size = int(cfg.data.cell_size)
 
     total_diff_loss = 0.0
     total_clf_loss  = 0.0
@@ -832,7 +834,7 @@ def train_step_standalone_painter(
         if use_clf:
             x0_pred  = _x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler)
             clf_loss = _classifier_loss_on_x0(
-                x0_pred, solution, timesteps, model.cell_size, classifier, clf_t_max,
+                x0_pred, solution, timesteps, cell_size, classifier, clf_t_max,
             )
             step_loss       = step_loss + clf_w * clf_loss
             total_clf_loss += clf_loss.item()
