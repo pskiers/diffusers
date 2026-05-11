@@ -419,6 +419,52 @@ def _fix_swap_target(images, noisy, noise, swap, timesteps, scheduler):
     return target
 
 
+def _x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler):
+    """Differentiably recover x0_pred from model output.
+
+    Supports epsilon and x0 prediction types.  Result is clamped to [0, 1]
+    (the image range used in this codebase) so it can be fed to the classifier.
+    """
+    pt = scheduler.config.prediction_type
+    if pt == "epsilon":
+        alpha_bar = scheduler.alphas_cumprod.to(noisy.device)[timesteps]
+        sqrt_ab   = alpha_bar.sqrt().view(-1, 1, 1, 1)
+        sqrt_1_ab = (1 - alpha_bar).sqrt().view(-1, 1, 1, 1)
+        x0 = (noisy - sqrt_1_ab * noise_pred.float()) / sqrt_ab
+    elif pt == "sample":
+        x0 = noise_pred.float()
+    else:
+        raise ValueError(f"Unsupported prediction_type for classifier loss: {pt}")
+    return x0.clamp(0.0, 1.0)
+
+
+def _classifier_loss_on_x0(x0_pred, solution, timesteps, cell_size, classifier, t_max):
+    """Cross-entropy loss between classifier predictions on x0_pred patches and solution.
+
+    Only applied to samples with timestep < t_max.
+    x0_pred:   (B, 1, H, W) float in [0, 1]
+    solution:  (B, 81) int64 in [0, 8]  (IGNORE_LABEL_ID for given cells)
+    Returns scalar loss (0 if no eligible samples).
+    """
+    eligible = (timesteps < t_max).nonzero(as_tuple=True)[0]
+    if eligible.numel() == 0:
+        return x0_pred.sum() * 0.0  # differentiable zero
+
+    x0_sel = x0_pred[eligible]                         # (N, 1, H, W)
+    sol_sel = solution[eligible].to(x0_pred.device)    # (N, 81)
+
+    N = x0_sel.shape[0]
+    cells = (x0_sel
+             .unfold(2, cell_size, cell_size)
+             .unfold(3, cell_size, cell_size))          # (N, 1, 9, 9, cell, cell)
+    cells = cells.permute(0, 2, 3, 1, 4, 5).contiguous().reshape(N * 81, 1, cell_size, cell_size)
+
+    logits = classifier(cells)                         # (N*81, 9)
+    labels = sol_sel.reshape(N * 81)                   # 0-8, IGNORE_LABEL_ID for blanks
+
+    return F.cross_entropy(logits, labels, ignore_index=IGNORE_LABEL_ID)
+
+
 def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size):
     K = len(micro_batches)
     device = accelerator.device
@@ -715,17 +761,32 @@ def train_step_painter_two_stage(
 
 def train_step_standalone_painter(
     model, micro_batches, scheduler, accelerator, optimizers, base_lrs,
-    global_step, cfg, ema_helper, global_batch_size,
+    global_step, cfg, ema_helper, global_batch_size, classifier=None,
 ):
-    """Single-stage training for StandalonePainter (no thinker)."""
+    """Single-stage training for StandalonePainter (no thinker).
+
+    Optional losses controlled by cfg.train:
+      mse_loss_weight   (float, default 1.0) – weight on diffusion MSE loss; set to 0 to disable.
+      classifier_loss:
+        weight  (float, default 0.0) – weight on classifier CE loss; 0 = disabled.
+        t_max   (int,   default 200) – only apply classifier loss when timestep < t_max.
+    """
     K = len(micro_batches)
     device = accelerator.device
 
+    mse_w   = float(cfg.train.get("mse_loss_weight", 1.0))
+    clf_cfg = cfg.train.get("classifier_loss", None)
+    clf_w   = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
+    clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
+    use_clf = (clf_w > 0.0 and classifier is not None)
+
     total_diff_loss = 0.0
+    total_clf_loss  = 0.0
 
     for mb in micro_batches:
-        images         = mb["images"].to(device)
-        solution_tokens = _solution_tokens(mb["solution"].to(device))
+        images          = mb["images"].to(device)
+        solution        = mb["solution"].to(device)      # (B, 81) int64  0-8
+        solution_tokens = _solution_tokens(solution)
 
         bsz       = images.shape[0]
         noise     = torch.randn_like(images)
@@ -737,9 +798,22 @@ def train_step_standalone_painter(
         target    = _fix_swap_target(images, noisy, target, swap, timesteps, scheduler)
 
         noise_pred, _ = model(noisy, timesteps, solution_tokens)
-        diff_loss = F.mse_loss(noise_pred.float(), target)
-        accelerator.backward(diff_loss / (global_batch_size * K))
-        total_diff_loss += diff_loss.item()
+
+        step_loss = torch.tensor(0.0, device=device)
+        if mse_w > 0.0:
+            diff_loss  = F.mse_loss(noise_pred.float(), target)
+            step_loss  = step_loss + mse_w * diff_loss
+            total_diff_loss += diff_loss.item()
+
+        if use_clf:
+            x0_pred  = _x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler)
+            clf_loss = _classifier_loss_on_x0(
+                x0_pred, solution, timesteps, model.cell_size, classifier, clf_t_max,
+            )
+            step_loss       = step_loss + clf_w * clf_loss
+            total_clf_loss += clf_loss.item()
+
+        accelerator.backward(step_loss / (global_batch_size * K))
 
     accelerator.clip_grad_norm_(model.parameters(), 1.0)
     lr = _apply_lr_and_step(optimizers, base_lrs, global_step, cfg)
@@ -748,7 +822,10 @@ def train_step_standalone_painter(
         ema_helper.update(model)
     global_step += 1
 
-    return {"diff_loss": total_diff_loss / K}, lr, global_step
+    losses = {"diff_loss": total_diff_loss / K}
+    if use_clf:
+        losses["clf_loss"] = total_clf_loss / K
+    return losses, lr, global_step
 
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
@@ -853,16 +930,23 @@ def main(cfg: DictConfig):
     )
 
     # ── MNIST cell classifier (painter / standalone_painter mode, opt-in) ────
+    # Loaded on all ranks when used as a training loss (classifier_loss.weight > 0),
+    # otherwise main-process only (eval use only).
     classifier = None
-    if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter") and accelerator.is_main_process:
+    if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
         classifier_path = cfg.train.get("eval_classifier_path", None)
-        if classifier_path:
+        clf_train_w = float(cfg.train.get("classifier_loss", {}).get("weight", 0.0))
+        load_on_this_rank = accelerator.is_main_process or clf_train_w > 0.0
+        if classifier_path and load_on_this_rank:
             classifier = load_or_train_classifier(
                 classifier_path,
                 cfg.data.mnist_root,
                 cell_size,
                 accelerator.device,
             )
+            # Freeze: gradients flow through inputs (for training loss) but not weights.
+            for p in classifier.parameters():
+                p.requires_grad_(False)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     t = cfg.thinker
@@ -1112,6 +1196,7 @@ def main(cfg: DictConfig):
             losses, lr, global_step = train_step_standalone_painter(
                 unwrapped, micro_batches, scheduler, accelerator, optimizers, base_lrs,
                 global_step, cfg, ema_helper, global_batch_size,
+                classifier=classifier,
             )
             log_dict = {f"train/{k}": v for k, v in losses.items()}
             log_dict["train/lr"] = lr

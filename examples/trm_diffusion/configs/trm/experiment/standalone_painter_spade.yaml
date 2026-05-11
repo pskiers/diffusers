@@ -33,3 +33,9 @@ train:
   eval_every: 2000
   save_every: 10000
   gradient_accumulation_steps: 2
+  sudoku_loss_weight: 0.0
+  mse_loss_weight: 1.0
+  eval_classifier_path: null
+  classifier_loss:
+    weight: 0.0
+    t_max: 200
