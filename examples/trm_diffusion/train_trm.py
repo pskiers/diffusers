@@ -1181,6 +1181,10 @@ def main(cfg: DictConfig):
         global_step = int(ckpt["step"])
         if ema_helper is not None and ckpt.get("ema_state") is not None:
             ema_helper.load_state_dict(ckpt["ema_state"])
+            # Shadow tensors come back as CPU tensors from the checkpoint; move
+            # them to the same device as the model (already on GPU after prepare).
+            for k in ema_helper.shadow:
+                ema_helper.shadow[k] = ema_helper.shadow[k].to(accelerator.device)
         logger.info(f"Resumed from {resume_path} at step {global_step}"
                     + ("" if load_opt else " (optimizer state NOT loaded)"))
 
