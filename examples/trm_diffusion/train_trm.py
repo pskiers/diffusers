@@ -1039,6 +1039,7 @@ def main(cfg: DictConfig):
         model = ThinkerWithFrozenPainter(
             painter=frozen_painter,
             thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
+            adapter_in_channels=int(p.get("adapter_in_channels", 0)),
             **thinker_kwargs,
         )
     elif painter_variant == "v0tok":
@@ -1169,15 +1170,19 @@ def main(cfg: DictConfig):
     # ── Resume ────────────────────────────────────────────────────────────────
     global_step = 0
     resume_path = cfg.get("resume_from_checkpoint", None)
+    load_opt    = cfg.get("load_optimizer_state", True)
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
-        accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"])
-        for opt, sd in zip(optimizers, ckpt["optimizer_states"]):
-            opt.load_state_dict(sd)
+        accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"], strict=False)
+        if load_opt and ckpt.get("optimizer_states"):
+            opt_states = ckpt["optimizer_states"]
+            for opt, sd in zip(optimizers, opt_states):
+                opt.load_state_dict(sd)
         global_step = int(ckpt["step"])
         if ema_helper is not None and ckpt.get("ema_state") is not None:
             ema_helper.load_state_dict(ckpt["ema_state"])
-        logger.info(f"Resumed from {resume_path} at step {global_step}")
+        logger.info(f"Resumed from {resume_path} at step {global_step}"
+                    + ("" if load_opt else " (optimizer state NOT loaded)"))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     num_steps        = cfg.train.num_steps

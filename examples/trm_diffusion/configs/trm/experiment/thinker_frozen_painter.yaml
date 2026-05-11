@@ -20,6 +20,7 @@ painter:
   painter_channels: [32, 64, 64]
   painter_layers_per_block: 2
   thinker_bridge_mode: "logits"
+  adapter_in_channels: 0      # 0 = use bridge's native channel count; set to N to project thinker logits to N channels and replace bridge first conv
   dtype: bfloat16
   painter_checkpoint: null   # REQUIRED: path to StandalonePainter checkpoint
 
