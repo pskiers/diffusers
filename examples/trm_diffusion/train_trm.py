@@ -1179,12 +1179,23 @@ def main(cfg: DictConfig):
             for opt, sd in zip(optimizers, opt_states):
                 opt.load_state_dict(sd)
         global_step = int(ckpt["step"])
-        if ema_helper is not None and ckpt.get("ema_state") is not None:
-            ema_helper.load_state_dict(ckpt["ema_state"])
-            # Shadow tensors come back as CPU tensors from the checkpoint; move
-            # them to the same device as the model (already on GPU after prepare).
-            for k in ema_helper.shadow:
-                ema_helper.shadow[k] = ema_helper.shadow[k].to(accelerator.device)
+        if ema_helper is not None:
+            if load_opt and ckpt.get("ema_state") is not None:
+                ema_helper.load_state_dict(ckpt["ema_state"])
+                # Shadow tensors come back as CPU tensors from the checkpoint; move
+                # them to the same device as the model (already on GPU after prepare).
+                for k in ema_helper.shadow:
+                    ema_helper.shadow[k] = ema_helper.shadow[k].to(accelerator.device)
+            else:
+                # Optimizer state not loaded (e.g. architecture change) — skip EMA
+                # state too (keys may not match) and re-sync shadow from the model
+                # weights that were just loaded from the checkpoint.
+                unwrapped = accelerator.unwrap_model(model)
+                ema_helper.shadow = {
+                    name: param.data.clone()
+                    for name, param in unwrapped.named_parameters()
+                    if param.requires_grad
+                }
         logger.info(f"Resumed from {resume_path} at step {global_step}"
                     + ("" if load_opt else " (optimizer state NOT loaded)"))
 
