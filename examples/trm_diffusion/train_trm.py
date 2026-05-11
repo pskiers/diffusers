@@ -371,12 +371,13 @@ def _apply_noisy_swap(images: torch.Tensor, noisy: torch.Tensor,
 
     Config: train.noisy_swap.{prob, t_min, t_max}
     """
+    _empty_swap = torch.zeros(0, dtype=torch.long, device=images.device)
     swap_cfg = cfg.train.get("noisy_swap", None)
     if swap_cfg is None:
-        return noisy
+        return noisy, _empty_swap
     prob = float(swap_cfg.get("prob", 0.0))
     if prob <= 0.0:
-        return noisy
+        return noisy, _empty_swap
     t_min = int(swap_cfg.get("t_min", 0))
     t_max = int(swap_cfg.get("t_max", cfg.num_timesteps - 1))
 
