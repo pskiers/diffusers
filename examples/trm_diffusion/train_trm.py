@@ -466,10 +466,15 @@ def _classifier_loss_on_x0(x0_pred, solution, timesteps, cell_size, classifier, 
     return F.cross_entropy(logits, labels, ignore_index=IGNORE_LABEL_ID)
 
 
-def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size):
+def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size, classifier=None):
     K = len(micro_batches)
     device = accelerator.device
     sudoku_w = cfg.train.sudoku_loss_weight
+    mse_w    = float(cfg.train.get("mse_loss_weight", 1.0))
+    clf_cfg  = cfg.train.get("classifier_loss", None)
+    clf_w    = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
+    clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
+    use_clf  = (clf_w > 0.0 and classifier is not None)
 
     # Pre-process: sample noise, build carry state for each micro-batch
     mb_data = []
@@ -491,6 +496,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
         mb_data.append({
             "condition":  condition,
+            "solution":   solution,
             "ce_labels":  _make_ce_labels(solution, model),
             "puzzle_ids": puzzle_ids,
             "noisy":      noisy,
@@ -502,6 +508,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
     total_diff_loss   = 0.0
     total_sudoku_loss = 0.0
+    total_clf_loss    = 0.0
     lr = None
 
     for _ in range(model.n_sup):
@@ -510,7 +517,13 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
                 d["condition"], d["noisy"], d["z_H"], d["z_L"],
                 d["timesteps"], d["puzzle_ids"],
             )
-            diff_loss = F.mse_loss(noise_pred.float(), d["target"])
+
+            step_loss = torch.tensor(0.0, device=device)
+
+            if mse_w > 0.0:
+                diff_loss  = F.mse_loss(noise_pred.float(), d["target"])
+                step_loss  = step_loss + mse_w * diff_loss
+                total_diff_loss += diff_loss.item()
 
             sudoku_loss = torch.tensor(0.0, device=device)
             if logits is not None and sudoku_w > 0:
@@ -520,11 +533,18 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
                     d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
                     ignore_index=IGNORE_LABEL_ID,
                 )
+                step_loss = step_loss + sudoku_w * sudoku_loss
+                total_sudoku_loss += sudoku_loss.item()
 
-            step_loss = diff_loss + sudoku_w * sudoku_loss
+            if use_clf:
+                x0_pred  = _x0_from_noise_pred(noise_pred, d["noisy"], d["timesteps"], scheduler)
+                clf_loss = _classifier_loss_on_x0(
+                    x0_pred, d["solution"], d["timesteps"], model.cell_size, classifier, clf_t_max,
+                )
+                step_loss      = step_loss + clf_w * clf_loss
+                total_clf_loss += clf_loss.item()
+
             accelerator.backward(step_loss / (global_batch_size * K))
-            total_diff_loss   += diff_loss.item()
-            total_sudoku_loss += sudoku_loss.item()
 
         # Clip thinker and painter separately, matching train_mnist_sudoku.py
         accelerator.clip_grad_norm_(model.get_thinker_params(), 1.0)
@@ -536,7 +556,10 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
         global_step += 1
 
     n = model.n_sup * K
-    return {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}, lr, global_step
+    losses = {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}
+    if use_clf:
+        losses["clf_loss"] = total_clf_loss / n
+    return losses, lr, global_step
 
 
 def _get_condition(mb: dict, model, device) -> torch.Tensor:
@@ -1205,6 +1228,7 @@ def main(cfg: DictConfig):
             losses, lr, global_step = train_step_painter(
                 unwrapped, micro_batches, scheduler, accelerator, optimizers, base_lrs,
                 global_step, cfg, ema_helper, global_batch_size,
+                classifier=classifier,
             )
             log_dict = {f"train/{k}": v for k, v in losses.items()}
             log_dict["train/lr"] = lr
