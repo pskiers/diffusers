@@ -67,6 +67,8 @@ def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(args: DictConfig):
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
     # ---------------------------------------------------------
     # 1. Setup Accelerator & Loggers
     # ---------------------------------------------------------
@@ -135,6 +137,8 @@ def main(args: DictConfig):
     train_dl, eval_dl = get_dataloaders(args)
 
     model = instantiate(args.model, _convert_="all")
+    if hasattr(model, "core_model"):
+        model.core_model = torch.compile(model.core_model, mode="reduce-overhead")
 
     # Enable xformers
     if args.enable_xformers_memory_efficient_attention:
@@ -267,13 +271,17 @@ def main(args: DictConfig):
     )
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
-    mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
+    # mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
+
+    total_optimization_steps = (len(train_dl) // args.gradient_accumulation_steps) * args.num_epochs
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler.name,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_scheduler.warmup_steps * args.gradient_accumulation_steps * mult,
-        num_training_steps=len(train_dl) * args.num_epochs * mult,
+        # num_warmup_steps=args.lr_scheduler.warmup_steps * args.gradient_accumulation_steps * mult,
+        # num_training_steps=len(train_dl) * args.num_epochs * mult,
+        num_warmup_steps=args.lr_scheduler.warmup_steps,
+        num_training_steps=total_optimization_steps,
     )
 
     if hasattr(model, "get_trainable_modules"):
@@ -292,7 +300,7 @@ def main(args: DictConfig):
         tracker_config["total_params"] = total_params
         tracker_config["trainable_params"] = trainable_params
         accelerator.init_trackers(
-            project_name="small-llm-diffusion",
+            project_name="TRM-Diffusion",
             config=tracker_config,
             init_kwargs={"wandb": {"name": args.output_dir}} if args.logger == "wandb" else {},
         )
@@ -410,9 +418,21 @@ def main(args: DictConfig):
 
                     loss_full = None
 
-                    for n_step in range(get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)):
+                    (x_high, enc_hs, ts, embedded_ts,
+                    class_labels, enc_mask, autocast_ctx) = base_model.encode_features(
+                        latent_model_input, timesteps, model_cond, mask
+                    )
+
+                    n_sup_current = get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)
+                    for n_step in range(n_sup_current):
                         # with accelerator.autocast():
-                        model_output, y, z = base_model.reasoning_step(latent_model_input, y, z, timesteps, model_cond, mask)
+                        y_final_high, y, z = base_model.reasoning_core(
+                            x_high, y, z, enc_hs, ts, class_labels, enc_mask, autocast_ctx
+                        )
+                        model_output = base_model.decode_features(
+                            y_final_high, ts, class_labels, embedded_ts, autocast_ctx
+                        )
+
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
                         loss = loss if not args.trm_loss_nsup_decay else loss * (args.trm_loss_nsup_decay**n_step)
 
@@ -433,7 +453,8 @@ def main(args: DictConfig):
                             loss_full = loss_full + loss if loss_full is not None else loss
 
                     if not args.grad_every_n_sup:
-                        accelerator.backward(loss)
+                        final_loss = loss_full / n_sup_current
+                        accelerator.backward(final_loss)
                         if accelerator.sync_gradients:
                             if hasattr(base_model, "get_trainable_modules"):
                                 params_to_clip = []

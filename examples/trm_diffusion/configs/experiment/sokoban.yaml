@@ -4,20 +4,26 @@ defaults:
   - override /optimizer: adamw
   - override /dataset: sokoban
   - override /task: sokoban_uncond
-  - override /model: sokoban_unet_trm
+  - override /model: sokoban_vit_trm
 
-phases: [90000, 180000, 300001] # 0.3*300000, 0.6*300000
-n_sup_phases: [1, 2, 3]
+# ~900k total steps:
+phases: [150000, 300000, 500000, 750000]
+n_sup_phases: [1, 2, 4, 8]
 
-num_epochs: 300
-save_model_epochs: 75
-save_images_epochs: 75
+num_epochs: 600 # 60 * 10^6 / 100 000 [samples in my dataset]= 600
+gradient_accumulation_steps: 12 # 64 * 12 = 768
+save_model_epochs: 100
+save_images_epochs: 100
 train_batch_size: 64
-eval_batch_size: 64 # for validation in training
+eval_batch_size: 10 # for validation in training
 num_samples: 1000
 rescale_betas_zero_snr: true
 clip_sample_range: 1.0
 resume_from_checkpoint: latest
 
-ddpm_num_inference_steps: 400
+ddpm_num_inference_steps: 500
 output_dir: /net/tscratch/people/plgmgrzanka/training-outputs/diffusion/${hydra:runtime.choices.model}-${hydra:runtime.choices.task}
+
+grad_every_n_sup: false
+ema_max_decay: 0.999
+mixed_precision: "bf16"

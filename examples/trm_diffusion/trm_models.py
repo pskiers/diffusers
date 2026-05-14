@@ -614,7 +614,7 @@ class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
         )
         return y_final, y_final.detach(), z_final.detach()
 
-    def reasoning_step(self, x, y, z, timesteps, conditions=None, masks=None):
+    def encode_features(self, x, timesteps, conditions=None, masks=None):
         dtype = x.dtype
         autocast_ctx = (
             torch.autocast(device_type=x.device.type, dtype=dtype)
@@ -627,8 +627,8 @@ class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
         encoder_hidden_states, class_labels = self._prepare_conditions(
             conditions, bs=bsz, device=x.device, model=self._core
         )
-        encoder_attention_mask = masks
 
+        encoder_attention_mask = masks
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(x.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
@@ -637,12 +637,17 @@ class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
             x_high, encoder_hidden_states, ts, embedded_ts = self._core._operate_on_patched_inputs(
                 x, encoder_hidden_states, timestep, None
             )
-        x_high = x_high.to(torch.float32)  # Force state to remain FP32
 
+        x_high = x_high.to(torch.float32) # Force FP32 for latent stability
+        return x_high, encoder_hidden_states, ts, embedded_ts, class_labels, encoder_attention_mask, autocast_ctx
+
+    def reasoning_core(self, x_high, y, z, encoder_hidden_states, ts, class_labels, encoder_attention_mask, autocast_ctx):
         y_final_high, y_next, z_next = self._deep_recursion(
             x_high, y, z, encoder_hidden_states, ts, class_labels, None, encoder_attention_mask, None, autocast_ctx
         )
+        return y_final_high, y_next, z_next
 
+    def decode_features(self, y_final_high, ts, class_labels, embedded_ts, autocast_ctx):
         with autocast_ctx:
             with self._unwrap_first_block(self._core):
                 y_final_4ch = self._core._get_output_for_patched_inputs(
@@ -653,7 +658,7 @@ class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
                     height=self.h_p,
                     width=self.w_p,
                 )
-        return y_final_4ch, y_next, z_next
+        return y_final_4ch
 
     def __call__(
         self,
@@ -673,59 +678,30 @@ class DiTTRMv2(DiTUtilsMixin, ExtraModulesMixin, BaseIterativeStrategy):
         )
 
         bsz = sample.shape[0]
-        timestep = self._format_timestep(timestep, bsz, sample.device)
         y, z = self.get_initial_states(bsz)
-
-        conditions = class_labels if class_labels is not None else encoder_hidden_states
-        encoder_hidden_states, class_labels = self._prepare_conditions(
-            conditions, bs=bsz, device=sample.device, model=self._core
-        )
 
         # If train.py passed the sequence mask into attention_mask, reroute it to cross-attention.
         if attention_mask is not None and encoder_attention_mask is None:
             encoder_attention_mask = attention_mask
             attention_mask = None
 
-        # Process standard self-attention mask (now safely None for CLEVR)
-        if attention_mask is not None and attention_mask.ndim == 2:
-            attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
-            attention_mask = attention_mask.unsqueeze(1)
+        conditions = class_labels if class_labels is not None else encoder_hidden_states
 
-        # Process cross-attention mask (now properly holding the CLEVR sequence mask)
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (1 - encoder_attention_mask.to(sample.dtype)) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+        # 1. ENCODE (Raz na krok dyfuzji)
+        x_high, enc_hs, ts, embedded_ts, class_labels, enc_mask, autocast_ctx = self.encode_features(
+            sample, timestep, conditions, encoder_attention_mask
+        )
 
-        with autocast_ctx:
-            x_high, encoder_hidden_states, ts, embedded_ts = self._core._operate_on_patched_inputs(
-                sample, encoder_hidden_states, timestep, None
-            )
-        x_high = x_high.to(torch.float32)
-
+        # 2. REASONING LOOP (Głęboki nadzór w trybie inferencji)
         for _ in range(self.n_sup):
-            y_final_high, y, z = self._deep_recursion(
-                x_high,
-                y,
-                z,
-                encoder_hidden_states,
-                ts,
-                class_labels,
-                attention_mask,
-                encoder_attention_mask,
-                None,
-                autocast_ctx,
+            y_final_high, y, z = self.reasoning_core(
+                x_high, y, z, enc_hs, ts, class_labels, enc_mask, autocast_ctx
             )
 
-        with autocast_ctx:
-            with self._unwrap_first_block(self._core):
-                model_output = self._core._get_output_for_patched_inputs(
-                    hidden_states=y_final_high,
-                    timestep=ts,
-                    class_labels=class_labels,
-                    embedded_timestep=embedded_ts,
-                    height=self.h_p,
-                    width=self.w_p,
-                )
+        # 3. DECODE (Raz na krok dyfuzji)
+        model_output = self.decode_features(
+            y_final_high, ts, class_labels, embedded_ts, autocast_ctx
+        )
 
         return TRMOutput(sample=model_output)
 

@@ -231,7 +231,7 @@ class SokobanEvaluator:
         for k_metric, v in valid_agg.items():
             metrics[f"sokoban/validity_{k_metric}_ratio"] = v
 
-        solvable_results = Parallel(n_jobs=8, backend="threading")(
+        solvable_results = Parallel(n_jobs=8, backend="loky")(
             delayed(self._is_board_solvable)(board, is_val)
             for board, is_val in zip(generated_boards, valid_results)
         )
@@ -274,7 +274,7 @@ class SokobanEvaluator:
                         k_distances_correctness = [self._check_k_step_dist_validity(cond, gen, k) for gen in gen_chunk]
                         in_correct_k_distance.append(any(k_distances_correctness))
 
-            metrics["sokoban/taget_in_generated_percentage"] = sum(target_in_generated) / len(target_in_generated) if target_in_generated else 0.0
+            metrics["sokoban/target_in_generated_percentage"] = sum(target_in_generated) / len(target_in_generated) if target_in_generated else 0.0
             if k_values is not None:
                 metrics["sokoban/in_correct_k_distance_percentage"] = sum(in_correct_k_distance) / len(in_correct_k_distance) if in_correct_k_distance else 0.0
 
