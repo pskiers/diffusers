@@ -299,10 +299,13 @@ def main(args: DictConfig):
         tracker_config = OmegaConf.to_container(args, resolve=True)
         tracker_config["total_params"] = total_params
         tracker_config["trainable_params"] = trainable_params
+
+        run_name = os.path.basename(args.output_dir)
+
         accelerator.init_trackers(
             project_name="TRM-Diffusion",
             config=tracker_config,
-            init_kwargs={"wandb": {"name": args.output_dir}} if args.logger == "wandb" else {},
+            init_kwargs={"wandb": {"name": run_name}} if args.logger == "wandb" else {},
         )
     if accelerator.is_main_process:
         run = os.path.split(__file__)[-1].split(".")[0]
