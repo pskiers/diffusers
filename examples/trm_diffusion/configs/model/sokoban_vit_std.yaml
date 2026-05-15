@@ -1,4 +1,4 @@
-_target_: models.UnifiedConditionDiT
+_target_: models_pt.UnifiedConditionDiT
 sample_size: 12
 out_channels: 3
 in_channels: ${in_channels}
