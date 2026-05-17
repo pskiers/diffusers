@@ -453,8 +453,11 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         B, _, C = logits.shape
         mode = getattr(self, "thinker_bridge_mode", "logits")
         if mode == "onehot":
-            preds  = logits.argmax(dim=-1)
-            onehot = F.one_hot(preds, num_classes=C).float()
+            # Straight-through estimator: hard one-hot in the forward pass,
+            # softmax gradient in the backward pass so thinker weights can update.
+            soft   = logits.float().softmax(dim=-1)
+            hard   = F.one_hot(logits.argmax(dim=-1), num_classes=C).float()
+            onehot = hard - soft.detach() + soft   # forward≈hard, grad flows via soft
             return onehot.transpose(1, 2).reshape(B, C, self._grid, self._grid)
         elif mode == "softmax":
             probs = logits.float().softmax(dim=-1)
