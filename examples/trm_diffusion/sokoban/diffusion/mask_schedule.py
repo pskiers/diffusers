@@ -44,7 +44,7 @@ class AbsorbingMaskSchedule:
         Each token replaced with MASK_TOKEN_ID independently with probability γ(t).
         """
         gamma = self.mask_rate(t).unsqueeze(1)  # [B, 1]
-        rand = torch.rand_like(x_0.float(), generator=generator)
+        rand = torch.rand(x_0.shape, device=x_0.device, dtype=torch.float32, generator=generator)
         mask = rand < gamma  # [B, L] True → replace with MASK
         mask_val = torch.tensor(MASK_TOKEN_ID, dtype=x_0.dtype, device=x_0.device)
         x_t = torch.where(mask, mask_val, x_0)
@@ -85,7 +85,7 @@ class AbsorbingMaskSchedule:
         is_masked = (x_t == MASK_TOKEN_ID)  # [B, L]
 
         # Decide which masked positions to unmask
-        rand = torch.rand_like(x_t.float(), generator=generator)
+        rand = torch.rand(x_t.shape, device=x_t.device, dtype=torch.float32, generator=generator)
         do_unmask = is_masked & (rand < unmask_prob)  # [B, L]
 
         # Sample tokens from predicted distribution
