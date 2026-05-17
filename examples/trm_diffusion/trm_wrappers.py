@@ -1196,7 +1196,7 @@ class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
         painter.painter_checkpoint=runs/standalone_painter/checkpoint_final.pt
     """
 
-    def __init__(self, painter: StandalonePainter, **thinker_kwargs):
+    def __init__(self, painter: StandalonePainter, adapter_in_channels: int = 0, **thinker_kwargs):
         super().__init__(**thinker_kwargs)
         # Replace the freshly-built bridge+painter with the pretrained frozen ones.
         self.bridge  = painter.bridge
@@ -1206,8 +1206,50 @@ class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
         for p in self.painter.parameters():
             p.requires_grad_(False)
 
+        # Optional channel-count adaptation at the thinker→bridge interface.
+        # When adapter_in_channels != 0 and != the bridge's native input channels:
+        #   - A learnable linear projection maps each cell's logits from vocab_size
+        #     to adapter_in_channels (handles both fewer and more channels without
+        #     information bottlenecks).
+        #   - The bridge's first Conv2d is replaced with a new trainable one that
+        #     accepts adapter_in_channels; the second conv retains its pretrained
+        #     weights.  The bridge's second conv operates in bridge_channels space
+        #     and is unaffected by the input channel change.
+        native_in = painter.bridge.conv[0].in_channels          # vocab_size the bridge was trained with
+        self.logit_projection   = None
+        self.bridge_input_conv  = None
+        if adapter_in_channels > 0 and adapter_in_channels != native_in:
+            bridge_channels = painter.bridge.conv[0].out_channels
+            # Per-cell linear projection on thinker logits: (B,81,vocab) → (B,81,adapter_in)
+            self.logit_projection  = nn.Linear(self.vocab_size, adapter_in_channels)
+            # Replace first bridge conv; second conv (bridge_ch→bridge_ch) stays frozen.
+            self.bridge_input_conv = nn.Conv2d(adapter_in_channels, bridge_channels, kernel_size=3, padding=1)
+
+    def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.logit_projection is not None:
+            logits = self.logit_projection(logits)   # (B, 81, adapter_in_channels)
+        return super()._logits_to_spatial(logits)
+
+    def _run_painter(self, noisy, spatial_cond, timesteps):
+        if self.bridge_input_conv is not None:
+            # Apply new trainable first conv, then the frozen second conv.
+            spatial_cond = F.interpolate(spatial_cond, size=self.bridge.painter_size,
+                                         mode="bilinear", align_corners=False)
+            spatial_cond = torch.nn.functional.silu(self.bridge_input_conv(spatial_cond))
+            bridge_feat  = self.bridge.conv[2](spatial_cond)
+            return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
+        return super()._run_painter(noisy, spatial_cond, timesteps)
+
     def get_painter_params(self) -> list:
         return []  # frozen — excluded from all optimizers
+
+    def get_thinker_params(self) -> list:
+        params = super().get_thinker_params()
+        if self.logit_projection is not None:
+            params = params + list(self.logit_projection.parameters())
+        if self.bridge_input_conv is not None:
+            params = params + list(self.bridge_input_conv.parameters())
+        return params
 
 
 # ── Standalone SPADE painter ──────────────────────────────────────────────────

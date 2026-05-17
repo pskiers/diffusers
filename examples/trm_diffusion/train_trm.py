@@ -32,7 +32,8 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from adam_atan2 import AdamATan2
+# from adam_atan2 import AdamATan2
+from adam_atan2_pytorch import AdamAtan2
 from diffusers import DDPMScheduler
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, random_split
@@ -439,42 +440,80 @@ def _x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler):
     return x0.clamp(0.0, 1.0)
 
 
-def _classifier_loss_on_x0(x0_pred, solution, timesteps, cell_size, classifier, t_max):
-    """Cross-entropy loss between classifier predictions on x0_pred patches and solution.
+def _ddim_prev_sample(x0_pred: torch.Tensor, noisy: torch.Tensor,
+                       timesteps: torch.Tensor, scheduler) -> torch.Tensor:
+    """Compute x_{t-1} from x0_pred using the deterministic DDIM formula.
 
-    Only applied to samples with timestep < t_max.
-    x0_pred:   (B, 1, H, W) float in [0, 1]
-    solution:  (B, 81) int64 in [0, 8]  (IGNORE_LABEL_ID for given cells)
-    Returns scalar loss (0 if no eligible samples).
+    Differentiable w.r.t. x0_pred — suitable as input to a classifier loss.
+    """
+    device       = noisy.device
+    ab_t         = scheduler.alphas_cumprod.to(device)[timesteps]
+    ab_tm1       = scheduler.alphas_cumprod.to(device)[(timesteps - 1).clamp(min=0)]
+    sqrt_ab_t    = ab_t.sqrt().view(-1, 1, 1, 1)
+    sqrt_1ab_t   = (1.0 - ab_t).sqrt().view(-1, 1, 1, 1)
+    sqrt_ab_tm1  = ab_tm1.sqrt().view(-1, 1, 1, 1)
+    sqrt_1ab_tm1 = (1.0 - ab_tm1).sqrt().view(-1, 1, 1, 1)
+    eps   = (noisy - sqrt_ab_t * x0_pred) / sqrt_1ab_t
+    return (sqrt_ab_tm1 * x0_pred + sqrt_1ab_tm1 * eps).clamp(0.0, 1.0)
+
+
+def _classifier_loss(x0_pred, noisy, images, solution, timesteps, cell_size, classifier,
+                     scheduler, t_max, target="x0_pred", loss_type="ce"):
+    """Classifier-based training loss on predicted images.
+
+    target:    "x0_pred"    – single-step clean prediction (blurry at high t)
+               "x_tm1"      – one DDIM step back (noisy at level t-1; needs a
+                               classifier trained with noise augmentation)
+    loss_type: "ce"         – cross-entropy on classifier logits vs solution labels
+               "perceptual" – L2 between classifier encoder features of prediction
+                              vs clean real images; solution not required
+    images:    (B, 1, H, W) clean ground-truth images; only used for perceptual loss
     """
     eligible = (timesteps < t_max).nonzero(as_tuple=True)[0]
     if eligible.numel() == 0:
-        return x0_pred.sum() * 0.0  # differentiable zero
+        return x0_pred.sum() * 0.0
 
-    x0_sel = x0_pred[eligible]                         # (N, 1, H, W)
-    sol_sel = solution[eligible].to(x0_pred.device)    # (N, 81)
+    x0_sel  = x0_pred[eligible]
+    noi_sel = noisy[eligible]
+    ts_sel  = timesteps[eligible]
+    sol_sel = solution[eligible].to(x0_pred.device)
+    N = eligible.numel()
 
-    N = x0_sel.shape[0]
-    cells = (x0_sel
+    img_sel = (_ddim_prev_sample(x0_sel, noi_sel, ts_sel, scheduler)
+               if target == "x_tm1" else x0_sel)
+
+    cells = (img_sel
              .unfold(2, cell_size, cell_size)
-             .unfold(3, cell_size, cell_size))          # (N, 1, 9, 9, cell, cell)
+             .unfold(3, cell_size, cell_size))
     cells = cells.permute(0, 2, 3, 1, 4, 5).contiguous().reshape(N * 81, 1, cell_size, cell_size)
 
-    logits = classifier(cells)                         # (N*81, 9)
-    labels = sol_sel.reshape(N * 81)                   # 0-8, IGNORE_LABEL_ID for blanks
+    if loss_type == "perceptual":
+        clean_sel = images[eligible]
+        clean_cells = (clean_sel
+                       .unfold(2, cell_size, cell_size)
+                       .unfold(3, cell_size, cell_size))
+        clean_cells = clean_cells.permute(0, 2, 3, 1, 4, 5).contiguous().reshape(N * 81, 1, cell_size, cell_size)
+        feats_pred = classifier.encoder(cells)
+        with torch.no_grad():
+            feats_ref = classifier.encoder(clean_cells)
+        return F.mse_loss(feats_pred.flatten(1), feats_ref.flatten(1))
 
+    logits = classifier(cells)
+    labels = sol_sel.reshape(N * 81)
     return F.cross_entropy(logits, labels, ignore_index=IGNORE_LABEL_ID)
 
 
 def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers, base_lrs, global_step, cfg, ema_helper, global_batch_size, classifier=None):
     K = len(micro_batches)
     device = accelerator.device
-    sudoku_w = cfg.train.sudoku_loss_weight
-    mse_w    = float(cfg.train.get("mse_loss_weight", 1.0))
-    clf_cfg  = cfg.train.get("classifier_loss", None)
-    clf_w    = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
+    sudoku_w  = cfg.train.sudoku_loss_weight
+    mse_w     = float(cfg.train.get("mse_loss_weight", 1.0))
+    clf_cfg   = cfg.train.get("classifier_loss", None)
+    clf_w     = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
     clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
-    use_clf  = (clf_w > 0.0 and classifier is not None)
+    clf_target    = str(clf_cfg.get("target", "x0_pred")) if clf_cfg is not None else "x0_pred"
+    clf_loss_type = str(clf_cfg.get("loss_type", "ce")) if clf_cfg is not None else "ce"
+    use_clf   = (clf_w > 0.0 and classifier is not None)
     cell_size = int(cfg.data.cell_size)
 
     # Pre-process: sample noise, build carry state for each micro-batch
@@ -497,6 +536,7 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
         mb_data.append({
             "condition":  condition,
+            "images":     images,
             "solution":   solution,
             "ce_labels":  _make_ce_labels(solution, model),
             "puzzle_ids": puzzle_ids,
@@ -539,8 +579,9 @@ def train_step_painter(model, micro_batches, scheduler, accelerator, optimizers,
 
             if use_clf:
                 x0_pred  = _x0_from_noise_pred(noise_pred, d["noisy"], d["timesteps"], scheduler)
-                clf_loss = _classifier_loss_on_x0(
-                    x0_pred, d["solution"], d["timesteps"], cell_size, classifier, clf_t_max,
+                clf_loss = _classifier_loss(
+                    x0_pred, d["noisy"], d["images"], d["solution"], d["timesteps"],
+                    cell_size, classifier, scheduler, clf_t_max, clf_target, clf_loss_type,
                 )
                 step_loss      = step_loss + clf_w * clf_loss
                 total_clf_loss += clf_loss.item()
@@ -799,12 +840,14 @@ def train_step_standalone_painter(
     K = len(micro_batches)
     device = accelerator.device
 
-    mse_w   = float(cfg.train.get("mse_loss_weight", 1.0))
-    clf_cfg = cfg.train.get("classifier_loss", None)
-    clf_w   = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
-    clf_t_max = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
-    use_clf = (clf_w > 0.0 and classifier is not None)
-    cell_size = int(cfg.data.cell_size)
+    mse_w         = float(cfg.train.get("mse_loss_weight", 1.0))
+    clf_cfg       = cfg.train.get("classifier_loss", None)
+    clf_w         = float(clf_cfg.get("weight", 0.0)) if clf_cfg is not None else 0.0
+    clf_t_max     = int(clf_cfg.get("t_max", 200)) if clf_cfg is not None else 200
+    clf_target    = str(clf_cfg.get("target", "x0_pred")) if clf_cfg is not None else "x0_pred"
+    clf_loss_type = str(clf_cfg.get("loss_type", "ce")) if clf_cfg is not None else "ce"
+    use_clf       = (clf_w > 0.0 and classifier is not None)
+    cell_size     = int(cfg.data.cell_size)
 
     total_diff_loss = 0.0
     total_clf_loss  = 0.0
@@ -833,8 +876,9 @@ def train_step_standalone_painter(
 
         if use_clf:
             x0_pred  = _x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler)
-            clf_loss = _classifier_loss_on_x0(
-                x0_pred, solution, timesteps, cell_size, classifier, clf_t_max,
+            clf_loss = _classifier_loss(
+                x0_pred, noisy, images, solution, timesteps,
+                cell_size, classifier, scheduler, clf_t_max, clf_target, clf_loss_type,
             )
             step_loss       = step_loss + clf_w * clf_loss
             total_clf_loss += clf_loss.item()
@@ -962,14 +1006,19 @@ def main(cfg: DictConfig):
     if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
         classifier_path = cfg.train.get("eval_classifier_path", None)
         clf_train_w = float(cfg.train.get("classifier_loss", {}).get("weight", 0.0))
+        use_noisy_clf = bool(cfg.train.get("classifier_loss", {}).get("noisy_classifier", False))
         load_on_this_rank = accelerator.is_main_process or clf_train_w > 0.0
         if classifier_path and load_on_this_rank:
-            classifier = load_or_train_classifier(
-                classifier_path,
-                cfg.data.mnist_root,
-                cell_size,
-                accelerator.device,
-            )
+            if use_noisy_clf:
+                from train_noisy_classifier import load_noisy_classifier
+                classifier = load_noisy_classifier(classifier_path, accelerator.device)
+            else:
+                classifier = load_or_train_classifier(
+                    classifier_path,
+                    cfg.data.mnist_root,
+                    cell_size,
+                    accelerator.device,
+                )
             # Freeze: gradients flow through inputs (for training loss) but not weights.
             for p in classifier.parameters():
                 p.requires_grad_(False)

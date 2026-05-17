@@ -39,5 +39,8 @@ train:
   mse_loss_weight: 1.0          # set to 0.0 to disable MSE loss
   eval_classifier_path: null    # path to MNISTCellClassifier checkpoint (for eval metrics)
   classifier_loss:
-    weight: 0.0                 # set > 0 to enable classifier CE loss during training
+    weight: 0.0                 # set > 0 to enable classifier loss during training
     t_max: 200                  # only apply classifier loss when timestep < t_max
+    target: "x0_pred"           # "x0_pred" or "x_tm1"
+    loss_type: "ce"             # "ce" or "perceptual"
+    noisy_classifier: false

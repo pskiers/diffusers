@@ -37,5 +37,8 @@ train:
   mse_loss_weight: 1.0          # set to 0.0 to disable MSE loss
   eval_classifier_path: null    # path to MNISTCellClassifier checkpoint (for eval metrics)
   classifier_loss:
-    weight: 0.0                 # set > 0 to enable classifier CE loss during training
-    t_max: 200                  # only apply classifier loss when timestep < t_max
+    weight: 0.0                 # set > 0 to enable classifier loss during training
+    t_max: 100                  # only apply classifier loss when timestep < t_max
+    target: "x_tm1"             # "x0_pred" or "x_tm1" (one DDIM step back; better with noisy classifier)
+    loss_type: "ce"             # "ce" (cross-entropy) or "perceptual" (feature L2)
+    noisy_classifier: false     # set true to load checkpoint via load_noisy_classifier()
