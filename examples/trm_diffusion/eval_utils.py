@@ -5,6 +5,7 @@ import numpy as np
 import logging
 from tqdm.auto import tqdm
 from torchvision.utils import make_grid
+from diffusers import DDIMScheduler, DDPMScheduler
 from diffusers.utils import is_accelerate_version
 from diffusers import DDPMPipeline
 from trm_utils import get_model_output
@@ -121,14 +122,21 @@ def generate_image_batch(
         and hasattr(unet, "reasoning_step")
     )
 
-    for t in tqdm(scheduler.timesteps, desc="Sampling", disable=not show_progress):
+    if args.use_ddim:
+        eval_scheduler = DDIMScheduler.from_config(scheduler.config)
+        eval_scheduler.set_timesteps(args.ddim_num_inference_steps)
+    else:
+        eval_scheduler = scheduler
+        eval_scheduler.set_timesteps(args.ddpm_num_inference_steps)
+
+    for t in tqdm(eval_scheduler.timesteps, desc="Sampling", disable=not show_progress):
         if cond_images is not None:
             current_latents = torch.cat([latents, cond_images], dim=1) # latents: [B, C_noise, H, W], cond_images: [B, C_cond, H, W]
         else:
             current_latents = latents
 
         latent_model_input = torch.cat([current_latents] * 2) if do_cfg else current_latents
-        latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+        latent_model_input = eval_scheduler.scale_model_input(latent_model_input, t)
         latent_model_input_cast = latent_model_input.to(weight_dtype)
 
         class_input = torch.cat([conds, unconds]) if do_cfg and conds is not None else conds
@@ -141,7 +149,7 @@ def generate_image_batch(
                 # CFG is applied inside the loop so convergence is measured on
                 # the post-guidance prediction.
                 t_idx = t.long().cpu().item()
-                alpha_bar = scheduler.alphas_cumprod[t_idx].float().to(device)
+                alpha_bar = eval_scheduler.alphas_cumprod[t_idx].float().to(device)
                 scale = torch.sqrt((1.0 - alpha_bar) / alpha_bar.clamp(min=1e-8))
 
                 y, z = unet.get_initial_states(latent_model_input_cast.shape[0])
@@ -207,7 +215,7 @@ def generate_image_batch(
             noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        latents = scheduler.step(noise_pred, t, latents).prev_sample
+        latents = eval_scheduler.step(noise_pred, t, latents).prev_sample
 
     # 4. VAE Decoding & Clamping
     if vae is not None:
