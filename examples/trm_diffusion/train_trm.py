@@ -1222,7 +1222,9 @@ def main(cfg: DictConfig):
     load_opt    = cfg.get("load_optimizer_state", True)
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
-        accelerator.unwrap_model(model).load_state_dict(ckpt["model_state"], strict=False)
+        accelerator.unwrap_model(model).load_state_dict(
+            strip_compiled_prefix(ckpt["model_state"]), strict=False
+        )
         if load_opt and ckpt.get("optimizer_states"):
             opt_states = ckpt["optimizer_states"]
             for opt, sd in zip(optimizers, opt_states):
