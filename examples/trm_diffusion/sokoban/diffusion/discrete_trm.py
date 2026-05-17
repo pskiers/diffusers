@@ -240,6 +240,10 @@ class DiscreteTRMDiffusion(nn.Module):
         self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
         self.q_head = CastedLinear(hidden_size, 2, bias=True)
 
+        # Carry normalization (matching continuous TRM's norm_z / norm_y)
+        self.norm_z = nn.LayerNorm(hidden_size)
+        self.norm_y = nn.LayerNorm(hidden_size)
+
         _h_init = torch.zeros(hidden_size, dtype=self.forward_dtype)
         _l_init = torch.zeros(hidden_size, dtype=self.forward_dtype)
         self.register_buffer("H_init", _h_init, persistent=True)
@@ -294,18 +298,18 @@ class DiscreteTRMDiffusion(nn.Module):
         with torch.no_grad():
             for _ in range(self.H_cycles - 1):
                 for _ in range(self.L_cycles):
-                    z_L = self.L_level(z_L, z_H + x_emb, t_emb, cos_sin)
-                z_H = self.L_level(z_H, z_L, t_emb, cos_sin)
+                    z_L = self.norm_z(self.L_level(z_L, z_H + x_emb, t_emb, cos_sin))
+                z_H = self.norm_y(self.L_level(z_H, z_L, t_emb, cos_sin))
 
         for _ in range(self.L_cycles):
-            z_L = self.L_level(z_L, z_H + x_emb, t_emb, cos_sin)
-        z_H = self.L_level(z_H, z_L, t_emb, cos_sin)
+            z_L = self.norm_z(self.L_level(z_L, z_H + x_emb, t_emb, cos_sin))
+        z_H = self.norm_y(self.L_level(z_H, z_L, t_emb, cos_sin))
 
         # Output
         z_H_normed = rms_norm(z_H, self.rms_norm_eps) * self.final_norm_weight.to(z_H.dtype)
         logits = self.lm_head(z_H_normed)  # [B, 144, V]
 
-        q_input = z_H.mean(dim=1)  # [B, D]
+        q_input = z_H_normed.mean(dim=1)  # [B, D]  — use normalized z_H
         q_logits = self.q_head(q_input).to(torch.float32)  # [B, 2]
 
         new_carry = DiscreteTRMCarry(z_H=z_H.detach(), z_L=z_L.detach())
