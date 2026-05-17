@@ -289,6 +289,7 @@ def main(args: DictConfig):
         halt_loss_weight=args.model.get("halt_loss_weight", 0.5),
         use_carry_recycling=args.model.get("use_carry_recycling", False),
         carry_recycle_prob=args.model.get("carry_recycle_prob", 0.5),
+        halt_warmup_steps=args.model.get("halt_warmup_steps", 0),
     )
 
     # Optional: compile for throughput
@@ -423,6 +424,7 @@ def main(args: DictConfig):
                 global_step += 1
 
                 # Per-step logging (every step for W&B)
+                base_model = accelerator.unwrap_model(model)
                 step_logs = {
                     "train/lm_loss": metrics["lm_loss"],
                     "train/halt_loss": metrics["halt_loss"],
@@ -430,6 +432,7 @@ def main(args: DictConfig):
                     "train/token_accuracy": metrics["token_accuracy"],
                     "train/exact_accuracy": metrics["exact_accuracy"],
                     "train/avg_halt_steps": metrics["avg_halt_steps"],
+                    "train/current_max_halt": base_model.get_current_max_halt(),
                     "train/q_halt_mean": metrics["q_halt_mean"],
                     "train/q_halt_pos_frac": metrics["q_halt_pos_frac"],
                     "train/mask_ratio": metrics["mask_ratio"],

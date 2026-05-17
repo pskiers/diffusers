@@ -40,9 +40,10 @@ model:
   forward_dtype: bfloat16
   pos_encodings: rope
   # ACT wrapper
-  halt_max_steps: 16
+  halt_max_steps: 8
   halt_exploration_prob: 0.1
   halt_loss_weight: 0.5
+  halt_warmup_steps: 5000
   # Carry recycling (configurable)
   use_carry_recycling: false
   carry_recycle_prob: 0.5

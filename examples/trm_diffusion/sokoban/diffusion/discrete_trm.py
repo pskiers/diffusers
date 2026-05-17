@@ -330,11 +330,12 @@ class ACTMaskedDiffusionWrapper(nn.Module):
     def __init__(
         self,
         inner: DiscreteTRMDiffusion,
-        halt_max_steps: int = 16,
+        halt_max_steps: int = 8,
         halt_exploration_prob: float = 0.1,
         halt_loss_weight: float = 0.5,
         use_carry_recycling: bool = False,
         carry_recycle_prob: float = 0.5,
+        halt_warmup_steps: int = 0,
     ):
         super().__init__()
         self.inner = inner
@@ -343,6 +344,15 @@ class ACTMaskedDiffusionWrapper(nn.Module):
         self.halt_loss_weight = halt_loss_weight
         self.use_carry_recycling = use_carry_recycling
         self.carry_recycle_prob = carry_recycle_prob
+        self.halt_warmup_steps = halt_warmup_steps
+        self._training_step = 0
+
+    def get_current_max_halt(self) -> int:
+        """Linearly ramp halt_max_steps from 1 to halt_max_steps over halt_warmup_steps."""
+        if self.halt_warmup_steps <= 0 or self._training_step >= self.halt_warmup_steps:
+            return self.halt_max_steps
+        frac = self._training_step / self.halt_warmup_steps
+        return max(1, int(1 + frac * (self.halt_max_steps - 1)))
 
     def forward(
         self,
@@ -360,6 +370,10 @@ class ACTMaskedDiffusionWrapper(nn.Module):
         B = x_t.shape[0]
         device = x_t.device
         is_masked = (x_t == MASK_TOKEN_ID)  # [B, 144]
+
+        current_max_halt = self.get_current_max_halt()
+        if self.training:
+            self._training_step += 1
 
         # Labels: -100 for unmasked → CE ignores them natively
         labels = x_0.clone()  # [B, 144]
@@ -395,19 +409,19 @@ class ACTMaskedDiffusionWrapper(nn.Module):
         last_logits = None
         last_q_halt = None
 
-        for k in range(self.halt_max_steps):
+        for k in range(current_max_halt):
             logits, (q_halt, _), new_carry = self.inner(x_t, timestep, carry)
 
             steps = steps + (~halted).int()
-            is_last = (steps >= self.halt_max_steps)
+            is_last = (steps >= current_max_halt)
 
             with torch.no_grad():
                 halt_now = is_last.clone()
-                if self.training and self.halt_max_steps > 1:
+                if self.training and current_max_halt > 1:
                     halt_now = halt_now | (q_halt > 0)
                     if self.halt_exploration_prob > 0:
                         explore = torch.rand(B, device=device) < self.halt_exploration_prob
-                        min_steps = torch.randint(2, self.halt_max_steps + 1, (B,), device=device)
+                        min_steps = torch.randint(2, current_max_halt + 1, (B,), device=device)
                         halt_now = halt_now & ((steps >= min_steps) | ~explore)
                 else:
                     halt_now = is_last
