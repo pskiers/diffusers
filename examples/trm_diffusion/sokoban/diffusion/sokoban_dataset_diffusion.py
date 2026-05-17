@@ -155,7 +155,7 @@ class SokobanDataset(Dataset):
         boards_list = []
         trajectory_start_idx = []
         samples = []    # (board_idx, target_idx, k_value, k_label)
-        group_boundaries = [0]  # cumulative board count per trajectory
+        group_boundaries = [0]  # cumulative sample count per trajectory
 
         current_global_idx = 0
         trajectories_loaded = 0
@@ -195,7 +195,7 @@ class SokobanDataset(Dataset):
                                 samples.append((b_idx, t_idx, k_val, k_lbl, current_step))
 
                 current_global_idx += sample_size
-                group_boundaries.append(current_global_idx)
+                group_boundaries.append(len(samples))
                 trajectories_loaded += 1
 
                 if self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories:
