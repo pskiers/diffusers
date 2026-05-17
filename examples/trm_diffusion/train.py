@@ -169,7 +169,14 @@ def main(args: DictConfig):
 
     # Safely target the core model if it's wrapped
     unet_for_ema = model.core_model if hasattr(model, "core_model") else model
-    model_cls_for_ema = type(unet_for_ema)
+
+    # FIX: Odwijamy model ze struktury torch.compile dla zapisów EMA
+    if hasattr(unet_for_ema, "_orig_mod"):
+        unet_for_ema_uncompiled = unet_for_ema._orig_mod
+    else:
+        unet_for_ema_uncompiled = unet_for_ema
+
+    model_cls_for_ema = type(unet_for_ema_uncompiled)
 
     if args.use_ema:
         ema_model = EMAModel(
