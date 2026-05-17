@@ -122,7 +122,8 @@ def main(args: DictConfig):
         scheduler_kwargs["prediction_type"] = args.prediction_type
 
     scheduler = SchedulerClass(**scheduler_kwargs)
-    scheduler.set_timesteps(args.ddpm_num_inference_steps)
+    num_steps = args.ddim_num_inference_steps if args.use_ddim else args.ddpm_num_inference_steps
+    scheduler.set_timesteps(num_steps)
 
     # 3. Distributed Math & Setup
     world_size = accelerator.num_processes

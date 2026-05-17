@@ -298,7 +298,7 @@ class SokobanEvaluator:
         return metrics
 
     def _is_board_valid(self, board: np.ndarray) -> dict:
-        is_board_correct = board.ndim == 2 and np.all(board >= 0) and np.all(board < 7)
+        is_board_correct = board.ndim == 2 and np.all(board >= 0) and np.all(board < 8)
         is_one_player = np.sum((board == FieldStates.PLAYER.id) | (board == FieldStates.PLAYER_ON_TARGET.id)) == 1
         box_count_match = np.sum((board == FieldStates.BOX.id) | (board == FieldStates.BOX_ON_TARGET.id)) == self.num_boxes
         targets_num_match = np.sum((board == FieldStates.BOX_TARGET.id) | (board == FieldStates.BOX_ON_TARGET.id) | (board == FieldStates.PLAYER_ON_TARGET.id)) == self.num_boxes

@@ -324,7 +324,8 @@ def evaluate_and_save(
 
     # Save Pipeline
     if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-        pipeline = DDPMPipeline(unet=unet, scheduler=noise_scheduler)
+        unet_to_save = unet.core_model if hasattr(unet, "core_model") else unet
+        pipeline = DDPMPipeline(unet=unet_to_save, scheduler=noise_scheduler)
         pipeline.save_pretrained(args.output_dir)
 
     if args.use_ema:

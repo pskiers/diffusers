@@ -10,7 +10,7 @@ defaults:
 phases: [12000, 25000, 42000, 63000]
 n_sup_phases: [1, 2, 4, 8]
 
-num_epochs: 900 # 60 * 10^6 [original trained on 60mln images] / (1000*64) [samples in my dataset] ~= 900
+num_epochs: 900 # 60 * 10^6 [original trained on 60mln images] / (1000*64) [samples in 1 epoch] ~= 900
 gradient_accumulation_steps: 12 # 64 * 12 = 768
 
 save_model_epochs: 100
@@ -25,7 +25,7 @@ resume_from_checkpoint: latest
 
 use_ddim: true
 ddim_num_inference_steps: 50
-ddpm_num_inference_steps: 500
+ddpm_num_inference_steps: 400
 output_dir: /net/tscratch/people/plgmgrzanka/training-outputs/diffusion/${hydra:runtime.choices.model}-${hydra:runtime.choices.task}
 
 grad_every_n_sup: false

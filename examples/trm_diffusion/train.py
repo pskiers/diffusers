@@ -1,5 +1,5 @@
 import sys
-from xml.parsers.expat import model
+import time
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -105,13 +105,6 @@ def main(args: DictConfig):
     else:
         datasets.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
-
-    import debugpy
-    #debugpy.listen(("0.0.0.0", 5679))
-    logger.info("⏳ Oczekiwanie na podłączenie debuggera z VS Code (port 5679)...")
-
-    #debugpy.wait_for_client()
-    logger.info("✅ Debugger podłączony, ruszamy dalej!")
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -275,6 +268,7 @@ def main(args: DictConfig):
         num_train_timesteps=args.ddpm_num_steps,
         beta_schedule=args.ddpm_beta_schedule,
         prediction_type=args.prediction_type,
+        clip_sample_range=getattr(args, "clip_sample_range", 1.0),
     )
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
@@ -302,7 +296,7 @@ def main(args: DictConfig):
     if args.use_ema:
         ema_model.to(accelerator.device)
 
-    if accelerator.is_main_process and args.logger == "wandb":
+    if accelerator.is_main_process:
         tracker_config = OmegaConf.to_container(args, resolve=True)
         tracker_config["total_params"] = total_params
         tracker_config["trainable_params"] = trainable_params
@@ -314,9 +308,6 @@ def main(args: DictConfig):
             config=tracker_config,
             init_kwargs={"wandb": {"name": run_name}} if args.logger == "wandb" else {},
         )
-    if accelerator.is_main_process:
-        run = os.path.split(__file__)[-1].split(".")[0]
-        accelerator.init_trackers(run)
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -367,6 +358,8 @@ def main(args: DictConfig):
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in SafeIterator(enumerate(train_dl), logger=logger):
+            step_start_time = time.monotonic()
+
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -533,7 +526,16 @@ def main(args: DictConfig):
                     accelerator.save_state(save_path)
                     logger.info(f"Saved state to {save_path}")
 
-            logs = {"train/loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            step_time = time.monotonic() - step_start_time
+            logs = {
+                "train/loss": loss.detach().item(),
+                "train/step_time_sec": step_time,
+                "train/gpu_mem_mb": torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0,
+                "lr": lr_scheduler.get_last_lr()[0],
+                "step": global_step,
+            }
+            if hasattr(base_model, "reasoning_step"):
+                logs["train/n_sup"] = n_sup_current
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
@@ -611,7 +613,7 @@ def main(args: DictConfig):
 
         val_pbar.close()
 
-        if accelerator.is_main_process and (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
+        if accelerator.is_main_process and epoch > 0 and (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
             evaluate_and_save(
                 model,
                 ema_model,
@@ -625,7 +627,7 @@ def main(args: DictConfig):
                 weight_dtype,
             )
 
-        if accelerator.is_main_process and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):
+        if accelerator.is_main_process and epoch > 0 and (epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1):
             unet = accelerator.unwrap_model(model)
             unet_to_save = unet.core_model if hasattr(unet, "core_model") else unet
 
