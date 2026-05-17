@@ -205,9 +205,7 @@ class DiscreteTRMDiffusion(nn.Module):
         self.forward_dtype = getattr(torch, forward_dtype)
         self.rms_norm_eps = rms_norm_eps
 
-        embed_scale = math.sqrt(hidden_size)
-        self.embed_scale = embed_scale
-        embed_init_std = 1.0 / embed_scale
+        embed_init_std = 1.0 / math.sqrt(hidden_size)
 
         self.embed_tokens = CastedEmbedding(
             vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
@@ -242,8 +240,8 @@ class DiscreteTRMDiffusion(nn.Module):
         self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
         self.q_head = CastedLinear(hidden_size, 2, bias=True)
 
-        _h_init = trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1)
-        _l_init = trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1)
+        _h_init = torch.zeros(hidden_size, dtype=self.forward_dtype)
+        _l_init = torch.zeros(hidden_size, dtype=self.forward_dtype)
         self.register_buffer("H_init", _h_init, persistent=True)
         self.register_buffer("L_init", _l_init, persistent=True)
         self.H_init: torch.Tensor
@@ -275,9 +273,9 @@ class DiscreteTRMDiffusion(nn.Module):
         token_emb = self.embed_tokens(x_t.to(torch.int32))
         if self.pos_encodings == "learned":
             pos = self.embed_pos.embedding_weight.to(self.forward_dtype)
-            x_emb = self.embed_scale * (token_emb + pos)
+            x_emb = token_emb + pos
         else:
-            x_emb = self.embed_scale * token_emb
+            x_emb = token_emb
 
         # Timestep embedding [B, D]
         t_emb_sin = sinusoidal_embedding(timestep, self.hidden_size).to(self.forward_dtype)
