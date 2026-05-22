@@ -59,7 +59,7 @@ def run_script(script_path, output_dir, args, resume_from_checkpoint=False, clea
         assert res.returncode == 0, f"Initial Run Failed!\n{res.stdout}\n{res.stderr}"
 
         if resume_from_checkpoint:
-            cmd_resume = cmd + [f"{RESUME_FROM_CKPT_ARG}={output_dir}/checkpoint"]
+            cmd_resume = cmd + [f"{RESUME_FROM_CKPT_ARG}={output_dir}/checkpoint_final.pt"]
             res = subprocess.run(cmd_resume, env=env, capture_output=True, text=True)
             assert res.returncode == 0, f"Resume Run Failed!\n{res.stdout}\n{res.stderr}"
     finally:
@@ -91,7 +91,7 @@ def test_pt_v0tok():
 
 @pytest.mark.v0tok
 @pytest.mark.two_stage_pt
-def test_pt_v0tok():
+def test_pt_v0tok_2stage():
     args = (
         ["experiment=v0tok_two_stage"]
         + FAST_TRAINING_ARGS
@@ -208,7 +208,7 @@ def test_thinker_frozen_painter_v0tok():
     args = ["experiment=standalone_painter"] + FAST_TRAINING_ARGS + SMALL_PAINTER_ARGS
     run_script(script_path=SCRIPT_PATH, output_dir=TMP_DIR, args=args, resume_from_checkpoint=False, cleanup=False)
     args = (
-        ["experiment=thinker_frozen_painter", "painter.painter_checkpoint=runs/standalone_painter/checkpoint_final.pt"]
+        ["experiment=thinker_frozen_painter", f"painter.painter_checkpoint={TMP_DIR}/checkpoint_final.pt"]
         + FAST_TRAINING_ARGS
         + SMALL_PAINTER_ARGS
     )
