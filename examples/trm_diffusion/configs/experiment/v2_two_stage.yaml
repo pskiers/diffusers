@@ -1,53 +1,32 @@
 # @package _global_
 # Painter-thinker V2 with two-stage interleaved training.
-#
-# Since V2 has no CE loss, the thinker stage only contributes via the
-# diffusion gradient through the bridge (painter frozen = no painter update,
-# but thinker still receives diff-loss gradient from the painter-stage tick).
-# Effectively the two-stage here isolates painter learning (painter stage with
-# teacher-forced solution image) from thinker learning (thinker stage, painter
-# frozen, full gradient through bridge to thinker).
 
 mode: "painter"
 painter_variant: "v2"
-output_dir: "runs/trm_v2_two_stage"
-compile: true
 
-use_ema: true
-ema_rate: 0.999
+run:
+  output_dir: "runs/trm_v2_two_stage"
 
 thinker:
   puzzle_emb_ndim: 0
-  n_sup: 16
-  hidden_size: 512
   halt_exploration_prob: 0.0
 
 painter:
-  enc_channels: 32
   thinker_out_channels: 16
-  bridge_channels: 16
-  painter_channels: [32, 64, 64]
-  painter_layers_per_block: 2
-  diff_thinker_weight: 1.0
-  dtype: bfloat16
-
-data:
-  cell_size: 16
 
 train:
-  lr: 1e-4
   lr_min_ratio: 1.0
-  weight_decay: 1.0
   batch_size: 384
   num_steps: 100000
-  warmup_steps: 2000
-  eval_every: 2000
-  save_every: 10000
   sudoku_loss_weight: 0.0
   gradient_accumulation_steps: 2
 
+eval:
+  eval_every: 2000
+  save_every: 10000
+
 painter_stage:
-  freeze_thinker: false  # true = only painter+bridge updated during painter stage
+  freeze_thinker: false
   n_sup: 4
   H_cycles: 1
   L_cycles: 2

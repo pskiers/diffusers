@@ -1,43 +1,27 @@
 # @package _global_
 # Painter-thinker V2 — no sudoku CE loss, unconstrained thinker output channels.
-# Training wheel removed vs V1: thinker gets no explicit digit supervision.
-# Thinker outputs a latent spatial map that the bridge upsamples to condition
-# the painter; logits are None so CE loss is automatically skipped.
+# Thinker outputs a latent spatial map; CE loss is skipped.
 
 mode: "painter"
 painter_variant: "v2"
-output_dir: "runs/trm_v2"
-compile: true
 
-use_ema: true
-ema_rate: 0.999
+run:
+  output_dir: "runs/trm_v2"
 
 thinker:
   puzzle_emb_ndim: 0
-  n_sup: 16
-  hidden_size: 512
   halt_exploration_prob: 0.0
 
 painter:
-  enc_channels: 32
   thinker_out_channels: 16
-  bridge_channels: 16
-  painter_channels: [32, 64, 64]
-  painter_layers_per_block: 2
-  diff_thinker_weight: 1.0
-  dtype: bfloat16
-
-data:
-  cell_size: 16
 
 train:
-  lr: 1e-4
   lr_min_ratio: 1.0
-  weight_decay: 1.0
   batch_size: 384
   num_steps: 100000
-  warmup_steps: 2000
+  sudoku_loss_weight: 0.0
+  gradient_accumulation_steps: 2
+
+eval:
   eval_every: 2000
   save_every: 10000
-  sudoku_loss_weight: 0.0   # no CE loss for V2
-  gradient_accumulation_steps: 2

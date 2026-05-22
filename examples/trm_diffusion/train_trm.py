@@ -382,7 +382,7 @@ def _apply_noisy_swap(images: torch.Tensor, noisy: torch.Tensor,
     if prob <= 0.0:
         return noisy, _empty_swap
     t_min = int(swap_cfg.get("t_min", 0))
-    t_max = int(swap_cfg.get("t_max", cfg.num_timesteps - 1))
+    t_max = int(swap_cfg.get("t_max", cfg.diffusion.num_train_timesteps - 1))
 
     B = images.shape[0]
     eligible = ((timesteps >= t_min) & (timesteps <= t_max))
@@ -920,24 +920,24 @@ def save_checkpoint(accelerator, model, optimizers, step, output_dir, tag, ema_h
 def main(cfg: DictConfig):
     mode = cfg.mode   # "sudoku" | "painter" | "standalone_painter"
 
-    wandb_project = cfg.get("wandb_project", None)
+    wandb_project = cfg.run.get("wandb_project", None)
     log_with = ["wandb"] if wandb_project else []
 
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
     accelerator = Accelerator(
-        mixed_precision=cfg.get("mixed_precision", "no"),
+        mixed_precision=cfg.precision.mixed_precision,
         log_with=log_with,
     )
     logging.basicConfig(level=logging.INFO)
 
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(cfg))
-        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(cfg.run.output_dir).mkdir(parents=True, exist_ok=True)
 
     if wandb_project and accelerator.is_main_process:
-        run_name = Path(cfg.output_dir).name
+        run_name = Path(cfg.run.output_dir).name
         init_kwargs = {"wandb": {"name": run_name}}
         accelerator.init_trackers(
             project_name=wandb_project,
@@ -945,7 +945,7 @@ def main(cfg: DictConfig):
             init_kwargs=init_kwargs,
         )
 
-    torch.manual_seed(cfg.seed + accelerator.process_index)
+    torch.manual_seed(cfg.train.seed + accelerator.process_index)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     if mode == "sudoku":
@@ -976,12 +976,12 @@ def main(cfg: DictConfig):
             mask_given=True,
         )
         scheduler = DDPMScheduler(
-            num_train_timesteps=cfg.num_timesteps,
-            beta_schedule=cfg.beta_schedule,
-            prediction_type=cfg.prediction_type,
+            num_train_timesteps=cfg.diffusion.num_train_timesteps,
+            beta_schedule=cfg.diffusion.beta_schedule,
+            prediction_type=cfg.diffusion.prediction_type,
         )
 
-    n_workers = cfg.get("num_workers", 4)
+    n_workers = cfg.data.num_workers
     train_dl = DataLoader(
         train_ds,
         batch_size=cfg.train.batch_size,
@@ -1006,7 +1006,7 @@ def main(cfg: DictConfig):
     # otherwise main-process only (eval use only).
     classifier = None
     if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter"):
-        classifier_path = cfg.train.get("eval_classifier_path", None)
+        classifier_path = cfg.eval.get("classifier_path", None)
         clf_train_w = float(cfg.train.get("classifier_loss", {}).get("weight", 0.0))
         use_noisy_clf = bool(cfg.train.get("classifier_loss", {}).get("noisy_classifier", False))
         load_on_this_rank = accelerator.is_main_process or clf_train_w > 0.0
@@ -1028,7 +1028,7 @@ def main(cfg: DictConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     t = cfg.thinker
     thinker_kwargs = dict(
-        vocab_size=t.vocab_size,
+        vocab_size=cfg.data.vocab_size,
         seq_len=t.seq_len,
         hidden_size=t.hidden_size,
         n_heads=t.n_heads,
@@ -1037,7 +1037,7 @@ def main(cfg: DictConfig):
         H_cycles=t.H_cycles,
         n_sup=t.n_sup,
         expansion=t.expansion,
-        forward_dtype=t.forward_dtype,
+        forward_dtype=cfg.precision.thinker_dtype,
         mlp_t=t.mlp_t,
         pos_encodings=t.pos_encodings,
         puzzle_emb_ndim=t.puzzle_emb_ndim,
@@ -1057,12 +1057,12 @@ def main(cfg: DictConfig):
         common_kwargs = dict(
             painter_size=painter_size,
             cell_size=cell_size,
-            vocab_size=p.get("vocab_size", 11),
+            vocab_size=cfg.data.vocab_size,
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
-            cfg_prob=p.get("cfg_prob", 0.0),
-            cfg_scale=p.get("cfg_scale", 1.0),
-            painter_dtype=p.get("dtype", None),
+            cfg_prob=p.cfg_prob,
+            cfg_scale=p.cfg_scale,
+            painter_dtype=cfg.precision.painter_dtype,
         )
         if mode == "standalone_painter":
             model = StandalonePainter(bridge_channels=p.bridge_channels, **common_kwargs)
@@ -1078,18 +1078,18 @@ def main(cfg: DictConfig):
         frozen_painter = StandalonePainter(
             painter_size=painter_size,
             cell_size=cell_size,
-            vocab_size=p.get("vocab_size", 11),
+            vocab_size=cfg.data.vocab_size,
             bridge_channels=p.bridge_channels,
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
-            painter_dtype=p.get("dtype", None),
+            painter_dtype=cfg.precision.painter_dtype,
         )
         ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
         frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
         logger.info(f"Loaded StandalonePainter from {painter_ckpt_path}")
         model = ThinkerWithFrozenPainter(
             painter=frozen_painter,
-            thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
+            thinker_bridge_mode=p.thinker_bridge_mode,
             adapter_in_channels=int(p.get("adapter_in_channels", 0)),
             **thinker_kwargs,
         )
@@ -1102,10 +1102,10 @@ def main(cfg: DictConfig):
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
             diff_thinker_weight=p.diff_thinker_weight,
-            thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
-            cfg_prob=p.get("cfg_prob", 0.0),
-            cfg_scale=p.get("cfg_scale", 1.0),
-            painter_dtype=p.get("dtype", None),
+            thinker_bridge_mode=p.thinker_bridge_mode,
+            cfg_prob=p.cfg_prob,
+            cfg_scale=p.cfg_scale,
+            painter_dtype=cfg.precision.painter_dtype,
             **thinker_kwargs,
         )
     else:
@@ -1121,7 +1121,7 @@ def main(cfg: DictConfig):
             H_cycles=t.H_cycles,
             n_sup=t.n_sup,
             expansion=t.expansion,
-            forward_dtype=t.forward_dtype,
+            forward_dtype=cfg.precision.thinker_dtype,
             mlp_t=t.mlp_t,
             pos_encodings=t.pos_encodings,
             halt_exploration_prob=t.halt_exploration_prob,
@@ -1131,16 +1131,16 @@ def main(cfg: DictConfig):
         img_painter_kwargs = dict(
             painter_size=painter_size,
             cell_size=cell_size,
-            enc_channels=p.get("enc_channels", 32),
-            enc_hidden_channels=tuple(p.get("enc_hidden_channels", [16, 32])),
+            enc_channels=p.enc_channels,
+            enc_hidden_channels=tuple(p.enc_hidden_channels),
             bridge_channels=p.bridge_channels,
             painter_channels=tuple(p.painter_channels),
             painter_layers_per_block=p.painter_layers_per_block,
             diff_thinker_weight=p.diff_thinker_weight,
-            thinker_bridge_mode=p.get("thinker_bridge_mode", "logits"),
-            cfg_prob=p.get("cfg_prob", 0.0),
-            cfg_scale=p.get("cfg_scale", 1.0),
-            painter_dtype=p.get("dtype", None),
+            thinker_bridge_mode=p.thinker_bridge_mode,
+            cfg_prob=p.cfg_prob,
+            cfg_scale=p.cfg_scale,
+            painter_dtype=cfg.precision.painter_dtype,
         )
         _VARIANT_CLS = {
             "v0": OriginalTRMRatatouilleV0,
@@ -1181,7 +1181,7 @@ def main(cfg: DictConfig):
     # Compile submodules individually to avoid tracing the Python-level n_sup /
     # H_cycles / L_cycles loops (dynamic control flow defeats fullgraph compile).
     # L_level is the hot path: called H_cycles*L_cycles times per sup step.
-    if cfg.get("compile", False):
+    if cfg.train.compile:
         if mode == "sudoku":
             model.inner.L_level = torch.compile(model.inner.L_level, fullgraph=False)
         elif mode in _STANDALONE_PAINTER_MODES:
@@ -1213,14 +1213,14 @@ def main(cfg: DictConfig):
 
     # ── EMA — using EMAHelper from models/ema.py, same as pretrain.py ─────────
     ema_helper = None
-    if cfg.use_ema:
-        ema_helper = EMAHelper(mu=cfg.ema_rate)
+    if cfg.ema.enabled:
+        ema_helper = EMAHelper(mu=cfg.ema.rate)
         ema_helper.register(accelerator.unwrap_model(model))
-        logger.info(f"EMA enabled (mu={cfg.ema_rate})")
+        logger.info(f"EMA enabled (mu={cfg.ema.rate})")
 
     # ── Resume ────────────────────────────────────────────────────────────────
     global_step = 0
-    resume_path = cfg.get("resume_from_checkpoint", None)
+    resume_path = cfg.run.get("resume_from_checkpoint", None)
     load_opt    = cfg.get("load_optimizer_state", True)
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
@@ -1254,9 +1254,9 @@ def main(cfg: DictConfig):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     num_steps        = cfg.train.num_steps
-    eval_every       = cfg.train.get("eval_every", 1000)
-    save_every       = cfg.train.get("save_every", 5000)
-    log_every        = cfg.train.get("log_every", 100)
+    eval_every       = cfg.eval.eval_every
+    save_every       = cfg.eval.save_every
+    log_every        = cfg.eval.log_every
     sudoku_w         = cfg.train.get("sudoku_loss_weight", 1.0)
     grad_accum_steps = cfg.train.get("gradient_accumulation_steps", 1)
 
@@ -1366,10 +1366,10 @@ def main(cfg: DictConfig):
 
             # ── Digit-level sampling eval (painter / standalone_painter) ─────
             if mode in ("painter", *_STANDALONE_PAINTER_MODES, "thinker_frozen_painter") and accelerator.is_main_process and classifier is not None:
-                n_total = cfg.train.get("eval_num_samples",   128)
-                n_batch = cfg.train.get("eval_batch_size",     32)
-                n_ddim  = cfg.train.get("eval_num_ddim_steps", 20)
-                n_log   = cfg.train.get("eval_num_log_images", 10)
+                n_total = cfg.eval.num_samples
+                n_batch = cfg.eval.batch_size
+                n_ddim  = cfg.eval.num_ddim_steps
+                n_log   = cfg.eval.num_log_images
 
                 all_cell_acc:   list[float] = []
                 all_puzzle_acc: list[float] = []
@@ -1394,7 +1394,7 @@ def main(cfg: DictConfig):
                     ema_helper.ema(unwrapped)
                 unwrapped.eval()
 
-                eval_cfg_scale = cfg.train.get("eval_cfg_scale", 1.0)
+                eval_cfg_scale = cfg.eval.cfg_scale
                 orig_cfg_scale = getattr(unwrapped, "cfg_scale", 1.0)
                 if hasattr(unwrapped, "cfg_scale"):
                     unwrapped.cfg_scale = eval_cfg_scale
@@ -1413,9 +1413,9 @@ def main(cfg: DictConfig):
                     sr = sample_grids(
                         unwrapped,
                         conds_sample,
-                        num_train_timesteps=cfg.num_timesteps,
-                        beta_schedule=cfg.beta_schedule,
-                        prediction_type=cfg.prediction_type,
+                        num_train_timesteps=cfg.diffusion.num_train_timesteps,
+                        beta_schedule=cfg.diffusion.beta_schedule,
+                        prediction_type=cfg.diffusion.prediction_type,
                         num_steps=n_ddim,
                         device=accelerator.device,
                         puzzle_ids=pids,
@@ -1501,7 +1501,7 @@ def main(cfg: DictConfig):
                     unwrapped.eval()
                     real_loader = DataLoader(
                         eval_ds, batch_size=n_batch, shuffle=False,
-                        num_workers=cfg.get("num_workers", 4), pin_memory=True,
+                        num_workers=cfg.data.num_workers, pin_memory=True,
                     )
                     n_real_done = 0
                     for eb_r in tqdm(real_loader, "Realsolution eval",
@@ -1514,9 +1514,9 @@ def main(cfg: DictConfig):
                         full_cond    = _get_full_solution_condition(eb_r, unwrapped)
                         sr_r = sample_grids(
                             unwrapped, full_cond,
-                            num_train_timesteps=cfg.num_timesteps,
-                            beta_schedule=cfg.beta_schedule,
-                            prediction_type=cfg.prediction_type,
+                            num_train_timesteps=cfg.diffusion.num_train_timesteps,
+                            beta_schedule=cfg.diffusion.beta_schedule,
+                            prediction_type=cfg.diffusion.prediction_type,
                             num_steps=n_ddim,
                             device=accelerator.device,
                             puzzle_ids=pids_r,
@@ -1592,12 +1592,12 @@ def main(cfg: DictConfig):
 
         if global_step >= next_save and accelerator.is_main_process:
             save_checkpoint(accelerator, model, optimizers, global_step,
-                            cfg.output_dir, f"step-{global_step}", ema_helper)
+                            cfg.run.output_dir, f"step-{global_step}", ema_helper)
             next_save = global_step + save_every
 
     if accelerator.is_main_process:
         save_checkpoint(accelerator, model, optimizers, global_step,
-                        cfg.output_dir, "final", ema_helper)
+                        cfg.run.output_dir, "final", ema_helper)
         logger.info("Training complete.")
 
     if wandb_project:

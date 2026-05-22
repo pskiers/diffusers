@@ -21,16 +21,16 @@ SMALL_PAINTER_ARGS = [
 ]
 
 FAST_TRAINING_ARGS = [
-    "compile=false",
+    "train.compile=false",
     "train.batch_size=2",
     "train.num_steps=3",
-    "train.eval_every=2",
-    "train.save_every=2",
-    "train.log_every=1",
+    "eval.eval_every=2",
+    "eval.save_every=2",
+    "eval.log_every=1",
+    "eval.num_samples=2",
+    "eval.batch_size=2",
+    "eval.num_log_images=2",
     "train.gradient_accumulation_steps=1",
-    "train.eval_num_samples=2",
-    "train.eval_batch_size=2",
-    "train.eval_num_log_images=2",
 ]
 
 TWO_STAGE_PT_ARGS = [
@@ -40,7 +40,7 @@ TWO_STAGE_PT_ARGS = [
     "thinker_stage.n_sup=2",
 ]
 
-RESUME_FROM_CKPT_ARG = "resume_from_checkpoint"
+RESUME_FROM_CKPT_ARG = "run.resume_from_checkpoint"
 
 SCRIPT_PATH = "train_trm.py"
 
@@ -54,7 +54,7 @@ def run_script(script_path, output_dir, args, resume_from_checkpoint=False, clea
         env["WANDB_MODE"] = "offline"
         env["WANDB_DIR"] = output_dir
 
-        cmd = ["python", script_path, f"output_dir={output_dir}"] + args
+        cmd = ["python", script_path, f"run.output_dir={output_dir}"] + args
         res = subprocess.run(cmd, env=env, capture_output=True, text=True)
         assert res.returncode == 0, f"Initial Run Failed!\n{res.stdout}\n{res.stderr}"
 

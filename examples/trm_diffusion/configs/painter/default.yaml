@@ -1,0 +1,23 @@
+bridge_channels: 16
+painter_channels: [32, 64, 64]
+painter_layers_per_block: 2
+diff_thinker_weight: 1.0
+thinker_bridge_mode: "logits"
+
+# Image-encoder size (V0/V1 only)
+enc_channels: 32
+enc_hidden_channels: [16, 32]
+thinker_out_channels: null
+
+# Timestep conditioning (V1 only)
+enc_timestep_cond: false
+thinker_timestep_cond: false
+temb_dim: 256
+
+# Classifier-free guidance
+cfg_prob: 0.0
+cfg_scale: 1.0
+
+# Separate AdamW LR/WD for painter+bridge (null = inherit from train.lr / train.weight_decay)
+lr: 1e-4
+weight_decay: null

@@ -1,0 +1,10 @@
+eval_every: 1000
+save_every: 5000
+log_every: 100
+
+classifier_path: runs/mnist_classifier_cell16.pt
+cfg_scale: 1.0
+num_samples: 7680
+batch_size: 384
+num_ddim_steps: 20
+num_log_images: 10

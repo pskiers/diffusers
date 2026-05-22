@@ -1,41 +1,20 @@
 # @package _global_
 # Standalone SPADE painter: solution tokens → one-hot → bilinear upsample →
 # SPADE semantic map fed to every ResBlock norm (no bridge concatenation).
-#
-# Usage:
-#   python train_trm.py experiment=standalone_painter_spade
 
 mode: "standalone_painter_spade"
-output_dir: "runs/standalone_painter_spade"
-compile: true
 
-use_ema: true
-ema_rate: 0.999
-
-painter:
-  vocab_size: 11
-  painter_channels: [32, 64, 64]
-  painter_layers_per_block: 2
-  cfg_prob: 0.0
-  cfg_scale: 1.0
-  dtype: bfloat16
-
-data:
-  cell_size: 16
+run:
+  output_dir: "runs/standalone_painter_spade"
 
 train:
-  lr: 1e-4
   lr_min_ratio: 1.0
   weight_decay: 0.01
   batch_size: 384
   num_steps: 100000
-  warmup_steps: 2000
+  sudoku_loss_weight: 0.0
+  gradient_accumulation_steps: 2
+
+eval:
   eval_every: 2000
   save_every: 10000
-  gradient_accumulation_steps: 2
-  sudoku_loss_weight: 0.0
-  mse_loss_weight: 1.0
-  eval_classifier_path: null
-  classifier_loss:
-    weight: 0.0
-    t_max: 200

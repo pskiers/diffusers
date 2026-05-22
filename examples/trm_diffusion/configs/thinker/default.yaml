@@ -1,0 +1,16 @@
+seq_len: 81
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+pos_encodings: "rope"
+mlp_t: false
+
+puzzle_emb_ndim: 512
+puzzle_emb_len: 16
+num_puzzle_identifiers: 1000
+halt_exploration_prob: 0.0
+freeze_weights: false

@@ -1,5 +1,5 @@
 # Base config for train_trm.py.
-# Select a mode with: experiment=sudoku  or  experiment=v0tok
+# Select an experiment with: experiment=sudoku  or  experiment=v0tok
 #
 # Usage:
 #   python train_trm.py experiment=sudoku
@@ -8,135 +8,27 @@
 
 defaults:
   - _self_
+  - thinker: default
+  - painter: default
+  - data: mnist_sudoku
+  - diffusion: ddpm
+  - train: default
+  - eval: default
   - experiment: null
 
-mode: "sudoku"   # "sudoku" | "painter"
-compile: true   # torch.compile hot submodules (L_level, painter, bridge)
+mode: "sudoku"            # "sudoku" | "painter" | "standalone_painter" | ...
+painter_variant: "v0tok"  # "v0tok" | "v0" | "v1" | "v2" | "v3" | "v4"
 
-output_dir: "runs/trm"
-num_workers: 4
-mixed_precision: "no"
-resume_from_checkpoint: null
-seed: 0
+run:
+  output_dir: "runs/trm"
+  resume_from_checkpoint: null
+  wandb_project: small-llm-diffusion
 
-wandb_project: small-llm-diffusion   # set to enable wandb logging
+ema:
+  enabled: true
+  rate: 0.999
 
-# ── EMA ───────────────────────────────────────────────────────────────────────
-# ema_rate matches the original pretrain.py naming (vs ema_decay in our scripts).
-use_ema: true
-ema_rate: 0.999    # original default; our old scripts used 0.9999
-
-# ── Thinker ───────────────────────────────────────────────────────────────────
-# All params map directly to TinyRecursiveReasoningModel_ACTV1Config.
-thinker:
-  vocab_size: 11          # 0=PAD, 1=blank, 2-10=digits 1-9
-  seq_len: 81
-  hidden_size: 512        # original: 512
-  n_heads: 8              # original: 8  (= hidden_size // 64)
-  L_layers: 2             # transformer layers per block call
-  L_cycles: 6             # inner iterations per H-cycle
-  H_cycles: 3             # outer macroscopic cycles
-  n_sup: 16               # supervision steps (= halt_max_steps in original)
-  expansion: 4.0          # SwiGLU hidden-dim multiplier; original: 4
-  forward_dtype: "bfloat16"
-  pos_encodings: "rope"   # "rope" | "learned"
-  mlp_t: false            # true = MLP-T block instead of attention
-
-  # ── Puzzle embeddings ──────────────────────────────────────────────────────
-  # The original uses sparse puzzle embeddings trained with a dedicated
-  # SignSGD optimizer (see puzzle_emb_lr / puzzle_emb_weight_decay below).
-  # Set puzzle_emb_ndim=0 to disable (pure AdamW, no SignSGD needed).
-  # To match the original: puzzle_emb_ndim=512, puzzle_emb_len=16.
-  puzzle_emb_ndim: 512          # 0 = disabled; original: hidden_size (512)
-  puzzle_emb_len: 16            # prefix token count; ignored when ndim=0
-  num_puzzle_identifiers: 1000  # unique puzzle IDs; needed when ndim > 0
-  # batch_size: 768               # per-GPU batch size; needed by CastedSparseEmbedding
-
-  # ── ACT exploration ────────────────────────────────────────────────────────
-  # 0.0 = fixed n_sup steps, no adaptive halting (what we use).
-  # > 0 = enables the original ACT: the model sometimes runs for a random
-  #       number of steps before halting (original uses 0.1).
-  halt_exploration_prob: 0.0    # original: 0.1
-
-  # ── Freeze weights ─────────────────────────────────────────────────────────
-  # If true, only the puzzle embeddings are trained (SignSGD), all other
-  # parameters are frozen.  Used to fine-tune embeddings on a new puzzle set.
-  freeze_weights: false         # original: false
-
-# ── Painter (painter mode only) ───────────────────────────────────────────────
-painter:
-  bridge_channels: 16
-  painter_channels: [32, 64, 64]
-  painter_layers_per_block: 2
-  diff_thinker_weight: 1.0   # 0=detach thinker from diffusion loss, 1=full grad
-  thinker_bridge_mode: "logits"  # "logits" | "onehot" | "softmax"
-  # Image-encoder size (V0/V1 only)
-  enc_channels: 32
-  enc_hidden_channels: [16, 32]  # intermediate widths in SpatialEncoder conv stack
-  thinker_out_channels: null  # null = same as num_classes (no expansion)
-  # Timestep conditioning (V1 only)
-  enc_timestep_cond: false     # FiLM scale+shift on encoder features
-  thinker_timestep_cond: false # T2: broadcast temb added to thinker input tokens
-  temb_dim: 256
-  # CFG (standalone_painter only)
-  cfg_prob: 0.0
-  cfg_scale: 1.0
-  vocab_size: 11
-  # Separate AdamW LR/WD for painter+bridge (null = inherit from train.lr / train.weight_decay)
-  lr: 1e-4
-  weight_decay: null
-  # Mixed precision for bridge+UNet only (null=disabled, "bfloat16", "float16").
-  # TRM is unaffected — it manages its own dtype via thinker.forward_dtype.
-  # If using "float16", set mixed_precision="fp16" so accelerate handles GradScaler.
-  dtype: bfloat16
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
-data:
-  sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
-  mnist_root: "data/mnist"   # painter mode only
-  cell_size: 16              # painter mode only; grid = 9*cell_size px
-
-# ── Diffusion scheduler (painter mode only) ───────────────────────────────────
-num_timesteps: 100
-beta_schedule: "squaredcos_cap_v2"
-prediction_type: "sample"   # "epsilon" (predict noise) or "sample" (predict x0)
-
-# ── Training ──────────────────────────────────────────────────────────────────
-train:
-  lr: 1e-4
-  lr_min_ratio: 0.1       # cosine decay floor as fraction of lr; original: 0.0
-  weight_decay: 1.0       # original: 1.0
-  beta1: 0.9              # AdamW beta1; original uses AdamATan2 with same betas
-  beta2: 0.95             # AdamW beta2
-
-  # Puzzle-embedding optimizer (only used when thinker.puzzle_emb_ndim > 0)
-  puzzle_emb_lr: 1e-4     # SignSGD LR for sparse puzzle embedding
-  puzzle_emb_weight_decay: 1.0
-
-  batch_size: 768         # sudoku default; painter uses 128 (set in v0tok.yaml)
-  num_steps: 50000
-  warmup_steps: 2000
-  eval_every: 1000
-  save_every: 5000
-  log_every: 100
-  sudoku_loss_weight: 1.0  # painter mode: thinker CE weight relative to diff loss
-  gradient_accumulation_steps: 1  # accumulate over N batches before each optimizer step
-
-  # ── Noisy-swap augmentation ────────────────────────────────────────────────
-  # For samples whose timestep falls in [t_min, t_max], randomly replace
-  # x_noisy with a different clean image from the batch noised to the same
-  # timestep.  Forces the painter to rely on conditioning rather than x_noisy.
-  # prob=0.0 disables the augmentation entirely.
-  noisy_swap:
-    prob: 0.0          # per-sample swap probability (0.0 = disabled)
-    t_min: 80          # inclusive lower timestep bound (high-noise region)
-    t_max: 100         # inclusive upper timestep bound
-
-  # ── Digit-level sampling eval (painter mode only) ─────────────────────────
-  # Set eval_classifier_path to enable DDIM sampling + digit accuracy metrics.
-  eval_classifier_path: runs/mnist_classifier_cell16.pt   # path to save/load MNIST cell classifier
-  eval_cfg_scale: 1.0          # CFG scale during sampling eval (1.0 = disabled)
-  eval_num_samples: 7680        # total samples for digit-level eval
-  eval_batch_size: 384          # batch size for sampling
-  eval_num_ddim_steps: 20      # DDIM denoising steps
-  eval_num_log_images: 10      # panel images to log to wandb
+precision:
+  mixed_precision: "no"   # accelerate AMP ("no" | "fp16" | "bf16")
+  thinker_dtype: bfloat16 # TRM forward dtype (CastedEmbedding / forward pass)
+  painter_dtype: bfloat16 # bridge + UNet forward dtype

@@ -1,43 +1,24 @@
 # @package _global_
 # Painter-thinker V1 — image-conditioned thinker, sees cat(condition, noisy).
-# Training wheel removed vs V0: encoder receives the noisy image too, forcing
-# the thinker to reason from a corrupted signal.
 # Losses: diffusion MSE + sudoku CE.
 
 mode: "painter"
 painter_variant: "v1"
-output_dir: "runs/trm_v1"
-compile: true
 
-use_ema: true
-ema_rate: 0.999
+run:
+  output_dir: "runs/trm_v1"
 
 thinker:
   puzzle_emb_ndim: 0
   num_classes: 9
-  n_sup: 16
-  hidden_size: 512
   halt_exploration_prob: 0.0
 
-painter:
-  enc_channels: 32
-  bridge_channels: 16
-  painter_channels: [32, 64, 64]
-  painter_layers_per_block: 2
-  diff_thinker_weight: 1.0
-  dtype: bfloat16
-
-data:
-  cell_size: 16
-
 train:
-  lr: 1e-4
   lr_min_ratio: 1.0
-  weight_decay: 1.0
   batch_size: 384
   num_steps: 100000
-  warmup_steps: 2000
+  gradient_accumulation_steps: 2
+
+eval:
   eval_every: 2000
   save_every: 10000
-  sudoku_loss_weight: 1.0
-  gradient_accumulation_steps: 2
