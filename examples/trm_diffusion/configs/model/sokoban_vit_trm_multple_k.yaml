@@ -2,7 +2,7 @@ _target_: trm_models.DiTTRMv2
 resolution: 12
 n: 6
 T: 3
-n_sup: 16
+n_sup: 3
 
 core_model:
   _target_: models_pt.UnifiedConditionDiT
@@ -11,10 +11,10 @@ core_model:
   in_channels: ${in_channels}
   condition_mode: ${condition_mode}
 
-  num_layers: 2
+  num_layers: 3
   patch_size: 1
   attention_head_dim: 64
-  num_attention_heads: 3
+  num_attention_heads: 4
   cross_attention_dim: 192
 
   activation_fn: "swiglu"
