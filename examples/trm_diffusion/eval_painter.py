@@ -116,6 +116,30 @@ def build_model(args) -> torch.nn.Module:
             cfg_scale=1.0,
             painter_dtype=args.painter_dtype,
         )
+    elif args.mode == "thinker_frozen_painter":
+        # Build a dummy StandalonePainter (random weights) so ThinkerWithFrozenPainter
+        # can set up self.bridge / self.painter.  load_state_dict overwrites all weights.
+        dummy_painter = StandalonePainter(
+            painter_size=painter_size,
+            cell_size=args.cell_size,
+            vocab_size=args.vocab_size,
+            bridge_channels=args.bridge_channels,
+            painter_channels=tuple(args.painter_channels),
+            painter_layers_per_block=args.painter_layers_per_block,
+            painter_dtype=args.painter_dtype,
+        )
+        model = ThinkerWithFrozenPainter(
+            painter=dummy_painter,
+            adapter_in_channels=args.adapter_in_channels,
+            painter_size=painter_size,
+            cell_size=args.cell_size,
+            bridge_channels=args.bridge_channels,
+            painter_channels=tuple(args.painter_channels),
+            painter_layers_per_block=args.painter_layers_per_block,
+            thinker_bridge_mode=args.thinker_bridge_mode,
+            painter_dtype=args.painter_dtype,
+            **thinker_kwargs,
+        )
     elif args.painter_variant == "v0tok":
         model = OriginalTRMRatatouilleV0Tok(
             painter_size=painter_size,
@@ -432,6 +456,8 @@ def parse_args():
     p.add_argument("--painter_layers_per_block", type=int, default=2)
     p.add_argument("--thinker_bridge_mode",     default="logits",
                    choices=["logits", "onehot", "softmax"])
+    p.add_argument("--adapter_in_channels",     type=int, default=0,
+                   help="thinker_frozen_painter only: adapter projection channels (0=disabled)")
     p.add_argument("--painter_dtype",           default="bfloat16",
                    choices=["bfloat16", "float16", "none"])
 
