@@ -51,12 +51,59 @@ from models.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1InnerCarry,
 )
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from mnist_sudoku_models import (
-    SpatialBridge, _make_painter,
-    _make_painter_control, ConditioningPyramid, SPADEUNet2D,
-)
-from models_pt import SpatialEncoder, AttentiveBridge, TimestepMLP
+from diffusers import UNet2DModel
+from models_pt import SpatialEncoder, AttentiveBridge, TimestepMLP, SpatialBridge, ControlPainterUNet, ConditioningPyramid, SPADEUNet2D
 
+
+
+def _make_painter(
+    painter_size: int,
+    bridge_channels: int,
+    painter_channels: tuple[int, ...],
+    layers_per_block: int = 2,
+) -> UNet2DModel:
+    """
+    Build the denoising UNet.  Uses plain conv blocks throughout (no attention)
+    to keep compute O(pixels) rather than O(pixels²).  For a 9×9 grid of
+    independent digits, self-attention across the full image adds little value
+    and dominates wall-clock time.
+    """
+    n = len(painter_channels)
+    norm_num_groups = 32
+    while norm_num_groups > 1 and any(c % norm_num_groups != 0 for c in painter_channels):
+        norm_num_groups //= 2
+    return UNet2DModel(
+        sample_size=painter_size,
+        in_channels=1 + bridge_channels,
+        out_channels=1,
+        block_out_channels=painter_channels,
+        down_block_types=("DownBlock2D",) * n,
+        up_block_types=("UpBlock2D",) * n,
+        norm_num_groups=norm_num_groups,
+        layers_per_block=layers_per_block,
+    )
+
+
+def _make_painter_control(
+    painter_size: int,
+    painter_channels: tuple[int, ...],
+    layers_per_block: int = 2,
+) -> ControlPainterUNet:
+    """Build a ControlNet-capable painter UNet (in_channels=1, no bridge concat)."""
+    n = len(painter_channels)
+    norm_num_groups = 32
+    while norm_num_groups > 1 and any(c % norm_num_groups != 0 for c in painter_channels):
+        norm_num_groups //= 2
+    return ControlPainterUNet(
+        sample_size=painter_size,
+        in_channels=1,
+        out_channels=1,
+        block_out_channels=painter_channels,
+        down_block_types=("DownBlock2D",) * n,
+        up_block_types=("UpBlock2D",) * n,
+        norm_num_groups=norm_num_groups,
+        layers_per_block=layers_per_block,
+    )
 
 # ── Sparse puzzle-embedding optimizer factory ──────────────────────────────────
 

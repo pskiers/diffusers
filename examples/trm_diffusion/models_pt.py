@@ -2,202 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from diffusers import UNet2DConditionModel, Transformer2DModel
+from diffusers import UNet2DConditionModel, Transformer2DModel, UNet2DModel
+from diffusers.models.unets.unet_2d import UNet2DOutput
 from diffusers.configuration_utils import register_to_config
 
 
 def strip_compiled_prefix(state_dict: dict) -> dict:
     """Remove '_orig_mod.' prefix inserted by torch.compile on submodules."""
     return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
-
-
-class UnifiedConditionUNet(UNet2DConditionModel):
-    @register_to_config
-    def __init__(
-        self,
-        condition_mode="class",  # "class" (ImageNet) or "sequence" (CLEVR)
-        num_classes=1000,
-        raw_dim=21,
-        # --- Explicitly unroll standard UNet args so ConfigMixin captures them properly ---
-        sample_size=64,
-        in_channels=3,
-        out_channels=3,
-        center_input_sample=False,
-        flip_sin_to_cos=True,
-        freq_shift=0,
-        down_block_types=("CrossAttnDownBlock2D",),
-        up_block_types=("CrossAttnUpBlock2D",),
-        block_out_channels=(256,),
-        layers_per_block=2,
-        downsample_padding=1,
-        mid_block_scale_factor=1,
-        act_fn="silu",
-        norm_num_groups=32,
-        norm_eps=1e-5,
-        cross_attention_dim=1024,
-        attention_head_dim=8,
-    ):
-        # Call parent explicitly, skipping num_class_embeds so we don't trigger native class logic
-        super().__init__(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            center_input_sample=center_input_sample,
-            flip_sin_to_cos=flip_sin_to_cos,
-            freq_shift=freq_shift,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
-            layers_per_block=layers_per_block,
-            downsample_padding=downsample_padding,
-            mid_block_scale_factor=mid_block_scale_factor,
-            act_fn=act_fn,
-            norm_num_groups=norm_num_groups,
-            norm_eps=norm_eps,
-            cross_attention_dim=cross_attention_dim,
-            attention_head_dim=attention_head_dim,
-        )
-
-        # Note: We use self.config here because @register_to_config puts arguments there
-        if self.config.condition_mode == "class":
-            self.condition_projector = nn.Embedding(self.config.num_classes + 1, self.config.cross_attention_dim)
-        elif self.config.condition_mode == "sequence":
-            self.condition_projector = nn.Sequential(
-                nn.Linear(self.config.raw_dim, self.config.cross_attention_dim),
-                nn.SiLU(),
-                nn.Linear(self.config.cross_attention_dim, self.config.cross_attention_dim),
-            )
-        else:
-            raise ValueError(f"Unknown condition_mode: {self.config.condition_mode}")
-
-    def forward(self, sample, timestep, condition_tensors, attention_mask=None, **kwargs):
-        """
-        Generic forward pass handling both discrete classes and continuous sequences.
-        """
-        if self.config.condition_mode == "class":
-            encoder_hidden_states = self.condition_projector(condition_tensors).unsqueeze(1)
-        else:
-            encoder_hidden_states = self.condition_projector(condition_tensors)
-
-        return super().forward(
-            sample,
-            timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=attention_mask,
-            **kwargs,
-        )
-
-
-class UnifiedConditionDiT(Transformer2DModel):
-    @register_to_config
-    def __init__(
-        self,
-        condition_mode="class",  # "class", "class_adaln", or "sequence"
-        num_classes=1000,
-        raw_dim=21,
-        # --- Standard Transformer2DModel args ---
-        sample_size=32,
-        in_channels=4,
-        out_channels=4,
-        num_layers=12,
-        patch_size=2,
-        attention_head_dim=64,
-        num_attention_heads=16,
-        cross_attention_dim=1024,
-        activation_fn="gelu-approximate",
-    ):
-        # Configure norm and cross-attention based on mode.
-        # "spatial_concat" concatenates the condition map to the noisy input before
-        # patch-embedding, so it also needs no cross-attention.
-        is_adaln = condition_mode in ("class_adaln", "spatial_concat")
-
-        # FIX: DiTs ALWAYS require ada_norm_zero to process the diffusion timestep.
-        norm_type = "ada_norm_zero"
-
-        # class_adaln uses all classes + dropout token; everything else just needs
-        # a single dummy embedding to carry the timestep through adaLN.
-        num_embeds_ada_norm = num_classes + 1 if condition_mode == "class_adaln" else 1
-
-        # In adaLN / spatial_concat mode, strip out cross-attention. Otherwise, use it.
-        actual_cross_attn_dim = None if is_adaln else cross_attention_dim
-
-        # Call parent explicitly
-        super().__init__(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            num_layers=num_layers,
-            patch_size=patch_size,
-            attention_head_dim=attention_head_dim,
-            num_attention_heads=num_attention_heads,
-            cross_attention_dim=actual_cross_attn_dim,
-            activation_fn=activation_fn,
-            num_embeds_ada_norm=num_embeds_ada_norm,
-            norm_type=norm_type,
-        )
-
-        if self.config.condition_mode == "class":
-            self.condition_projector = nn.Embedding(self.config.num_classes + 1, self.config.cross_attention_dim)
-        elif self.config.condition_mode == "sequence":
-            self.condition_projector = nn.Sequential(
-                nn.Linear(self.config.raw_dim, self.config.cross_attention_dim),
-                nn.SiLU(),
-                nn.Linear(self.config.cross_attention_dim, self.config.cross_attention_dim),
-            )
-        elif self.config.condition_mode == "class_adaln":
-            # Diffusers handles the adaLN embedding internally, so we don't need a projector
-            self.condition_projector = None
-        elif self.config.condition_mode == "spatial_concat":
-            # Condition is a (C, H, W) spatial map concatenated to the noisy input
-            # before patch-embedding; no projector needed.
-            self.condition_projector = None
-        else:
-            raise ValueError(f"Unknown condition_mode: {self.config.condition_mode}")
-
-    def forward(self, sample, timestep, condition_tensors=None, attention_mask=None, **kwargs):
-        """
-        Generic forward pass matching your custom UNet signature.
-        """
-        encoder_hidden_states = None
-
-        # Default dummy class_labels to carry the timestep through the adaLN block
-        class_labels = torch.zeros((sample.shape[0],), dtype=torch.long, device=sample.device)
-
-        if condition_tensors is not None:
-            if self.config.condition_mode == "class":
-                encoder_hidden_states = self.condition_projector(condition_tensors).unsqueeze(1)
-            elif self.config.condition_mode == "sequence":
-                encoder_hidden_states = self.condition_projector(condition_tensors)
-            elif self.config.condition_mode == "class_adaln":
-                # Override the dummy labels with the actual condition labels
-                class_labels = condition_tensors
-            elif self.config.condition_mode == "spatial_concat":
-                # Concatenate the spatial map to the noisy input before patch-embedding.
-                # condition_tensors: (B, C_mask, H, W); sample: (B, C_noise, H, W)
-                sample = torch.cat([sample, condition_tensors.to(sample.dtype)], dim=1)
-        elif self.config.condition_mode == "class_adaln":
-            # Unconditional inference fallback for class_adaln
-            class_labels = torch.full(
-                (sample.shape[0],), self.config.num_classes, dtype=torch.long, device=sample.device
-            )
-
-        return super().forward(
-            hidden_states=sample,
-            timestep=timestep,
-            encoder_hidden_states=encoder_hidden_states,
-            class_labels=class_labels,
-            encoder_attention_mask=attention_mask,
-            **kwargs,
-        )
-
-    @classmethod
-    def from_config(cls, config, **kwargs):
-        """
-        Bypass the buggy diffusers class remapping logic for custom classes.
-        This forces diffusers to instantiate THIS class during EMA saving/loading.
-        """
-        init_dict, unused_kwargs, hidden_config_dict = cls.extract_init_dict(config, **kwargs)
-        return cls(**init_dict)
 
 
 class TimestepMLP(nn.Module):
@@ -423,3 +235,324 @@ class ConditioningPyramid(nn.Module):
         mid_res = x + self.mid_block(x)
 
         return residuals, mid_res
+
+
+class SpatialBridge(nn.Module):
+    """
+    Bilinear upsample + 2 conv layers.
+    (B, in_c, H_t, W_t) → (B, bridge_c, painter_size, painter_size)
+    Used for V0–V3.  V4 uses AttentiveBridge from models.py instead.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, painter_size: int):
+        super().__init__()
+        self.painter_size = painter_size
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=self.painter_size, mode="bilinear", align_corners=False)
+        return self.conv(x)
+
+
+class ControlPainterUNet(UNet2DModel):
+    """UNet2DModel extended with ControlNet-style residual injection.
+
+    Identical to UNet2DModel in every way except forward() accepts
+    down_block_additional_residuals and mid_block_additional_residual, which are
+    added to the skip connections before the up-blocks (standard ControlNet math).
+    """
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        class_labels=None,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        return_dict: bool = True,
+    ):
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep * torch.ones(sample.shape[0], dtype=timestep.dtype, device=timestep.device)
+        t_emb = self.time_proj(timestep).to(dtype=self.dtype)
+        emb = self.time_embedding(t_emb)
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError("class_labels required for class conditioning")
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+            emb = emb + self.class_embedding(class_labels).to(dtype=self.dtype)
+
+        skip_sample = sample
+        sample = self.conv_in(sample)
+
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if hasattr(downsample_block, "skip_conv"):
+                sample, res_samples, skip_sample = downsample_block(
+                    hidden_states=sample, temb=emb, skip_sample=skip_sample
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+            down_block_res_samples += res_samples
+
+        if down_block_additional_residuals is not None:
+            new_down = ()
+            for orig, add in zip(down_block_res_samples, down_block_additional_residuals):
+                new_down += (orig + add,)
+            down_block_res_samples = new_down
+
+        if self.mid_block is not None:
+            sample = self.mid_block(sample, emb)
+
+        if mid_block_additional_residual is not None:
+            sample = sample + mid_block_additional_residual
+
+        skip_sample = None
+        for upsample_block in self.up_blocks:
+            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(upsample_block.resnets)]
+            if hasattr(upsample_block, "skip_conv"):
+                sample, skip_sample = upsample_block(sample, res_samples, emb, skip_sample)
+            else:
+                sample = upsample_block(sample, res_samples, emb)
+
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        if skip_sample is not None:
+            sample += skip_sample
+
+        if self.config.time_embedding_type == "fourier":
+            timestep = timestep.reshape((sample.shape[0], *([1] * len(sample.shape[1:]))))
+            sample = sample / timestep
+
+        if not return_dict:
+            return (sample,)
+        return UNet2DOutput(sample=sample)
+
+
+class SPADEGroupNorm(nn.Module):
+    """GroupNorm + spatially adaptive scale/bias from a semantic map.
+
+    h_out = gamma(s) * GroupNorm(h) + beta(s)
+    where gamma, beta are predicted by a small CNN applied to s resized to h's size.
+    """
+
+    def __init__(self, num_groups: int, num_channels: int, sem_channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, num_channels, affine=False)
+        mid = max(num_channels, sem_channels)
+        self.shared     = nn.Sequential(nn.Conv2d(sem_channels, mid, 3, padding=1), nn.SiLU())
+        self.gamma_proj = nn.Conv2d(mid, num_channels, 3, padding=1)
+        self.beta_proj  = nn.Conv2d(mid, num_channels, 3, padding=1)
+
+    def forward(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        h_norm = self.norm(h)
+        s_r    = F.interpolate(s, size=h.shape[-2:], mode="bilinear", align_corners=False)
+        feat   = self.shared(s_r)
+        return self.gamma_proj(feat) * h_norm + self.beta_proj(feat)
+
+
+class SPADEResBlock(nn.Module):
+    """ResNet block with both GroupNorms replaced by SPADE."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        sem_channels: int,
+        temb_channels: int,
+        norm_groups: int = 32,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = SPADEGroupNorm(norm_groups, in_channels, sem_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm2 = SPADEGroupNorm(norm_groups, out_channels, sem_channels)
+        self.conv2 = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+        self.act            = nn.SiLU()
+        self.time_emb_proj  = nn.Sequential(nn.SiLU(), nn.Linear(temb_channels, out_channels))
+        self.conv_shortcut  = (nn.Conv2d(in_channels, out_channels, 1)
+                               if in_channels != out_channels else None)
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.norm1(x, s))
+        h = self.conv1(h)
+        h = h + self.time_emb_proj(temb)[:, :, None, None]
+        h = self.act(self.norm2(h, s))
+        h = self.conv2(h)
+        if self.conv_shortcut is not None:
+            x = self.conv_shortcut(x)
+        return x + h
+
+
+class _SPADEDownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, temb_ch, sem_ch, num_layers, add_downsample, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            SPADEResBlock(in_ch if i == 0 else out_ch, out_ch, sem_ch, temb_ch, norm_groups, dropout)
+            for i in range(num_layers)
+        ])
+        self.downsamplers = (
+            nn.ModuleList([nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1)])
+            if add_downsample else None
+        )
+
+    def forward(self, hidden, temb, s):
+        outputs = ()
+        for r in self.resnets:
+            hidden = r(hidden, temb, s);  outputs += (hidden,)
+        if self.downsamplers is not None:
+            for d in self.downsamplers:
+                hidden = d(hidden)
+            outputs += (hidden,)
+        return hidden, outputs
+
+
+class _SPADEMidBlock(nn.Module):
+    def __init__(self, channels, temb_ch, sem_ch, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            SPADEResBlock(channels, channels, sem_ch, temb_ch, norm_groups, dropout)
+            for _ in range(2)   # UNetMidBlock2D default: num_layers=1 → 2 resnets
+        ])
+
+    def forward(self, hidden, temb, s):
+        for r in self.resnets:
+            hidden = r(hidden, temb, s)
+        return hidden
+
+
+class _SPADEUpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, prev_out_ch, temb_ch, sem_ch, num_layers, add_upsample, norm_groups, dropout):
+        super().__init__()
+        self.resnets = nn.ModuleList()
+        for i in range(num_layers):
+            # Mirrors diffusers UpBlock2D channel formula exactly
+            res_skip_ch = in_ch if (i == num_layers - 1) else out_ch
+            res_in_ch   = prev_out_ch if i == 0 else out_ch
+            self.resnets.append(
+                SPADEResBlock(res_in_ch + res_skip_ch, out_ch, sem_ch, temb_ch, norm_groups, dropout)
+            )
+        self.upsamplers = (
+            nn.ModuleList([nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="nearest"),
+                nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            )])
+            if add_upsample else None
+        )
+
+    def forward(self, hidden, res_tuple, temb, s):
+        for r in self.resnets:
+            skip       = res_tuple[-1]
+            res_tuple  = res_tuple[:-1]
+            hidden     = r(torch.cat([hidden, skip], dim=1), temb, s)
+        if self.upsamplers is not None:
+            for up in self.upsamplers:
+                hidden = up(hidden)
+        return hidden
+
+
+class SPADEUNet2D(nn.Module):
+    """UNet2DModel with SPADE normalization throughout.
+
+    Takes an extra semantic map `s` (B, sem_channels, H, W) in forward().
+    Each SPADEGroupNorm bilinearly resizes `s` to the current feature map
+    resolution — no pyramid required.
+
+    Architecturally matches _make_painter_control (in_channels=1, no concat).
+    """
+
+    def __init__(
+        self,
+        painter_size: int,
+        sem_channels: int,
+        block_out_channels: tuple[int, ...] = (32, 64, 128, 256),
+        layers_per_block: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        norm_groups = 32
+        while norm_groups > 1 and any(c % norm_groups != 0 for c in block_out_channels):
+            norm_groups //= 2
+
+        ch0    = block_out_channels[0]
+        temb_ch = ch0 * 4
+
+        self.time_proj      = Timesteps(ch0, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.time_embedding = TimestepEmbedding(ch0, temb_ch)
+        self.conv_in        = nn.Conv2d(1, ch0, 3, padding=1)
+
+        # Down blocks
+        n = len(block_out_channels)
+        self.down_blocks = nn.ModuleList()
+        cur_ch = ch0
+        for i, out_ch in enumerate(block_out_channels):
+            self.down_blocks.append(_SPADEDownBlock(
+                in_ch=cur_ch, out_ch=out_ch, temb_ch=temb_ch, sem_ch=sem_channels,
+                num_layers=layers_per_block, add_downsample=(i < n - 1),
+                norm_groups=norm_groups, dropout=dropout,
+            ))
+            cur_ch = out_ch
+
+        # Mid block
+        self.mid_block = _SPADEMidBlock(
+            channels=cur_ch, temb_ch=temb_ch, sem_ch=sem_channels,
+            norm_groups=norm_groups, dropout=dropout,
+        )
+
+        # Up blocks (mirrors UNet2DModel channel formula)
+        rev = list(reversed(block_out_channels))
+        self.up_blocks = nn.ModuleList()
+        prev_out_ch = rev[0]
+        for i, out_ch in enumerate(rev):
+            in_skip_ch = rev[min(i + 1, n - 1)]
+            self.up_blocks.append(_SPADEUpBlock(
+                in_ch=in_skip_ch, out_ch=out_ch, prev_out_ch=prev_out_ch,
+                temb_ch=temb_ch, sem_ch=sem_channels,
+                num_layers=layers_per_block + 1, add_upsample=(i < n - 1),
+                norm_groups=norm_groups, dropout=dropout,
+            ))
+            prev_out_ch = out_ch
+
+        self.conv_norm_out = nn.GroupNorm(norm_groups, ch0)
+        self.conv_act      = nn.SiLU()
+        self.conv_out      = nn.Conv2d(ch0, 1, 3, padding=1)
+
+    def forward(self, sample: torch.Tensor, timestep, s: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif timestep.ndim == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep * torch.ones(sample.shape[0], dtype=timestep.dtype, device=timestep.device)
+        emb = self.time_embedding(self.time_proj(timestep).to(sample.dtype))
+
+        x = self.conv_in(sample)
+        skips = (x,)
+        for block in self.down_blocks:
+            x, res = block(x, emb, s);  skips += res
+
+        x = self.mid_block(x, emb, s)
+
+        for block in self.up_blocks:
+            n_skip   = len(block.resnets)
+            res_tup  = skips[-n_skip:]
+            skips    = skips[:-n_skip]
+            x = block(x, res_tup, emb, s)
+
+        return self.conv_out(self.conv_act(self.conv_norm_out(x)))
