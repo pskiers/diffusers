@@ -136,21 +136,19 @@ def build_optimizers(model, cfg, world_size: int):
         betas=(tr.beta1, tr.beta2),
     )
 
-    if t.puzzle_emb_ndim == 0:
+    puzzle_opt = build_puzzle_emb_optimizer(
+        model, world_size=world_size, lr=0,
+        weight_decay=tr.puzzle_emb_weight_decay,
+    )
+    has_puzzle_emb = puzzle_opt is not None
+
+    if not has_puzzle_emb or t.puzzle_emb_ndim == 0:
         optimizers = [AdamATan2(thinker_params, **adamatan2_kwargs)]
         base_lrs = [tr.lr]
     elif t.freeze_weights:
-        puzzle_opt = build_puzzle_emb_optimizer(
-            model, world_size=world_size, lr=0,
-            weight_decay=tr.puzzle_emb_weight_decay,
-        )
         optimizers = [puzzle_opt]
         base_lrs = [tr.puzzle_emb_lr]
     else:
-        puzzle_opt = build_puzzle_emb_optimizer(
-            model, world_size=world_size, lr=0,
-            weight_decay=tr.puzzle_emb_weight_decay,
-        )
         # Exclude puzzle emb buffers from AdamATan2
         puzzle_ids = {id(p) for p in get_non_puzzle_emb_params(model)} ^ {id(p) for p in model.parameters()}
         adamatan2 = AdamATan2(
