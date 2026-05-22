@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from mnist_eval import MNISTCellClassifier, _load_mnist_digits
+from eval.mnist_eval import MNISTCellClassifier, _load_mnist_digits
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

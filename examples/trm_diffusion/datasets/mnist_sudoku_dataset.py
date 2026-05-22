@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
-from sudoku_dataset import SudokuDataset, PAD_ID
+from datasets.sudoku_dataset import SudokuDataset, PAD_ID
 
 
 class MNISTSudokuDataset(Dataset):

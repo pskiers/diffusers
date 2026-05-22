@@ -39,11 +39,11 @@ from torch.utils.data import DataLoader
 from diffusers import DDIMScheduler
 from tqdm.auto import tqdm
 
-from mnist_sudoku_dataset import MNISTSudokuDataset
-from mnist_eval import evaluate_grids, load_or_train_classifier
-from models_pt import strip_compiled_prefix
-from trm_wrappers import StandalonePainter
-from models.ema import EMAHelper
+from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
+from eval.mnist_eval import evaluate_grids, load_or_train_classifier
+from models.utility_models import strip_compiled_prefix
+from models.painters import StandalonePainter
+from models.trm.ema import EMAHelper
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

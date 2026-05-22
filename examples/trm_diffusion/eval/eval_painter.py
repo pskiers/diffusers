@@ -38,20 +38,20 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 # ── Local imports (same cwd as train_trm.py) ─────────────────────────────────
-from mnist_sudoku_dataset import MNISTSudokuDataset
-from mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids, make_panel_image
-from models_pt import strip_compiled_prefix
-from trm_wrappers import (
+from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
+from eval.mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids, make_panel_image
+from models.utility_models import strip_compiled_prefix
+from models.painter_thinkers import (
     OriginalTRMRatatouilleV0Tok,
     OriginalTRMRatatouilleV0,
     OriginalTRMRatatouilleV1,
     OriginalTRMRatatouilleV2,
     OriginalTRMRatatouilleV3,
     OriginalTRMRatatouilleV4,
-    StandalonePainter,
     ThinkerWithFrozenPainter,
 )
-from models.ema import EMAHelper
+from models.painters import StandalonePainter
+from models.trm.ema import EMAHelper
 
 
 # ── Condition helpers (mirrors train_trm.py) ──────────────────────────────────

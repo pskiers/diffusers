@@ -39,29 +39,33 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, random_split
 from tqdm.auto import tqdm
 
-from sudoku_dataset import SudokuDataset, IGNORE_LABEL_ID
-from mnist_sudoku_dataset import MNISTSudokuDataset
-from mnist_eval import (
+from datasets.sudoku_dataset import SudokuDataset, IGNORE_LABEL_ID
+from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
+from eval.mnist_eval import (
     evaluate_grids, load_or_train_classifier, sample_grids,
     make_panel_image, plot_thinker_ts_curve,
 )
-from trm_wrappers import (
+from models.trm_wrappers import (
     OriginalTRMSudoku,
+    build_puzzle_emb_optimizer,
+    get_non_puzzle_emb_params,
+)
+from models.painter_thinkers import (
     OriginalTRMRatatouilleV0Tok,
     OriginalTRMRatatouilleV0,
     OriginalTRMRatatouilleV1,
     OriginalTRMRatatouilleV2,
     OriginalTRMRatatouilleV3,
     OriginalTRMRatatouilleV4,
+    ThinkerWithFrozenPainter,
+)
+from models.painters import (
     StandalonePainter,
     StandalonePainterSPADE,
     StandalonePainterControl,
-    ThinkerWithFrozenPainter,
-    build_puzzle_emb_optimizer,
-    get_non_puzzle_emb_params,
 )
-from models.ema import EMAHelper
-from models_pt import strip_compiled_prefix
+from models.trm.ema import EMAHelper
+from models.utility_models import strip_compiled_prefix
 
 try:
     import wandb as _wandb
@@ -912,7 +916,7 @@ def save_checkpoint(accelerator, model, optimizers, step, output_dir, tag, ema_h
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-@hydra.main(version_base=None, config_path="configs/trm", config_name="config")
+@hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     mode = cfg.mode   # "sudoku" | "painter" | "standalone_painter"
 

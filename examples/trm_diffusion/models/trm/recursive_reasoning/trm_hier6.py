@@ -7,16 +7,22 @@ import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
 import random
-from models.common import trunc_normal_init_
-from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
-from models.sparse_embedding import CastedSparseEmbedding
+from models.trm.common import trunc_normal_init_
+from models.trm.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.trm.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
 
 @dataclass
 class TinyRecursiveReasoningModel_ACTV1InnerCarry:
     z_H: torch.Tensor
-    z_L: torch.Tensor
+    z_L1: torch.Tensor
+    z_L2: torch.Tensor
+    z_L3: torch.Tensor
+    z_L4: torch.Tensor
+    z_L5: torch.Tensor
+    z_L6: torch.Tensor
+
 
 
 @dataclass
@@ -151,7 +157,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Initial states
         self.register_buffer("H_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.register_buffer("L_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L1_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L2_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L3_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L4_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L5_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.register_buffer("L6_init", trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -184,14 +195,25 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     def empty_carry(self, batch_size: int):
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L1=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L2=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L3=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L4=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L5=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L6=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_L1=torch.where(reset_flag.view(-1, 1, 1), self.L1_init, carry.z_L1),
+            z_L2=torch.where(reset_flag.view(-1, 1, 1), self.L2_init, carry.z_L2),
+            z_L3=torch.where(reset_flag.view(-1, 1, 1), self.L3_init, carry.z_L3),
+            z_L4=torch.where(reset_flag.view(-1, 1, 1), self.L4_init, carry.z_L4),
+            z_L5=torch.where(reset_flag.view(-1, 1, 1), self.L5_init, carry.z_L5),
+            z_L6=torch.where(reset_flag.view(-1, 1, 1), self.L6_init, carry.z_L6),
         )
+
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
@@ -203,20 +225,24 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Forward iterations
         it = 0
-        z_H, z_L = carry.z_H, carry.z_L
+        z_H, z_L = carry.z_H, [carry.z_L1, carry.z_L2, carry.z_L3, carry.z_L4, carry.z_L5, carry.z_L6]
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+                    z_L_ = z_L[0] + z_L[1] + z_L[2] + z_L[3] + z_L[4] + z_L[5]
+                    z_L[_L_step] = self.L_level(z_L_, z_H + input_embeddings, **seq_info)
+                z_L_ = z_L[0] + z_L[1] + z_L[2] + z_L[3] + z_L[4] + z_L[5]
+                z_H = self.L_level(z_H, z_L_, **seq_info)
         # 1 with grad
         for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            z_L_ = z_L[0] + z_L[1] + z_L[2] + z_L[3] + z_L[4] + z_L[5]
+            z_L[_L_step] = self.L_level(z_L_, z_H + input_embeddings, **seq_info)
+        z_L_ = z_L[0] + z_L[1] + z_L[2] + z_L[3] + z_L[4] + z_L[5]
+        z_H = self.L_level(z_H, z_L_, **seq_info)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L1=z_L[0].detach(), z_L2=z_L[1].detach(), z_L3=z_L[2].detach(), z_L4=z_L[3].detach(), z_L5=z_L[4].detach(), z_L6=z_L[5].detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])

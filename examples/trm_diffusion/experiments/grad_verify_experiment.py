@@ -44,10 +44,10 @@ from torch.utils.data import DataLoader
 from diffusers import DDPMScheduler
 from tqdm.auto import tqdm
 
-from mnist_sudoku_dataset import MNISTSudokuDataset
-from mnist_eval import load_or_train_classifier
-from models_pt import strip_compiled_prefix
-from trm_wrappers import StandalonePainter
+from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
+from eval.mnist_eval import load_or_train_classifier
+from models.utility_models import strip_compiled_prefix
+from models.painters import StandalonePainter
 
 VOCAB_SIZE   = 11
 DIGIT_OFFSET = 2       # token for digit d (1-indexed) = d + DIGIT_OFFSET  [2..10]

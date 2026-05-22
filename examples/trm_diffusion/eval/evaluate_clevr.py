@@ -15,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 from transformers import SiglipProcessor, SiglipModel
 
-from clevr_dataset import CLEVRHybridDataset, COLORS, SHAPES, ORIG_H, ORIG_W
+from datasets.clevr_dataset import CLEVRHybridDataset, COLORS, SHAPES, ORIG_H, ORIG_W
 
 
 # Joint Prompts for Material/Color context

@@ -36,13 +36,11 @@ import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from mnist_eval import load_or_train_classifier
-from mnist_sudoku_dataset import MNISTSudokuDataset
-from trm_wrappers import StandalonePainter
-from models_pt import strip_compiled_prefix
-from sudoku_dataset import IGNORE_LABEL_ID
+from eval.mnist_eval import load_or_train_classifier
+from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
+from models.painters import StandalonePainter
+from models.utility_models import strip_compiled_prefix
+from datasets.sudoku_dataset import IGNORE_LABEL_ID
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
