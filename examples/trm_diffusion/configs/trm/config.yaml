@@ -50,7 +50,7 @@ thinker:
   puzzle_emb_ndim: 512          # 0 = disabled; original: hidden_size (512)
   puzzle_emb_len: 16            # prefix token count; ignored when ndim=0
   num_puzzle_identifiers: 1000  # unique puzzle IDs; needed when ndim > 0
-  batch_size: 768               # per-GPU batch size; needed by CastedSparseEmbedding
+  # batch_size: 768               # per-GPU batch size; needed by CastedSparseEmbedding
 
   # ── ACT exploration ────────────────────────────────────────────────────────
   # 0.0 = fixed n_sup steps, no adaptive halting (what we use).
