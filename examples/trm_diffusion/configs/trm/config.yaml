@@ -135,6 +135,7 @@ train:
   # ── Digit-level sampling eval (painter mode only) ─────────────────────────
   # Set eval_classifier_path to enable DDIM sampling + digit accuracy metrics.
   eval_classifier_path: runs/mnist_classifier_cell16.pt   # path to save/load MNIST cell classifier
+  eval_cfg_scale: 1.0          # CFG scale during sampling eval (1.0 = disabled)
   eval_num_samples: 7680        # total samples for digit-level eval
   eval_batch_size: 384          # batch size for sampling
   eval_num_ddim_steps: 20      # DDIM denoising steps

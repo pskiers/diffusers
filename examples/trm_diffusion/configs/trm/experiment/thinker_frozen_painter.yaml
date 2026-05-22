@@ -33,6 +33,7 @@ train:
   warmup_steps: 2000
   eval_every: 1000
   save_every: 5000
+  eval_cfg_scale: 2.0
   sudoku_loss_weight: 0.0   # no CE loss — thinker trained purely on diffusion
   mse_loss_weight: 1.0          # set to 0.0 to disable MSE loss
   # eval_classifier_path inherited from base config (runs/mnist_classifier_cell16.pt)

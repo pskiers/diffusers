@@ -1392,6 +1392,11 @@ def main(cfg: DictConfig):
                     ema_helper.ema(unwrapped)
                 unwrapped.eval()
 
+                eval_cfg_scale = cfg.train.get("eval_cfg_scale", 1.0)
+                orig_cfg_scale = getattr(unwrapped, "cfg_scale", 1.0)
+                if hasattr(unwrapped, "cfg_scale"):
+                    unwrapped.cfg_scale = eval_cfg_scale
+
                 sample_loader = DataLoader(eval_ds, batch_size=n_batch, shuffle=False)
                 for eb in tqdm(sample_loader, "Sampling for eval",
                                total=(n_total + n_batch - 1) // n_batch):
@@ -1525,10 +1530,12 @@ def main(cfg: DictConfig):
                         all_real_puzzle_acc.append(acc_r["puzzle_acc"])
                         n_real_done += sols_r.shape[0]
 
-                # Restore live weights
+                # Restore live weights and cfg_scale
                 if ema_helper is not None:
                     for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
                         p.data.copy_(live)
+                if hasattr(unwrapped, "cfg_scale"):
+                    unwrapped.cfg_scale = orig_cfg_scale
                 unwrapped.train()
 
                 mean_cell   = float(np.mean(all_cell_acc))
