@@ -52,6 +52,7 @@ def get_n_sup_phase(step, phases, n_sup_phases, default):
     for phase, n_sup in zip(phases, n_sup_phases):
         if step < phase:
             return n_sup
+    return n_sup_phases[-1]
 
 
 def compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args):
@@ -272,17 +273,20 @@ def main(args: DictConfig):
     )
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
-    # mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
+    mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
-    total_optimization_steps = (len(train_dl) // args.gradient_accumulation_steps) * args.num_epochs
+    if args.grad_every_n_sup:
+        total_training_steps = len(train_dl) * args.num_epochs * mult
+        warmup_steps = args.lr_scheduler.warmup_steps * mult
+    else:
+        total_training_steps = (len(train_dl) // args.gradient_accumulation_steps) * args.num_epochs
+        warmup_steps = args.lr_scheduler.warmup_steps
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler.name,
         optimizer=optimizer,
-        # num_warmup_steps=args.lr_scheduler.warmup_steps * args.gradient_accumulation_steps * mult,
-        # num_training_steps=len(train_dl) * args.num_epochs * mult,
-        num_warmup_steps=args.lr_scheduler.warmup_steps,
-        num_training_steps=total_optimization_steps,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps,
     )
 
     if hasattr(model, "get_trainable_modules"):
@@ -353,6 +357,9 @@ def main(args: DictConfig):
     # MAIN LOOP
     # ---------------------------------------------------------
     for epoch in range(first_epoch, args.num_epochs):
+        train_dl.batch_sampler.set_epoch(epoch)
+        eval_dl.batch_sampler.set_epoch(epoch)
+
         model.train()
         progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -421,20 +428,24 @@ def main(args: DictConfig):
 
                     loss_full = None
 
-                    (x_high, enc_hs, ts, embedded_ts,
-                    class_labels, enc_mask, autocast_ctx) = base_model.encode_features(
-                        latent_model_input, timesteps, model_cond, mask
-                    )
+                    if hasattr(base_model, "encode_features"):
+                        x_high, enc_hs, ts, embedded_ts, class_labels, enc_mask, autocast_ctx = base_model.encode_features(
+                            latent_model_input, timesteps, model_cond, mask
+                        )
 
                     n_sup_current = get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)
                     for n_step in range(n_sup_current):
-                        # with accelerator.autocast():
-                        y_final_high, y, z = base_model.reasoning_core(
-                            x_high, y, z, enc_hs, ts, class_labels, enc_mask, autocast_ctx
-                        )
-                        model_output = base_model.decode_features(
-                            y_final_high, ts, class_labels, embedded_ts, autocast_ctx
-                        )
+                        if hasattr(base_model, "encode_features"):
+                            y_final_high, y, z = base_model.reasoning_core(
+                                x_high, y, z, enc_hs, ts, class_labels, enc_mask, autocast_ctx
+                            )
+                            model_output = base_model.decode_features(
+                                y_final_high, ts, class_labels, embedded_ts, autocast_ctx
+                            )
+                        else:
+                            model_output, y, z = base_model.reasoning_step(
+                                latent_model_input, y, z, timesteps, model_cond, mask
+                            )
 
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
                         loss = loss if not args.trm_loss_nsup_decay else loss * (args.trm_loss_nsup_decay**n_step)

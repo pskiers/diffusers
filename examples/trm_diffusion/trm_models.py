@@ -113,6 +113,9 @@ class BaseIterativeStrategy:
         for name, module in core.named_modules():
             # Check for Diffusers Attention block
             if type(module).__name__ == "Attention" and hasattr(module, "set_processor"):
+                if module.to_k.in_features != module.inner_dim:
+                    continue
+
                 head_dim = module.inner_dim // module.heads
                 processor = FastQKNormProcessor(head_dim).to(device=core.device, dtype=core.dtype)
                 module.set_processor(processor)

@@ -17,7 +17,7 @@ eval "$(conda shell.bash hook)"
 conda activate /net/tscratch/people/plgmgrzanka/reasoning_diffusion_env
 
 # ── Navigate to project root ──
-cd /net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion
+cd /net/people/plgrid/plgmgrzanka//diffusers/examples/trm_diffusion
 
 # ── Ensure WandB is configured (set WANDB_API_KEY in your environment or .bashrc) ──
 export WANDB_PROJECT="discrete-trm-sokoban"
