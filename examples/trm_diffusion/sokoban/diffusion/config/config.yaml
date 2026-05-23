@@ -30,12 +30,13 @@ dataset:
 model:
   # Inner model
   vocab_size: 8 # 0=MASK, 1-7=field states
+  class_weights: [0.0, 0.5, 0.5, 5.0, 5.0, 5.0, 10.0, 10.0]
   seq_len: 144 # 12*12
   hidden_size: 512
   num_heads: 8
-  L_layers: 2
-  L_cycles: 6
-  H_cycles: 3
+  layers: 2
+  n: 6
+  T: 3
   expansion: 4.0
   forward_dtype: bfloat16
   pos_encodings: rope

@@ -34,8 +34,6 @@ class SokobanTokenDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         item = self.dataset[idx]
-        # item["target"] is np.ndarray [12, 12] with values 0-6 (argmax of one-hot)
-        # Apply +1 offset so MASK=0 is free; IDs become 1-7
         board = item["target"]  # [12, 12] uint8
         tokens = torch.from_numpy(board.flatten()).long() + 1  # [144] ∈ {1,...,7}
         return {"tokens": tokens}

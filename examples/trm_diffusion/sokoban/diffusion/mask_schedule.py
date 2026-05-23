@@ -28,21 +28,16 @@ class AbsorbingMaskSchedule:
         self.num_steps = num_steps
 
     def mask_rate(self, t: torch.Tensor) -> torch.Tensor:
-        """γ(t) = t / T. Input t: [B] int in {0, ..., T}. Returns [B] float."""
+        """y(t) = t / T. Input t: [B] int in {0, ..., T}. Returns [B] float."""
         return t.float() / self.num_steps
 
-    # ── Forward process (training) ──────────────────────────────────────────
-
-    def forward_mask(
+    def forward_mask(   # training
         self,
         x_0: torch.Tensor,
         t: torch.Tensor,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Apply absorbing mask: x_0 [B, L] → x_t [B, L].
-
-        Each token replaced with MASK_TOKEN_ID independently with probability γ(t).
-        """
+        """Apply absorbing mask: x_0 [B, L] → x_t [B, L]. Each token replaced with MASK_TOKEN_ID independently with probability y(t)."""
         gamma = self.mask_rate(t).unsqueeze(1)  # [B, 1]
         rand = torch.rand(x_0.shape, device=x_0.device, dtype=torch.float32, generator=generator)
         mask = rand < gamma  # [B, L] True → replace with MASK
@@ -50,9 +45,7 @@ class AbsorbingMaskSchedule:
         x_t = torch.where(mask, mask_val, x_0)
         return x_t
 
-    # ── Reverse process (sampling) ──────────────────────────────────────────
-
-    def reverse_step(
+    def reverse_step(   # sampling
         self,
         x_t: torch.Tensor,
         probs: torch.Tensor,
@@ -61,8 +54,7 @@ class AbsorbingMaskSchedule:
     ) -> torch.Tensor:
         """One reverse step: x_t → x_{t-1}.
 
-        For masked positions: unmask with probability (γ(t) - γ(t-1)) / γ(t),
-        sampling the token from the predicted distribution `probs`.
+        For masked positions: unmask with probability (γ(t) - γ(t-1)) / γ(t), sampling the token from the predicted distribution `probs`.
         Unmasked positions are preserved.
 
         Args:
@@ -90,17 +82,14 @@ class AbsorbingMaskSchedule:
 
         # Sample tokens from predicted distribution
         B, L, V = probs.shape
-        flat_probs = probs.reshape(B * L, V).clamp_min(1e-8)
-        # torch.multinomial on CUDA with Generator can be unreliable;
-        # sample on CPU and move back for reliability.
-        sampled = torch.multinomial(flat_probs.cpu(), num_samples=1).to(probs.device)
+        flat_probs = probs.reshape(B * L, V).float().clamp_min(1e-8)
+        sampled = torch.multinomial(flat_probs, num_samples=1)
         sampled = sampled.reshape(B, L)
 
         x_t_minus_1 = torch.where(do_unmask, sampled, x_t)
         return x_t_minus_1
 
-    # ── Full sampling loop ──────────────────────────────────────────────────
-
+    # Full sampling loop
     @torch.no_grad()
     def sample(
         self,
@@ -113,18 +102,11 @@ class AbsorbingMaskSchedule:
         temperature: float = 1.0,
     ):
         """Full reverse sampling: x_T → x_0.
-
-        The model's carry persists across diffusion timesteps (Option III).
-
         Args:
             model: DiscreteTRMDiffusion instance
             batch_size: number of boards to generate
-            seq_len: 144 for 12x12 Sokoban
-            device: target device
             carry: optional initial carry (None → fresh)
-            generator: optional RNG
             temperature: sampling temperature (applied to logits)
-
         Returns:
             x_0: [B, L] generated token sequence
             carry: final carry state

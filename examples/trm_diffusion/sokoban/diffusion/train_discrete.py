@@ -53,15 +53,11 @@ from sokoban.sokoban_utils import SokobanEvaluator
 logger = get_logger(__name__, log_level="INFO")
 
 
-# ─── Metric helpers ───────────────────────────────────────────────────────────
-
-
 def _safe_mean(lst):
     return sum(lst) / len(lst) if lst else 0.0
 
 
 def _bucket_name(mask_ratio: float) -> str:
-    """Map mask ratio to a human-readable bucket name."""
     if mask_ratio < 0.25:
         return "low_mask_0_25"
     elif mask_ratio < 0.50:
@@ -73,11 +69,6 @@ def _bucket_name(mask_ratio: float) -> str:
 
 
 class MetricAccumulator:
-    """Accumulates per-step metrics and computes epoch-level aggregates.
-
-    Supports bucketed tracking by mask ratio for diffusion-specific analysis.
-    """
-
     def __init__(self):
         self.reset()
 
@@ -116,9 +107,6 @@ class MetricAccumulator:
         return {k: v / total for k, v in sorted(self.halt_step_counts.items())}
 
 
-# ─── Sampling & evaluation ────────────────────────────────────────────────────
-
-
 @torch.no_grad()
 def run_sampling_evaluation(
     model: ACTMaskedDiffusionWrapper,
@@ -127,78 +115,73 @@ def run_sampling_evaluation(
     accelerator: Accelerator,
     epoch: int,
     global_step: int,
-) -> dict:
+):
     """Generate boards, evaluate with SokobanEvaluator, log to WandB."""
     base_model = accelerator.unwrap_model(model)
     inner = base_model.inner
     inner.eval()
 
+    num_processes = accelerator.num_processes
+    samples_per_process = math.ceil(args.num_samples / num_processes)
+
     evaluator = SokobanEvaluator(args.dataset.num_boxes)
-    num_samples = args.num_samples
-    batch_size = min(args.sample_batch_size, num_samples)
+    batch_size = min(args.sample_batch_size, samples_per_process)
     device = accelerator.device
 
-    all_boards = []
+    all_local_boards = []
 
-    for start in range(0, num_samples, batch_size):
-        bsz = min(batch_size, num_samples - start)
+    for start in range(0, samples_per_process, batch_size):
+        bsz = min(batch_size, samples_per_process - start)
         tokens, _ = schedule.sample(
             inner,
             batch_size=bsz,
             seq_len=144,
             device=device,
-            generator=None,  # multinomial samples on CPU internally
+            generator=None,
             temperature=args.get("sample_temperature", 1.0),
         )
-        # tokens [B, 144] ∈ {0,...,7}. Evaluator expects FieldStates IDs 1-7.
-        # MASK=0 residue will naturally fail validity checks.
-        boards_np = tokens.cpu().numpy().reshape(-1, 12, 12)
-        all_boards.append(boards_np)
+        all_local_boards.append(tokens)
 
-    all_boards_np = np.concatenate(all_boards, axis=0)
+    local_tokens = torch.cat(all_local_boards, dim=0)
+    gathered = accelerator.gather(local_tokens)
 
-    sokoban_metrics = evaluator.generate_metrics(
-        generated_boards=all_boards_np,
-        conditioning_boards=None,
-        target_boards=None,
-        k_values=None,
-        n_images_per_conditioning=1,
-    )
+    if accelerator.is_main_process:
+        raw_np = gathered[:args.num_samples].cpu().numpy().reshape(-1, 12, 12)
 
-    logger.info(f"Epoch {epoch} sokoban metrics: {sokoban_metrics}")
-    accelerator.log(sokoban_metrics, step=global_step)
+        mask_residue = (raw_np == 0).mean()
+        accelerator.log({"sample/mask_residue_ratio": mask_residue}, step=global_step)
 
-    # Count residual MASK tokens in generated boards
-    mask_residue = (all_boards_np == 0).sum() / max(all_boards_np.size, 1)
-    accelerator.log({"sample/mask_residue_ratio": mask_residue}, step=global_step)
+        boards_np = np.clip(raw_np - 1, 0, 6)
 
-    # Rendered board grid for WandB
-    if args.logger == "wandb" and accelerator.is_main_process:
-        try:
-            import wandb
-            from torchvision.utils import make_grid
-            from sokoban.sokoban_utils import SokobanSampler
+        sokoban_metrics = evaluator.generate_metrics(
+            generated_boards=boards_np,
+            conditioning_boards=None,
+            target_boards=None,
+            k_values=None,
+        )
 
-            sampler = SokobanSampler(args)
-            n_show = min(64, len(all_boards_np))
-            # Renderer uses board value as index into 7-element surface array;
-            # our tokens are 1-7 (FieldStates IDs) but renderer expects 0-6.
-            boards_for_render = np.clip(all_boards_np[:n_show] - 1, 0, 6)
-            sampler.all_gen_boards_list = [boards_for_render]
-            rendered = sampler.render_boards()
-            n_cols = min(8, int(math.ceil(math.sqrt(n_show) * 1.5)))
-            grid = make_grid(rendered, nrow=n_cols, padding=2)
-            accelerator.get_tracker("wandb").log(
-                {"sokoban_samples": wandb.Image(grid), "epoch": epoch},
-                step=global_step,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to render WandB board grid: {e}")
+        logger.info(f"Epoch {epoch} sokoban metrics: {sokoban_metrics}")
+        accelerator.log(sokoban_metrics, step=global_step)
 
-    return sokoban_metrics
+        # Rendered board grid for WandB
+        if args.logger == "wandb" and accelerator.is_main_process:
+            try:
+                import wandb
+                from torchvision.utils import make_grid
+                from sokoban.sokoban_utils import SokobanSampler
 
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
+                sampler = SokobanSampler(args)
+                n_show = min(64, len(boards_np))
+                sampler.all_gen_boards_list = [boards_np]
+                rendered = sampler.render_boards()
+                n_cols = min(8, int(math.ceil(math.sqrt(n_show) * 1.5)))
+                grid = make_grid(rendered, nrow=n_cols, padding=2)
+                accelerator.get_tracker("wandb").log(
+                    {"sokoban_samples": wandb.Image(grid), "epoch": epoch},
+                    step=global_step,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to render WandB board grid: {e}")
 
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
@@ -206,7 +189,7 @@ def main(args: DictConfig):
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
-    # ── 1. Accelerator ──
+    # Accelerator & logging
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
     accelerator = Accelerator(
@@ -229,7 +212,7 @@ def main(args: DictConfig):
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── 2. Dataset ──
+    # Dataset
     train_base = SokobanDataset(
         data_path=args.dataset.train_data_dir,
         k=0,
@@ -268,15 +251,15 @@ def main(args: DictConfig):
         collate_fn=collate_fn, pin_memory=True, persistent_workers=(n_workers > 0),
     )
 
-    # ── 3. Model ──
+    # Model
     inner_model = DiscreteTRMDiffusion(
         vocab_size=args.model.vocab_size,
         seq_len=args.model.seq_len,
         hidden_size=args.model.hidden_size,
         num_heads=args.model.num_heads,
-        L_layers=args.model.L_layers,
-        L_cycles=args.model.L_cycles,
-        H_cycles=args.model.H_cycles,
+        layers=args.model.layers,
+        n=args.model.n,
+        T=args.model.T,
         expansion=args.model.expansion,
         forward_dtype=args.model.forward_dtype,
         pos_encodings=args.model.pos_encodings,
@@ -284,15 +267,16 @@ def main(args: DictConfig):
 
     model = ACTMaskedDiffusionWrapper(
         inner=inner_model,
+        class_weights=args.model.class_weights,
         halt_max_steps=args.model.halt_max_steps,
         halt_exploration_prob=args.model.halt_exploration_prob,
         halt_loss_weight=args.model.get("halt_loss_weight", 0.5),
         use_carry_recycling=args.model.get("use_carry_recycling", False),
         carry_recycle_prob=args.model.get("carry_recycle_prob", 0.5),
         halt_warmup_steps=args.model.get("halt_warmup_steps", 0),
+        gradient_accumulation_steps=args.get("gradient_accumulation_steps")
     )
 
-    # Optional: compile for throughput
     if args.get("compile", False):
         model.inner = torch.compile(model.inner, mode="reduce-overhead")  # type: ignore[assignment]
 
@@ -301,10 +285,7 @@ def main(args: DictConfig):
     logger.info(f"Total parameters: {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
-    # ── 4. Mask schedule ──
-    schedule = AbsorbingMaskSchedule(num_steps=args.mask_diffusion_steps)
-
-    # ── 5. Optimizer & LR scheduler ──
+    # Optimizer & schedulers
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.optimizer.lr,
@@ -316,6 +297,8 @@ def main(args: DictConfig):
     num_update_steps_per_epoch = math.ceil(len(train_dl) / args.gradient_accumulation_steps)
     total_training_steps = num_update_steps_per_epoch * args.num_epochs
 
+    mask_scheduler = AbsorbingMaskSchedule(num_steps=args.mask_diffusion_steps)
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler.name,
         optimizer=optimizer,
@@ -323,12 +306,11 @@ def main(args: DictConfig):
         num_training_steps=total_training_steps,
     )
 
-    # ── 6. Accelerate prepare ──
     model, optimizer, train_dl, eval_dl, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dl, eval_dl, lr_scheduler
     )
 
-    # ── 7. Resume from checkpoint ──
+    # Checkpoint
     global_step = 0
     first_epoch = 0
     resume_step = 0
@@ -350,7 +332,7 @@ def main(args: DictConfig):
                 resume_step = (global_step % num_update_steps_per_epoch) * args.gradient_accumulation_steps
                 logger.info(f"Resumed from {ckpt_path} at step {global_step}")
 
-    # ── 8. WandB / tracker setup ──
+    # WandB setup
     if accelerator.is_main_process:
         tracker_config = OmegaConf.to_container(args, resolve=True)
         if args.logger == "wandb":
@@ -369,14 +351,15 @@ def main(args: DictConfig):
     logger.info(f"  Effective batch size = {args.train_batch_size * args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {total_training_steps}")
     logger.info(f"  Mask diffusion steps T = {args.mask_diffusion_steps}")
-    logger.info(f"  TRM: H={args.model.H_cycles} L={args.model.L_cycles} D={args.model.hidden_size} halt_max={args.model.halt_max_steps}")
+    logger.info(f"  TRM: T={args.model.T} n={args.model.n} D={args.model.hidden_size} halt_max={args.model.halt_max_steps}")
     logger.info(f"  Carry recycling: {args.model.get('use_carry_recycling', False)}")
 
-    # ─────────────────────────────────────────────────────────────────────────
     # MAIN TRAINING LOOP
-    # ─────────────────────────────────────────────────────────────────────────
-
     for epoch in range(first_epoch, args.num_epochs):
+        train_sampler.set_epoch(epoch)
+        eval_sampler.set_epoch(epoch)
+
+        # TRAIN
         model.train()
         train_metrics = MetricAccumulator()
         progress_bar = tqdm(
@@ -395,10 +378,10 @@ def main(args: DictConfig):
             B = x_0.shape[0]
 
             # Sample t ∈ {1, ..., T}
-            t = torch.randint(1, schedule.num_steps + 1, (B,), device=accelerator.device)
+            t = torch.randint(1, mask_scheduler.num_steps + 1, (B,), device=accelerator.device)
 
             # Forward mask: x_0 → x_t
-            x_t = schedule.forward_mask(x_0, t)
+            x_t = mask_scheduler.forward_mask(x_0, t)
 
             with accelerator.accumulate(model):
                 loss, metrics, _ = model(x_t, x_0, t, diffusion_carry=None)
@@ -412,7 +395,6 @@ def main(args: DictConfig):
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Track metrics
             train_metrics.update(
                 metrics,
                 mask_ratio=metrics.get("mask_ratio", 0.0),
@@ -423,7 +405,6 @@ def main(args: DictConfig):
                 progress_bar.update(1)
                 global_step += 1
 
-                # Per-step logging (every step for W&B)
                 base_model = accelerator.unwrap_model(model)
                 step_logs = {
                     "train/lm_loss": metrics["lm_loss"],
@@ -473,7 +454,6 @@ def main(args: DictConfig):
 
         progress_bar.close()
 
-        # ── Epoch-level aggregate metrics ──
         epoch_agg = train_metrics.aggregate("train")
         halt_hist = train_metrics.halt_histogram()
         if halt_hist:
@@ -483,7 +463,7 @@ def main(args: DictConfig):
 
         accelerator.wait_for_everyone()
 
-        # ── Validation ──
+        # VALIDATION
         model.eval()
         val_metrics = MetricAccumulator()
         val_pbar = tqdm(total=len(eval_dl), disable=not accelerator.is_local_main_process)
@@ -492,8 +472,8 @@ def main(args: DictConfig):
         for batch in eval_dl:
             x_0 = batch["tokens"].to(accelerator.device)
             B = x_0.shape[0]
-            t = torch.randint(1, schedule.num_steps + 1, (B,), device=accelerator.device)
-            x_t = schedule.forward_mask(x_0, t)
+            t = torch.randint(1, mask_scheduler.num_steps + 1, (B,), device=accelerator.device)
+            x_t = mask_scheduler.forward_mask(x_0, t)
 
             with torch.no_grad():
                 loss, metrics, _ = model(x_t, x_0, t, diffusion_carry=None)
@@ -523,15 +503,9 @@ def main(args: DictConfig):
                 f"halt={val_agg.get('val/avg_halt_steps', 0):.1f}"
             )
 
-        # ── Sampling & Board Evaluation ──
-        if (
-            accelerator.is_main_process
-            and epoch > 0
-            and (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1)
-        ):
-            run_sampling_evaluation(model, schedule, args, accelerator, epoch, global_step)
+        if (epoch > 0 and (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1)):
+            run_sampling_evaluation(model, mask_scheduler, args, accelerator, epoch, global_step)
 
-        # ── Save model ──
         if (
             accelerator.is_main_process
             and epoch > 0

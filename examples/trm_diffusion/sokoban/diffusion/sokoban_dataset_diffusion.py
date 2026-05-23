@@ -31,6 +31,9 @@ class GroupBatchSampler(Sampler[list[int]]):
         self.seed = seed
         self.epoch = 0
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
     def __iter__(self) -> Iterator[list[int]]:
         rng = np.random.default_rng(self.seed + self.epoch)
         group_order = rng.permutation(self.n_groups)
@@ -39,6 +42,8 @@ class GroupBatchSampler(Sampler[list[int]]):
         for g in group_order:
             lo = self.group_boundaries[g]
             hi = self.group_boundaries[g + 1]
+            if lo >= hi:
+                continue  # skip empty group
             idx = int(rng.integers(lo, hi))
             batch.append(idx)
             if len(batch) == self.batch_size:
@@ -47,8 +52,6 @@ class GroupBatchSampler(Sampler[list[int]]):
 
         if batch and not self.drop_last:
             yield batch
-
-        self.epoch += 1
 
     def __len__(self) -> int:
         if self.drop_last:
