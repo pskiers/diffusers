@@ -361,8 +361,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         model_cfg = _painter_thinker_cfg(cfg)
 
         if painter_variant == "v0":
-            vocab_size = int(cfg.thinker.get("num_classes", 9))
-            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
             return ThinkerWithFrozenPainterV0(
@@ -378,8 +377,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             )
 
         if painter_variant == "v1":
-            vocab_size = int(cfg.thinker.get("num_classes", 9))
-            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
             return ThinkerWithFrozenPainterV1(
