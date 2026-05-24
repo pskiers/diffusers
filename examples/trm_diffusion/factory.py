@@ -359,7 +359,21 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             scheduler=scheduler,
         )
         ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
-        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
+        missing, unexpected = frozen_painter.load_state_dict(
+            strip_compiled_prefix(ckpt["model_state"]), strict=False
+        )
+        # Only eval_clf keys may be missing (eval_clf is built from cfg but not saved in painter checkpoints)
+        bad_missing = [k for k in missing if not k.startswith("eval_clf.")]
+        if bad_missing:
+            raise RuntimeError(
+                f"Frozen painter checkpoint is missing expected keys: {bad_missing}\n"
+                "This likely means the checkpoint is wrong or bridge/painter weights were not saved."
+            )
+        if unexpected:
+            raise RuntimeError(
+                f"Frozen painter checkpoint has unexpected keys after strip_compiled_prefix: {unexpected}\n"
+                "strip_compiled_prefix may need updating."
+            )
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
         thinker_optim_cfg = _thinker_optim_cfg(cfg)
