@@ -482,9 +482,9 @@ class PainterThinkerV0Tok(BaseModel):
                 for t_step, a in sr.get("ts_puzzle_acc", []):
                     ts_puzzle_accs.setdefault(t_step, []).append(a)
 
-                # Painter deviation from thinker
+                # Painter deviation from thinker (all CPU: preds are .cpu(), gm must match)
                 painter_preds = acc["preds"]
-                _gm = given_masks[:B_cur] if given_masks is not None else None
+                _gm = given_masks[:B_cur].cpu() if given_masks is not None else None
                 for tp_raw, dev_lst in [
                     (sr.get("best_thinker_preds"), all_painter_dev_best),
                     (sr.get("mean_thinker_preds"), all_painter_dev_mean),
