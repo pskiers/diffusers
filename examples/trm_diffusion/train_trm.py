@@ -234,7 +234,9 @@ def main(cfg: DictConfig):
             unwrapped.train()
 
             if accelerator.is_main_process:
-                logger.info(f"[val] step={global_step}  " + "  ".join(f"{k}={v:.4f}" for k, v in val_log.items()))
+                logger.info(f"[val] step={global_step}  " + "  ".join(
+                    f"{k}={v:.4f}" for k, v in val_log.items() if isinstance(v, (int, float))
+                ))
                 if wandb_project:
                     accelerator.log(val_log, step=global_step)
 
