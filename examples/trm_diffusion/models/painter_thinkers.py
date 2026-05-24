@@ -1024,3 +1024,140 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
         if self.bridge_input_conv is not None:
             params = params + list(self.bridge_input_conv.parameters())
         return params
+
+
+# ── Thinker with frozen painter (image-conditioned variants) ──────────────────
+
+
+class ThinkerWithFrozenPainterV0(OriginalTRMRatatouilleV0):
+    """
+    Trains thinker + image encoder; bridge + UNet are loaded from a pretrained
+    StandalonePainter checkpoint and kept frozen throughout.
+
+    Compared to ThinkerWithFrozenPainter (V0Tok), the thinker receives CNN-encoded
+    puzzle image features instead of discrete tokens — so the image_encoder and
+    enc_proj are trainable new parameters optimized with painter_optim_cfg.
+    """
+
+    def __init__(
+        self,
+        painter: StandalonePainter,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+    ):
+        super().__init__(
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+        )
+        self.painter_optim_cfg = painter_optim_cfg
+        self.bridge = painter.bridge
+        self.painter = painter.painter
+        for p in self.bridge.parameters():
+            p.requires_grad_(False)
+        for p in self.painter.parameters():
+            p.requires_grad_(False)
+
+    def get_painter_params(self) -> list:
+        return []
+
+    def _get_encoder_params(self) -> list:
+        frozen_ids = {id(p) for p in self.bridge.parameters()} | {id(p) for p in self.painter.parameters()}
+        thinker_ids = {id(p) for p in self.thinker.parameters()}
+        return [
+            p for p in self.parameters() if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
+        ]
+
+    def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
+        thinker_optims = self.thinker.build_optimizers(world_size, num_steps)
+        encoder_params = self._get_encoder_params()
+        if not encoder_params:
+            return thinker_optims
+        enc_optim = torch.optim.AdamW(encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+        enc_scheduled = ScheduledOptimizer(
+            enc_optim,
+            base_lr=self.painter_optim_cfg.lr,
+            warmup_steps=self.painter_optim_cfg.warmup_steps,
+            num_steps=num_steps,
+            min_ratio=self.painter_optim_cfg.lr_min_ratio,
+        )
+        return thinker_optims + [enc_scheduled]
+
+
+class ThinkerWithFrozenPainterV1(OriginalTRMRatatouilleV1):
+    """
+    Same as ThinkerWithFrozenPainterV0 but the encoder sees cat(condition, noisy)
+    (2 channels) and optionally uses timestep conditioning — matching V1 semantics.
+
+    Trainable: thinker, image_encoder, enc_proj, logit_expand (if present),
+               and any V1 timestep modules (timestep_mlp, enc_film, thinker_temb_proj).
+    Frozen: bridge + UNet (loaded from StandalonePainter checkpoint).
+    """
+
+    def __init__(
+        self,
+        painter: StandalonePainter,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+        timestep_cfg=None,
+    ):
+        super().__init__(
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+            timestep_cfg=timestep_cfg,
+        )
+        self.painter_optim_cfg = painter_optim_cfg
+        self.bridge = painter.bridge
+        self.painter = painter.painter
+        for p in self.bridge.parameters():
+            p.requires_grad_(False)
+        for p in self.painter.parameters():
+            p.requires_grad_(False)
+
+    def get_painter_params(self) -> list:
+        return []
+
+    def _get_encoder_params(self) -> list:
+        frozen_ids = {id(p) for p in self.bridge.parameters()} | {id(p) for p in self.painter.parameters()}
+        thinker_ids = {id(p) for p in self.thinker.parameters()}
+        return [
+            p for p in self.parameters() if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
+        ]
+
+    def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
+        thinker_optims = self.thinker.build_optimizers(world_size, num_steps)
+        encoder_params = self._get_encoder_params()
+        if not encoder_params:
+            return thinker_optims
+        enc_optim = torch.optim.AdamW(encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+        enc_scheduled = ScheduledOptimizer(
+            enc_optim,
+            base_lr=self.painter_optim_cfg.lr,
+            warmup_steps=self.painter_optim_cfg.warmup_steps,
+            num_steps=num_steps,
+            min_ratio=self.painter_optim_cfg.lr_min_ratio,
+        )
+        return thinker_optims + [enc_scheduled]

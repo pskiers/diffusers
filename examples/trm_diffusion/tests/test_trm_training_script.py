@@ -215,3 +215,31 @@ def test_thinker_frozen_painter_v0tok():
     )
     run_script(script_path=SCRIPT_PATH, output_dir=TMP_DIR, args=args, resume_from_checkpoint=True, cleanup=True)
     shutil.rmtree(painter_dir, ignore_errors=True)
+
+
+@pytest.mark.frozen_painter_v0
+def test_thinker_frozen_painter_v0():
+    painter_dir = TMP_DIR + "_standalone_painter"
+    args = ["experiment=standalone_painter"] + FAST_TRAINING_ARGS + SMALL_PAINTER_ARGS
+    run_script(script_path=SCRIPT_PATH, output_dir=painter_dir, args=args, resume_from_checkpoint=False, cleanup=False)
+    args = (
+        ["experiment=thinker_frozen_painter_v0", f"painter.painter_checkpoint={painter_dir}/checkpoint_final.pt"]
+        + FAST_TRAINING_ARGS
+        + SMALL_PAINTER_ARGS
+    )
+    run_script(script_path=SCRIPT_PATH, output_dir=TMP_DIR, args=args, resume_from_checkpoint=True, cleanup=True)
+    shutil.rmtree(painter_dir, ignore_errors=True)
+
+
+@pytest.mark.frozen_painter_v1
+def test_thinker_frozen_painter_v1():
+    painter_dir = TMP_DIR + "_standalone_painter"
+    args = ["experiment=standalone_painter"] + FAST_TRAINING_ARGS + SMALL_PAINTER_ARGS
+    run_script(script_path=SCRIPT_PATH, output_dir=painter_dir, args=args, resume_from_checkpoint=False, cleanup=False)
+    args = (
+        ["experiment=thinker_frozen_painter_v1", f"painter.painter_checkpoint={painter_dir}/checkpoint_final.pt"]
+        + FAST_TRAINING_ARGS
+        + SMALL_PAINTER_ARGS
+    )
+    run_script(script_path=SCRIPT_PATH, output_dir=TMP_DIR, args=args, resume_from_checkpoint=True, cleanup=True)
+    shutil.rmtree(painter_dir, ignore_errors=True)

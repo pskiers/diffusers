@@ -43,6 +43,8 @@ from models.painter_thinkers import (
     OriginalTRMRatatouilleV4,
     PainterThinkerV0Tok,
     ThinkerWithFrozenPainter,
+    ThinkerWithFrozenPainterV0,
+    ThinkerWithFrozenPainterV1,
 )
 from models.painters import (
     StandalonePainter,
@@ -352,14 +354,55 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         )
         ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
         frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
+
+        painter_variant = str(cfg.get("painter_variant", "v0tok"))
+        thinker_optim_cfg = _thinker_optim_cfg(cfg)
+        painter_optim_cfg = _painter_optim_cfg(cfg)
+        model_cfg = _painter_thinker_cfg(cfg)
+
+        if painter_variant == "v0":
+            vocab_size = int(cfg.thinker.get("num_classes", 9))
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+            thinker_cfg.puzzle_emb_ndim = 0
+            thinker_cfg.puzzle_emb_len = 0
+            return ThinkerWithFrozenPainterV0(
+                painter=frozen_painter,
+                thinker_cfg=thinker_cfg,
+                encoder_cfg=_image_encoder_cfg(cfg),
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim_cfg,
+                painter_optim_cfg=painter_optim_cfg,
+                scheduler=scheduler,
+            )
+
+        if painter_variant == "v1":
+            vocab_size = int(cfg.thinker.get("num_classes", 9))
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+            thinker_cfg.puzzle_emb_ndim = 0
+            thinker_cfg.puzzle_emb_len = 0
+            return ThinkerWithFrozenPainterV1(
+                painter=frozen_painter,
+                thinker_cfg=thinker_cfg,
+                encoder_cfg=_image_encoder_cfg(cfg),
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim_cfg,
+                painter_optim_cfg=painter_optim_cfg,
+                scheduler=scheduler,
+                timestep_cfg=_timestep_cond_cfg(cfg),
+            )
+
         return ThinkerWithFrozenPainter(
             painter=frozen_painter,
             thinker_cfg=_thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size)),
-            model_cfg=_painter_thinker_cfg(cfg),
+            model_cfg=model_cfg,
             train_cfg=train_cfg,
             eval_cfg=eval_cfg,
-            thinker_optim_cfg=_thinker_optim_cfg(cfg),
-            painter_optim_cfg=_painter_optim_cfg(cfg),
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
             adapter_in_channels=int(cfg.painter.get("adapter_in_channels", 0)),
         )
