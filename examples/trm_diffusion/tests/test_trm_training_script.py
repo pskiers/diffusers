@@ -34,10 +34,10 @@ FAST_TRAINING_ARGS = [
 ]
 
 TWO_STAGE_PT_ARGS = [
-    "painter_stage.n_sup=2",
-    "painter_stage.H_cycles=1",
-    "painter_stage.L_cycles=2",
-    "thinker_stage.n_sup=2",
+    "train.two_stage.painter.n_sup=2",
+    "train.two_stage.painter.H_cycles=1",
+    "train.two_stage.painter.L_cycles=2",
+    "train.two_stage.thinker.n_sup=2",
 ]
 
 RESUME_FROM_CKPT_ARG = "run.resume_from_checkpoint"

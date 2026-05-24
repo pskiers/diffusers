@@ -287,6 +287,18 @@ class SudokuDataset(Dataset):
     BLANK_TOKEN: int = 1
 
 
+
+def make_tok_labels(solution: torch.Tensor) -> torch.Tensor:
+    """
+    solution: (B,81) int64 — 0-8 for blank cells, IGNORE_LABEL_ID (-100) for given cells.
+    Returns token-format labels: 2-10 for blank cells, IGNORE_LABEL_ID for given cells.
+    """
+    labels = solution.clone()
+    valid = labels != IGNORE_LABEL_ID
+    labels[valid] = labels[valid] + 2
+    return labels
+
+
 if ArgParser is not None:
     cli = ArgParser()
 

@@ -7,9 +7,12 @@ mode: "standalone_painter_spade"
 run:
   output_dir: "runs/standalone_painter_spade"
 
+painter:
+  optim:
+    lr_min_ratio: 1.0
+    weight_decay: 0.01
+
 train:
-  lr_min_ratio: 1.0
-  weight_decay: 0.01
   batch_size: 384
   num_steps: 100000
   sudoku_loss_weight: 0.0

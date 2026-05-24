@@ -10,30 +10,32 @@ run:
 thinker:
   puzzle_emb_ndim: 0
   halt_exploration_prob: 0.0
+  optim:
+    lr_min_ratio: 1.0
 
 painter:
   thinker_out_channels: 64
   compression_factor: 16
   bridge_num_heads: 4
+  optim:
+    lr_min_ratio: 1.0
 
 train:
-  lr_min_ratio: 1.0
   batch_size: 384
   num_steps: 100000
   sudoku_loss_weight: 0.0
   gradient_accumulation_steps: 2
+  two_stage:
+    painter:
+      freeze_thinker: false
+      n_sup: 4
+      H_cycles: 1
+      L_cycles: 2
+      every: 1
+    thinker:
+      n_sup: 16
+      every: 1
 
 eval:
   eval_every: 2000
   save_every: 10000
-
-painter_stage:
-  freeze_thinker: false
-  n_sup: 4
-  H_cycles: 1
-  L_cycles: 2
-  every: 1
-
-thinker_stage:
-  n_sup: 16
-  every: 1

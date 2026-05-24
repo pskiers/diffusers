@@ -42,7 +42,7 @@ from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
 from eval.mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids, make_panel_image
 from models.utility_models import strip_compiled_prefix
 from models.painter_thinkers import (
-    OriginalTRMRatatouilleV0Tok,
+    PainterThinkerV0Tok,
     OriginalTRMRatatouilleV0,
     OriginalTRMRatatouilleV1,
     OriginalTRMRatatouilleV2,
@@ -141,7 +141,7 @@ def build_model(args) -> torch.nn.Module:
             **thinker_kwargs,
         )
     elif args.painter_variant == "v0tok":
-        model = OriginalTRMRatatouilleV0Tok(
+        model = PainterThinkerV0Tok(
             painter_size=painter_size,
             cell_size=args.cell_size,
             bridge_channels=args.bridge_channels,

@@ -14,10 +14,8 @@ enc_timestep_cond: false
 thinker_timestep_cond: false
 temb_dim: 256
 
-# Classifier-free guidance
-cfg_prob: 0.0
-cfg_scale: 1.0
-
-# Separate AdamW LR/WD for painter+bridge (null = inherit from train.lr / train.weight_decay)
-lr: 1e-4
-weight_decay: null
+optim:
+  lr: 1e-4
+  lr_min_ratio: 1.0
+  weight_decay: 0.01
+  warmup_steps: 2000

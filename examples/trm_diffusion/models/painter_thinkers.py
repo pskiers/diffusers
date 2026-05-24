@@ -4,131 +4,106 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.trm_wrappers import OriginalTRMSudoku
+from models.trm_wrappers import SpatialTRM
 from models.utility_models import SpatialEncoder, AttentiveBridge, SpatialBridge, TimestepMLP
-from models.painters import make_painter, StandalonePainter
+import numpy as np
+from tqdm.auto import tqdm
+
+from models.painters import make_painter, StandalonePainter, compute_losses_painter
+from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.diffusion_utils import apply_noisy_swap
+from datasets.sudoku_dataset import IGNORE_LABEL_ID, make_tok_labels
+from eval.mnist_eval import sample_grids, evaluate_grids, load_or_train_classifier
+from configs.schemas import (
+    ThinkerModelConfig,
+    PainterThinkerConfig,
+    ImageEncoderConfig,
+    TimestepCondConfig,
+    ThinkerOptimConfig,
+    PainterOptimConfig,
+    TrainConfig,
+    EvalConfig,
+)
+from models.base import BaseModel
 
 
-class OriginalTRMRatatouilleV0Tok(nn.Module):
+class PainterThinkerV0Tok(BaseModel):
     """
     Painter-thinker model using the original TRM as the thinker (token input).
-
-    Thinker: OriginalTRMSudoku(vocab_size) — receives puzzle tokens directly,
-             outputs (B, 81, vocab_size) logits over sudoku token IDs.
-    Bridge:  SpatialBridge — bilinear upsample + 2 convs:
-             (B, vocab_size, 9, 9) → (B, bridge_channels, painter_size, painter_size).
-    Painter: UNet2DModel — denoises cat([noisy, bridge_feat], dim=1).
-
-    The thinker logits are reshaped to (B, vocab_size, 9, 9) before the bridge:
-      logits (B,81,V) → transpose → (B,V,81) → reshape → (B,V,9,9)
-
-    token_input=True tells train_trm.py to use batch["puzzle_tokens"] as
-    the condition, not batch["conditions"].
-
-    Sudoku CE loss: labels must be in token format (2-10 for correct digit, -100
-    for ignored). train_trm.py converts solution (0-8 digit classes) → (2-10)
-    automatically.  See train_trm.py for details.
-
-    diff_thinker_weight: scale of diffusion-loss gradient back into the thinker.
-      0.0  → thinker trained only on sudoku CE loss (bridge sees detached spatial).
-      1.0  → full diffusion gradient reaches thinker.
     """
 
     token_input: bool = True
-    has_realsolution_eval: bool = True   # eval with full solution tokens as condition
+    has_realsolution_eval: bool = True  # eval with full solution tokens as condition
 
     def __init__(
         self,
-        # --- painter geometry ---
-        painter_size: int = 144,
-        cell_size: int = 16,
-        # --- thinker ---
-        vocab_size: int = 11,
-        seq_len: int = 81,
-        hidden_size: int = 512,
-        n_heads: int = 8,
-        L_layers: int = 2,
-        L_cycles: int = 6,
-        H_cycles: int = 3,
-        n_sup: int = 16,
-        expansion: float = 4.0,
-        forward_dtype: str = "bfloat16",
-        mlp_t: bool = False,
-        pos_encodings: str = "rope",
-        puzzle_emb_ndim: int = 0,
-        puzzle_emb_len: int = 16,
-        num_puzzle_identifiers: int = 1,
-        halt_exploration_prob: float = 0.0,
-        batch_size: int = 1,
-        freeze_weights: bool = False,
-        # --- bridge & painter ---
-        bridge_channels: int = 16,
-        painter_channels: tuple = (32, 64, 128),
-        painter_layers_per_block: int = 1,
-        diff_thinker_weight: float = 1.0,
-        # How thinker logits are converted to spatial conditioning at inference time.
-        #   "logits"  – raw logits (default, matches training with raw logit spatial)
-        #   "onehot"  – argmax → one-hot (matches painter trained on real one-hot solutions)
-        #   "softmax" – softmax probabilities (soft version of onehot)
-        thinker_bridge_mode: str = "logits",
-        # Classifier-free guidance.  cfg_prob > 0 randomly zeros the spatial
-        # conditioning during training.  cfg_scale > 1.0 at inference enables
-        # the double-forward CFG pass in forward().
-        cfg_prob: float = 0.0,
-        cfg_scale: float = 1.0,
-        # Autocast dtype for the bridge + painter UNet.  None = no autocast
-        # (painter runs in whatever dtype the tensors arrive in).
-        # "bfloat16" is the safe default: same exponent range as float32, so no
-        # GradScaler needed.  "float16" also works but requires a GradScaler
-        # (use accelerate mixed_precision="fp16" which handles this automatically).
-        # The TRM thinker is NOT affected — it manages its own dtype via forward_dtype.
-        painter_dtype: Optional[str] = None,
+        thinker_cfg: ThinkerModelConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
     ):
         super().__init__()
-        self.diff_thinker_weight = diff_thinker_weight
-        self.thinker_bridge_mode = thinker_bridge_mode
-        self.cfg_prob  = cfg_prob
-        self.cfg_scale = cfg_scale
-        self._grid = painter_size // cell_size   # e.g. 144//16 = 9
+        self.thinker_cfg = thinker_cfg
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg
+        self.eval_cfg = eval_cfg
+        self.thinker_optim_cfg = thinker_optim_cfg
+        self.painter_optim_cfg = painter_optim_cfg
+        self.scheduler = scheduler
+
+        self.diff_thinker_weight = model_cfg.diff_thinker_weight
+        self.thinker_bridge_mode = model_cfg.thinker_bridge_mode
+        self._grid = model_cfg.painter_size // model_cfg.cell_size
         # Thinker vocab uses 0=PAD, 1=blank, 2-10=digits 1-9.
         # sample_grids compares argmax predictions against raw solution labels (0-8),
         # so it needs to know to shift by this offset when comparing.
         self.token_offset = 2
         self._painter_dtype: Optional[torch.dtype] = (
-            {"bfloat16": torch.bfloat16, "float16": torch.float16}[painter_dtype]
-            if painter_dtype is not None else None
+            {"bfloat16": torch.bfloat16, "float16": torch.float16}[model_cfg.painter_dtype]
+            if model_cfg.painter_dtype is not None
+            else None
         )
 
-        self.thinker = OriginalTRMSudoku(
-            vocab_size=vocab_size,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            L_layers=L_layers,
-            L_cycles=L_cycles,
-            H_cycles=H_cycles,
-            n_sup=n_sup,
-            expansion=expansion,
-            forward_dtype=forward_dtype,
-            mlp_t=mlp_t,
-            pos_encodings=pos_encodings,
-            puzzle_emb_ndim=puzzle_emb_ndim,
-            puzzle_emb_len=puzzle_emb_len,
-            num_puzzle_identifiers=num_puzzle_identifiers,
-            halt_exploration_prob=halt_exploration_prob,
-            batch_size=batch_size,
-            freeze_weights=freeze_weights,
+        self.eval_clf = None
+        if eval_cfg.classifier_path is not None:
+            self.eval_clf = load_or_train_classifier(eval_cfg.classifier_path, None, model_cfg.cell_size, "cuda")
+            for p in self.eval_clf.parameters():
+                p.requires_grad_(False)
+
+        self.thinker = SpatialTRM(
+            optim_cfg=thinker_optim_cfg,
+            vocab_size=thinker_cfg.vocab_size,
+            seq_len=thinker_cfg.seq_len,
+            hidden_size=thinker_cfg.hidden_size,
+            n_heads=thinker_cfg.n_heads,
+            L_layers=thinker_cfg.L_layers,
+            L_cycles=thinker_cfg.L_cycles,
+            H_cycles=thinker_cfg.H_cycles,
+            n_sup=thinker_cfg.n_sup,
+            expansion=thinker_cfg.expansion,
+            forward_dtype=thinker_cfg.forward_dtype,
+            mlp_t=thinker_cfg.mlp_t,
+            pos_encodings=thinker_cfg.pos_encodings,
+            puzzle_emb_ndim=thinker_cfg.puzzle_emb_ndim,
+            puzzle_emb_len=thinker_cfg.puzzle_emb_len,
+            num_puzzle_identifiers=thinker_cfg.num_puzzle_identifiers,
+            halt_exploration_prob=thinker_cfg.halt_exploration_prob,
+            batch_size=thinker_cfg.batch_size,
+            freeze_weights=thinker_cfg.freeze_weights,
         )
         self.bridge = SpatialBridge(
-            in_channels=vocab_size,
-            out_channels=bridge_channels,
-            painter_size=painter_size,
+            in_channels=thinker_cfg.vocab_size,
+            out_channels=model_cfg.bridge_channels,
+            painter_size=model_cfg.painter_size,
         )
         self.painter = make_painter(
-            painter_size=painter_size,
-            bridge_channels=bridge_channels,
-            painter_channels=tuple(painter_channels),
-            layers_per_block=painter_layers_per_block,
+            painter_size=model_cfg.painter_size,
+            bridge_channels=model_cfg.bridge_channels,
+            painter_channels=tuple(model_cfg.painter_channels),
+            layers_per_block=model_cfg.painter_layers_per_block,
         )
 
     @property
@@ -147,22 +122,364 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
         painter_ids = {id(p) for p in self.get_painter_params()}
         return [p for p in self.parameters() if id(p) not in painter_ids]
 
+    def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
+        thinker_optims = self.thinker.build_optimizers(world_size, num_steps)
+        painter_params = self.get_painter_params()
+        painter_optim = torch.optim.AdamW(painter_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+        painter_scheduled = ScheduledOptimizer(
+            painter_optim,
+            base_lr=self.painter_optim_cfg.lr,
+            warmup_steps=self.painter_optim_cfg.warmup_steps,
+            num_steps=num_steps,
+            min_ratio=self.painter_optim_cfg.lr_min_ratio,
+        )
+        return thinker_optims + [painter_scheduled]
+
+    # ── Condition helpers (overrideable by subclasses) ────────────────────────
+
+    def _get_condition(self, mb: dict, device) -> torch.Tensor:
+        return mb["puzzle_tokens"].to(device)
+
+    def _get_teacher_condition(self, mb: dict, device) -> torch.Tensor:
+        solution = mb["solution"].to(device)
+        return solution.clamp(min=0) + self.token_offset
+
+    def _make_ce_labels(self, solution: torch.Tensor) -> torch.Tensor:
+        return make_tok_labels(solution)
+
+    # ── Training step ─────────────────────────────────────────────────────────
+
+    def train_step(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step, **kwargs):
+        if self.train_cfg.two_stage is not None:
+            return self._train_step_two_stage(
+                micro_batches, accelerator, optimizers, ema, global_batch_size, global_step
+            )
+        return self._train_step_standard(micro_batches, accelerator, optimizers, ema, global_batch_size, global_step)
+
+    def _prep_mb_data(self, micro_batches, device):
+        mb_data = []
+        for mb in micro_batches:
+            images = mb["images"].to(device)
+            solution = mb["solution"].to(device)
+            puzzle_ids = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
+            bsz = images.shape[0]
+
+            noise = torch.randn_like(images)
+            timesteps = torch.randint(
+                0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
+            )
+            noisy = self.scheduler.add_noise(images, noise, timesteps)
+            target = noise if self.scheduler.config.prediction_type == "epsilon" else images
+            noisy, target = apply_noisy_swap(
+                images=images,
+                noisy=noisy,
+                target=target,
+                timesteps=timesteps,
+                scheduler=self.scheduler,
+                swap_cfg=self.train_cfg.noisy_swap,
+            )
+            z_H, z_L = self.get_initial_states(bsz)
+            mb_data.append(
+                {
+                    "condition": self._get_condition(mb, device),
+                    "solution": solution,
+                    "ce_labels": self._make_ce_labels(solution),
+                    "puzzle_ids": puzzle_ids,
+                    "noisy": noisy,
+                    "timesteps": timesteps,
+                    "target": target,
+                    "z_H": z_H.to(device),
+                    "z_L": z_L.to(device),
+                }
+            )
+        return mb_data
+
+    def _compute_step_loss(self, noise_pred, logits, d, device, *, include_sudoku=True):
+        sudoku_w = self.train_cfg.sudoku_loss_weight
+        mse_w = self.train_cfg.mse_loss_weight
+        step_loss = torch.tensor(0.0, device=device)
+        diff_loss = sudoku_loss = torch.tensor(0.0, device=device)
+
+        if mse_w > 0.0:
+            diff_loss = F.mse_loss(noise_pred.float(), d["target"])
+            step_loss = step_loss + mse_w * diff_loss
+
+        if include_sudoku and logits is not None and sudoku_w > 0:
+            B_, N, C = logits.shape
+            sudoku_loss = F.cross_entropy(
+                logits.float().reshape(B_ * N, C),
+                d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
+                ignore_index=IGNORE_LABEL_ID,
+            )
+            step_loss = step_loss + sudoku_w * sudoku_loss
+
+        return step_loss, diff_loss, sudoku_loss
+
+    def _train_step_standard(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step):
+        K = len(micro_batches)
+        device = accelerator.device
+        mb_data = self._prep_mb_data(micro_batches, device)
+
+        total_diff_loss = 0.0
+        total_sudoku_loss = 0.0
+        lr = 0.0
+
+        for _ in range(self.n_sup):
+            for d in mb_data:
+                noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
+                    d["condition"],
+                    d["noisy"],
+                    d["z_H"],
+                    d["z_L"],
+                    d["timesteps"],
+                    d["puzzle_ids"],
+                )
+                step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
+                accelerator.backward(step_loss / (global_batch_size * K))
+                total_diff_loss += diff_loss.item()
+                total_sudoku_loss += sudoku_loss.item()
+
+            accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+            accelerator.clip_grad_norm_(self.get_painter_params(), 1.0)
+            lr = apply_lr_and_step(optimizers, global_step)
+            global_step += 1
+            if ema is not None:
+                ema.update(self)
+
+        n = self.n_sup * K
+        return {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}, lr, global_step
+
+    def _train_step_two_stage(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step):
+        K = len(micro_batches)
+        device = accelerator.device
+        ts_cfg = self.train_cfg.two_stage
+        ps = ts_cfg.painter
+        ts = ts_cfg.thinker
+        ps_n_sup = self.n_sup if ps.n_sup < 0 else ps.n_sup
+        ts_n_sup = self.n_sup if ts.n_sup < 0 else ts.n_sup
+        run_painter_stage = global_step % ps.every == 0
+        run_thinker_stage = global_step % ts.every == 0
+
+        mb_data = []
+        for mb in micro_batches:
+            images = mb["images"].to(device)
+            solution = mb["solution"].to(device)
+            puzzle_ids = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
+            bsz = images.shape[0]
+
+            noise = torch.randn_like(images)
+            timesteps = torch.randint(
+                0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
+            )
+            noisy = self.scheduler.add_noise(images, noise, timesteps)
+            target = noise if self.scheduler.config.prediction_type == "epsilon" else images
+            z_H_p, z_L_p = self.get_initial_states(bsz)
+            z_H_t, z_L_t = self.get_initial_states(bsz)
+            mb_data.append(
+                {
+                    "condition": self._get_condition(mb, device),
+                    "teacher": self._get_teacher_condition(mb, device),
+                    "ce_labels": self._make_ce_labels(solution),
+                    "puzzle_ids": puzzle_ids,
+                    "noisy": noisy,
+                    "timesteps": timesteps,
+                    "target": target,
+                    "z_H_p": z_H_p.to(device),
+                    "z_L_p": z_L_p.to(device),
+                    "z_H_t": z_H_t.to(device),
+                    "z_L_t": z_L_t.to(device),
+                }
+            )
+
+        thinker_optims = optimizers[:-1]
+        painter_optims = optimizers[-1:]
+        painter_params = self.get_painter_params()
+
+        total_diff_loss = 0.0
+        total_sudoku_loss = 0.0
+        n_painter_ticks = 0
+        n_thinker_ticks = 0
+        lr = 0.0
+        n_ticks = max(ps_n_sup if run_painter_stage else 0, ts_n_sup if run_thinker_stage else 0)
+
+        for tick in range(n_ticks):
+            # Painter sub-step: teacher-forced, updates painter (and optionally thinker)
+            if run_painter_stage and tick < ps_n_sup:
+                thinker_params = self.get_thinker_params()
+                if ps.freeze_thinker:
+                    for p in thinker_params:
+                        p.requires_grad_(False)
+
+                for d in mb_data:
+                    noise_pred, logits, d["z_H_p"], d["z_L_p"] = self.reasoning_step(
+                        d["teacher"],
+                        d["noisy"],
+                        d["z_H_p"],
+                        d["z_L_p"],
+                        d["timesteps"],
+                        d["puzzle_ids"],
+                        H_cycles=ps.H_cycles,
+                        L_cycles=ps.L_cycles,
+                    )
+                    step_loss, diff_loss, sudoku_loss = self._compute_step_loss(
+                        noise_pred, logits, d, device, include_sudoku=not ps.freeze_thinker
+                    )
+                    accelerator.backward(step_loss / (global_batch_size * K))
+                    total_diff_loss += diff_loss.item()
+                    total_sudoku_loss += sudoku_loss.item()
+                    n_painter_ticks += 1
+
+                if not ps.freeze_thinker:
+                    accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+                accelerator.clip_grad_norm_(painter_params, 1.0)
+                lr = apply_lr_and_step(painter_optims if ps.freeze_thinker else optimizers, global_step)
+
+                if ps.freeze_thinker:
+                    for p in thinker_params:
+                        p.requires_grad_(True)
+
+            # Thinker sub-step: real condition, painter frozen, only thinker optims step
+            if run_thinker_stage and tick < ts_n_sup:
+                for p in painter_params:
+                    p.requires_grad_(False)
+
+                for d in mb_data:
+                    noise_pred, logits, d["z_H_t"], d["z_L_t"] = self.reasoning_step(
+                        d["condition"],
+                        d["noisy"],
+                        d["z_H_t"],
+                        d["z_L_t"],
+                        d["timesteps"],
+                        d["puzzle_ids"],
+                    )
+                    step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
+                    accelerator.backward(step_loss / (global_batch_size * K))
+                    total_sudoku_loss += sudoku_loss.item()
+                    n_thinker_ticks += 1
+
+                accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+                lr_t = apply_lr_and_step(thinker_optims, global_step)
+                if lr == 0.0:
+                    lr = lr_t
+
+                for p in painter_params:
+                    p.requires_grad_(True)
+
+            if ema is not None:
+                ema.update(self)
+            global_step += 1
+
+        n_p = n_painter_ticks or 1
+        n_t = (n_painter_ticks + n_thinker_ticks) or 1
+        return {"diff_loss": total_diff_loss / n_p, "sudoku_loss": total_sudoku_loss / n_t}, lr, global_step
+
+    def compile_submodules(self):
+        self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False)
+        self.painter = torch.compile(self.painter)
+        if self.bridge is not None:
+            self.bridge = torch.compile(self.bridge)
+
+    @torch.no_grad()
+    def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
+        max_batches = kwargs.get("max_batches", 100)
+        self.eval()
+
+        # ── Loss eval (fast, always runs) ─────────────────────────────────────
+        metrics: dict[str, list] = {
+            "diff_loss": [],
+            "sudoku_loss": [],
+            "thinker_cell_acc": [],
+            "thinker_puzzle_acc": [],
+        }
+        for i, batch in tqdm(enumerate(dataloader), "Eval loss", total=max_batches):
+            if i >= max_batches:
+                break
+            m = compute_losses_painter(
+                model=self,
+                condition=self._get_condition(batch, accelerator.device),
+                batch=batch,
+                scheduler=self.scheduler,
+                accelerator=accelerator,
+                sudoku_loss_weight=self.train_cfg.sudoku_loss_weight,
+                token_input=self.token_input,
+            )
+            for k in metrics:
+                val = m.get(k)
+                if val is not None:
+                    metrics[k].append(val.item() if torch.is_tensor(val) else float(val))
+        result = {k: float(np.mean(v)) for k, v in metrics.items() if v}
+
+        # ── Sampling eval (slow, only when classifier provided) ───────────────
+        if self.eval_clf is not None and accelerator.is_main_process:
+            cell_size = self.model_cfg.cell_size
+            painter_size = self.model_cfg.painter_size
+            n_total = self.eval_cfg.num_samples
+            n_ddim = self.eval_cfg.num_ddim_steps
+
+            def _sample_loop(get_cond_fn, desc):
+                all_cell_acc, all_puzzle_acc, n_done = [], [], 0
+                for batch in tqdm(
+                    dataloader, desc, total=(n_total + self.eval_cfg.batch_size - 1) // self.eval_cfg.batch_size
+                ):
+                    if n_done >= n_total:
+                        break
+                    solutions = batch["solution"]
+                    puzzle_ids = batch.get("puzzle_id")
+                    if puzzle_ids is not None:
+                        puzzle_ids = puzzle_ids.to(accelerator.device)
+                    sr = sample_grids(
+                        self,
+                        get_cond_fn(batch, accelerator.device),
+                        num_train_timesteps=self.scheduler.config.num_train_timesteps,
+                        beta_schedule=self.scheduler.config.beta_schedule,
+                        prediction_type=self.scheduler.config.prediction_type,
+                        num_steps=n_ddim,
+                        device=accelerator.device,
+                        puzzle_ids=puzzle_ids,
+                        solutions=solutions,
+                        painter_size=painter_size,
+                        given_masks=batch.get("given_mask"),
+                    )
+                    acc = evaluate_grids(
+                        sr["generated"],
+                        solutions,
+                        self.eval_clf,
+                        cell_size,
+                        given_masks=batch.get("given_mask"),
+                    )
+                    all_cell_acc.append(acc["cell_acc"])
+                    all_puzzle_acc.append(acc["puzzle_acc"])
+                    n_done += solutions.shape[0]
+                return float(np.mean(all_cell_acc)), float(np.mean(all_puzzle_acc))
+
+            cell_acc, puzzle_acc = _sample_loop(self._get_condition, "Sampling eval")
+            result["cell_acc"] = cell_acc
+            result["puzzle_acc"] = puzzle_acc
+
+            if self.has_realsolution_eval:
+                real_cell_acc, real_puzzle_acc = _sample_loop(self._get_teacher_condition, "Realsolution eval")
+                result["real_cell_acc"] = real_cell_acc
+                result["real_puzzle_acc"] = real_puzzle_acc
+
+        self.train()
+        return result
+
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         """(B, N, C) logits → (B, C, grid, grid) spatial conditioning.
 
         Conversion respects self.thinker_bridge_mode:
-          "logits"  – raw float logits (default)
-          "onehot"  – argmax → one-hot
-          "softmax" – softmax probabilities
+          "logits"  - raw float logits (default)
+          "onehot"  - argmax → one-hot
+          "softmax" - softmax probabilities
         """
         B, _, C = logits.shape
         mode = getattr(self, "thinker_bridge_mode", "logits")
         if mode == "onehot":
             # Straight-through estimator: hard one-hot in the forward pass,
             # softmax gradient in the backward pass so thinker weights can update.
-            soft   = logits.float().softmax(dim=-1)
-            hard   = F.one_hot(logits.argmax(dim=-1), num_classes=C).float()
-            onehot = hard - soft.detach() + soft   # forward≈hard, grad flows via soft
+            soft = logits.float().softmax(dim=-1)
+            hard = F.one_hot(logits.argmax(dim=-1), num_classes=C).float()
+            onehot = hard - soft.detach() + soft  # forward≈hard, grad flows via soft
             return onehot.transpose(1, 2).reshape(B, C, self._grid, self._grid)
         elif mode == "softmax":
             probs = logits.float().softmax(dim=-1)
@@ -219,15 +536,14 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
             sc_for_painter = spatial_cond.detach()
         elif self.diff_thinker_weight != 1.0:
             sc_for_painter = (
-                self.diff_thinker_weight * spatial_cond
-                + (1.0 - self.diff_thinker_weight) * spatial_cond.detach()
+                self.diff_thinker_weight * spatial_cond + (1.0 - self.diff_thinker_weight) * spatial_cond.detach()
             )
         else:
             sc_for_painter = spatial_cond
 
         # CFG training dropout: randomly zero conditioning per sample.
-        if self.training and self.cfg_prob > 0:
-            drop = torch.rand(sc_for_painter.shape[0], 1, 1, 1, device=sc_for_painter.device) < self.cfg_prob
+        if self.training and self.train_cfg.cfg_prob > 0:
+            drop = torch.rand(sc_for_painter.shape[0], 1, 1, 1, device=sc_for_painter.device) < self.train_cfg.cfg_prob
             sc_for_painter = sc_for_painter * (~drop)
 
         noise_pred = self._run_painter(noisy, sc_for_painter, timesteps)
@@ -251,17 +567,15 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
 
         logits = None
         for _ in range(self.n_sup):
-            logits, z_H, z_L = self.thinker.reasoning_step(
-                puzzle_tokens, z_H, z_L, puzzle_ids
-            )
+            logits, z_H, z_L = self.thinker.reasoning_step(puzzle_tokens, z_H, z_L, puzzle_ids)
 
         spatial_cond = self._logits_to_spatial(logits.float())
 
-        if not self.training and self.cfg_scale > 1.0:
+        if not self.training and self.eval_cfg.cfg_scale > 1.0:
             null = torch.zeros_like(spatial_cond)
-            pred_cond   = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_cond = self._run_painter(noisy, spatial_cond, timesteps)
             pred_uncond = self._run_painter(noisy, null, timesteps)
-            noise_pred  = pred_uncond + self.cfg_scale * (pred_cond - pred_uncond)
+            noise_pred = pred_uncond + self.eval_cfg.cfg_scale * (pred_cond - pred_uncond)
         else:
             noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
         return noise_pred, logits
@@ -269,7 +583,8 @@ class OriginalTRMRatatouilleV0Tok(nn.Module):
 
 # ── Painter-thinker (V0: image-conditioned) ───────────────────────────────────
 
-class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
+
+class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
     """
     Image-conditioned painter-thinker (V0).
 
@@ -284,94 +599,63 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
     """
 
     token_input: bool = False
-    has_realsolution_eval: bool = True   # eval with full MNIST image as condition
+    has_realsolution_eval: bool = True  # eval with full MNIST image as condition
 
     def __init__(
         self,
-        # --- painter geometry ---
-        painter_size: int = 144,
-        cell_size: int = 16,
-        # --- thinker ---
-        num_classes: int = 9,
-        seq_len: int = 81,
-        hidden_size: int = 512,
-        n_heads: int = 8,
-        L_layers: int = 2,
-        L_cycles: int = 6,
-        H_cycles: int = 3,
-        n_sup: int = 16,
-        expansion: float = 4.0,
-        forward_dtype: str = "bfloat16",
-        mlp_t: bool = False,
-        pos_encodings: str = "rope",
-        halt_exploration_prob: float = 0.0,
-        batch_size: int = 1,
-        freeze_weights: bool = False,
-        # --- image encoder ---
-        enc_channels: int = 32,
-        enc_hidden_channels: tuple = (16, 32),  # intermediate widths in SpatialEncoder
-        # --- bridge & painter ---
-        thinker_out_channels: int = None,   # if > num_classes, expands logits before bridge
-        bridge_channels: int = 16,
-        painter_channels: tuple = (32, 64, 128),
-        painter_layers_per_block: int = 1,
-        diff_thinker_weight: float = 1.0,
-        thinker_bridge_mode: str = "logits",
-        cfg_prob: float = 0.0,
-        cfg_scale: float = 1.0,
-        painter_dtype: Optional[str] = None,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
     ):
-        _toc = thinker_out_channels if thinker_out_channels is not None else num_classes
         super().__init__(
-            painter_size=painter_size,
-            cell_size=cell_size,
-            vocab_size=num_classes,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            L_layers=L_layers,
-            L_cycles=L_cycles,
-            H_cycles=H_cycles,
-            n_sup=n_sup,
-            expansion=expansion,
-            forward_dtype=forward_dtype,
-            mlp_t=mlp_t,
-            pos_encodings=pos_encodings,
-            puzzle_emb_ndim=0,
-            halt_exploration_prob=halt_exploration_prob,
-            batch_size=batch_size,
-            freeze_weights=freeze_weights,
-            bridge_channels=bridge_channels,
-            painter_channels=painter_channels,
-            painter_layers_per_block=painter_layers_per_block,
-            diff_thinker_weight=diff_thinker_weight,
-            thinker_bridge_mode=thinker_bridge_mode,
-            cfg_prob=cfg_prob,
-            cfg_scale=cfg_scale,
-            painter_dtype=painter_dtype,
+            thinker_cfg=thinker_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
         )
+        self.encoder_cfg = encoder_cfg
         self.token_offset = 0
 
-        # condition image (B,1,H,W) → (B, enc_channels, grid, grid)
-        self.image_encoder = SpatialEncoder(1, enc_channels, factor=cell_size,
-                                            hidden_channels=tuple(enc_hidden_channels))
-        # project enc_channels → hidden_size per cell
-        std = 1.0 / (math.sqrt(hidden_size) * math.sqrt(enc_channels))
-        self.enc_proj = nn.Conv2d(enc_channels, hidden_size, 1)
+        self.image_encoder = SpatialEncoder(
+            1,
+            encoder_cfg.enc_channels,
+            factor=model_cfg.cell_size,
+            hidden_channels=tuple(encoder_cfg.enc_hidden_channels),
+        )
+        std = 1.0 / (math.sqrt(thinker_cfg.hidden_size) * math.sqrt(encoder_cfg.enc_channels))
+        self.enc_proj = nn.Conv2d(encoder_cfg.enc_channels, thinker_cfg.hidden_size, 1)
         nn.init.normal_(self.enc_proj.weight, std=std)
         nn.init.zeros_(self.enc_proj.bias)
 
-        # Optional expansion: project num_classes → thinker_out_channels before bridge.
-        # CE loss still uses raw num_classes logits; only the bridge sees the expanded map.
-        if _toc != num_classes:
-            self.logit_expand = nn.Linear(num_classes, _toc, bias=False)
+        _toc = (
+            encoder_cfg.thinker_out_channels if encoder_cfg.thinker_out_channels is not None else thinker_cfg.vocab_size
+        )
+        if _toc != thinker_cfg.vocab_size:
+            self.logit_expand = nn.Linear(thinker_cfg.vocab_size, _toc, bias=False)
             self.bridge = SpatialBridge(
                 in_channels=_toc,
-                out_channels=bridge_channels,
-                painter_size=painter_size,
+                out_channels=model_cfg.bridge_channels,
+                painter_size=model_cfg.painter_size,
             )
         else:
             self.logit_expand = None
+
+    def _get_condition(self, mb: dict, device) -> torch.Tensor:
+        return mb["conditions"].to(device)
+
+    def _get_teacher_condition(self, mb: dict, device) -> torch.Tensor:
+        return mb["images"].to(device)
+
+    def _make_ce_labels(self, solution: torch.Tensor) -> torch.Tensor:
+        return solution
 
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         if self.logit_expand is not None:
@@ -380,12 +664,14 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
 
     def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
         """(B, C, H, W) → float embeddings (B, 81, hidden_size)"""
-        feat = self.image_encoder(x)               # (B, enc_channels, grid, grid)
-        proj = self.enc_proj(feat)                 # (B, hidden_size, grid, grid)
-        return proj.flatten(2).transpose(1, 2)     # (B, 81, hidden_size)
+        feat = self.image_encoder(x)  # (B, enc_channels, grid, grid)
+        proj = self.enc_proj(feat)  # (B, hidden_size, grid, grid)
+        return proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
 
     def _get_enc_emb(
-        self, condition: torch.Tensor, noisy: torch.Tensor,
+        self,
+        condition: torch.Tensor,
+        noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """V0: encode condition only, ignore noisy and timesteps.
@@ -405,8 +691,14 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
     ):
         enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
         return super().reasoning_step(
-            enc_emb, noisy, z_H, z_L, timesteps,
-            puzzle_ids=puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles,
+            enc_emb,
+            noisy,
+            z_H,
+            z_L,
+            timesteps,
+            puzzle_ids=puzzle_ids,
+            H_cycles=H_cycles,
+            L_cycles=L_cycles,
         )
 
     def forward(
@@ -424,22 +716,21 @@ class OriginalTRMRatatouilleV0(OriginalTRMRatatouilleV0Tok):
 
         logits = None
         for _ in range(self.n_sup):
-            logits, z_H, z_L = self.thinker.reasoning_step(
-                enc_emb, z_H, z_L, puzzle_ids
-            )
+            logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
 
         spatial_cond = self._logits_to_spatial(logits.float())
-        if not self.training and self.cfg_scale > 1.0:
+        if not self.training and self.eval_cfg.cfg_scale > 1.0:
             null = torch.zeros_like(spatial_cond)
-            pred_cond   = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_cond = self._run_painter(noisy, spatial_cond, timesteps)
             pred_uncond = self._run_painter(noisy, null, timesteps)
-            noise_pred  = pred_uncond + self.cfg_scale * (pred_cond - pred_uncond)
+            noise_pred = pred_uncond + self.eval_cfg.cfg_scale * (pred_cond - pred_uncond)
         else:
             noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
         return noise_pred, logits
 
 
 # ── Painter-thinker (V1: image+noisy-conditioned) ────────────────────────────
+
 
 class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
     """
@@ -455,94 +746,53 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
 
     def __init__(
         self,
-        # --- painter geometry ---
-        painter_size: int = 144,
-        cell_size: int = 16,
-        # --- thinker ---
-        num_classes: int = 9,
-        seq_len: int = 81,
-        hidden_size: int = 512,
-        n_heads: int = 8,
-        L_layers: int = 2,
-        L_cycles: int = 6,
-        H_cycles: int = 3,
-        n_sup: int = 16,
-        expansion: float = 4.0,
-        forward_dtype: str = "bfloat16",
-        mlp_t: bool = False,
-        pos_encodings: str = "rope",
-        halt_exploration_prob: float = 0.0,
-        batch_size: int = 1,
-        freeze_weights: bool = False,
-        # --- image encoder ---
-        enc_channels: int = 32,
-        enc_hidden_channels: tuple = (16, 32),
-        thinker_out_channels: int = None,
-        # --- timestep conditioning (V1-specific) ---
-        enc_timestep_cond: bool = False,     # FiLM scale+shift on encoder features
-        thinker_timestep_cond: bool = False, # T2: broadcast temb added to thinker input tokens
-        temb_dim: int = 256,                 # output dim of the shared TimestepMLP
-        # --- bridge & painter ---
-        bridge_channels: int = 16,
-        painter_channels: tuple = (32, 64, 128),
-        painter_layers_per_block: int = 1,
-        diff_thinker_weight: float = 1.0,
-        thinker_bridge_mode: str = "logits",
-        cfg_prob: float = 0.0,
-        cfg_scale: float = 1.0,
-        painter_dtype: Optional[str] = None,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+        timestep_cfg: Optional[TimestepCondConfig] = None,
     ):
         super().__init__(
-            painter_size=painter_size,
-            cell_size=cell_size,
-            num_classes=num_classes,
-            thinker_out_channels=thinker_out_channels,
-            enc_hidden_channels=enc_hidden_channels,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            L_layers=L_layers,
-            L_cycles=L_cycles,
-            H_cycles=H_cycles,
-            n_sup=n_sup,
-            expansion=expansion,
-            forward_dtype=forward_dtype,
-            mlp_t=mlp_t,
-            pos_encodings=pos_encodings,
-            halt_exploration_prob=halt_exploration_prob,
-            batch_size=batch_size,
-            freeze_weights=freeze_weights,
-            enc_channels=enc_channels,
-            bridge_channels=bridge_channels,
-            painter_channels=painter_channels,
-            painter_layers_per_block=painter_layers_per_block,
-            diff_thinker_weight=diff_thinker_weight,
-            thinker_bridge_mode=thinker_bridge_mode,
-            cfg_prob=cfg_prob,
-            cfg_scale=cfg_scale,
-            painter_dtype=painter_dtype,
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
         )
         # Replace 1-channel encoder with 2-channel (condition + noisy)
-        self.image_encoder = SpatialEncoder(2, enc_channels, factor=cell_size,
-                                            hidden_channels=tuple(enc_hidden_channels))
+        self.image_encoder = SpatialEncoder(
+            2,
+            encoder_cfg.enc_channels,
+            factor=model_cfg.cell_size,
+            hidden_channels=tuple(encoder_cfg.enc_hidden_channels),
+        )
 
         # Timestep conditioning.  Both projections are zero-init so the model
         # starts as the no-timestep identity and gradually learns to use t.
-        self.enc_timestep_cond     = enc_timestep_cond
-        self.thinker_timestep_cond = thinker_timestep_cond
-        if enc_timestep_cond or thinker_timestep_cond:
-            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=temb_dim)
-        if enc_timestep_cond:
-            self.enc_film = nn.Linear(temb_dim, 2 * enc_channels)
+        self.enc_timestep_cond = timestep_cfg.enc_timestep_cond if timestep_cfg is not None else False
+        self.thinker_timestep_cond = timestep_cfg.thinker_timestep_cond if timestep_cfg is not None else False
+        if timestep_cfg is not None and (timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond):
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
+        if timestep_cfg is not None and timestep_cfg.enc_timestep_cond:
+            self.enc_film = nn.Linear(timestep_cfg.temb_dim, 2 * encoder_cfg.enc_channels)
             nn.init.zeros_(self.enc_film.weight)
             nn.init.zeros_(self.enc_film.bias)
-        if thinker_timestep_cond:
-            self.thinker_temb_proj = nn.Linear(temb_dim, hidden_size)
+        if timestep_cfg is not None and timestep_cfg.thinker_timestep_cond:
+            self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
             nn.init.zeros_(self.thinker_temb_proj.weight)
             nn.init.zeros_(self.thinker_temb_proj.bias)
 
     def _get_enc_emb(
-        self, condition: torch.Tensor, noisy: torch.Tensor,
+        self,
+        condition: torch.Tensor,
+        noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Compute shared timestep embedding once (if any conditioning is active).
@@ -555,8 +805,8 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         if temb is not None and self.enc_timestep_cond:
             scale, shift = self.enc_film(temb).chunk(2, dim=1)  # (B, enc_channels) each
             feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
-        proj    = self.enc_proj(feat)
-        enc_emb = proj.flatten(2).transpose(1, 2)          # (B, 81, hidden_size)
+        proj = self.enc_proj(feat)
+        enc_emb = proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
 
         # T2: broadcast timestep embedding into thinker token space.
         if temb is not None and self.thinker_timestep_cond:
@@ -566,6 +816,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
 
 
 # ── Painter-thinker (V2: no CE supervision) ───────────────────────────────────
+
 
 class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
     """
@@ -579,77 +830,18 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
     Use thinker_out_channels=16 (or any value) instead of num_classes=9.
     """
 
-    has_realsolution_eval: bool = False   # latent thinker; no digit-level solution eval
+    has_realsolution_eval: bool = False  # latent thinker; no digit-level solution eval
 
-    def __init__(
-        self,
-        # --- painter geometry ---
-        painter_size: int = 144,
-        cell_size: int = 16,
-        # --- thinker ---
-        thinker_out_channels: int = 16,
-        seq_len: int = 81,
-        hidden_size: int = 512,
-        n_heads: int = 8,
-        L_layers: int = 2,
-        L_cycles: int = 6,
-        H_cycles: int = 3,
-        n_sup: int = 16,
-        expansion: float = 4.0,
-        forward_dtype: str = "bfloat16",
-        mlp_t: bool = False,
-        pos_encodings: str = "rope",
-        halt_exploration_prob: float = 0.0,
-        batch_size: int = 1,
-        freeze_weights: bool = False,
-        # --- image encoder ---
-        enc_channels: int = 32,
-        enc_hidden_channels: tuple = (16, 32),
-        # --- bridge & painter ---
-        bridge_channels: int = 16,
-        painter_channels: tuple = (32, 64, 128),
-        painter_layers_per_block: int = 1,
-        diff_thinker_weight: float = 1.0,
-        thinker_bridge_mode: str = "logits",
-        cfg_prob: float = 0.0,
-        cfg_scale: float = 1.0,
-        painter_dtype: Optional[str] = None,
-    ):
-        super().__init__(
-            painter_size=painter_size,
-            cell_size=cell_size,
-            num_classes=thinker_out_channels,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            L_layers=L_layers,
-            L_cycles=L_cycles,
-            H_cycles=H_cycles,
-            n_sup=n_sup,
-            expansion=expansion,
-            forward_dtype=forward_dtype,
-            mlp_t=mlp_t,
-            pos_encodings=pos_encodings,
-            halt_exploration_prob=halt_exploration_prob,
-            batch_size=batch_size,
-            freeze_weights=freeze_weights,
-            enc_channels=enc_channels,
-            enc_hidden_channels=enc_hidden_channels,
-            bridge_channels=bridge_channels,
-            painter_channels=painter_channels,
-            painter_layers_per_block=painter_layers_per_block,
-            diff_thinker_weight=diff_thinker_weight,
-            thinker_bridge_mode=thinker_bridge_mode,
-            cfg_prob=cfg_prob,
-            cfg_scale=cfg_scale,
-            painter_dtype=painter_dtype,
-        )
-
-    def reasoning_step(self, condition, noisy, z_H, z_L, timesteps,
-                       puzzle_ids=None, H_cycles=None, L_cycles=None):
+    def reasoning_step(self, condition, noisy, z_H, z_L, timesteps, puzzle_ids=None, H_cycles=None, L_cycles=None):
         noise_pred, _logits, z_H_next, z_L_next = super().reasoning_step(
-            condition, noisy, z_H, z_L, timesteps,
-            puzzle_ids=puzzle_ids, H_cycles=H_cycles, L_cycles=L_cycles,
+            condition,
+            noisy,
+            z_H,
+            z_L,
+            timesteps,
+            puzzle_ids=puzzle_ids,
+            H_cycles=H_cycles,
+            L_cycles=L_cycles,
         )
         return noise_pred, None, z_H_next, z_L_next
 
@@ -660,6 +852,7 @@ class OriginalTRMRatatouilleV2(OriginalTRMRatatouilleV1):
 
 # ── Painter-thinker (V3: larger latent, same as V2) ───────────────────────────
 
+
 class OriginalTRMRatatouilleV3(OriginalTRMRatatouilleV2):
     """
     Same as V2 but with a larger thinker latent (thinker_out_channels=64).
@@ -669,11 +862,9 @@ class OriginalTRMRatatouilleV3(OriginalTRMRatatouilleV2):
     Use this when you want a higher-capacity thinker latent for the bridge.
     """
 
-    def __init__(self, thinker_out_channels: int = 64, **kwargs):
-        super().__init__(thinker_out_channels=thinker_out_channels, **kwargs)
-
 
 # ── Painter-thinker (V4: AttentiveBridge + decoupled compression factor) ──────
+
 
 class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
     """
@@ -691,84 +882,48 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
 
     def __init__(
         self,
-        # --- painter geometry ---
-        painter_size: int = 144,
-        cell_size: int = 16,            # only for _run_painter noisy input shape
-        compression_factor: int = 16,   # encoder + thinker grid factor
-        # --- thinker ---
-        thinker_out_channels: int = 64,
-        hidden_size: int = 512,
-        n_heads: int = 8,
-        L_layers: int = 2,
-        L_cycles: int = 6,
-        H_cycles: int = 3,
-        n_sup: int = 16,
-        expansion: float = 4.0,
-        forward_dtype: str = "bfloat16",
-        mlp_t: bool = False,
-        pos_encodings: str = "rope",
-        halt_exploration_prob: float = 0.0,
-        batch_size: int = 1,
-        freeze_weights: bool = False,
-        # --- image encoder ---
-        enc_channels: int = 32,
-        enc_hidden_channels: tuple = (16, 32),
-        # --- bridge & painter ---
-        bridge_channels: int = 16,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+        compression_factor: int = 16,
         bridge_num_heads: int = 4,
-        painter_channels: tuple = (32, 64, 128),
-        painter_layers_per_block: int = 1,
-        diff_thinker_weight: float = 1.0,
-        thinker_bridge_mode: str = "logits",
-        cfg_prob: float = 0.0,
-        cfg_scale: float = 1.0,
-        painter_dtype: Optional[str] = None,
+        timestep_cfg: Optional[TimestepCondConfig] = None,
     ):
-        grid_size = painter_size // compression_factor
-        seq_len   = grid_size * grid_size
+        grid_size = model_cfg.painter_size // compression_factor
+        thinker_cfg.seq_len = grid_size * grid_size
 
         super().__init__(
-            painter_size=painter_size,
-            cell_size=cell_size,
-            thinker_out_channels=thinker_out_channels,
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            L_layers=L_layers,
-            L_cycles=L_cycles,
-            H_cycles=H_cycles,
-            n_sup=n_sup,
-            expansion=expansion,
-            forward_dtype=forward_dtype,
-            mlp_t=mlp_t,
-            pos_encodings=pos_encodings,
-            halt_exploration_prob=halt_exploration_prob,
-            batch_size=batch_size,
-            freeze_weights=freeze_weights,
-            enc_channels=enc_channels,
-            enc_hidden_channels=enc_hidden_channels,
-            bridge_channels=bridge_channels,
-            painter_channels=painter_channels,
-            painter_layers_per_block=painter_layers_per_block,
-            diff_thinker_weight=diff_thinker_weight,
-            thinker_bridge_mode=thinker_bridge_mode,
-            cfg_prob=cfg_prob,
-            cfg_scale=cfg_scale,
-            painter_dtype=painter_dtype,
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+            timestep_cfg=timestep_cfg,
         )
 
-        # Thinker grid is compression_factor-based, not cell_size-based
         self._grid = grid_size
 
-        # Replace 1→2 channel encoder (set by V1) with compression_factor version
-        self.image_encoder = SpatialEncoder(2, enc_channels, factor=compression_factor,
-                                            hidden_channels=tuple(enc_hidden_channels))
+        # Replace 2-channel encoder (set by V1) with compression_factor version
+        self.image_encoder = SpatialEncoder(
+            2,
+            encoder_cfg.enc_channels,
+            factor=compression_factor,
+            hidden_channels=tuple(encoder_cfg.enc_hidden_channels),
+        )
 
         # Replace SpatialBridge with AttentiveBridge
         self.bridge = AttentiveBridge(
-            in_channels=thinker_out_channels,
-            out_channels=bridge_channels,
-            out_resolution=painter_size,
+            in_channels=thinker_cfg.vocab_size,
+            out_channels=model_cfg.bridge_channels,
+            out_resolution=model_cfg.painter_size,
             factor=compression_factor,
             num_heads=bridge_num_heads,
         )
@@ -776,7 +931,8 @@ class OriginalTRMRatatouilleV4(OriginalTRMRatatouilleV3):
 
 # ── Thinker with frozen painter ───────────────────────────────────────────────
 
-class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
+
+class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
     """
     Trains only the thinker; bridge + UNet are loaded from a pretrained
     StandalonePainter checkpoint and kept frozen throughout.
@@ -791,10 +947,29 @@ class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
         painter.painter_checkpoint=runs/standalone_painter/checkpoint_final.pt
     """
 
-    def __init__(self, painter: StandalonePainter, adapter_in_channels: int = 0, **thinker_kwargs):
-        super().__init__(**thinker_kwargs)
+    def __init__(
+        self,
+        painter: StandalonePainter,
+        thinker_cfg: ThinkerModelConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+        adapter_in_channels: int = 0,
+    ):
+        super().__init__(
+            thinker_cfg=thinker_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+        )
         # Replace the freshly-built bridge+painter with the pretrained frozen ones.
-        self.bridge  = painter.bridge
+        self.bridge = painter.bridge
         self.painter = painter.painter
         for p in self.bridge.parameters():
             p.requires_grad_(False)
@@ -810,28 +985,29 @@ class ThinkerWithFrozenPainter(OriginalTRMRatatouilleV0Tok):
         #     accepts adapter_in_channels; the second conv retains its pretrained
         #     weights.  The bridge's second conv operates in bridge_channels space
         #     and is unaffected by the input channel change.
-        native_in = painter.bridge.conv[0].in_channels          # vocab_size the bridge was trained with
-        self.logit_projection   = None
-        self.bridge_input_conv  = None
+        native_in = painter.bridge.conv[0].in_channels  # vocab_size the bridge was trained with
+        self.logit_projection = None
+        self.bridge_input_conv = None
         if adapter_in_channels > 0 and adapter_in_channels != native_in:
             bridge_channels = painter.bridge.conv[0].out_channels
             # Per-cell linear projection on thinker logits: (B,81,vocab) → (B,81,adapter_in)
-            self.logit_projection  = nn.Linear(self.vocab_size, adapter_in_channels)
+            self.logit_projection = nn.Linear(thinker_cfg.vocab_size, adapter_in_channels)
             # Replace first bridge conv; second conv (bridge_ch→bridge_ch) stays frozen.
             self.bridge_input_conv = nn.Conv2d(adapter_in_channels, bridge_channels, kernel_size=3, padding=1)
 
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         if self.logit_projection is not None:
-            logits = self.logit_projection(logits)   # (B, 81, adapter_in_channels)
+            logits = self.logit_projection(logits)  # (B, 81, adapter_in_channels)
         return super()._logits_to_spatial(logits)
 
     def _run_painter(self, noisy, spatial_cond, timesteps):
         if self.bridge_input_conv is not None:
             # Apply new trainable first conv, then the frozen second conv.
-            spatial_cond = F.interpolate(spatial_cond, size=self.bridge.painter_size,
-                                         mode="bilinear", align_corners=False)
+            spatial_cond = F.interpolate(
+                spatial_cond, size=self.bridge.painter_size, mode="bilinear", align_corners=False
+            )
             spatial_cond = torch.nn.functional.silu(self.bridge_input_conv(spatial_cond))
-            bridge_feat  = self.bridge.conv[2](spatial_cond)
+            bridge_feat = self.bridge.conv[2](spatial_cond)
             return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
         return super()._run_painter(noisy, spatial_cond, timesteps)
 

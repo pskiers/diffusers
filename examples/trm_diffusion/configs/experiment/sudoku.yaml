@@ -10,11 +10,13 @@ thinker:
   puzzle_emb_ndim: 512
   puzzle_emb_len: 16
   halt_exploration_prob: 0.0
+  optim:
+    lr_min_ratio: 1.0
+    warmup_steps: 2000
+    puzzle_emb:
+      lr: 1e-4
+      weight_decay: 1.0
 
 train:
-  lr_min_ratio: 1.0
-  puzzle_emb_lr: 1e-4
-  puzzle_emb_weight_decay: 1.0
   batch_size: 768
   num_steps: 100000
-  warmup_steps: 2000

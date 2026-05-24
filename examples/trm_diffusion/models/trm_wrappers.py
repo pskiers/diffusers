@@ -2,82 +2,29 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from adam_atan2 import AdamATan2
+import numpy as np
+from tqdm.auto import tqdm
+from accelerate import Accelerator
+from typing import Any, Optional
 
-from typing import Optional
-
+from configs.schemas import ThinkerOptimConfig
+from datasets.sudoku_dataset import IGNORE_LABEL_ID
+from models.base import BaseModel
 from models.trm.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1_Inner,
     TinyRecursiveReasoningModel_ACTV1Config,
     TinyRecursiveReasoningModel_ACTV1InnerCarry,
 )
 from models.trm.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.optim_utils import ScheduledOptimizer
 
 
-# ── Sparse puzzle-embedding optimizer factory ──────────────────────────────────
-
-def build_puzzle_emb_optimizer(
-    model: "OriginalTRMSudoku",
-    world_size: int = 1,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-2,
-) -> Optional[CastedSparseEmbeddingSignSGD_Distributed]:
+class SpatialTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
     """
-    Return a CastedSparseEmbeddingSignSGD_Distributed optimizer for the inner
-    model's sparse puzzle embedding, or None when puzzle_emb_ndim=0.
-
-    The returned optimizer must be stepped separately from (and after) AdamW.
-    Pass the puzzle_emb parameters to AdamW with lr=0 so they are excluded from
-    its update: use `get_non_puzzle_emb_params(model)` to build the AdamW group.
-
-    Example usage in training script:
-        puzzle_opt = build_puzzle_emb_optimizer(model, world_size=accelerator.num_processes)
-        adamw = torch.optim.AdamW(get_non_puzzle_emb_params(model), lr=lr, ...)
-        # in training loop:
-        adamw.step(); adamw.zero_grad()
-        if puzzle_opt: puzzle_opt.step()
-    """
-    inner = model.inner if isinstance(model, OriginalTRMSudoku) else model.thinker.inner
-    if not hasattr(inner, "puzzle_emb"):
-        return None
-    emb = inner.puzzle_emb
-    return CastedSparseEmbeddingSignSGD_Distributed(
-        emb.buffers(),
-        world_size=world_size,
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-
-def get_non_puzzle_emb_params(model: nn.Module) -> list:
-    """
-    Return all parameters except the sparse puzzle embedding's local_weights /
-    local_ids / weights buffers.  Use these as the AdamW parameter group so that
-    AdamW does not touch the sparse embedding.
-    """
-    exclude_ids: set[int] = set()
-    inner = model.inner if hasattr(model, "inner") else getattr(model, "thinker", model).inner
-    if hasattr(inner, "puzzle_emb"):
-        emb = inner.puzzle_emb
-        for buf in (emb.local_weights, emb.local_ids, emb.weights):
-            exclude_ids.add(id(buf))
-    return [p for p in model.parameters() if id(p) not in exclude_ids]
-
-
-# ── Spatial-input TRM inner model ─────────────────────────────────────────────
-
-class _SpatialInputTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
-    """Drop-in replacement for TinyRecursiveReasoningModel_ACTV1_Inner that also
-    accepts pre-computed float embeddings as inputs.
-
-    When batch["inputs"] is a *floating-point* tensor (B, seq_len, hidden_size),
-    the embed_tokens call is skipped and the tensor is used directly as the input
-    injection signal (scaled by embed_scale, plus learned pos enc if configured).
-
-    When batch["inputs"] is an integer tensor the behaviour is identical to the
-    parent class — fully backward-compatible.
-
-    This enables image-conditioned variants (V0–V4) where a CNN encoder computes
-    the input embeddings rather than an nn.Embedding lookup.
+    Drop-in replacement for TinyRecursiveReasoningModel_ACTV1_Inner that also
+    accepts float embeddings as inputs.
     """
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
@@ -85,45 +32,19 @@ class _SpatialInputTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
             # Pre-computed embedding: (B, seq_len, hidden_size)
             embedding = input.to(self.forward_dtype)
             if self.config.pos_encodings == "learned":
-                embedding = 0.707106781 * (
-                    embedding + self.embed_pos.embedding_weight.to(self.forward_dtype)
-                )
+                embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
             return self.embed_scale * embedding
         return super()._input_embeddings(input, puzzle_identifiers)
 
 
-# ── Core thinker wrapper ───────────────────────────────────────────────────────
-
-class OriginalTRMSudoku(nn.Module):
+class SpatialTRM(BaseModel):
     """
-    Wraps TinyRecursiveReasoningModel_ACTV1_Inner for Sudoku training.
-
-    Parameters
-    ----------
-    vocab_size          Token vocabulary size (0=PAD, 1=blank, 2-10=digits).
-    seq_len             Sequence length (81 for 9×9 Sudoku).
-    hidden_size         Transformer hidden dimension.
-    n_heads             Number of attention heads.
-    L_layers            Transformer layers per block call (L_layers in original).
-    L_cycles            Inner iterations per H-cycle.
-    H_cycles            Outer macroscopic cycles.
-    n_sup               Supervision steps per batch (= halt_max_steps).
-    expansion           SwiGLU hidden-dim multiplier (original uses 4).
-    forward_dtype       Internal compute dtype ("bfloat16" | "float32").
-    mlp_t               Use MLP-T block instead of attention (original default False).
-    puzzle_emb_ndim     Dimensionality of sparse puzzle embeddings (0 = disabled).
-                        When > 0, must also set num_puzzle_identifiers and
-                        use build_puzzle_emb_optimizer() for a SignSGD optimizer.
-    puzzle_emb_len      Number of prefix tokens for puzzle embeddings.
-                        Ignored when puzzle_emb_ndim=0.
-    num_puzzle_identifiers  Number of distinct puzzle IDs for sparse embeddings.
-    halt_exploration_prob   ACT exploration probability (0 = fixed n_sup steps,
-                            0.1 = original setting with adaptive halting).
-    batch_size          Used only by CastedSparseEmbedding when puzzle_emb_ndim>0.
+    Wrapper for SpatialTRMInner for training.
     """
 
     def __init__(
         self,
+        optim_cfg: ThinkerOptimConfig,
         vocab_size: int = 11,
         seq_len: int = 81,
         hidden_size: int = 512,
@@ -147,6 +68,7 @@ class OriginalTRMSudoku(nn.Module):
         self.n_sup = n_sup
         self.vocab_size = vocab_size
         self.freeze_weights = freeze_weights
+        self.optim_cfg = optim_cfg
 
         # puzzle_emb_len is only meaningful when puzzle_emb_ndim > 0
         effective_puzzle_emb_len = puzzle_emb_len if puzzle_emb_ndim > 0 else 0
@@ -159,7 +81,7 @@ class OriginalTRMSudoku(nn.Module):
             vocab_size=vocab_size,
             H_cycles=H_cycles,
             L_cycles=L_cycles,
-            H_layers=0,                         # ignored by inner model
+            H_layers=0,  # ignored by inner model
             L_layers=L_layers,
             hidden_size=hidden_size,
             expansion=expansion,
@@ -172,20 +94,67 @@ class OriginalTRMSudoku(nn.Module):
             puzzle_emb_len=effective_puzzle_emb_len,
             no_ACT_continue=True,
         )
-        self.inner = _SpatialInputTRMInner(config)
+        self.inner = SpatialTRMInner(config)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def get_initial_states(self, bsz: int):
+    def build_optimizers(self, world_size: int, num_steps) -> list[ScheduledOptimizer]:
+        """
+        Builds optimizers.
+        """
+        optims = []
+
+        exclude_ids: set[int] = set()
+
+        # puzzle emb optim
+        if hasattr(self.inner, "puzzle_emb"):
+            emb = self.inner.puzzle_emb
+            emb_optim = CastedSparseEmbeddingSignSGD_Distributed(
+                emb.buffers(),
+                world_size=world_size,
+                lr=0,  # set per-step by scheduler
+                weight_decay=self.optim_cfg.puzzle_emb.weight_decay,
+            )
+            optims.append(
+                ScheduledOptimizer(
+                    emb_optim,
+                    base_lr=self.optim_cfg.puzzle_emb.lr,
+                    warmup_steps=self.optim_cfg.puzzle_emb.warmup_steps,
+                    num_steps=num_steps,
+                    min_ratio=self.optim_cfg.puzzle_emb.lr_min_ratio,
+                )
+            )
+            for buf in (emb.local_weights, emb.local_ids, emb.weights):
+                exclude_ids.add(id(buf))
+
+        if not self.freeze_weights:
+            optim = AdamATan2(
+                [p for p in self.parameters() if id(p) not in exclude_ids],
+                lr=0,  # set per-step by scheduler
+                weight_decay=self.optim_cfg.weight_decay,
+                betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+            )
+            optims.append(
+                ScheduledOptimizer(
+                    optim,
+                    base_lr=self.optim_cfg.lr,
+                    warmup_steps=self.optim_cfg.warmup_steps,
+                    num_steps=num_steps,
+                    min_ratio=self.optim_cfg.lr_min_ratio,
+                )
+            )
+        return optims
+
+    def get_initial_states(self, bs: int):
         """
         Return (z_H, z_L) on the same device as the model, initialized from
         H_init / L_init buffers (1-D vectors broadcast to all sequence positions).
         """
         total_len = self.inner.config.seq_len + self.inner.puzzle_emb_len
-        # H_init / L_init: (hidden_size,) → expand to (bsz, total_len, hidden_size)
-        z_H = self.inner.H_init.view(1, 1, -1).expand(bsz, total_len, -1).clone()
-        z_L = self.inner.L_init.view(1, 1, -1).expand(bsz, total_len, -1).clone()
+        # H_init / L_init: (hidden_size,) → expand to (bs, total_len, hidden_size)
+        z_H = self.inner.H_init.view(1, 1, -1).expand(bs, total_len, -1).clone()
+        z_L = self.inner.L_init.view(1, 1, -1).expand(bs, total_len, -1).clone()
         return z_H, z_L
 
     def reasoning_step(
@@ -198,17 +167,16 @@ class OriginalTRMSudoku(nn.Module):
         L_cycles: Optional[int] = None,
     ):
         """
-        One supervision step. Internally runs H_cycles-1 no-grad cycles then
-        one full-grad cycle (matching the original training pattern).
+        One supervision step. Internally runs H_cycles-1 no-grad cycles then one full-grad cycle.
 
         H_cycles / L_cycles: override the config values for this call only.
 
         Returns: (logits, z_H_detached, z_L_detached)
           logits: (B, seq_len, vocab_size) — gradients attached
         """
-        bsz = inputs.shape[0]
+        bs = inputs.shape[0]
         if puzzle_ids is None:
-            puzzle_ids = torch.zeros(bsz, dtype=torch.int32, device=inputs.device)
+            puzzle_ids = torch.zeros(bs, dtype=torch.int32, device=inputs.device)
 
         orig_H = self.inner.config.H_cycles
         orig_L = self.inner.config.L_cycles
@@ -233,15 +201,14 @@ class OriginalTRMSudoku(nn.Module):
         puzzle_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Full inference: n_sup × H_cycles × L_cycles uniformly (no grad split).
-        Matches the original eval behaviour (always runs max steps).
+        Full inference: n_sup * H_cycles * L_cycles uniformly (no grad split). Always runs max steps.
         """
         n_sup = n_sup or self.n_sup
-        bsz = inputs.shape[0]
+        bs = inputs.shape[0]
         if puzzle_ids is None:
-            puzzle_ids = torch.zeros(bsz, dtype=torch.int32, device=inputs.device)
+            puzzle_ids = torch.zeros(bs, dtype=torch.int32, device=inputs.device)
 
-        z_H, z_L = self.get_initial_states(bsz)
+        z_H, z_L = self.get_initial_states(bs)
         z_H = z_H.to(inputs.device)
         z_L = z_L.to(inputs.device)
 
@@ -254,4 +221,93 @@ class OriginalTRMSudoku(nn.Module):
                     z_L = self.inner.L_level(z_L, z_H + input_emb, **seq_info)
                 z_H = self.inner.L_level(z_H, z_L, **seq_info)
 
-        return self.inner.lm_head(z_H)[:, self.inner.puzzle_emb_len:]
+        return self.inner.lm_head(z_H)[:, self.inner.puzzle_emb_len :]
+
+    def _sudoku_metrics(self, logits: torch.Tensor, labels: torch.Tensor) -> dict:
+        preds = logits.argmax(-1)
+        blank = labels != IGNORE_LABEL_ID
+        loss = F.cross_entropy(
+            logits.float().view(-1, logits.size(-1)),
+            labels.view(-1).clamp(min=0),
+            ignore_index=IGNORE_LABEL_ID,
+            reduction="mean",
+        )
+        cell_acc = (preds == labels)[blank].float().mean()
+        correct = (preds == labels) & blank
+        puzzle_acc = (correct.sum(-1) == blank.sum(-1)).float().mean()
+        return {"sudoku_loss": loss, "cell_acc": cell_acc, "puzzle_acc": puzzle_acc}
+
+    def train_step(
+        self,
+        micro_batches: list[dict],
+        accelerator: Any,
+        optimizers: list,
+        ema: Any,
+        global_batch_size: int,
+        global_step: int,
+        **kwargs,
+    ) -> tuple[dict, float, int]:
+        from models.optim_utils import apply_lr_and_step
+
+        K = len(micro_batches)
+        device = accelerator.device
+
+        mb_data = []
+        for mb in micro_batches:
+            bsz = mb["inputs"].shape[0]
+            z_H, z_L = self.get_initial_states(bsz)
+            puzzle_ids = mb.get("puzzle_id")
+            mb_data.append(
+                {
+                    "inputs": mb["inputs"].to(device),
+                    "labels": mb["labels"].to(device),
+                    "puzzle_ids": puzzle_ids.to(device) if puzzle_ids is not None else None,
+                    "z_H": z_H.to(device),
+                    "z_L": z_L.to(device),
+                }
+            )
+
+        total_loss = 0.0
+        lr = None
+        for _ in range(self.n_sup):
+            for d in mb_data:
+                logits, d["z_H"], d["z_L"] = self.reasoning_step(d["inputs"], d["z_H"], d["z_L"], d["puzzle_ids"])
+                step_loss = F.cross_entropy(
+                    logits.float().view(-1, self.vocab_size),
+                    d["labels"].view(-1).clamp(min=0),
+                    ignore_index=IGNORE_LABEL_ID,
+                )
+                accelerator.backward(step_loss / (global_batch_size * K))
+                total_loss += step_loss.item()
+
+            accelerator.clip_grad_norm_(self.parameters(), 1.0)
+            lr = apply_lr_and_step(optimizers, global_step)
+            if ema is not None:
+                ema.update(self)
+            global_step += 1
+
+        avg_loss = total_loss / (self.n_sup * K)
+        return {"loss": avg_loss}, lr, global_step
+
+    def compile_submodules(self):
+        self.inner.L_level = torch.compile(self.inner.L_level, fullgraph=False)
+
+    @torch.no_grad()
+    def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:
+        self.eval()
+        max_batches = kwargs.get("max_batches", 10)
+        accum: dict[str, list] = {"sudoku_loss": [], "cell_acc": [], "puzzle_acc": []}
+        for i, batch in tqdm(enumerate(dataloader), desc="Evaluating", total=max_batches):
+            if i >= max_batches:
+                break
+            inputs = batch["inputs"].to(accelerator.device)
+            labels = batch["labels"].to(accelerator.device)
+            puzzle_ids = batch.get("puzzle_id")
+            if puzzle_ids is not None:
+                puzzle_ids = puzzle_ids.to(accelerator.device)
+            logits = self.predict(inputs, puzzle_ids=puzzle_ids)
+            m = self._sudoku_metrics(logits.float(), labels)
+            for k, v in m.items():
+                accum[k].append(v.item())
+        self.train()
+        return {k: float(np.mean(v)) for k, v in accum.items()}

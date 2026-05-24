@@ -12,13 +12,16 @@ mode: "thinker_frozen_painter"
 run:
   output_dir: "runs/thinker_frozen_painter"
 
+thinker:
+  optim:
+    lr_min_ratio: 0.1
+
 painter:
   thinker_bridge_mode: "logits"
   adapter_in_channels: 0
   painter_checkpoint: null   # REQUIRED: path to StandalonePainter checkpoint
 
 train:
-  lr_min_ratio: 0.1
   batch_size: 768
   num_steps: 50000
   sudoku_loss_weight: 0.0

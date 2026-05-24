@@ -1,21 +1,12 @@
 seed: 0
 compile: true
 
-lr: 1e-4
-lr_min_ratio: 0.1
-weight_decay: 1.0
-beta1: 0.9
-beta2: 0.95
-
-puzzle_emb_lr: 1e-4
-puzzle_emb_weight_decay: 1.0
-
 batch_size: 768
 num_steps: 50000
-warmup_steps: 2000
 gradient_accumulation_steps: 1
 sudoku_loss_weight: 1.0
 mse_loss_weight: 1.0
+cfg_prob: 0.0
 
 noisy_swap:
   prob: 0.0

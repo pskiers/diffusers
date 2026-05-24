@@ -179,3 +179,8 @@ class MNISTSudokuDataset(Dataset):
             "puzzle_tokens": torch.from_numpy(inputs_tok.copy()),          # (81,) long
             "given_mask":    torch.from_numpy(given_mask),                 # (81,) bool
         }
+
+
+def get_solution_tokens(solution: torch.Tensor) -> torch.Tensor:
+    """Raw solution (0-8) → full token grid (2-10, no blanks) for painter stage."""
+    return solution.clamp(min=0) + 2
