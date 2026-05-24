@@ -261,6 +261,7 @@ class StandalonePainter(BaseModel):
         noisy: torch.Tensor,
         timesteps: torch.Tensor,
         condition: torch.Tensor,  # (B, 81) long solution tokens 2-10
+        puzzle_ids: Optional[torch.Tensor] = None,
     ):
         """
         Training: randomly drops conditioning per sample at rate cfg_prob.
