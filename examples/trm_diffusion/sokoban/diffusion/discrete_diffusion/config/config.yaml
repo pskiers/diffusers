@@ -1,0 +1,88 @@
+# Hydra config for Discrete TRM Diffusion on Sokoban
+defaults:
+  - _self_
+
+# ── Output & Logging ──
+output_dir: /net/tscratch/people/plgmgrzanka/training-outputs/discrete-trm-sokoban
+logging_dir: logs
+logger: wandb
+project_name: discrete-trm-sokoban
+run_name: null
+
+# ── Dataset ──
+dataset:
+  train_data_dir: /net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4
+  eval_data_dir: /net/tscratch/people/plgmgrzanka/diffusers/examples/trm_diffusion/sokoban/comparison/data/12-12-4-test
+  resolution: 12
+  num_boxes: 4
+  max_trajectories: null
+  max_training_boards: null
+  max_validation_boards: null
+  # For SokobanSampler compatibility
+  input_channels: 3
+  n_images_to_eval: 4
+  n_images_per_conditioning: 1
+  k: 0
+  concat_conditioning: false
+  class_conditional: false
+
+# ── Model (DiscreteTRMDiffusion + ACT wrapper) ──
+model:
+  # Inner model
+  vocab_size: 8 # 0=MASK, 1-7=field states
+  class_weights: [0.0, 0.5, 0.5, 5.0, 5.0, 5.0, 10.0, 10.0]
+  seq_len: 144 # 12*12
+  hidden_size: 512
+  num_heads: 8
+  layers: 2
+  n: 6
+  T: 3
+  expansion: 4.0
+  forward_dtype: bfloat16
+  pos_encodings: rope
+  # ACT wrapper
+  halt_max_steps: 8
+  halt_exploration_prob: 0.1
+  halt_loss_weight: 0.5
+  halt_warmup_steps: 5000
+  # Carry recycling (configurable)
+  use_carry_recycling: false
+  carry_recycle_prob: 0.5
+
+# ── Mask Diffusion ──
+mask_diffusion_steps: 100 # T (number of discrete diffusion steps)
+
+# ── Training ──
+train_batch_size: 64
+eval_batch_size: 64
+dataloader_num_workers: 4
+num_epochs: 600
+gradient_accumulation_steps: 8 # effective batch = 64 * 8 = 512
+mixed_precision: bf16
+
+# ── Optimizer ──
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  eps: 1.0e-8
+
+# ── LR Scheduler ──
+lr_scheduler:
+  name: cosine
+  warmup_steps: 2000
+
+# ── Saving & Checkpointing ──
+save_images_epochs: 50
+save_model_epochs: 50
+checkpointing_steps: 5000
+checkpoints_total_limit: 3
+resume_from_checkpoint: latest
+
+# ── Sampling ──
+num_samples: 100
+sample_batch_size: 100
+sample_temperature: 1.0
+
+# ── torch.compile ──
+compile: false

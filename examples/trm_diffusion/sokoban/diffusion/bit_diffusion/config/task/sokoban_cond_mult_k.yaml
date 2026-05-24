@@ -1,0 +1,14 @@
+# @package _global_
+
+in_channels: 6
+num_class_embeds: 4
+condition_mode: "class"
+
+dataset:
+  k: [1, 3, 6]
+  num_classes: 3
+  concat_conditioning: true
+  class_conditional: true
+
+cfg_drop_rate: 0.1
+guidance_scale: 4.0
