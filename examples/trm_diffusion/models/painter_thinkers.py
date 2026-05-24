@@ -1014,6 +1014,9 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
     def get_painter_params(self) -> list:
         return []  # frozen — excluded from all optimizers
 
+    def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
+        return self.thinker.build_optimizers(world_size, num_steps)
+
     def get_thinker_params(self) -> list:
         params = super().get_thinker_params()
         if self.logit_projection is not None:
