@@ -56,10 +56,13 @@ class MNISTSudokuDataset(Dataset):
         mnist_split: str = "train",
         mask_given: bool = True,
         seed: int = 0,
+        num_givens: Optional[int] = None,
     ):
         super().__init__()
         self.cell_size  = cell_size
         self.mask_given = mask_given
+        self.num_givens = num_givens
+        self._given_seed = seed  # separate seed for given-cell selection
 
         # ── Load Sudoku data ──────────────────────────────────────────────────
         self.sudoku = SudokuDataset(sudoku_dir, mask_given=False)
@@ -143,6 +146,16 @@ class MNISTSudokuDataset(Dataset):
 
         # The "labels" from SudokuDataset with mask_given=False are the full solutions.
         # Blank cells in inputs are token 1; given cells have real token 2-10.
+
+        # ── Easy-mode override: randomly reveal num_givens cells ──────────────
+        if self.num_givens is not None:
+            # Use a per-item deterministic RNG so access order doesn't matter.
+            item_rng = np.random.default_rng(self._given_seed * 104729 + idx)
+            valid_cells = np.where((labels_tok >= 2) & (labels_tok <= 10))[0]
+            n = min(self.num_givens, len(valid_cells))
+            chosen = item_rng.choice(valid_cells, size=n, replace=False)
+            inputs_tok = np.full(81, SudokuDataset.BLANK_TOKEN, dtype=labels_tok.dtype)
+            inputs_tok[chosen] = labels_tok[chosen]
 
         # ── Full solved image ─────────────────────────────────────────────────
         # Use solution for every cell (so blank cells get their answer digit).

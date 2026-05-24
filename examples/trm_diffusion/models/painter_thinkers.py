@@ -1161,3 +1161,253 @@ class ThinkerWithFrozenPainterV1(OriginalTRMRatatouilleV1):
             min_ratio=self.painter_optim_cfg.lr_min_ratio,
         )
         return thinker_optims + [enc_scheduled]
+
+
+# ── Thinker with frozen painter + self-verification head ─────────────────────
+
+
+class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
+    """
+    ThinkerWithFrozenPainterV1 augmented with a binary self-verification head.
+
+    The thinker is trained to additionally predict whether a given (condition,
+    x_noisy) pair is consistent — i.e., whether x_noisy looks like it was
+    produced from the correct solution for this puzzle.
+
+    Positive examples: real condition + noise(real_image).
+    Negative examples: corrupted condition + same noise(real_image).
+      Corruption options (one chosen at random per sample, 1-5 cells):
+        1. swap_given   — replace a given cell's patch with a different digit's patch
+        2. add_wrong    — add a wrong digit patch to a blank cell
+        3. swap_positions — swap two given cells with different digits
+
+    The verification head is a Linear(hidden_size → 1) on mean-pooled z_H after
+    all n_sup thinker reasoning steps. Both positive and negative examples share
+    the same x_noisy; only the condition image differs.
+    """
+
+    def __init__(
+        self,
+        painter: StandalonePainter,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+        timestep_cfg=None,
+        verif_weight: float = 0.1,
+        verif_max_corruptions: int = 5,
+    ):
+        super().__init__(
+            painter=painter,
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+            timestep_cfg=timestep_cfg,
+        )
+        self.verif_weight = verif_weight
+        self.verif_max_corruptions = verif_max_corruptions
+        self.verif_head = nn.Linear(thinker_cfg.hidden_size, 1)
+        nn.init.zeros_(self.verif_head.weight)
+        nn.init.zeros_(self.verif_head.bias)
+
+    def _corrupt_condition(
+        self,
+        conditions: torch.Tensor,
+        solution: torch.Tensor,
+        given_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace 1-5 cell patches in each condition image to create mismatches.
+
+        conditions:  (B, 1, H, W) float
+        solution:    (B, 81) int64, 0-8 or -100
+        given_mask:  (B, 81) bool — True = cell is shown in condition
+        """
+        B = conditions.shape[0]
+        cs = self.model_cfg.cell_size
+        corrupted = conditions.clone()
+
+        for b in range(B):
+            n_corrupt = torch.randint(1, self.verif_max_corruptions + 1, (1,)).item()
+            ctype = torch.randint(3, (1,)).item()  # 0=swap_given, 1=add_wrong, 2=swap_pos
+
+            given_indices = given_mask[b].nonzero(as_tuple=True)[0]
+            blank_indices = (~given_mask[b]).nonzero(as_tuple=True)[0]
+
+            if ctype == 0 and len(given_indices) >= 1:
+                cells = given_indices[torch.randperm(len(given_indices), device=given_indices.device)[:n_corrupt]]
+                for cell_idx in cells:
+                    cell_idx = cell_idx.item()
+                    row, col = divmod(cell_idx, 9)
+                    orig_digit = solution[b, cell_idx].item()
+                    candidates = [
+                        b2 for b2 in range(B)
+                        if b2 != b
+                        and given_mask[b2, cell_idx].item()
+                        and solution[b2, cell_idx].item() != orig_digit
+                        and solution[b2, cell_idx].item() >= 0
+                    ]
+                    if not candidates:
+                        continue
+                    b2 = candidates[torch.randint(len(candidates), (1,)).item()]
+                    r0, c0 = row * cs, col * cs
+                    corrupted[b, :, r0:r0 + cs, c0:c0 + cs] = conditions[b2, :, r0:r0 + cs, c0:c0 + cs]
+
+            elif ctype == 1 and len(blank_indices) >= 1:
+                cells = blank_indices[torch.randperm(len(blank_indices), device=blank_indices.device)[:n_corrupt]]
+                for cell_idx in cells:
+                    cell_idx = cell_idx.item()
+                    row, col = divmod(cell_idx, 9)
+                    real_digit = solution[b, cell_idx].item()
+                    candidates = [
+                        b2 for b2 in range(B)
+                        if b2 != b
+                        and given_mask[b2, cell_idx].item()
+                        and solution[b2, cell_idx].item() != real_digit
+                        and solution[b2, cell_idx].item() >= 0
+                    ]
+                    if not candidates:
+                        continue
+                    b2 = candidates[torch.randint(len(candidates), (1,)).item()]
+                    r0, c0 = row * cs, col * cs
+                    corrupted[b, :, r0:r0 + cs, c0:c0 + cs] = conditions[b2, :, r0:r0 + cs, c0:c0 + cs]
+
+            elif len(given_indices) >= 2:
+                n = min(n_corrupt * 2, len(given_indices))
+                cells = given_indices[torch.randperm(len(given_indices), device=given_indices.device)[:n]]
+                for i in range(0, len(cells) - 1, 2):
+                    c1, c2 = cells[i].item(), cells[i + 1].item()
+                    if solution[b, c1].item() != solution[b, c2].item():
+                        r1, col1 = divmod(c1, 9)
+                        r2, col2 = divmod(c2, 9)
+                        patch1 = corrupted[b, :, r1 * cs:r1 * cs + cs, col1 * cs:col1 * cs + cs].clone()
+                        corrupted[b, :, r1 * cs:r1 * cs + cs, col1 * cs:col1 * cs + cs] = (
+                            conditions[b, :, r2 * cs:r2 * cs + cs, col2 * cs:col2 * cs + cs]
+                        )
+                        corrupted[b, :, r2 * cs:r2 * cs + cs, col2 * cs:col2 * cs + cs] = patch1
+
+        return corrupted
+
+    def _thinker_forward(
+        self,
+        condition: torch.Tensor,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run encoder + n_sup thinker steps; return mean-pooled z_H. No painter."""
+        B = noisy.shape[0]
+        z_H, z_L = self.get_initial_states(B)
+        z_H, z_L = z_H.to(noisy.device), z_L.to(noisy.device)
+        enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
+        for _ in range(self.n_sup):
+            _, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L)
+        seq_len = self.thinker.inner.config.seq_len
+        return z_H[:, :seq_len, :].float().mean(dim=1)  # (B, hidden_size)
+
+    def _train_step_standard(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step):
+        K = len(micro_batches)
+        device = accelerator.device
+        mb_data = self._prep_mb_data(micro_batches, device)
+
+        # Pre-compute corrupted conditions for verification
+        corrupted_conds = []
+        for i, mb in enumerate(micro_batches):
+            given_mask = mb.get("given_mask")
+            real_cond = mb_data[i]["condition"]
+            if given_mask is not None:
+                corrupted = self._corrupt_condition(real_cond, mb_data[i]["solution"], given_mask.to(device))
+            else:
+                corrupted = real_cond
+            corrupted_conds.append(corrupted)
+
+        total_diff_loss = 0.0
+        total_sudoku_loss = 0.0
+        total_verif_loss = 0.0
+        lr = 0.0
+
+        for sup_idx in range(self.n_sup):
+            for i, d in enumerate(mb_data):
+                noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
+                    d["condition"], d["noisy"], d["z_H"], d["z_L"], d["timesteps"], d["puzzle_ids"]
+                )
+                step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
+                total_diff_loss += diff_loss.item()
+                total_sudoku_loss += sudoku_loss.item()
+
+                # Verification loss only at the last supervision step
+                if sup_idx == self.n_sup - 1:
+                    seq_len = self.thinker.inner.config.seq_len
+                    z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1)
+                    z_H_neg = self._thinker_forward(corrupted_conds[i], d["noisy"], d["timesteps"])
+                    B = z_H_pos.shape[0]
+                    verif_logits = torch.cat([self.verif_head(z_H_pos), self.verif_head(z_H_neg)]).squeeze(-1)
+                    verif_labels = torch.cat([torch.ones(B), torch.zeros(B)]).to(device)
+                    verif_loss = F.binary_cross_entropy_with_logits(verif_logits, verif_labels)
+                    step_loss = step_loss + self.verif_weight * verif_loss
+                    total_verif_loss += verif_loss.item()
+
+                accelerator.backward(step_loss / (global_batch_size * K))
+
+            accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+            accelerator.clip_grad_norm_(self.get_painter_params(), 1.0)
+            lr = apply_lr_and_step(optimizers, global_step)
+            global_step += 1
+            if ema is not None:
+                ema.update(self)
+
+        n = self.n_sup * K
+        return {
+            "diff_loss": total_diff_loss / n,
+            "sudoku_loss": total_sudoku_loss / n,
+            "verif_loss": total_verif_loss / K,
+        }, lr, global_step
+
+    @torch.no_grad()
+    def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
+        result = super().eval_step(dataloader, accelerator, **kwargs)
+
+        max_batches = kwargs.get("max_batches", 20)
+        self.eval()
+        correct_pos, correct_neg, total = 0, 0, 0
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            device = accelerator.device
+            condition = self._get_condition(batch, device)
+            noisy_imgs = batch["images"].to(device)
+            given_mask = batch.get("given_mask")
+            solution = batch["solution"].to(device)
+
+            noise = torch.randn_like(noisy_imgs)
+            timesteps = torch.randint(
+                0, self.scheduler.config.num_train_timesteps, (noisy_imgs.shape[0],), device=device
+            )
+            noisy = self.scheduler.add_noise(noisy_imgs, noise, timesteps)
+
+            z_H_pos = self._thinker_forward(condition, noisy, timesteps)
+            if given_mask is not None:
+                corrupted = self._corrupt_condition(condition, solution, given_mask.to(device))
+                z_H_neg = self._thinker_forward(corrupted, noisy, timesteps)
+            else:
+                z_H_neg = z_H_pos
+
+            pred_pos = self.verif_head(z_H_pos).squeeze(-1) > 0
+            pred_neg = self.verif_head(z_H_neg).squeeze(-1) > 0
+            correct_pos += pred_pos.sum().item()
+            correct_neg += (~pred_neg).sum().item()
+            total += noisy_imgs.shape[0]
+
+        if total > 0:
+            result["verif_pos_acc"] = correct_pos / total
+            result["verif_neg_acc"] = correct_neg / total
+            result["verif_acc"] = (correct_pos + correct_neg) / (2 * total)
+        self.train()
+        return result

@@ -45,6 +45,7 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainter,
     ThinkerWithFrozenPainterV0,
     ThinkerWithFrozenPainterV1,
+    ThinkerWithFrozenPainterV1Verif,
 )
 from models.painters import (
     StandalonePainter,
@@ -269,12 +270,16 @@ def build_datasets(cfg: DictConfig) -> tuple[Dataset, Dataset]:
     train_dir = os.path.join(cfg.data.sudoku_dir, "train")
     test_dir = os.path.join(cfg.data.sudoku_dir, "test")
     sudoku_eval_dir = test_dir if os.path.isdir(test_dir) else train_dir
+    num_givens = cfg.data.get("num_givens", None)
+    if num_givens is not None:
+        num_givens = int(num_givens)
     train_ds = MNISTSudokuDataset(
         sudoku_dir=train_dir,
         mnist_root=cfg.data.mnist_root,
         cell_size=cell_size,
         mnist_split="train",
         mask_given=True,
+        num_givens=num_givens,
     )
     eval_ds = MNISTSudokuDataset(
         sudoku_dir=sudoku_eval_dir,
@@ -282,6 +287,7 @@ def build_datasets(cfg: DictConfig) -> tuple[Dataset, Dataset]:
         cell_size=cell_size,
         mnist_split="test",
         mask_given=True,
+        num_givens=num_givens,
     )
     return train_ds, eval_ds
 
@@ -376,11 +382,16 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 scheduler=scheduler,
             )
 
-        if painter_variant == "v1":
+        if painter_variant in ("v1", "v1_verif"):
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
-            return ThinkerWithFrozenPainterV1(
+            cls = ThinkerWithFrozenPainterV1Verif if painter_variant == "v1_verif" else ThinkerWithFrozenPainterV1
+            extra = {}
+            if painter_variant == "v1_verif":
+                extra["verif_weight"] = float(cfg.painter.get("verif_weight", 0.1))
+                extra["verif_max_corruptions"] = int(cfg.painter.get("verif_max_corruptions", 5))
+            return cls(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
                 encoder_cfg=_image_encoder_cfg(cfg),
@@ -391,6 +402,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 painter_optim_cfg=painter_optim_cfg,
                 scheduler=scheduler,
                 timestep_cfg=_timestep_cond_cfg(cfg),
+                **extra,
             )
 
         return ThinkerWithFrozenPainter(
