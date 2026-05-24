@@ -396,6 +396,10 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         vocab_size = int(cfg.thinker.get("num_classes", 9))
 
     thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+    # Image-conditioned variants (V0–V4) don't use puzzle identifiers.
+    # Force to 0 so test overrides of thinker.puzzle_emb_ndim don't bleed in.
+    thinker_cfg.puzzle_emb_ndim = 0
+    thinker_cfg.puzzle_emb_len = 0
     encoder_cfg = _image_encoder_cfg(cfg)
 
     if painter_variant == "v4":
