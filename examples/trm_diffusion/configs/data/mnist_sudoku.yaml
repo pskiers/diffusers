@@ -3,3 +3,4 @@ mnist_root: "data/mnist"
 cell_size: 16
 num_workers: 4
 vocab_size: 11   # 0=PAD, 1=blank, 2-10=digits 1-9
+num_givens: null  # if set, randomly keep only this many given cells per puzzle
