@@ -30,16 +30,26 @@ EMA weights are used automatically when present (pass --no_ema to skip).
 
 import argparse
 import os
-import sys
 
 import numpy as np
 import torch
+from diffusers import DDPMScheduler
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 # ── Local imports (same cwd as train_trm.py) ─────────────────────────────────
+from configs.schemas import (
+    EvalConfig,
+    ImageEncoderConfig,
+    PainterConfig,
+    PainterOptimConfig,
+    PainterThinkerConfig,
+    ThinkerModelConfig,
+    ThinkerOptimConfig,
+    TrainConfig,
+)
 from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
-from eval.mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids, make_panel_image
+from eval.mnist_eval import evaluate_grids, load_or_train_classifier, sample_grids
 from models.utility_models import strip_compiled_prefix
 from models.painter_thinkers import (
     PainterThinkerV0Tok,
@@ -51,7 +61,6 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainter,
 )
 from models.painters import StandalonePainter
-from models.trm.ema import EMAHelper
 
 
 # ── Condition helpers (mirrors train_trm.py) ──────────────────────────────────
@@ -79,127 +88,181 @@ def _get_full_solution_condition(mb: dict, model, device="cpu") -> torch.Tensor:
 
 def build_model(args) -> torch.nn.Module:
     """Instantiate the model skeleton from CLI args (no weights loaded yet)."""
-    t = args  # shorthand — we use the same field names as the thinker config
-
-    thinker_kwargs = dict(
-        vocab_size=args.vocab_size,
-        seq_len=args.seq_len,
-        hidden_size=args.hidden_size,
-        n_heads=args.n_heads,
-        L_layers=args.L_layers,
-        L_cycles=args.L_cycles,
-        H_cycles=args.H_cycles,
-        n_sup=args.n_sup,
-        expansion=args.expansion,
-        forward_dtype=args.forward_dtype,
-        mlp_t=args.mlp_t,
-        pos_encodings=args.pos_encodings,
-        puzzle_emb_ndim=args.puzzle_emb_ndim,
-        puzzle_emb_len=args.puzzle_emb_len,
-        num_puzzle_identifiers=args.num_puzzle_identifiers,
-        halt_exploration_prob=0.0,
-        batch_size=args.batch_size,
-        freeze_weights=False,
+    scheduler = DDPMScheduler(
+        num_train_timesteps=args.num_train_timesteps,
+        beta_schedule=args.beta_schedule,
+        prediction_type=args.prediction_type,
     )
 
-    painter_size = 9 * args.cell_size
+    # Dummy optim configs — values unused at eval time but required by constructors.
+    thinker_optim = ThinkerOptimConfig(
+        lr=1e-4, weight_decay=1.0, beta1=0.9, beta2=0.95, warmup_steps=0
+    )
+    painter_optim = PainterOptimConfig(lr=1e-4, weight_decay=1.0, warmup_steps=0)
+
+    train_cfg = TrainConfig(seed=0, batch_size=args.batch_size, num_steps=1)
+    eval_cfg = EvalConfig(
+        eval_every=1,
+        save_every=1,
+        log_every=1,
+        cfg_scale=1.0,  # overridden per-run inside run_eval
+        num_samples=args.num_samples,
+        batch_size=args.batch_size,
+        num_ddim_steps=args.num_steps,
+        classifier_path=args.classifier_path,
+    )
+
+    cell_size = args.cell_size
+    painter_size = 9 * cell_size
+    painter_cfg = PainterConfig(
+        vocab_size=args.vocab_size,
+        painter_size=painter_size,
+        cell_size=cell_size,
+        bridge_channels=args.bridge_channels,
+        painter_channels=tuple(args.painter_channels),
+        painter_layers_per_block=args.painter_layers_per_block,
+        painter_dtype=args.painter_dtype,
+    )
 
     if args.mode == "standalone_painter":
-        model = StandalonePainter(
-            painter_size=painter_size,
-            cell_size=args.cell_size,
-            vocab_size=args.vocab_size,
-            bridge_channels=args.bridge_channels,
-            painter_channels=tuple(args.painter_channels),
-            painter_layers_per_block=args.painter_layers_per_block,
-            cfg_prob=0.0,
-            cfg_scale=1.0,
-            painter_dtype=args.painter_dtype,
+        return StandalonePainter(
+            model_cfg=painter_cfg,
+            optim_cfg=painter_optim,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            scheduler=scheduler,
         )
-    elif args.mode == "thinker_frozen_painter":
-        # Build a dummy StandalonePainter (random weights) so ThinkerWithFrozenPainter
-        # can set up self.bridge / self.painter.  load_state_dict overwrites all weights.
-        dummy_painter = StandalonePainter(
-            painter_size=painter_size,
-            cell_size=args.cell_size,
-            vocab_size=args.vocab_size,
-            bridge_channels=args.bridge_channels,
-            painter_channels=tuple(args.painter_channels),
-            painter_layers_per_block=args.painter_layers_per_block,
-            painter_dtype=args.painter_dtype,
-        )
-        model = ThinkerWithFrozenPainter(
-            painter=dummy_painter,
-            adapter_in_channels=args.adapter_in_channels,
-            painter_size=painter_size,
-            cell_size=args.cell_size,
-            bridge_channels=args.bridge_channels,
-            painter_channels=tuple(args.painter_channels),
-            painter_layers_per_block=args.painter_layers_per_block,
-            thinker_bridge_mode=args.thinker_bridge_mode,
-            painter_dtype=args.painter_dtype,
-            **thinker_kwargs,
-        )
-    elif args.painter_variant == "v0tok":
-        model = PainterThinkerV0Tok(
-            painter_size=painter_size,
-            cell_size=args.cell_size,
-            bridge_channels=args.bridge_channels,
-            painter_channels=tuple(args.painter_channels),
-            painter_layers_per_block=args.painter_layers_per_block,
-            diff_thinker_weight=1.0,
-            thinker_bridge_mode=args.thinker_bridge_mode,
-            painter_dtype=args.painter_dtype,
-            **thinker_kwargs,
-        )
-    else:
-        img_thinker_kwargs = {k: v for k, v in thinker_kwargs.items()
-                              if k not in ("vocab_size", "puzzle_emb_ndim", "puzzle_emb_len",
-                                           "num_puzzle_identifiers", "halt_exploration_prob",
-                                           "batch_size", "freeze_weights")}
-        img_painter_kwargs = dict(
-            painter_size=painter_size,
-            cell_size=args.cell_size,
-            enc_channels=args.enc_channels,
-            enc_hidden_channels=tuple(args.enc_hidden_channels),
-            bridge_channels=args.bridge_channels,
-            painter_channels=tuple(args.painter_channels),
-            painter_layers_per_block=args.painter_layers_per_block,
-            diff_thinker_weight=1.0,
-            thinker_bridge_mode=args.thinker_bridge_mode,
-            cfg_prob=0.0,
-            cfg_scale=1.0,
-            painter_dtype=args.painter_dtype,
-        )
-        _VARIANT_CLS = {
-            "v0": OriginalTRMRatatouilleV0,
-            "v1": OriginalTRMRatatouilleV1,
-            "v2": OriginalTRMRatatouilleV2,
-            "v3": OriginalTRMRatatouilleV3,
-            "v4": OriginalTRMRatatouilleV4,
-        }
-        cls = _VARIANT_CLS.get(args.painter_variant)
-        if cls is None:
-            raise ValueError(f"Unknown painter_variant: {args.painter_variant!r}")
-        if args.painter_variant in ("v2", "v3", "v4"):
-            extra = dict(thinker_out_channels=args.thinker_out_channels or 16)
-            if args.painter_variant == "v4":
-                extra["compression_factor"] = args.cell_size
-                extra["bridge_num_heads"]   = 4
-                img_thinker_kwargs = {k: v for k, v in img_thinker_kwargs.items() if k != "seq_len"}
-            model = cls(**extra, **img_painter_kwargs, **img_thinker_kwargs)
-        else:
-            v1_kwargs = {}
-            if args.painter_variant == "v1":
-                v1_kwargs = dict(enc_timestep_cond=False, thinker_timestep_cond=False)
-            model = cls(
-                num_classes=args.num_classes,
-                thinker_out_channels=args.thinker_out_channels,
-                **v1_kwargs,
-                **img_painter_kwargs, **img_thinker_kwargs,
-            )
 
-    return model
+    # Common thinker arch config for painter-thinker modes.
+    def _make_thinker_cfg(vocab_size, puzzle_emb_ndim=0, puzzle_emb_len=16):
+        return ThinkerModelConfig(
+            vocab_size=vocab_size,
+            seq_len=args.seq_len,
+            hidden_size=args.hidden_size,
+            n_heads=args.n_heads,
+            L_layers=args.L_layers,
+            L_cycles=args.L_cycles,
+            H_cycles=args.H_cycles,
+            n_sup=args.n_sup,
+            batch_size=args.batch_size,
+            forward_dtype=args.forward_dtype,
+            expansion=args.expansion,
+            pos_encodings=args.pos_encodings,
+            mlp_t=args.mlp_t,
+            puzzle_emb_ndim=puzzle_emb_ndim,
+            puzzle_emb_len=puzzle_emb_len,
+            num_puzzle_identifiers=args.num_puzzle_identifiers,
+            halt_exploration_prob=0.0,
+            freeze_weights=False,
+        )
+
+    if args.mode == "thinker_frozen_painter":
+        # Build a dummy StandalonePainter so ThinkerWithFrozenPainter can
+        # set up its bridge/painter submodules; load_state_dict overwrites weights.
+        dummy_painter = StandalonePainter(
+            model_cfg=painter_cfg,
+            optim_cfg=painter_optim,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            scheduler=scheduler,
+        )
+        model_cfg = PainterThinkerConfig(
+            painter_size=painter_size,
+            cell_size=cell_size,
+            bridge_channels=args.bridge_channels,
+            painter_channels=tuple(args.painter_channels),
+            painter_layers_per_block=args.painter_layers_per_block,
+            thinker_bridge_mode=args.thinker_bridge_mode,
+            painter_dtype=args.painter_dtype,
+        )
+        return ThinkerWithFrozenPainter(
+            painter=dummy_painter,
+            thinker_cfg=_make_thinker_cfg(args.vocab_size),
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim,
+            painter_optim_cfg=painter_optim,
+            scheduler=scheduler,
+            adapter_in_channels=args.adapter_in_channels,
+        )
+
+    # mode == "painter"
+    model_cfg = PainterThinkerConfig(
+        painter_size=painter_size,
+        cell_size=cell_size,
+        bridge_channels=args.bridge_channels,
+        painter_channels=tuple(args.painter_channels),
+        painter_layers_per_block=args.painter_layers_per_block,
+        thinker_bridge_mode=args.thinker_bridge_mode,
+        painter_dtype=args.painter_dtype,
+    )
+
+    if args.painter_variant == "v0tok":
+        return PainterThinkerV0Tok(
+            thinker_cfg=_make_thinker_cfg(
+                args.vocab_size,
+                puzzle_emb_ndim=args.puzzle_emb_ndim,
+                puzzle_emb_len=args.puzzle_emb_len,
+            ),
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim,
+            painter_optim_cfg=painter_optim,
+            scheduler=scheduler,
+        )
+
+    # Image-conditioned variants V0–V4.
+    _VARIANT_CLS = {
+        "v0": OriginalTRMRatatouilleV0,
+        "v1": OriginalTRMRatatouilleV1,
+        "v2": OriginalTRMRatatouilleV2,
+        "v3": OriginalTRMRatatouilleV3,
+        "v4": OriginalTRMRatatouilleV4,
+    }
+    cls = _VARIANT_CLS.get(args.painter_variant)
+    if cls is None:
+        raise ValueError(f"Unknown painter_variant: {args.painter_variant!r}")
+
+    if args.painter_variant in ("v2", "v3", "v4"):
+        vocab_size = args.thinker_out_channels or 16
+    else:
+        vocab_size = args.num_classes
+
+    thinker_cfg = _make_thinker_cfg(vocab_size)
+    thinker_cfg.puzzle_emb_ndim = 0
+    thinker_cfg.puzzle_emb_len = 0
+
+    encoder_cfg = ImageEncoderConfig(
+        enc_channels=args.enc_channels,
+        enc_hidden_channels=tuple(args.enc_hidden_channels),
+        thinker_out_channels=args.thinker_out_channels,
+    )
+
+    common = dict(
+        thinker_cfg=thinker_cfg,
+        encoder_cfg=encoder_cfg,
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        eval_cfg=eval_cfg,
+        thinker_optim_cfg=thinker_optim,
+        painter_optim_cfg=painter_optim,
+        scheduler=scheduler,
+    )
+
+    if args.painter_variant == "v4":
+        return cls(
+            **common,
+            compression_factor=args.cell_size,
+            bridge_num_heads=4,
+            timestep_cfg=None,
+        )
+
+    if args.painter_variant == "v0":
+        return cls(**common)
+
+    return cls(**common, timestep_cfg=None)
 
 
 def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: torch.device):
@@ -246,8 +309,8 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
     )
 
     # Apply cfg_scale to model
-    if hasattr(model, "cfg_scale"):
-        model.cfg_scale = cfg_scale
+    if hasattr(model, "eval_cfg"):
+        model.eval_cfg.cfg_scale = cfg_scale
 
     model.eval()
     loader = DataLoader(eval_ds, batch_size=n_batch, shuffle=False,
