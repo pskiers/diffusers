@@ -177,7 +177,11 @@ def build_model(args) -> torch.nn.Module:
         )
         return ThinkerWithFrozenPainter(
             painter=dummy_painter,
-            thinker_cfg=_make_thinker_cfg(args.vocab_size),
+            thinker_cfg=_make_thinker_cfg(
+                args.vocab_size,
+                puzzle_emb_ndim=args.puzzle_emb_ndim,
+                puzzle_emb_len=args.puzzle_emb_len,
+            ),
             model_cfg=model_cfg,
             train_cfg=train_cfg,
             eval_cfg=eval_cfg,
