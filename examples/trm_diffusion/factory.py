@@ -46,6 +46,7 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainterV0,
     ThinkerWithFrozenPainterV1,
     ThinkerWithFrozenPainterV1Verif,
+    ThinkerWithFrozenPainterControlNet,
 )
 from models.painters import (
     StandalonePainter,
@@ -353,28 +354,53 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         painter_ckpt_path = cfg.painter.get("painter_checkpoint", None)
         if painter_ckpt_path is None:
             raise ValueError("thinker_frozen_painter requires painter.painter_checkpoint to be set.")
-        # Use classifier_path=None so StandalonePainter doesn't load eval_clf —
-        # it's used as a frozen backbone, not as a standalone evaluator.
+        # Use classifier_path=None so the frozen backbone doesn't load eval_clf.
         _frozen_eval_cfg = EvalConfig(
             eval_every=eval_cfg.eval_every,
             save_every=eval_cfg.save_every,
             log_every=eval_cfg.log_every,
             classifier_path=None,
         )
-        frozen_painter = StandalonePainter(
-            model_cfg=_painter_cfg(cfg),
-            optim_cfg=_painter_optim_cfg(cfg),
-            train_cfg=train_cfg,
-            eval_cfg=_frozen_eval_cfg,
-            scheduler=scheduler,
-        )
-        ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
-        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
+
+        if painter_variant == "controlnet":
+            frozen_painter = StandalonePainterControl(
+                model_cfg=_painter_cfg(cfg),
+                optim_cfg=_painter_optim_cfg(cfg),
+                train_cfg=train_cfg,
+                eval_cfg=_frozen_eval_cfg,
+                scheduler=scheduler,
+            )
+        else:
+            frozen_painter = StandalonePainter(
+                model_cfg=_painter_cfg(cfg),
+                optim_cfg=_painter_optim_cfg(cfg),
+                train_cfg=train_cfg,
+                eval_cfg=_frozen_eval_cfg,
+                scheduler=scheduler,
+            )
+        ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
+        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
         thinker_optim_cfg = _thinker_optim_cfg(cfg)
         painter_optim_cfg = _painter_optim_cfg(cfg)
         model_cfg = _painter_thinker_cfg(cfg)
+
+        if painter_variant == "controlnet":
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
+            thinker_cfg.puzzle_emb_ndim = 0
+            thinker_cfg.puzzle_emb_len = 0
+            return ThinkerWithFrozenPainterControlNet(
+                painter=frozen_painter,
+                thinker_cfg=thinker_cfg,
+                encoder_cfg=_image_encoder_cfg(cfg),
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim_cfg,
+                painter_optim_cfg=painter_optim_cfg,
+                scheduler=scheduler,
+            )
 
         if painter_variant == "v0":
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))

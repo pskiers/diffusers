@@ -1,0 +1,36 @@
+# @package _global_
+# Thinker with frozen ControlNet painter (image-conditioned encoder).
+# Loads a StandalonePainterControl checkpoint, freezes the ControlPainterUNet.
+# Trains thinker + image encoder + a fresh ConditioningPyramid.
+#
+# Usage:
+#   python train_trm.py experiment=thinker_frozen_painter_controlnet \
+#     painter.painter_checkpoint=runs/standalone_painter_control/checkpoint_final.pt
+
+mode: "thinker_frozen_painter"
+painter_variant: "controlnet"
+
+run:
+  output_dir: "runs/thinker_frozen_painter_controlnet"
+
+thinker:
+  puzzle_emb_ndim: 0
+  num_classes: 9
+  optim:
+    lr_min_ratio: 0.1
+
+painter:
+  painter_checkpoint: null   # REQUIRED: path to StandalonePainterControl checkpoint
+  optim:
+    lr_min_ratio: 0.1
+
+train:
+  batch_size: 384
+  num_steps: 100000
+  sudoku_loss_weight: 0.0
+  gradient_accumulation_steps: 2
+
+eval:
+  eval_every: 2000
+  save_every: 10000
+  cfg_scale: 2.0

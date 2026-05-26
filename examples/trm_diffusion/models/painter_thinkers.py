@@ -9,7 +9,8 @@ from models.utility_models import SpatialEncoder, AttentiveBridge, SpatialBridge
 import numpy as np
 from tqdm.auto import tqdm
 
-from models.painters import make_painter, StandalonePainter, compute_losses_painter
+from models.painters import make_painter, StandalonePainter, StandalonePainterControl, compute_losses_painter
+from models.utility_models import ConditioningPyramid
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.diffusion_utils import apply_noisy_swap
 from datasets.sudoku_dataset import IGNORE_LABEL_ID, make_tok_labels
@@ -1450,16 +1451,26 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         device = accelerator.device
         mb_data = self._prep_mb_data(micro_batches, device)
 
-        # Pre-compute corrupted conditions for verification
-        corrupted_conds = []
+        # Pre-compute corrupted conditions and negative encoder embeddings once.
+        # Negative z_H/z_L are stepped through the supervision loop alongside
+        # positives (one thinker step per iteration), avoiding the n_sup-step
+        # burst that _thinker_forward would otherwise create at the final step.
+        neg_states = []
         for i, mb in enumerate(micro_batches):
+            d = mb_data[i]
             given_mask = mb.get("given_mask")
-            real_cond = mb_data[i]["condition"]
             if given_mask is not None:
-                corrupted = self._corrupt_condition(real_cond, mb_data[i]["solution"], given_mask.to(device))
+                corrupted = self._corrupt_condition(d["condition"], d["solution"], given_mask.to(device))
             else:
-                corrupted = real_cond
-            corrupted_conds.append(corrupted)
+                corrupted = d["condition"]
+            enc_emb_neg = self._get_enc_emb(corrupted, d["noisy"], timesteps=d["timesteps"])
+            B = d["noisy"].shape[0]
+            z_H_neg, z_L_neg = self.get_initial_states(B)
+            neg_states.append({
+                "enc_emb": enc_emb_neg,
+                "z_H": z_H_neg.to(device),
+                "z_L": z_L_neg.to(device),
+            })
 
         total_diff_loss = 0.0
         total_sudoku_loss = 0.0
@@ -1475,11 +1486,15 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 total_diff_loss += diff_loss.item()
                 total_sudoku_loss += sudoku_loss.item()
 
-                # Verification loss only at the last supervision step
+                # Step negative state one thinker step (no painter).
+                ns = neg_states[i]
+                _, ns["z_H"], ns["z_L"] = self.thinker.reasoning_step(ns["enc_emb"], ns["z_H"], ns["z_L"])
+
+                # Verification loss at the last supervision step.
                 if sup_idx == self.n_sup - 1:
                     seq_len = self.thinker.inner.config.seq_len
                     z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1)
-                    z_H_neg = self._thinker_forward(corrupted_conds[i], d["noisy"], d["timesteps"])
+                    z_H_neg = ns["z_H"][:, :seq_len, :].float().mean(dim=1)
                     B = z_H_pos.shape[0]
                     verif_logits = torch.cat([self.verif_head(z_H_pos), self.verif_head(z_H_neg)]).squeeze(-1)
                     verif_labels = torch.cat([torch.ones(B), torch.zeros(B)]).to(device)
@@ -1548,3 +1563,122 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
             result["verif_acc"] = (correct_pos + correct_neg) / (2 * total)
         self.train()
         return result
+
+
+# ── Thinker with frozen ControlNet painter (image-conditioned) ────────────────
+
+
+class ThinkerWithFrozenPainterControlNet(OriginalTRMRatatouilleV0):
+    """
+    V0-style thinker (image-conditioned encoder) attached to a frozen
+    ControlNet painter loaded from a StandalonePainterControl checkpoint.
+
+    The thinker reasons over the puzzle condition image and produces logits
+    that are converted to a spatial control map, which is injected into the
+    frozen denoising UNet via ControlNet-style residuals.
+
+    Compared to ThinkerWithFrozenPainterV0:
+      - No bridge: replaced by a fresh trainable ConditioningPyramid.
+      - Frozen painter: ControlPainterUNet (in_channels=1, no bridge concat).
+      - The checkpoint's ConditioningPyramid is NOT reused — it was trained on
+        solution tokens, not thinker logits.
+
+    Trainable: thinker, image_encoder, enc_proj, logit_expand (if any),
+               control_pyramid.
+    Frozen:    ControlPainterUNet.
+    """
+
+    def __init__(
+        self,
+        painter: StandalonePainterControl,
+        thinker_cfg: ThinkerModelConfig,
+        encoder_cfg: ImageEncoderConfig,
+        model_cfg: PainterThinkerConfig,
+        train_cfg: TrainConfig,
+        eval_cfg: EvalConfig,
+        thinker_optim_cfg: ThinkerOptimConfig,
+        painter_optim_cfg: PainterOptimConfig,
+        scheduler,
+    ):
+        super().__init__(
+            thinker_cfg=thinker_cfg,
+            encoder_cfg=encoder_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=thinker_optim_cfg,
+            painter_optim_cfg=painter_optim_cfg,
+            scheduler=scheduler,
+        )
+        self.painter_optim_cfg = painter_optim_cfg
+
+        # Discard the bridge built by the parent (not needed for ControlNet).
+        self.bridge = None
+
+        # Freeze the denoising UNet from the checkpoint.
+        self.painter = painter.painter
+        for p in self.painter.parameters():
+            p.requires_grad_(False)
+
+        # Fresh ConditioningPyramid — trained to convert thinker logits to
+        # control residuals.  Channel count matches _logits_to_spatial output.
+        ctrl_in_ch = (
+            encoder_cfg.thinker_out_channels
+            if encoder_cfg.thinker_out_channels is not None
+            else thinker_cfg.vocab_size
+        )
+        self.control_pyramid = ConditioningPyramid(
+            in_channels=ctrl_in_ch,
+            block_out_channels=tuple(model_cfg.painter_channels),
+            layers_per_block=model_cfg.painter_layers_per_block,
+        )
+
+    def _run_painter(
+        self,
+        noisy: torch.Tensor,
+        spatial_cond: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        # spatial_cond: (B, C, 9, 9) from _logits_to_spatial — upsample to painter_size.
+        spatial_cond = F.interpolate(
+            spatial_cond, size=self.model_cfg.painter_size, mode="bilinear", align_corners=False
+        )
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+        with ctx:
+            down_res, mid_res = self.control_pyramid(spatial_cond)
+            return self.painter(
+                noisy,
+                timesteps,
+                down_block_additional_residuals=down_res,
+                mid_block_additional_residual=mid_res,
+            ).sample
+
+    def get_painter_params(self) -> list:
+        return []
+
+    def _get_encoder_params(self) -> list:
+        frozen_ids = {id(p) for p in self.painter.parameters()}
+        thinker_ids = {id(p) for p in self.thinker.parameters()}
+        return [
+            p for p in self.parameters()
+            if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
+        ]
+
+    def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
+        thinker_optims = self.thinker.build_optimizers(world_size, num_steps)
+        encoder_params = self._get_encoder_params()
+        if not encoder_params:
+            return thinker_optims
+        enc_optim = torch.optim.AdamW(encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+        enc_scheduled = ScheduledOptimizer(
+            enc_optim,
+            base_lr=self.painter_optim_cfg.lr,
+            warmup_steps=self.painter_optim_cfg.warmup_steps,
+            num_steps=num_steps,
+            min_ratio=self.painter_optim_cfg.lr_min_ratio,
+        )
+        return thinker_optims + [enc_scheduled]
