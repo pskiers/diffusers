@@ -116,6 +116,7 @@ class ImageEncoderConfig:
 class TimestepCondConfig:
     enc_timestep_cond: bool = False
     thinker_timestep_cond: bool = False
+    decoder_timestep_cond: bool = False
     temb_dim: int = 256
 
 

@@ -12,6 +12,7 @@ thinker_out_channels: null
 # Timestep conditioning (V1 only)
 enc_timestep_cond: false
 thinker_timestep_cond: false
+decoder_timestep_cond: false
 temb_dim: 256
 
 optim:

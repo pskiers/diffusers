@@ -234,11 +234,13 @@ def _timestep_cond_cfg(cfg: DictConfig) -> Optional[TimestepCondConfig]:
     p = cfg.painter
     enc_t = bool(p.get("enc_timestep_cond", False))
     thinker_t = bool(p.get("thinker_timestep_cond", False))
-    if not enc_t and not thinker_t:
+    decoder_t = bool(p.get("decoder_timestep_cond", False))
+    if not enc_t and not thinker_t and not decoder_t:
         return None
     return TimestepCondConfig(
         enc_timestep_cond=enc_t,
         thinker_timestep_cond=thinker_t,
+        decoder_timestep_cond=decoder_t,
         temb_dim=int(p.get("temb_dim", 256)),
     )
 

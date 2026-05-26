@@ -887,7 +887,10 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
         # starts as the no-timestep identity and gradually learns to use t.
         self.enc_timestep_cond = timestep_cfg.enc_timestep_cond if timestep_cfg is not None else False
         self.thinker_timestep_cond = timestep_cfg.thinker_timestep_cond if timestep_cfg is not None else False
-        if timestep_cfg is not None and (timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond):
+        self.decoder_timestep_cond = timestep_cfg.decoder_timestep_cond if timestep_cfg is not None else False
+        if timestep_cfg is not None and (
+            timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond or timestep_cfg.decoder_timestep_cond
+        ):
             self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
         if timestep_cfg is not None and timestep_cfg.enc_timestep_cond:
             self.enc_film = nn.Linear(timestep_cfg.temb_dim, 2 * encoder_cfg.enc_channels)
@@ -897,6 +900,10 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
             nn.init.zeros_(self.thinker_temb_proj.weight)
             nn.init.zeros_(self.thinker_temb_proj.bias)
+        if timestep_cfg is not None and timestep_cfg.decoder_timestep_cond:
+            self.dec_film = nn.Linear(timestep_cfg.temb_dim, 2 * model_cfg.bridge_channels)
+            nn.init.zeros_(self.dec_film.weight)
+            nn.init.zeros_(self.dec_film.bias)
 
     def _get_enc_emb(
         self,
@@ -922,6 +929,21 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
 
         return enc_emb
+
+    def _run_painter(self, noisy: torch.Tensor, spatial_cond: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        if not self.decoder_timestep_cond:
+            return super()._run_painter(noisy, spatial_cond, timesteps)
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+        with ctx:
+            bridge_feat = self.bridge(spatial_cond)
+            temb = self.timestep_mlp(timesteps)
+            scale, shift = self.dec_film(temb).chunk(2, dim=1)
+            bridge_feat = bridge_feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+            return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
 
 
 # ── Painter-thinker (V2: no CE supervision) ───────────────────────────────────
