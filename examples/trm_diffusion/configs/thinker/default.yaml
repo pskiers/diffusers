@@ -9,6 +9,7 @@ expansion: 4.0
 pos_encodings: "rope"
 mlp_t: false
 
+num_classes: 9
 puzzle_emb_ndim: 512
 puzzle_emb_len: 16
 num_puzzle_identifiers: 1000
