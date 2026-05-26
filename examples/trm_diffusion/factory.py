@@ -351,29 +351,23 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         painter_ckpt_path = cfg.painter.get("painter_checkpoint", None)
         if painter_ckpt_path is None:
             raise ValueError("thinker_frozen_painter requires painter.painter_checkpoint to be set.")
+        # Use classifier_path=None so StandalonePainter doesn't load eval_clf —
+        # it's used as a frozen backbone, not as a standalone evaluator.
+        _frozen_eval_cfg = EvalConfig(
+            eval_every=eval_cfg.eval_every,
+            save_every=eval_cfg.save_every,
+            log_every=eval_cfg.log_every,
+            classifier_path=None,
+        )
         frozen_painter = StandalonePainter(
             model_cfg=_painter_cfg(cfg),
             optim_cfg=_painter_optim_cfg(cfg),
             train_cfg=train_cfg,
-            eval_cfg=eval_cfg,
+            eval_cfg=_frozen_eval_cfg,
             scheduler=scheduler,
         )
         ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
-        missing, unexpected = frozen_painter.load_state_dict(
-            strip_compiled_prefix(ckpt["model_state"]), strict=False
-        )
-        # Only eval_clf keys may be missing (eval_clf is built from cfg but not saved in painter checkpoints)
-        bad_missing = [k for k in missing if not k.startswith("eval_clf.")]
-        if bad_missing:
-            raise RuntimeError(
-                f"Frozen painter checkpoint is missing expected keys: {bad_missing}\n"
-                "This likely means the checkpoint is wrong or bridge/painter weights were not saved."
-            )
-        if unexpected:
-            raise RuntimeError(
-                f"Frozen painter checkpoint has unexpected keys after strip_compiled_prefix: {unexpected}\n"
-                "strip_compiled_prefix may need updating."
-            )
+        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
         thinker_optim_cfg = _thinker_optim_cfg(cfg)

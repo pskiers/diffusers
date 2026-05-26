@@ -13,6 +13,7 @@ run:
   output_dir: "runs/thinker_frozen_painter"
 
 thinker:
+  puzzle_emb_ndim: 0
   optim:
     lr_min_ratio: 0.1
 

@@ -29,7 +29,7 @@ painter:
 train:
   batch_size: 384
   num_steps: 100000
-  sudoku_loss_weight: 1.0
+  sudoku_loss_weight: 0.0
   gradient_accumulation_steps: 2
 
 eval:
