@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 import hydra
+import hydra.utils
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -47,15 +48,17 @@ def build_vae(cfg) -> AutoencoderKL:
 
 def build_datasets(cfg):
     d = cfg.data
+    base = hydra.utils.to_absolute_path(d.sudoku_dir)
+    mnist_root = hydra.utils.to_absolute_path(d.mnist_root)
     train_ds = MNISTSudokuDataset(
-        sudoku_dir=d.sudoku_dir,
-        mnist_root=d.mnist_root,
+        sudoku_dir=os.path.join(base, "train"),
+        mnist_root=mnist_root,
         cell_size=d.cell_size,
         mnist_split="train",
     )
     eval_ds = MNISTSudokuDataset(
-        sudoku_dir=d.sudoku_dir,
-        mnist_root=d.mnist_root,
+        sudoku_dir=os.path.join(base, "test"),
+        mnist_root=mnist_root,
         cell_size=d.cell_size,
         mnist_split="test",
     )
@@ -100,12 +103,14 @@ def main(cfg: DictConfig):
     )
     logging.basicConfig(level=logging.INFO)
 
+    output_dir = hydra.utils.to_absolute_path(output_dir)
+
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(cfg))
-        Path(cfg.run.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     if wandb_project and accelerator.is_main_process:
-        run_name = Path(cfg.run.output_dir).name
+        run_name = Path(output_dir).name
         accelerator.init_trackers(
             project_name=wandb_project,
             config=OmegaConf.to_container(cfg, resolve=True),
@@ -150,6 +155,8 @@ def main(cfg: DictConfig):
 
     global_step = 0
     resume_path = cfg.run.get("resume_from_checkpoint", None)
+    if resume_path:
+        resume_path = hydra.utils.to_absolute_path(resume_path)
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
         accelerator.unwrap_model(vae).load_state_dict(ckpt["model_state"])
@@ -244,7 +251,7 @@ def main(cfg: DictConfig):
             # Save sample reconstructions
             val_batch = next(iter(eval_dl))
             log_reconstructions(
-                unwrapped_vae, val_batch, cfg.run.output_dir,
+                unwrapped_vae, val_batch, output_dir,
                 global_step, num_log_images, accelerator.device,
             )
             vae.train()
@@ -253,14 +260,14 @@ def main(cfg: DictConfig):
         if global_step >= next_save and accelerator.is_main_process:
             save_checkpoint(
                 accelerator, vae, optimizer, lr_scheduler,
-                global_step, cfg.run.output_dir, f"step-{global_step}",
+                global_step, output_dir, f"step-{global_step}",
             )
             next_save = global_step + save_every
 
     if accelerator.is_main_process:
         save_checkpoint(
             accelerator, vae, optimizer, lr_scheduler,
-            global_step, cfg.run.output_dir, "final",
+            global_step, output_dir, "final",
         )
         # Compute and save latent scaling factor (std of latents on training set)
         logger.info("Computing latent scaling factor...")
@@ -276,7 +283,7 @@ def main(cfg: DictConfig):
         all_latents = torch.cat(latent_samples, dim=0)
         scaling_factor = 1.0 / all_latents.std().item()
         logger.info(f"Latent std={1/scaling_factor:.4f}  scaling_factor={scaling_factor:.4f}")
-        torch.save({"scaling_factor": scaling_factor}, os.path.join(cfg.run.output_dir, "scaling_factor.pt"))
+        torch.save({"scaling_factor": scaling_factor}, os.path.join(output_dir, "scaling_factor.pt"))
         logger.info("Training complete.")
 
     if wandb_project:
