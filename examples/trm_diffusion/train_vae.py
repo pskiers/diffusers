@@ -103,7 +103,7 @@ def main(cfg: DictConfig):
     )
     logging.basicConfig(level=logging.INFO)
 
-    output_dir = hydra.utils.to_absolute_path(output_dir)
+    output_dir = hydra.utils.to_absolute_path(cfg.run.output_dir)
 
     if accelerator.is_main_process:
         logger.info(OmegaConf.to_yaml(cfg))
