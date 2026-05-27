@@ -9,10 +9,11 @@ from models.utility_models import SpatialEncoder, AttentiveBridge, SpatialBridge
 import numpy as np
 from tqdm.auto import tqdm
 
-from models.painters import make_painter, StandalonePainter, StandalonePainterControl, compute_losses_painter
+from models.painters import make_painter, StandalonePainter, StandalonePainterControl, compute_losses_painter, classifier_loss as _classifier_loss
+from models.diffusion_utils import apply_noisy_swap, x0_from_noise_pred
+from train_noisy_classifier import load_noisy_classifier
 from models.utility_models import ConditioningPyramid
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
-from models.diffusion_utils import apply_noisy_swap
 from datasets.sudoku_dataset import IGNORE_LABEL_ID, make_tok_labels
 from eval.mnist_eval import (
     sample_grids,
@@ -35,6 +36,7 @@ from configs.schemas import (
     PainterOptimConfig,
     TrainConfig,
     EvalConfig,
+    ClassifierLossConfig,
 )
 from models.base import BaseModel
 
@@ -83,6 +85,19 @@ class PainterThinkerV0Tok(BaseModel):
         if eval_cfg.classifier_path is not None:
             self.eval_clf = load_or_train_classifier(eval_cfg.classifier_path, None, model_cfg.cell_size, "cuda")
             for p in self.eval_clf.parameters():
+                p.requires_grad_(False)
+
+        # Training classifier — loaded from train.classifier_loss.classifier_path,
+        # kept separate from eval_clf so a noisy/different classifier can be used
+        # for the loss without polluting the evaluation metric.
+        self.train_clf = None
+        self.clf_cfg: Optional[ClassifierLossConfig] = train_cfg.classifier_loss
+        if self.clf_cfg is not None and self.clf_cfg.classifier_path is not None:
+            if self.clf_cfg.noisy_classifier:
+                self.train_clf = load_noisy_classifier(self.clf_cfg.classifier_path, "cuda")
+            else:
+                self.train_clf = load_or_train_classifier(self.clf_cfg.classifier_path, None, model_cfg.cell_size, "cuda")
+            for p in self.train_clf.parameters():
                 p.requires_grad_(False)
 
         self.thinker = SpatialTRM(
@@ -193,6 +208,7 @@ class PainterThinkerV0Tok(BaseModel):
             z_H, z_L = self.get_initial_states(bsz)
             mb_data.append(
                 {
+                    "images": images,
                     "condition": self._get_condition(mb, device),
                     "solution": solution,
                     "ce_labels": self._make_ce_labels(solution),
@@ -210,7 +226,7 @@ class PainterThinkerV0Tok(BaseModel):
         sudoku_w = self.train_cfg.sudoku_loss_weight
         mse_w = self.train_cfg.mse_loss_weight
         step_loss = torch.tensor(0.0, device=device)
-        diff_loss = sudoku_loss = torch.tensor(0.0, device=device)
+        diff_loss = sudoku_loss = clf_loss = torch.tensor(0.0, device=device)
 
         if mse_w > 0.0:
             diff_loss = F.mse_loss(noise_pred.float(), d["target"])
@@ -225,7 +241,22 @@ class PainterThinkerV0Tok(BaseModel):
             )
             step_loss = step_loss + sudoku_w * sudoku_loss
 
-        return step_loss, diff_loss, sudoku_loss
+        if self.clf_cfg is not None and self.clf_cfg.weight > 0.0 and self.train_clf is not None:
+            x0_pred = x0_from_noise_pred(noise_pred, d["noisy"], d["timesteps"], self.scheduler)
+            clf_loss = _classifier_loss(
+                x0_pred,
+                d["noisy"],
+                d["images"],
+                d["solution"],
+                d["timesteps"],
+                self.model_cfg.cell_size,
+                self.train_clf,
+                self.scheduler,
+                self.clf_cfg,
+            )
+            step_loss = step_loss + self.clf_cfg.weight * clf_loss
+
+        return step_loss, diff_loss, sudoku_loss, clf_loss
 
     def _train_step_standard(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step):
         K = len(micro_batches)
@@ -234,6 +265,7 @@ class PainterThinkerV0Tok(BaseModel):
 
         total_diff_loss = 0.0
         total_sudoku_loss = 0.0
+        total_clf_loss = 0.0
         lr = 0.0
 
         for _ in range(self.n_sup):
@@ -246,10 +278,12 @@ class PainterThinkerV0Tok(BaseModel):
                     d["timesteps"],
                     d["puzzle_ids"],
                 )
-                step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
-                accelerator.backward(step_loss / (global_batch_size * K))
+                step_loss, diff_loss, sudoku_loss, clf_loss = self._compute_step_loss(noise_pred, logits, d, device)
                 total_diff_loss += diff_loss.item()
                 total_sudoku_loss += sudoku_loss.item()
+                total_clf_loss += clf_loss.item()
+                if step_loss.requires_grad:
+                    accelerator.backward(step_loss / (global_batch_size * K))
 
             accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
             accelerator.clip_grad_norm_(self.get_painter_params(), 1.0)
@@ -259,7 +293,10 @@ class PainterThinkerV0Tok(BaseModel):
                 ema.update(self)
 
         n = self.n_sup * K
-        return {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}, lr, global_step
+        losses = {"diff_loss": total_diff_loss / n, "sudoku_loss": total_sudoku_loss / n}
+        if self.clf_cfg is not None and self.clf_cfg.weight > 0.0:
+            losses["clf_loss"] = total_clf_loss / n
+        return losses, lr, global_step
 
     def _train_step_two_stage(self, micro_batches, accelerator, optimizers, ema, global_batch_size, global_step):
         K = len(micro_batches)
@@ -333,7 +370,7 @@ class PainterThinkerV0Tok(BaseModel):
                         H_cycles=ps.H_cycles,
                         L_cycles=ps.L_cycles,
                     )
-                    step_loss, diff_loss, sudoku_loss = self._compute_step_loss(
+                    step_loss, diff_loss, sudoku_loss, clf_loss = self._compute_step_loss(
                         noise_pred, logits, d, device, include_sudoku=not ps.freeze_thinker
                     )
                     accelerator.backward(step_loss / (global_batch_size * K))
@@ -364,7 +401,7 @@ class PainterThinkerV0Tok(BaseModel):
                         d["timesteps"],
                         d["puzzle_ids"],
                     )
-                    step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
+                    step_loss, diff_loss, sudoku_loss, clf_loss = self._compute_step_loss(noise_pred, logits, d, device)
                     accelerator.backward(step_loss / (global_batch_size * K))
                     total_sudoku_loss += sudoku_loss.item()
                     n_thinker_ticks += 1
@@ -1483,7 +1520,7 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
                     d["condition"], d["noisy"], d["z_H"], d["z_L"], d["timesteps"], d["puzzle_ids"]
                 )
-                step_loss, diff_loss, sudoku_loss = self._compute_step_loss(noise_pred, logits, d, device)
+                step_loss, diff_loss, sudoku_loss, clf_loss = self._compute_step_loss(noise_pred, logits, d, device)
                 total_diff_loss += diff_loss.item()
                 total_sudoku_loss += sudoku_loss.item()
 

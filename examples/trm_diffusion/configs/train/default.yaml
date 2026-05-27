@@ -19,3 +19,4 @@ classifier_loss:
   target: "x0_pred"
   loss_type: "ce"
   noisy_classifier: false
+  classifier_path: null
