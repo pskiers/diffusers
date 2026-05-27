@@ -1,0 +1,47 @@
+run:
+  output_dir: "runs/vae"
+  resume_from_checkpoint: null
+  wandb_project: small-llm-diffusion
+
+data:
+  sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
+  mnist_root: "data/mnist"
+  cell_size: 16
+  num_workers: 4
+
+model:
+  in_channels: 1
+  out_channels: 1
+  down_block_types:
+    - "DownEncoderBlock2D"
+    - "DownEncoderBlock2D"
+  up_block_types:
+    - "UpDecoderBlock2D"
+    - "UpDecoderBlock2D"
+  block_out_channels:
+    - 64
+    - 128
+  layers_per_block: 2
+  latent_channels: 4
+  norm_num_groups: 32
+  act_fn: "silu"
+
+train:
+  seed: 0
+  batch_size: 128
+  num_steps: 30000
+  lr: 1e-4
+  lr_min_ratio: 0.1
+  weight_decay: 0.0
+  warmup_steps: 500
+  kl_weight: 1e-6
+  grad_clip: 1.0
+
+eval:
+  eval_every: 2000
+  save_every: 10000
+  log_every: 100
+  num_log_images: 8
+
+precision:
+  mixed_precision: "no"
