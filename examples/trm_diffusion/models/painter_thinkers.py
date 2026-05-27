@@ -1490,17 +1490,23 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 ns = neg_states[i]
                 _, ns["z_H"], ns["z_L"] = self.thinker.reasoning_step(ns["enc_emb"], ns["z_H"], ns["z_L"])
 
-                # Verification loss at the last supervision step.
-                if sup_idx == self.n_sup - 1:
-                    seq_len = self.thinker.inner.config.seq_len
-                    z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1)
-                    z_H_neg = ns["z_H"][:, :seq_len, :].float().mean(dim=1)
-                    B = z_H_pos.shape[0]
-                    verif_logits = torch.cat([self.verif_head(z_H_pos), self.verif_head(z_H_neg)]).squeeze(-1)
-                    verif_labels = torch.cat([torch.ones(B), torch.zeros(B)]).to(device)
-                    verif_loss = F.binary_cross_entropy_with_logits(verif_logits, verif_labels)
-                    step_loss = step_loss + self.verif_weight * verif_loss
-                    total_verif_loss += verif_loss.item()
+                # Verification loss at every supervision step.
+                # Computing here (rather than only at the final step) keeps each
+                # step's neg computation graph alive only until this backward call,
+                # so graph depth stays constant and memory doesn't accumulate.
+                seq_len = self.thinker.inner.config.seq_len
+                z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1)
+                z_H_neg = ns["z_H"][:, :seq_len, :].float().mean(dim=1)
+                B = z_H_pos.shape[0]
+                pos_loss = F.binary_cross_entropy_with_logits(
+                    self.verif_head(z_H_pos).squeeze(-1), torch.ones(B, device=device)
+                )
+                neg_loss = F.binary_cross_entropy_with_logits(
+                    self.verif_head(z_H_neg).squeeze(-1), torch.zeros(B, device=device)
+                )
+                verif_loss = (pos_loss + neg_loss) / 2
+                step_loss = step_loss + self.verif_weight * verif_loss
+                total_verif_loss += verif_loss.item()
 
                 accelerator.backward(step_loss / (global_batch_size * K))
 
@@ -1516,7 +1522,7 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
             {
                 "diff_loss": total_diff_loss / n,
                 "sudoku_loss": total_sudoku_loss / n,
-                "verif_loss": total_verif_loss / K,
+                "verif_loss": total_verif_loss / n,
             },
             lr,
             global_step,
