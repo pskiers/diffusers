@@ -1487,32 +1487,39 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 total_diff_loss += diff_loss.item()
                 total_sudoku_loss += sudoku_loss.item()
 
-                # Step negative state one thinker step (no painter).
-                # enc_emb_neg is recomputed fresh here so its encoder activations
-                # are freed by this step's backward, not held across all n_sup steps.
+                # Detach z_H_pos before the first backward so it survives as a
+                # leaf for the verif head.  Gradient through the positive verif
+                # path to the thinker is intentionally dropped: the diff+sudoku
+                # loss already fully supervises the thinker on positive examples,
+                # and the verif signal is more informative through the negative
+                # path (corrupted conditions have no other loss).
+                seq_len = self.thinker.inner.config.seq_len
+                z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1).detach()
+                B = z_H_pos.shape[0]
+
+                # First backward: frees the ~2 GB of pos encoder/thinker/painter
+                # activations before we allocate the neg encoder below.
+                accelerator.backward(step_loss / (global_batch_size * K))
+
+                # Neg step runs in the memory freed by the first backward.
+                # enc_emb_neg is created fresh each step so the encoder activations
+                # are freed by the second backward (not held across n_sup steps).
                 ns = neg_states[i]
                 enc_emb_neg = self._get_enc_emb(corrupted_conds[i], d["noisy"], timesteps=d["timesteps"])
                 _, ns["z_H"], ns["z_L"] = self.thinker.reasoning_step(enc_emb_neg, ns["z_H"], ns["z_L"])
-
-                # Verification loss at every supervision step.
-                # Computing here (rather than only at the final step) keeps each
-                # step's neg computation graph alive only until this backward call,
-                # so graph depth stays constant and memory doesn't accumulate.
-                seq_len = self.thinker.inner.config.seq_len
-                z_H_pos = d["z_H"][:, :seq_len, :].float().mean(dim=1)
                 z_H_neg = ns["z_H"][:, :seq_len, :].float().mean(dim=1)
-                B = z_H_pos.shape[0]
-                pos_loss = F.binary_cross_entropy_with_logits(
+
+                # Second backward: verif gradients accumulate on top of step 1.
+                # Gradient flows through the neg path to the thinker and encoder.
+                pos_verif = F.binary_cross_entropy_with_logits(
                     self.verif_head(z_H_pos).squeeze(-1), torch.ones(B, device=device)
                 )
-                neg_loss = F.binary_cross_entropy_with_logits(
+                neg_verif = F.binary_cross_entropy_with_logits(
                     self.verif_head(z_H_neg).squeeze(-1), torch.zeros(B, device=device)
                 )
-                verif_loss = (pos_loss + neg_loss) / 2
-                step_loss = step_loss + self.verif_weight * verif_loss
+                verif_loss = (pos_verif + neg_verif) / 2
+                accelerator.backward(self.verif_weight * verif_loss / (global_batch_size * K))
                 total_verif_loss += verif_loss.item()
-
-                accelerator.backward(step_loss / (global_batch_size * K))
 
             accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
             accelerator.clip_grad_norm_(self.get_painter_params(), 1.0)
