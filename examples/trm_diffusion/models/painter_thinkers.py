@@ -1455,6 +1455,11 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         # Negative z_H/z_L are stepped through the supervision loop alongside
         # positives (one thinker step per iteration), avoiding the n_sup-step
         # burst that _thinker_forward would otherwise create at the final step.
+        # Build corrupted conditions and init neg carry states.
+        # enc_emb_neg is NOT cached here — it is recomputed fresh at each
+        # supervision step so the encoder activations are freed by that step's
+        # backward instead of being held for the entire n_sup loop.
+        corrupted_conds = []
         neg_states = []
         for i, mb in enumerate(micro_batches):
             d = mb_data[i]
@@ -1463,21 +1468,17 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 corrupted = self._corrupt_condition(d["condition"], d["solution"], given_mask.to(device))
             else:
                 corrupted = d["condition"]
-            enc_emb_neg = self._get_enc_emb(corrupted, d["noisy"], timesteps=d["timesteps"])
+            corrupted_conds.append(corrupted)
             B = d["noisy"].shape[0]
             z_H_neg, z_L_neg = self.get_initial_states(B)
-            neg_states.append({
-                "enc_emb": enc_emb_neg,
-                "z_H": z_H_neg.to(device),
-                "z_L": z_L_neg.to(device),
-            })
+            neg_states.append({"z_H": z_H_neg.to(device), "z_L": z_L_neg.to(device)})
 
         total_diff_loss = 0.0
         total_sudoku_loss = 0.0
         total_verif_loss = 0.0
         lr = 0.0
 
-        for sup_idx in range(self.n_sup):
+        for _ in range(self.n_sup):
             for i, d in enumerate(mb_data):
                 noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
                     d["condition"], d["noisy"], d["z_H"], d["z_L"], d["timesteps"], d["puzzle_ids"]
@@ -1487,8 +1488,11 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
                 total_sudoku_loss += sudoku_loss.item()
 
                 # Step negative state one thinker step (no painter).
+                # enc_emb_neg is recomputed fresh here so its encoder activations
+                # are freed by this step's backward, not held across all n_sup steps.
                 ns = neg_states[i]
-                _, ns["z_H"], ns["z_L"] = self.thinker.reasoning_step(ns["enc_emb"], ns["z_H"], ns["z_L"])
+                enc_emb_neg = self._get_enc_emb(corrupted_conds[i], d["noisy"], timesteps=d["timesteps"])
+                _, ns["z_H"], ns["z_L"] = self.thinker.reasoning_step(enc_emb_neg, ns["z_H"], ns["z_L"])
 
                 # Verification loss at every supervision step.
                 # Computing here (rather than only at the final step) keeps each
