@@ -361,6 +361,11 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             log_every=eval_cfg.log_every,
             classifier_path=None,
         )
+        # Strip classifier_loss so the frozen backbone doesn't create a train_clf submodule,
+        # which would cause state_dict key mismatch when loading the pre-trained checkpoint.
+        # The outer ThinkerWithFrozenPainter still receives the full train_cfg and loads train_clf itself.
+        from dataclasses import replace as _dc_replace
+        _frozen_train_cfg = _dc_replace(train_cfg, classifier_loss=None)
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
 
@@ -368,7 +373,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             frozen_painter = StandalonePainterControl(
                 model_cfg=_painter_cfg(cfg),
                 optim_cfg=_painter_optim_cfg(cfg),
-                train_cfg=train_cfg,
+                train_cfg=_frozen_train_cfg,
                 eval_cfg=_frozen_eval_cfg,
                 scheduler=scheduler,
             )
@@ -376,7 +381,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             frozen_painter = StandalonePainter(
                 model_cfg=_painter_cfg(cfg),
                 optim_cfg=_painter_optim_cfg(cfg),
-                train_cfg=train_cfg,
+                train_cfg=_frozen_train_cfg,
                 eval_cfg=_frozen_eval_cfg,
                 scheduler=scheduler,
             )
