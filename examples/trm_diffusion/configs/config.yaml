@@ -10,6 +10,7 @@ defaults:
   - _self_
   - thinker: default
   - painter: default
+  - latent_dit: default
   - data: mnist_sudoku
   - diffusion: ddpm
   - train: default

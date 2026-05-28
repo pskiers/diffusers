@@ -1,0 +1,25 @@
+# @package _global_
+# Latent DiT: token-conditioned diffusion in VAE latent space.
+#
+# Usage:
+#   python train_trm.py experiment=latent_dit \
+#     latent_dit.vae_checkpoint=runs/vae/checkpoint_final.pt \
+#     eval.classifier_path=runs/mnist_classifier_cell16.pt
+
+mode: "latent_dit"
+
+run:
+  output_dir: "runs/latent_dit"
+
+train:
+  batch_size: 256
+  num_steps: 100000
+  compile: false   # Transformer2DModel works but compile adds startup overhead
+
+eval:
+  eval_every: 2000
+  save_every: 10000
+  cfg_scale: 2.0
+  num_samples: 1024
+  num_ddim_steps: 20
+  num_log_images: 8

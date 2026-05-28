@@ -37,7 +37,6 @@ from factory import build_model, build_datasets, build_scheduler
 from models.trm.ema import EMAHelper
 from models.utility_models import strip_compiled_prefix
 
-
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -225,7 +224,7 @@ def main(cfg: DictConfig):
                 live_params = [p.data.clone() for p in unwrapped.parameters() if p.requires_grad]
                 ema_helper.ema(unwrapped)
 
-            val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100)
+            val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step)
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
 
             if ema_helper is not None:
@@ -234,9 +233,10 @@ def main(cfg: DictConfig):
             unwrapped.train()
 
             if accelerator.is_main_process:
-                logger.info(f"[val] step={global_step}  " + "  ".join(
-                    f"{k}={v:.4f}" for k, v in val_log.items() if isinstance(v, (int, float))
-                ))
+                logger.info(
+                    f"[val] step={global_step}  "
+                    + "  ".join(f"{k}={v:.4f}" for k, v in val_log.items() if isinstance(v, (int, float)))
+                )
                 if wandb_project:
                     accelerator.log(val_log, step=global_step)
 

@@ -102,6 +102,34 @@ class PainterOptimConfig:
     lr_min_ratio: float = 0.0
 
 
+# ── Latent DiT configs ────────────────────────────────────────────────────────
+
+
+@dataclass
+class LatentDiTConfig:
+    vae_checkpoint: str  # path to trained VAE .pt checkpoint
+    latent_channels: int = 4
+    latent_size: int = 36  # spatial size after VAE encoding (painter_size // 4)
+    patch_size: int = 4  # patch_size=4 on 36×36 → 81 patches (one per cell)
+    num_attention_heads: int = 8
+    attention_head_dim: int = 64
+    num_layers: int = 6
+    mlp_ratio: float = 4.0
+    dropout: float = 0.0
+    vocab_size: int = 11  # 0=null, 1=blank, 2-10=digits 1-9
+    cond_embed_dim: int = 256
+    cell_size: int = 16
+    painter_size: int = 144
+
+
+@dataclass
+class LatentDiTOptimConfig:
+    lr: float = 1e-4
+    weight_decay: float = 0.0
+    warmup_steps: int = 1000
+    lr_min_ratio: float = 0.1
+
+
 # ── Model architecture configs ─────────────────────────────────────────────────
 
 

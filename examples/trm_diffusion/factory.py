@@ -19,6 +19,8 @@ from configs.schemas import (
     ClassifierLossConfig,
     EvalConfig,
     ImageEncoderConfig,
+    LatentDiTConfig,
+    LatentDiTOptimConfig,
     NoisySwapConfig,
     PainterConfig,
     PainterOptimConfig,
@@ -246,6 +248,56 @@ def _timestep_cond_cfg(cfg: DictConfig) -> Optional[TimestepCondConfig]:
     )
 
 
+# ── Latent DiT sub-config builders ────────────────────────────────────────────
+
+
+def _latent_dit_cfg(cfg: DictConfig) -> LatentDiTConfig:
+    d = cfg.latent_dit
+    cell_size = int(cfg.data.cell_size)
+    return LatentDiTConfig(
+        vae_checkpoint=str(d.vae_checkpoint),
+        latent_channels=int(d.get("latent_channels", 4)),
+        latent_size=int(d.get("latent_size", 36)),
+        patch_size=int(d.get("patch_size", 4)),
+        num_attention_heads=int(d.get("num_attention_heads", 8)),
+        attention_head_dim=int(d.get("attention_head_dim", 64)),
+        num_layers=int(d.get("num_layers", 6)),
+        mlp_ratio=float(d.get("mlp_ratio", 4.0)),
+        dropout=float(d.get("dropout", 0.0)),
+        vocab_size=int(d.get("vocab_size", 11)),
+        cond_embed_dim=int(d.get("cond_embed_dim", 256)),
+        cell_size=cell_size,
+        painter_size=cell_size * 9,
+    )
+
+
+def _latent_dit_optim_cfg(cfg: DictConfig) -> LatentDiTOptimConfig:
+    o = cfg.latent_dit.optim
+    return LatentDiTOptimConfig(
+        lr=float(o.lr),
+        weight_decay=float(o.weight_decay),
+        warmup_steps=int(o.warmup_steps),
+        lr_min_ratio=float(o.get("lr_min_ratio", 0.1)),
+    )
+
+
+def _build_vae(cfg: DictConfig):
+    from diffusers import AutoencoderKL
+
+    v = cfg.latent_dit.vae_arch
+    return AutoencoderKL(
+        in_channels=int(v.in_channels),
+        out_channels=int(v.out_channels),
+        latent_channels=int(v.latent_channels),
+        down_block_types=list(v.down_block_types),
+        up_block_types=list(v.up_block_types),
+        block_out_channels=list(v.block_out_channels),
+        layers_per_block=int(v.layers_per_block),
+        norm_num_groups=int(v.norm_num_groups),
+        act_fn=str(v.act_fn),
+    )
+
+
 # ── Public builders ────────────────────────────────────────────────────────────
 
 
@@ -316,6 +368,36 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     train_cfg = _train_cfg(cfg)
     eval_cfg = _eval_cfg(cfg)
 
+    if mode == "latent_dit":
+        from models.latent_dit import LatentDiT
+
+        dit_cfg = _latent_dit_cfg(cfg)
+        vae_ckpt_path = dit_cfg.vae_checkpoint
+
+        # Try to load scaling factor saved by train_vae.py next to the checkpoint.
+        ckpt_dir = os.path.dirname(vae_ckpt_path)
+        sf_path = os.path.join(ckpt_dir, "scaling_factor.pt")
+        scaling_factor = (
+            torch.load(sf_path, map_location="cpu", weights_only=True)["scaling_factor"]
+            if os.path.exists(sf_path)
+            else 1.0
+        )
+
+        ckpt = torch.load(vae_ckpt_path, map_location="cpu", weights_only=False)
+        vae = _build_vae(cfg)
+        vae.load_state_dict(ckpt["model_state"])
+        vae.eval()
+
+        return LatentDiT(
+            model_cfg=dit_cfg,
+            optim_cfg=_latent_dit_optim_cfg(cfg),
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            scheduler=scheduler,
+            vae=vae,
+            scaling_factor=scaling_factor,
+        )
+
     if mode == "sudoku":
         thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
         return SpatialTRM(
@@ -365,6 +447,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         # which would cause state_dict key mismatch when loading the pre-trained checkpoint.
         # The outer ThinkerWithFrozenPainter still receives the full train_cfg and loads train_clf itself.
         from dataclasses import replace as _dc_replace
+
         _frozen_train_cfg = _dc_replace(train_cfg, classifier_loss=None)
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
