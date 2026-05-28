@@ -538,13 +538,73 @@ class SpatialLatentUNet(nn.Module):
             result["cell_acc"] = float(np.mean(all_cell_acc))
             result["puzzle_acc"] = float(np.mean(all_puzzle_acc))
 
+            # ── Uniform DDIM sampling (all pixels same timestep) ───────────────
+            # Provides a direct comparison baseline for the spatial denoising.
+            all_cell_acc_u, all_puzzle_acc_u = [], []
+            n_done_u = 0
+            panel_images_u = []
+            # Evenly-spaced timesteps T_max-1 → 0
+            uniform_ts = torch.linspace(T_max - 1, 0, num_ddim_steps + 1).long()
+
+            for batch in tqdm(dataloader, desc="Sampling (uniform)", leave=False):
+                if n_done_u >= n_total:
+                    break
+                solutions = batch["solution"]
+                condition_tokens = get_solution_tokens(solutions.to(device))
+                given_masks = batch.get("given_mask")
+                conditions_pixel = batch.get("conditions")
+                B = condition_tokens.shape[0]
+
+                cond_emb = self.cond_encoder(condition_tokens)
+                null_emb = self.cond_encoder(torch.zeros_like(condition_tokens)) if cfg_scale > 1.0 else None
+
+                z = torch.randn(B, C, lH, lW, device=device)
+
+                for s in range(num_ddim_steps):
+                    t_val = uniform_ts[s].item()
+                    t_next = uniform_ts[s + 1].item()
+                    T_old = torch.full((B, 1, lH, lW), t_val, device=device, dtype=torch.long)
+                    T_new = torch.full((B, 1, lH, lW), t_next, device=device, dtype=torch.long)
+
+                    x0_pred, _ = self._run_unet(z, T_old, cond_emb, self.unet)
+                    if cfg_scale > 1.0:
+                        x0_uncond, _ = self._run_unet(z, T_old, null_emb, self.unet)
+                        x0_pred = x0_uncond + cfg_scale * (x0_pred - x0_uncond)
+
+                    z = ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
+
+                generated_u = self._decode(z)
+                acc_u = evaluate_grids(
+                    generated_u, solutions, self.eval_clf, self.cell_size,
+                    given_masks=given_masks,
+                )
+                all_cell_acc_u.append(acc_u["cell_acc"])
+                all_puzzle_acc_u.append(acc_u["puzzle_acc"])
+                n_done_u += B
+
+                if len(panel_images_u) < num_log_images and conditions_pixel is not None:
+                    for j in range(min(num_log_images - len(panel_images_u), B)):
+                        panel_images_u.append(
+                            make_panel_image(
+                                condition=conditions_pixel[j],
+                                generated=generated_u[j].cpu(),
+                                solution=solutions[j].numpy(),
+                            )
+                        )
+
+            result["cell_acc_uniform"] = float(np.mean(all_cell_acc_u))
+            result["puzzle_acc_uniform"] = float(np.mean(all_puzzle_acc_u))
+
             if panel_images and step is not None:
                 try:
                     import wandb
 
                     tracker = accelerator.get_tracker("wandb", unwrap=True)
                     tracker.log(
-                        {"val/examples": [wandb.Image(img) for img in panel_images]},
+                        {
+                            "val/examples_spatial": [wandb.Image(img) for img in panel_images],
+                            "val/examples_uniform": [wandb.Image(img) for img in panel_images_u],
+                        },
                         step=step,
                     )
                 except Exception:
