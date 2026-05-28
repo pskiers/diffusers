@@ -469,7 +469,10 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 scheduler=scheduler,
             )
         ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
-        frozen_painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
+        painter_state = strip_compiled_prefix(ckpt["model_state"])
+        model_keys = set(frozen_painter.state_dict().keys())
+        painter_state = {k: v for k, v in painter_state.items() if k in model_keys}
+        frozen_painter.load_state_dict(painter_state)
         thinker_optim_cfg = _thinker_optim_cfg(cfg)
         painter_optim_cfg = _painter_optim_cfg(cfg)
         model_cfg = _painter_thinker_cfg(cfg)
