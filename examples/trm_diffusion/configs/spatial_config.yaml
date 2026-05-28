@@ -1,0 +1,121 @@
+run:
+  output_dir: "runs/spatial_latent"
+  resume_from_checkpoint: null
+  wandb_project: small-llm-diffusion
+
+data:
+  sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
+  mnist_root: "data/mnist"
+  cell_size: 16
+  num_workers: 4
+
+# ── VAE ───────────────────────────────────────────────────────────────────────
+# Same architecture used in train_vae.py — must match the checkpoint.
+vae:
+  checkpoint: null     # REQUIRED: e.g. runs/vae/checkpoint_final.pt
+  in_channels: 1
+  out_channels: 1
+  latent_channels: 4
+  down_block_types:
+    - "DownEncoderBlock2D"
+    - "DownEncoderBlock2D"
+  up_block_types:
+    - "UpDecoderBlock2D"
+    - "UpDecoderBlock2D"
+  block_out_channels:
+    - 64
+    - 128
+  layers_per_block: 2
+  norm_num_groups: 32
+  act_fn: "silu"
+
+# ── UNet backbone ─────────────────────────────────────────────────────────────
+model:
+  latent_channels: 4
+  latent_size: 36
+
+  down_block_types:
+    - "DownBlock2D"
+    - "CrossAttnDownBlock2D"
+  up_block_types:
+    - "CrossAttnUpBlock2D"
+    - "UpBlock2D"
+  block_out_channels:
+    - 64
+    - 128
+  layers_per_block: 2
+  attention_head_dim: 8
+  norm_num_groups: 16
+
+  vocab_size: 11
+  cond_embed_dim: 256
+
+  # Spatial noise
+  f_spatial: 0.25       # 1/4 of latent size → grid_h=9 ≈ one blob per cell
+  tau_init: 20.0        # timestep spread for initial Perlin field
+  tau_student: 30.0     # timestep spread for Path B structured field
+  n_octaves: 1
+
+  # Path B schedule (starts all Path A, ramps up to p_refine_max)
+  p_refine_max: 0.7
+  p_refine_warmup_steps: 20000
+
+  teacher_ema_rate: 0.999
+
+  # ── Noise mode ───────────────────────────────────────────────────────────
+  # "perlin"         — original Path A/B with Perlin T_field from step 0
+  # "teacher_guided" — Stage 1 (uniform) then Stage 2 (teacher + roulette)
+  noise_mode: "perlin"
+
+  # teacher_guided: Stage 1 warm-up length (uniform scalar timestep only)
+  stage1_steps: 5000
+
+  # Augmentation roulette probabilities (must sum to 1.0)
+  aug_prob_vanilla: 0.20
+  aug_prob_power: 0.30
+  aug_prob_threshold: 0.30
+  aug_prob_perlin: 0.20
+
+  # Power scaling: gamma ~ U(power_gamma_min, power_gamma_max)
+  power_gamma_min: 2.0
+  power_gamma_max: 4.0
+
+  # Thresholding: n split points ~ randint(n_min, n_max),
+  #   each drawn from U(val_min, val_max) → quantise to n+1 levels
+  threshold_n_min: 1
+  threshold_n_max: 3
+  threshold_val_min: 0.2
+  threshold_val_max: 0.8
+
+  cell_size: 16
+  painter_size: 144
+
+# ── Optimiser ─────────────────────────────────────────────────────────────────
+optim:
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+train:
+  seed: 0
+  batch_size: 128
+  num_steps: 150000
+  gradient_accumulation_steps: 1
+  cfg_prob: 0.1
+  compile: false
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+eval:
+  eval_every: 2000
+  save_every: 10000
+  log_every: 100
+  num_ddim_steps: 30
+  num_samples: 512
+  cfg_scale: 2.0
+  num_log_images: 8
+  classifier_path: runs/mnist_classifier_cell16.pt
+
+precision:
+  mixed_precision: "no"
