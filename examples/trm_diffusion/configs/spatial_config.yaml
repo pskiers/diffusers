@@ -32,7 +32,12 @@ vae:
   norm_num_groups: 32
   act_fn: "silu"
 
-# ── UNet backbone ─────────────────────────────────────────────────────────────
+# ── Model type ───────────────────────────────────────────────────────────────
+# "unet" — UNet2DConditionModel with cross-attention puzzle conditioning (original)
+# "dit"  — SpatialDiT with per-token adaLN and channel-concat puzzle conditioning
+model_type: "unet"
+
+# ── UNet backbone (model_type: "unet") ────────────────────────────────────────
 model:
   latent_channels: 4
   latent_size: 36
@@ -64,6 +69,14 @@ model:
   p_refine_warmup_steps: 20000
 
   teacher_ema_rate: 0.999
+
+  # ── DiT backbone (model_type: "dit") ────────────────────────────────────────
+  patch_size: 4              # 36/4=9x9=81 patches — one per sudoku cell
+  n_heads: 8
+  attention_head_dim: 64     # d_model = 8*64 = 512
+  n_layers: 6
+  mlp_ratio: 4.0
+  t_freq_dim: 256            # sinusoidal embedding channels before MLP
 
   # Timestep mode: "discrete" uses integer T_field + alphas_cumprod table lookup.
   #               "continuous" keeps T_field as float and uses the analytical

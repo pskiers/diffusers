@@ -81,6 +81,13 @@ def _build_model_cfg(cfg: DictConfig) -> SpatialLatentConfig:
         threshold_val_min=float(m.get("threshold_val_min", 0.2)),
         threshold_val_max=float(m.get("threshold_val_max", 0.8)),
         continuous_time=bool(m.get("continuous_time", False)),
+        model_type=str(m.get("model_type", "unet")),
+        patch_size=int(m.get("patch_size", 4)),
+        n_heads=int(m.get("n_heads", 8)),
+        attention_head_dim=int(m.get("attention_head_dim", 64)),
+        n_layers=int(m.get("n_layers", 6)),
+        mlp_ratio=float(m.get("mlp_ratio", 4.0)),
+        t_freq_dim=int(m.get("t_freq_dim", 256)),
         cell_size=cell_size,
         painter_size=cell_size * 9,
     )
@@ -188,14 +195,21 @@ def main(cfg: DictConfig):
             logger.warning(f"Classifier not found at {clf_path}, skipping accuracy eval")
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = SpatialLatentUNet(
-        model_cfg=_build_model_cfg(cfg),
+    model_cfg = _build_model_cfg(cfg)
+    model_kwargs = dict(
+        model_cfg=model_cfg,
         optim_cfg=_build_optim_cfg(cfg),
         scheduler=scheduler,
         vae=vae,
         scaling_factor=scaling_factor,
         eval_clf=eval_clf,
     )
+    if model_cfg.model_type == "dit":
+        from models.spatial_dit import LatentSpatialDiT
+
+        model = LatentSpatialDiT(**model_kwargs)
+    else:
+        model = SpatialLatentUNet(**model_kwargs)
 
     if accelerator.is_main_process:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

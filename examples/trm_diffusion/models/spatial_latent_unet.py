@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from diffusers import UNet2DConditionModel
 from tqdm.auto import tqdm
 
-from datasets.mnist_sudoku_dataset import get_solution_tokens
+from datasets.mnist_sudoku_dataset import get_solution_tokens  # kept for eval metrics only
 from eval.mnist_eval import evaluate_grids, make_panel_image
 from models.latent_dit import ConditionEncoder
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
@@ -100,6 +100,17 @@ class SpatialLatentConfig:
     threshold_n_max: int = 3  # 3 splits → 4 levels
     threshold_val_min: float = 0.2
     threshold_val_max: float = 0.8
+
+    # Model type: "unet" (UNet2DConditionModel + cross-attention) or "dit" (SpatialDiT + channel concat)
+    model_type: str = "unet"
+
+    # DiT-specific (only used when model_type="dit")
+    patch_size: int = 4
+    n_heads: int = 8
+    attention_head_dim: int = 64
+    n_layers: int = 6
+    mlp_ratio: float = 4.0
+    t_freq_dim: int = 256
 
     # Timestep mode
     # "discrete"   — T_field values are integers in [0, T_max-1], alpha_bar looked up
@@ -226,14 +237,14 @@ class SpatialLatentUNet(nn.Module):
         t = t.clamp(0, T_max - 1)
         return t if self.model_cfg.continuous_time else t.long()
 
-    def _add_noise(self, x0: torch.Tensor, noise: torch.Tensor,
-                   T_field: torch.Tensor, T_max: int) -> torch.Tensor:
+    def _add_noise(self, x0: torch.Tensor, noise: torch.Tensor, T_field: torch.Tensor, T_max: int) -> torch.Tensor:
         if self.model_cfg.continuous_time:
             return add_noise_spatial_c(x0, noise, T_field, T_max)
         return add_noise_spatial(x0, noise, T_field, self.alphas_cumprod)
 
-    def _ddim_step(self, z: torch.Tensor, x0_pred: torch.Tensor,
-                   T_old: torch.Tensor, T_new: torch.Tensor, T_max: int) -> torch.Tensor:
+    def _ddim_step(
+        self, z: torch.Tensor, x0_pred: torch.Tensor, T_old: torch.Tensor, T_new: torch.Tensor, T_max: int
+    ) -> torch.Tensor:
         if self.model_cfg.continuous_time:
             return ddim_step_spatial_c(z, x0_pred, T_old, T_new, T_max)
         return ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
@@ -351,8 +362,7 @@ class SpatialLatentUNet(nn.Module):
 
         for mb in micro_batches:
             images = mb["images"].to(device)
-            solution = mb["solution"].to(device)
-            condition_tokens = get_solution_tokens(solution)
+            condition_tokens = mb["puzzle_tokens"].to(device)  # given cells only — not full solution
             B = images.shape[0]
 
             z0 = self._encode(images)
@@ -394,11 +404,15 @@ class SpatialLatentUNet(nn.Module):
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1
-        return {
-            "nll_loss": total_loss / K,
-            "p_refine": p_refine,
-            **{k: v / K for k, v in total_comps.items()},
-        }, lr, global_step
+        return (
+            {
+                "nll_loss": total_loss / K,
+                "p_refine": p_refine,
+                **{k: v / K for k, v in total_comps.items()},
+            },
+            lr,
+            global_step,
+        )
 
     def _train_step_teacher_guided(
         self,
@@ -419,8 +433,7 @@ class SpatialLatentUNet(nn.Module):
 
         for mb in micro_batches:
             images = mb["images"].to(device)
-            solution = mb["solution"].to(device)
-            condition_tokens = get_solution_tokens(solution)
+            condition_tokens = mb["puzzle_tokens"].to(device)  # given cells only — not full solution
             B = images.shape[0]
 
             z0 = self._encode(images)
@@ -464,18 +477,22 @@ class SpatialLatentUNet(nn.Module):
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1
-        return {
-            "nll_loss": total_loss / K,
-            "stage": 1 if in_stage1 else 2,
-            **{k: v / K for k, v in total_comps.items()},
-        }, lr, global_step
+        return (
+            {
+                "nll_loss": total_loss / K,
+                "stage": 1 if in_stage1 else 2,
+                **{k: v / K for k, v in total_comps.items()},
+            },
+            lr,
+            global_step,
+        )
 
     # ── T-field visualisation ──────────────────────────────────────────────────
 
     def _tfield_panels(
         self,
-        images: torch.Tensor,    # (N, 1, H, W) pixel images [0,1]
-        T_field: torch.Tensor,   # (N, 1, lH, lW) float or long
+        images: torch.Tensor,  # (N, 1, H, W) pixel images [0,1]
+        T_field: torch.Tensor,  # (N, 1, lH, lW) float or long
         T_max: int,
     ) -> list:
         """
@@ -484,19 +501,19 @@ class SpatialLatentUNet(nn.Module):
         then blended 50/50 with the greyscale image for the overlay column.
         """
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.cm as cm
 
         B, _, H, W = images.shape
-        t_norm = T_field.float() / (T_max - 1)                           # (N,1,lH,lW) in [0,1]
-        t_up = F.interpolate(t_norm, size=(H, W), mode="bilinear",
-                             align_corners=False).squeeze(1)              # (N,H,W)
+        t_norm = T_field.float() / (T_max - 1)  # (N,1,lH,lW) in [0,1]
+        t_up = F.interpolate(t_norm, size=(H, W), mode="bilinear", align_corners=False).squeeze(1)  # (N,H,W)
         cmap = cm.get_cmap("plasma")
         sep = np.full((H, 4, 3), 180, dtype=np.uint8)
         panels = []
         for i in range(B):
             img = (images[i, 0].cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
-            img_rgb = np.stack([img] * 3, axis=-1)                        # (H,W,3)
+            img_rgb = np.stack([img] * 3, axis=-1)  # (H,W,3)
             heat = (cmap(t_up[i].cpu().numpy())[:, :, :3] * 255).astype(np.uint8)
             overlay = ((img_rgb / 2.0) + (heat / 2.0)).astype(np.uint8)
             panels.append(np.concatenate([img_rgb, sep, overlay, sep, heat], axis=1))
@@ -512,11 +529,10 @@ class SpatialLatentUNet(nn.Module):
         cfg = self.model_cfg
         batch = next(iter(dataloader))
         images = batch["images"][:n_samples].to(device)
-        solution = batch["solution"][:n_samples].to(device)
         B = images.shape[0]
         _, _, H, W = images.shape
 
-        condition_tokens = get_solution_tokens(solution)
+        condition_tokens = batch["puzzle_tokens"][:n_samples].to(device)
         z0 = self._encode(images)
         _, _, lH, lW = z0.shape
 
@@ -530,42 +546,37 @@ class SpatialLatentUNet(nn.Module):
             z_noisy = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
             t_cond = self.teacher_cond_enc(condition_tokens)
             _, log_var_t = self._run_unet(z_noisy, T_uni, t_cond, self.teacher)
-            U_raw = log_var_t.sigmoid()   # (B, 1, lH, lW) in (0,1)
+            U_raw = log_var_t.sigmoid()  # (B, 1, lH, lW) in (0,1)
 
             aug_tfields = {}
 
             if cfg.aug_prob_vanilla > 0:
-                aug_tfields["vanilla"] = self._make_t_field(
-                    t_base, cfg.tau_student, U_raw, T_max)
+                aug_tfields["vanilla"] = self._make_t_field(t_base, cfg.tau_student, U_raw, T_max)
 
             if cfg.aug_prob_power > 0:
                 gamma = (cfg.power_gamma_min + cfg.power_gamma_max) / 2.0
-                aug_tfields["power"] = self._make_t_field(
-                    t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
+                aug_tfields["power"] = self._make_t_field(t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
 
             if cfg.aug_prob_threshold > 0:
                 n = max(1, (cfg.threshold_n_min + cfg.threshold_n_max) // 2)
                 mid = (cfg.threshold_val_min + cfg.threshold_val_max) / 2.0
                 splits = torch.linspace(
-                    cfg.threshold_val_min, cfg.threshold_val_max, n,
-                    device=device, dtype=torch.float32)
+                    cfg.threshold_val_min, cfg.threshold_val_max, n, device=device, dtype=torch.float32
+                )
                 bucket = torch.bucketize(U_raw.squeeze(1), splits).float() / n
-                aug_tfields["threshold"] = self._make_t_field(
-                    t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
+                aug_tfields["threshold"] = self._make_t_field(t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
 
             if cfg.aug_prob_perlin > 0:
-                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
-                                            n_octaves=cfg.n_octaves)
+                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
                 aug_tfields["perlin_aug"] = self._make_t_field(
-                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max)
+                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max
+                )
 
         # ── Perlin mode: show Path A and Path B Perlin fields ──────────────────
         else:
             aug_tfields = {}
-            perlin_a = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
-                                          n_octaves=cfg.n_octaves)
-            aug_tfields["perlin_pathA"] = self._make_t_field(
-                t_base, cfg.tau_init, perlin_a, T_max)
+            perlin_a = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+            aug_tfields["perlin_pathA"] = self._make_t_field(t_base, cfg.tau_init, perlin_a, T_max)
 
             if cfg.p_refine_max > 0:
                 # Simulate Path B: use teacher uncertainty × perlin
@@ -574,10 +585,8 @@ class SpatialLatentUNet(nn.Module):
                 t_cond = self.teacher_cond_enc(condition_tokens)
                 _, log_var_t = self._run_unet(z_init, T_init, t_cond, self.teacher)
                 U_teacher = log_var_t.sigmoid()
-                perlin_b = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
-                                              n_octaves=cfg.n_octaves)
-                aug_tfields["perlin_pathB"] = self._make_t_field(
-                    t_base, cfg.tau_student, U_teacher * perlin_b, T_max)
+                perlin_b = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+                aug_tfields["perlin_pathB"] = self._make_t_field(t_base, cfg.tau_student, U_teacher * perlin_b, T_max)
 
         # ── Build wandb log dict ────────────────────────────────────────────────
         log_dict = {}
@@ -585,6 +594,7 @@ class SpatialLatentUNet(nn.Module):
             panels = self._tfield_panels(images, T_field, T_max)
             try:
                 import wandb
+
                 log_dict[f"val/tfield_{aug_name}"] = [wandb.Image(p) for p in panels]
             except Exception:
                 pass
@@ -592,6 +602,7 @@ class SpatialLatentUNet(nn.Module):
         if log_dict:
             try:
                 import wandb
+
                 tracker = accelerator.get_tracker("wandb", unwrap=True)
                 tracker.log(log_dict, step=step)
             except Exception:
@@ -618,11 +629,10 @@ class SpatialLatentUNet(nn.Module):
             if i >= max_batches:
                 break
             images = batch["images"].to(device)
-            solution = batch["solution"].to(device)
             B = images.shape[0]
             z0 = self._encode(images)
             _, _, lH, lW = z0.shape
-            cond_emb = self.cond_encoder(get_solution_tokens(solution))
+            cond_emb = self.cond_encoder(batch["puzzle_tokens"].to(device))
 
             t_base = torch.randint(0, T_max, (B,), device=device).float()
             perlin = smooth_noise_field(B, lH, lW, self.model_cfg.f_spatial, device)
@@ -636,8 +646,7 @@ class SpatialLatentUNet(nn.Module):
 
         if val_losses:
             n = len(val_losses)
-            result = {"nll_loss": float(np.mean(val_losses)),
-                      **{k: v / n for k, v in val_comps.items()}}
+            result = {"nll_loss": float(np.mean(val_losses)), **{k: v / n for k, v in val_comps.items()}}
         else:
             result = {}
 
@@ -654,7 +663,7 @@ class SpatialLatentUNet(nn.Module):
                 if n_done >= n_total:
                     break
                 solutions = batch["solution"]
-                condition_tokens = get_solution_tokens(solutions.to(device))
+                condition_tokens = batch["puzzle_tokens"].to(device)
                 given_masks = batch.get("given_mask")
                 conditions_pixel = batch.get("conditions")
                 B = condition_tokens.shape[0]
@@ -724,7 +733,7 @@ class SpatialLatentUNet(nn.Module):
                 if n_done_u >= n_total:
                     break
                 solutions = batch["solution"]
-                condition_tokens = get_solution_tokens(solutions.to(device))
+                condition_tokens = batch["puzzle_tokens"].to(device)
                 given_masks = batch.get("given_mask")
                 conditions_pixel = batch.get("conditions")
                 B = condition_tokens.shape[0]
@@ -750,7 +759,10 @@ class SpatialLatentUNet(nn.Module):
 
                 generated_u = self._decode(z)
                 acc_u = evaluate_grids(
-                    generated_u, solutions, self.eval_clf, self.cell_size,
+                    generated_u,
+                    solutions,
+                    self.eval_clf,
+                    self.cell_size,
                     given_masks=given_masks,
                 )
                 all_cell_acc_u.append(acc_u["cell_acc"])
@@ -788,7 +800,9 @@ class SpatialLatentUNet(nn.Module):
         # T-field visualisation (main process, wandb only)
         if accelerator.is_main_process and step is not None:
             self._log_tfield_panels(
-                dataloader, accelerator, step,
+                dataloader,
+                accelerator,
+                step,
                 n_samples=num_log_images,
                 T_max=T_max,
                 device=device,
