@@ -126,6 +126,7 @@ train:
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 eval:
+  batch_size: 256      # smaller than train to avoid OOM across 3 eval passes + T-field viz
   eval_every: 2000
   save_every: 10000
   log_every: 100
