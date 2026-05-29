@@ -578,28 +578,26 @@ class LatentSpatialDiT(nn.Module):
 
         # Sampling + accuracy eval
         if self.eval_clf is not None and accelerator.is_main_process:
-            all_cell_acc, all_puzzle_acc = [], []
-            n_done, n_total = 0, num_samples
-            panel_images = []
-            dt = T_max / num_ddim_steps
             C = self.model_cfg.latent_channels
             lH = lW = self.model_cfg.latent_size
+            dt = T_max / num_ddim_steps
+            _dtype = torch.float32 if self.model_cfg.continuous_time else torch.long
 
+            # ── Spatial (confidence-driven) sampling ──────────────────────────
+            all_cell_acc, all_puzzle_acc, panel_images = [], [], []
+            n_done = 0
             for batch in tqdm(dataloader, desc="Sampling (spatial)", leave=False):
-                if n_done >= n_total:
+                if n_done >= num_samples:
                     break
                 solutions = batch["solution"]
                 puzzle_tokens = batch["puzzle_tokens"].to(device)
                 given_masks = batch.get("given_mask")
                 conditions_pixel = batch.get("conditions")
                 B = puzzle_tokens.shape[0]
-
                 null_tokens = torch.ones_like(puzzle_tokens) if cfg_scale > 1.0 else None
 
                 z = torch.randn(B, C, lH, lW, device=device)
-                _dtype = torch.float32 if self.model_cfg.continuous_time else torch.long
                 T_field = torch.full((B, 1, lH, lW), float(T_max - 1), device=device, dtype=_dtype)
-
                 for _ in range(num_ddim_steps):
                     T_old = T_field.clone()
                     x0_pred, log_var = self._run_model(z, T_field, puzzle_tokens, self.dit)
@@ -620,7 +618,6 @@ class LatentSpatialDiT(nn.Module):
                 all_cell_acc.append(acc["cell_acc"])
                 all_puzzle_acc.append(acc["puzzle_acc"])
                 n_done += B
-
                 if len(panel_images) < num_log_images and conditions_pixel is not None:
                     for j in range(min(num_log_images - len(panel_images), B)):
                         panel_images.append(
@@ -634,14 +631,157 @@ class LatentSpatialDiT(nn.Module):
             result["cell_acc"] = float(np.mean(all_cell_acc))
             result["puzzle_acc"] = float(np.mean(all_puzzle_acc))
 
-            if panel_images and step is not None:
+            # ── Uniform DDIM sampling (baseline comparison) ───────────────────
+            all_cell_acc_u, all_puzzle_acc_u, panel_images_u = [], [], []
+            n_done_u = 0
+            uniform_ts = torch.linspace(T_max - 1, 0, num_ddim_steps + 1).long()
+            for batch in tqdm(dataloader, desc="Sampling (uniform)", leave=False):
+                if n_done_u >= num_samples:
+                    break
+                solutions = batch["solution"]
+                puzzle_tokens = batch["puzzle_tokens"].to(device)
+                given_masks = batch.get("given_mask")
+                conditions_pixel = batch.get("conditions")
+                B = puzzle_tokens.shape[0]
+                null_tokens = torch.ones_like(puzzle_tokens) if cfg_scale > 1.0 else None
+
+                z = torch.randn(B, C, lH, lW, device=device)
+                for s in range(num_ddim_steps):
+                    t_val, t_next = uniform_ts[s].item(), uniform_ts[s + 1].item()
+                    T_old = torch.full((B, 1, lH, lW), t_val, device=device, dtype=_dtype)
+                    T_new = torch.full((B, 1, lH, lW), t_next, device=device, dtype=_dtype)
+                    x0_pred, _ = self._run_model(z, T_old, puzzle_tokens, self.dit)
+                    if cfg_scale > 1.0:
+                        x0_uncond, _ = self._run_model(z, T_old, null_tokens, self.dit)
+                        x0_pred = x0_uncond + cfg_scale * (x0_pred - x0_uncond)
+                    z = self._ddim_step(z, x0_pred, T_old, T_new, T_max)
+
+                generated_u = self._decode(z)
+                acc_u = evaluate_grids(generated_u, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
+                all_cell_acc_u.append(acc_u["cell_acc"])
+                all_puzzle_acc_u.append(acc_u["puzzle_acc"])
+                n_done_u += B
+                if len(panel_images_u) < num_log_images and conditions_pixel is not None:
+                    for j in range(min(num_log_images - len(panel_images_u), B)):
+                        panel_images_u.append(
+                            make_panel_image(
+                                condition=conditions_pixel[j],
+                                generated=generated_u[j].cpu(),
+                                solution=solutions[j].cpu().numpy(),
+                            )
+                        )
+
+            result["cell_acc_uniform"] = float(np.mean(all_cell_acc_u))
+            result["puzzle_acc_uniform"] = float(np.mean(all_puzzle_acc_u))
+
+            # ── Log images ────────────────────────────────────────────────────
+            if step is not None:
                 try:
                     import wandb
 
                     tracker = accelerator.get_tracker("wandb", unwrap=True)
-                    tracker.log({"val/examples": [wandb.Image(img) for img in panel_images]}, step=step)
+                    tracker.log(
+                        {
+                            "val/examples_spatial": [wandb.Image(img) for img in panel_images],
+                            "val/examples_uniform": [wandb.Image(img) for img in panel_images_u],
+                        },
+                        step=step,
+                    )
                 except Exception:
                     pass
 
+            # ── T-field heatmap visualisation ─────────────────────────────────
+            if step is not None:
+                self._log_tfield_panels(dataloader, accelerator, step, num_log_images, T_max, device)
+
         self.train()
         return result
+
+    # ── T-field visualisation (identical to SpatialLatentUNet) ────────────────
+
+    def _tfield_panels(self, images, T_field, T_max, H, W):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.cm as cm
+
+        B = images.shape[0]
+        t_norm = T_field.float() / (T_max - 1)
+        t_up = F.interpolate(t_norm, size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
+        cmap = cm.get_cmap("plasma")
+        sep = np.full((H, 4, 3), 180, dtype=np.uint8)
+        panels = []
+        for i in range(B):
+            img = (images[i, 0].cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            img_rgb = np.stack([img] * 3, axis=-1)
+            heat = (cmap(t_up[i].cpu().numpy())[:, :, :3] * 255).astype(np.uint8)
+            overlay = ((img_rgb / 2.0) + (heat / 2.0)).astype(np.uint8)
+            panels.append(np.concatenate([img_rgb, sep, overlay, sep, heat], axis=1))
+        return panels
+
+    @torch.no_grad()
+    def _log_tfield_panels(self, dataloader, accelerator, step, n_samples, T_max, device):
+        cfg = self.model_cfg
+        batch = next(iter(dataloader))
+        images = batch["images"][:n_samples].to(device)
+        puzzle_tokens = batch["puzzle_tokens"][:n_samples].to(device)
+        B = images.shape[0]
+        _, _, H, W = images.shape
+
+        z0 = self._encode(images)
+        _, _, lH, lW = z0.shape
+        t_base = torch.randint(0, T_max, (B,), device=device).float()
+
+        if cfg.noise_mode == "teacher_guided":
+            T_uni_f = t_base[:, None, None, None].expand(B, 1, lH, lW)
+            T_uni = T_uni_f if cfg.continuous_time else T_uni_f.long()
+            z_u = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
+            _, log_var_t = self._run_model(z_u, T_uni, puzzle_tokens, self.teacher)
+            U_raw = log_var_t.sigmoid()
+
+            aug_tfields = {}
+            if cfg.aug_prob_vanilla > 0:
+                aug_tfields["vanilla"] = self._make_t_field(t_base, cfg.tau_student, U_raw, T_max)
+            if cfg.aug_prob_power > 0:
+                gamma = (cfg.power_gamma_min + cfg.power_gamma_max) / 2.0
+                aug_tfields["power"] = self._make_t_field(t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
+            if cfg.aug_prob_threshold > 0:
+                n = max(1, (cfg.threshold_n_min + cfg.threshold_n_max) // 2)
+                splits = torch.linspace(cfg.threshold_val_min, cfg.threshold_val_max, n, device=device)
+                bucket = torch.bucketize(U_raw.squeeze(1), splits).float() / n
+                aug_tfields["threshold"] = self._make_t_field(t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
+            if cfg.aug_prob_perlin > 0:
+                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+                aug_tfields["perlin_aug"] = self._make_t_field(
+                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max
+                )
+        else:
+            aug_tfields = {}
+            perlin_a = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+            aug_tfields["perlin_pathA"] = self._make_t_field(t_base, cfg.tau_init, perlin_a, T_max)
+            if cfg.p_refine_max > 0:
+                T_init = aug_tfields["perlin_pathA"]
+                z_i = self._add_noise(z0, torch.randn_like(z0), T_init, T_max)
+                _, log_var_t = self._run_model(z_i, T_init, puzzle_tokens, self.teacher)
+                U_t = log_var_t.sigmoid()
+                perlin_b = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+                aug_tfields["perlin_pathB"] = self._make_t_field(t_base, cfg.tau_student, U_t * perlin_b, T_max)
+
+        log_dict = {}
+        for aug_name, T_field in aug_tfields.items():
+            panels = self._tfield_panels(images, T_field, T_max, H, W)
+            try:
+                import wandb
+
+                log_dict[f"val/tfield_{aug_name}"] = [wandb.Image(p) for p in panels]
+            except Exception:
+                pass
+
+        if log_dict:
+            try:
+                import wandb
+
+                tracker = accelerator.get_tracker("wandb", unwrap=True)
+                tracker.log(log_dict, step=step)
+            except Exception:
+                pass
