@@ -31,11 +31,10 @@ class GroupBatchSampler(Sampler[list[int]]):
         self.seed = seed
         self.epoch = 0
 
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
     def __iter__(self) -> Iterator[list[int]]:
         rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+
         group_order = rng.permutation(self.n_groups)
 
         batch: list[int] = []
@@ -93,7 +92,8 @@ class SokobanBitDataset(Dataset):
 
     def _int2bits(self, x, n, out_dtype=None):
         """Convert an integer x in (...) into bits in (..., n)."""
-        x = torch.bitwise_right_shift(torch.unsqueeze(x, -1), torch.arange(n))
+        shift_tensor = torch.arange(n, dtype=x.dtype, device=x.device)
+        x = torch.bitwise_right_shift(torch.unsqueeze(x, -1), shift_tensor)
         x = torch.remainder(x, 2)
         if out_dtype and out_dtype != x.dtype:
             x = x.to(out_dtype)
@@ -173,45 +173,49 @@ class SokobanDataset(Dataset):
                 trajectory_np = np.argmax(trajectory, axis=3).astype(np.uint8)
                 traj_len = len(trajectory_np)
 
-                # Subsample: take at most max_boards_per_trajectory boards
-                sample_size = min(self.max_boards_per_trajectory, traj_len)
-                selected_indices = rng.choice(traj_len, size=sample_size, replace=False)
-                selected_indices.sort()
-                trajectory_np = trajectory_np[selected_indices]
-
-                boards_list.append(trajectory_np)
-                trajectory_start_idx.append(current_global_idx)
-
+                valid_pairs = []
                 if self.k is None or self.k == 0:
-                    for i in range(sample_size):
-                        samples.append(current_global_idx + i)
+                    for i in range(traj_len):
+                        valid_pairs.append({"b_step": i, "t_step": i, "k_val": 0, "k_lbl": None})
                 else:
                     k_values = self.k if isinstance(self.k, list) else [self.k]
-
-                    for i in range(sample_size):
+                    for i in range(traj_len):
                         for k_val in k_values:
-                            if i + k_val < sample_size:
-                                b_idx = current_global_idx + i
-                                t_idx = current_global_idx + i + k_val
+                            if i + k_val < traj_len:
                                 k_lbl = self.k_label[k_val] if self.k_label else None
-                                current_step = int(selected_indices[i])
-                                samples.append((b_idx, t_idx, k_val, k_lbl, current_step))
+                                valid_pairs.append({"b_step": i, "t_step": i + k_val, "k_val": k_val, "k_lbl": k_lbl})
 
-                current_global_idx += sample_size
+                sample_size = min(self.max_boards_per_trajectory, len(valid_pairs))
+                if sample_size == 0:
+                    continue
+
+                selected_pair_indices = rng.choice(len(valid_pairs), size=sample_size, replace=False)
+                trajectory_start_idx.append(current_global_idx)
+                boards_list.append(trajectory_np)
+
+                for idx in selected_pair_indices:
+                    pair = valid_pairs[idx]
+                    b_idx = current_global_idx + pair["b_step"]
+                    t_idx = current_global_idx + pair["t_step"]
+                    samples.append((b_idx, t_idx, pair["k_val"], pair["k_lbl"], pair["b_step"]))
+
+                current_global_idx += traj_len
                 group_boundaries.append(len(samples))
                 trajectories_loaded += 1
 
-                if self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories:
-                    break
-                if self.max_boards is not None and current_global_idx >= self.max_boards:
+                if (self.max_boards is not None and current_global_idx >= self.max_boards) or \
+                    (self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories):
                     break
 
-            if self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories:
-                break
-            if self.max_boards is not None and current_global_idx >= self.max_boards:
-                break
+            if (self.max_boards is not None and current_global_idx >= self.max_boards) or \
+                    (self.max_trajectories is not None and trajectories_loaded >= self.max_trajectories):
+                    break
 
         final_boards = np.concatenate(boards_list, axis=0)
         self.group_boundaries = group_boundaries
 
         return final_boards, trajectory_start_idx, samples
+
+
+
+SokobanDataset("./sokoban/data/raw/12-12-4")

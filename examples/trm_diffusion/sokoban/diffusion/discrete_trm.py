@@ -369,6 +369,7 @@ class ACTMaskedDiffusionWrapper(nn.Module):
         halted = torch.zeros(B, dtype=torch.bool, device=device)
 
         halt_loss_accum = torch.tensor(0.0, device=device)
+        lm_loss_accum = torch.tensor(0.0, device=device)
         total_active_steps = torch.tensor(0.0, device=device)
 
         final_logits = None
@@ -385,11 +386,24 @@ class ACTMaskedDiffusionWrapper(nn.Module):
                 step_seq_correct = step_correct_at_mask.all(dim=1).float()
 
             active_mask = (~halted).float()
+            total_active_steps += active_mask.sum()
+
+            # TOKEN LOSS
+            step_per_token_loss = F.cross_entropy(
+                logits.float().reshape(-1, self.inner.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+                weight=self.class_weights,
+                reduction="none",
+            ).reshape(B, self.inner.seq_len)
+            step_lm_loss = step_per_token_loss.sum(dim=1) / mask_counts  # [B]
+            lm_loss_accum += (step_lm_loss * active_mask).sum()
+
+            # HALT LOSS
             step_halt_loss = F.binary_cross_entropy_with_logits(
                 q_halt, step_seq_correct, reduction="none"
             )
             halt_loss_accum += (step_halt_loss * active_mask).sum()
-            total_active_steps += active_mask.sum()
 
             # MASK UPDATE
             steps = steps + (~halted).int()
@@ -424,22 +438,12 @@ class ACTMaskedDiffusionWrapper(nn.Module):
             n_correct = ((final_preds == x_0) & is_masked).float().sum().item()
             final_seq_correct = ((final_preds == x_0) | ~is_masked).all(dim=1).float()
 
-        halt_loss = halt_loss_accum / total_active_steps.clamp_min(1.0)
+        safe_steps = total_active_steps.clamp_min(1.0)
+        halt_loss = halt_loss_accum / safe_steps
+        lm_loss = lm_loss_accum / safe_steps
 
-        # TOKEN LOSS
-        per_token_loss = F.cross_entropy(
-            final_logits.float().reshape(-1, self.inner.vocab_size),
-            labels.reshape(-1),
-            ignore_index=-100,
-            weight=self.class_weights,
-            reduction="none",
-        ).reshape(B, self.inner.seq_len)
-
-        per_sample_loss = per_token_loss.sum(dim=1) / mask_counts  # [B]
-        lm_loss = per_sample_loss.mean()
-
-        # TOTAL LOSS AND METRICS
-        total_loss = lm_loss + self.halt_loss_weight * halt_loss
+        # TOTAL LOSS
+        total_loss = lm_loss + (self.halt_loss_weight * halt_loss)
 
         metrics: Dict[str, object] = {
             "lm_loss": lm_loss.detach().item(),

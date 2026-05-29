@@ -1,5 +1,5 @@
 import sys
-import time
+from xml.parsers.expat import model
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -164,7 +164,6 @@ def main(args: DictConfig):
     # Safely target the core model if it's wrapped
     unet_for_ema = model.core_model if hasattr(model, "core_model") else model
 
-    # FIX: Odwijamy model ze struktury torch.compile dla zapisów EMA
     if hasattr(unet_for_ema, "_orig_mod"):
         unet_for_ema_uncompiled = unet_for_ema._orig_mod
     else:
@@ -275,18 +274,11 @@ def main(args: DictConfig):
 
     mult = getattr(model, "n_sup", 1) if not hasattr(args.model, "n_sup") else getattr(args.model, "n_sup", 1)
 
-    if args.grad_every_n_sup:
-        total_training_steps = len(train_dl) * args.num_epochs * mult
-        warmup_steps = args.lr_scheduler.warmup_steps * mult
-    else:
-        total_training_steps = (len(train_dl) // args.gradient_accumulation_steps) * args.num_epochs
-        warmup_steps = args.lr_scheduler.warmup_steps
-
     lr_scheduler = get_scheduler(
         args.lr_scheduler.name,
         optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_training_steps,
+        num_warmup_steps=args.lr_scheduler.warmup_steps * args.gradient_accumulation_steps * mult,
+        num_training_steps=len(train_dl) * args.num_epochs * mult,
     )
 
     if hasattr(model, "get_trainable_modules"):
@@ -300,7 +292,7 @@ def main(args: DictConfig):
     if args.use_ema:
         ema_model.to(accelerator.device)
 
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and args.logger == "wandb":
         tracker_config = OmegaConf.to_container(args, resolve=True)
         tracker_config["total_params"] = total_params
         tracker_config["trainable_params"] = trainable_params
@@ -312,6 +304,9 @@ def main(args: DictConfig):
             config=tracker_config,
             init_kwargs={"wandb": {"name": run_name}} if args.logger == "wandb" else {},
         )
+    elif accelerator.is_main_process:
+        run = os.path.split(__file__)[-1].split(".")[0]
+        accelerator.init_trackers(run)
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -365,8 +360,6 @@ def main(args: DictConfig):
         progress_bar.set_description(f"Epoch {epoch}")
 
         for step, batch in SafeIterator(enumerate(train_dl), logger=logger):
-            step_start_time = time.monotonic()
-
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -428,25 +421,10 @@ def main(args: DictConfig):
 
                     loss_full = None
 
-                    if hasattr(base_model, "encode_features"):
-                        x_high, enc_hs, ts, embedded_ts, class_labels, enc_mask, autocast_ctx = base_model.encode_features(
-                            latent_model_input, timesteps, model_cond, mask
-                        )
-
                     n_sup_current = get_n_sup_phase(global_step, args.phases, args.n_sup_phases, base_model.n_sup)
                     for n_step in range(n_sup_current):
-                        if hasattr(base_model, "encode_features"):
-                            y_final_high, y, z = base_model.reasoning_core(
-                                x_high, y, z, enc_hs, ts, class_labels, enc_mask, autocast_ctx
-                            )
-                            model_output = base_model.decode_features(
-                                y_final_high, ts, class_labels, embedded_ts, autocast_ctx
-                            )
-                        else:
-                            model_output, y, z = base_model.reasoning_step(
-                                latent_model_input, y, z, timesteps, model_cond, mask
-                            )
-
+                        # with accelerator.autocast():
+                        model_output, y, z = base_model.reasoning_step(latent_model_input, y, z, timesteps, model_cond, mask)
                         loss = compute_loss(model_output, noise, clean_images, timesteps, noise_scheduler, args)
                         loss = loss if not args.trm_loss_nsup_decay else loss * (args.trm_loss_nsup_decay**n_step)
 
@@ -537,18 +515,11 @@ def main(args: DictConfig):
                     accelerator.save_state(save_path)
                     logger.info(f"Saved state to {save_path}")
 
-            step_time = time.monotonic() - step_start_time
-            logs = {
-                "train/loss": loss.detach().item(),
-                "train/step_time_sec": step_time,
-                "train/gpu_mem_mb": torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0,
-                "lr": lr_scheduler.get_last_lr()[0],
-                "step": global_step,
-            }
-            if hasattr(base_model, "reasoning_step"):
-                logs["train/n_sup"] = n_sup_current
+            logs = {"train/loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
+            if hasattr(base_model, "reasoning_step"):
+                logs["train/n_sup"] = n_sup_current
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
