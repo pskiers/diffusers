@@ -12,13 +12,18 @@ data:
 model:
   in_channels: 1
   out_channels: 1
+  # 3 blocks → 2 effective downsampling steps → 144/4 = 36 latent size.
+  # AutoencoderKL skips downsampling in the last block, so N blocks → N-1 halvings.
   down_block_types:
+    - "DownEncoderBlock2D"
     - "DownEncoderBlock2D"
     - "DownEncoderBlock2D"
   up_block_types:
     - "UpDecoderBlock2D"
     - "UpDecoderBlock2D"
+    - "UpDecoderBlock2D"
   block_out_channels:
+    - 32
     - 64
     - 128
   layers_per_block: 2

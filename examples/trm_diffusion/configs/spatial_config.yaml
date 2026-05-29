@@ -19,10 +19,13 @@ vae:
   down_block_types:
     - "DownEncoderBlock2D"
     - "DownEncoderBlock2D"
+    - "DownEncoderBlock2D"
   up_block_types:
     - "UpDecoderBlock2D"
     - "UpDecoderBlock2D"
+    - "UpDecoderBlock2D"
   block_out_channels:
+    - 32
     - 64
     - 128
   layers_per_block: 2
