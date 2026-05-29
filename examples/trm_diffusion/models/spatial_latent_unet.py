@@ -85,21 +85,30 @@ class SpatialLatentConfig:
     stage1_steps: int = 5000
 
     # Augmentation roulette probabilities (must sum to 1.0)
-    aug_prob_vanilla: float = 0.20  # raw U_teacher
-    aug_prob_power: float = 0.30  # U_teacher ^ gamma  (sharpens peaks)
-    aug_prob_threshold: float = 0.30  # quantise to n+1 levels at random thresholds
-    aug_prob_perlin: float = 0.20  # multiply by Perlin noise
+    aug_prob_vanilla: float = 0.20  # raw U_teacher → standard make_t_field
+    aug_prob_power: float = 0.30  # trajectory simulation (see below)
+    aug_prob_threshold: float = 0.30  # rank-based adaptive T assignment
+    aug_prob_perlin: float = 0.20  # U_teacher × Perlin noise → make_t_field
 
-    # Power: gamma ~ U(power_gamma_min, power_gamma_max)
-    power_gamma_min: float = 2.0
-    power_gamma_max: float = 4.0
+    # Power (denoising trajectory simulation):
+    #   T = T_max * (1 - progress * (1 - U_teacher))
+    #   progress ∈ [progress_min, progress_max] sampled per step.
+    #   Simulates the T_field after `progress` fraction of confidence-driven denoising:
+    #   confident pixels (low U) converge toward T=0; uncertain pixels stay near T_max.
+    progress_min: float = 0.1
+    progress_max: float = 0.9
 
-    # Thresholding: sample n ~ randint(n_min, n_max) split points from
-    #   U(val_min, val_max), then quantise mask to n+1 uniform levels
-    threshold_n_min: int = 1  # 1 split → binary (2 levels)
-    threshold_n_max: int = 3  # 3 splits → 4 levels
-    threshold_val_min: float = 0.2
-    threshold_val_max: float = 0.8
+    # Thresholding: rank pixels by U_teacher, split into n equal buckets,
+    #   assign n randomly sampled T values (ascending → low U gets low T).
+    #   Adaptive by construction — no fixed value range needed.
+    threshold_n_min: int = 1
+    threshold_n_max: int = 3
+
+    # Teacher evaluation timestep for power & threshold augmentations.
+    #   U_teacher is only informative at high noise levels; these augmentations
+    #   always evaluate the teacher in [T_max * teacher_t_min_frac, T_max).
+    #   Vanilla and perlin still use the batch's t_base.
+    teacher_t_min_frac: float = 0.6
 
     # Model type: "unet" (UNet2DConditionModel + cross-attention) or "dit" (SpatialDiT + channel concat)
     model_type: str = "unet"
@@ -250,41 +259,87 @@ class SpatialLatentUNet(nn.Module):
             return ddim_step_spatial_c(z, x0_pred, T_old, T_new, T_max)
         return ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
 
-    def _augment_mask(self, U: torch.Tensor, lH: int, lW: int, device: torch.device) -> torch.Tensor:
-        """
-        Apply one randomly-chosen augmentation to uncertainty mask U in [0,1].
-        Draws from the roulette defined in model_cfg.aug_prob_*.
-        """
+    def _select_aug(self, roll: float) -> str:
+        """Roulette selection — returns one of 'vanilla', 'power', 'threshold', 'perlin'."""
         cfg = self.model_cfg
-        roll = torch.rand(1).item()
         cum_v = cfg.aug_prob_vanilla
         cum_p = cum_v + cfg.aug_prob_power
         cum_t = cum_p + cfg.aug_prob_threshold
-
         if roll < cum_v:
-            # Vanilla — unchanged
-            return U
-
+            return "vanilla"
         if roll < cum_p:
-            # Power scaling: sharpen peaks, crush valleys
-            gamma = cfg.power_gamma_min + torch.rand(1).item() * (cfg.power_gamma_max - cfg.power_gamma_min)
-            return U.pow(gamma)
-
+            return "power"
         if roll < cum_t:
-            # Random quantisation: sample n split points, map to n+1 uniform levels
-            n = torch.randint(cfg.threshold_n_min, cfg.threshold_n_max + 1, (1,)).item()
-            splits = sorted(
-                cfg.threshold_val_min + torch.rand(n).tolist()[i] * (cfg.threshold_val_max - cfg.threshold_val_min)
-                for i in range(n)
-            )
-            boundaries = torch.tensor(splits, device=device, dtype=torch.float32)
-            bucket = torch.bucketize(U.squeeze(1), boundaries)  # (B, lH, lW) int
-            return (bucket.float() / n).unsqueeze(1)  # (B, 1, lH, lW) in [0,1]
+            return "threshold"
+        return "perlin"
 
-        # Perlin modulation: add organic blur to edges
+    def _teacher_t(self, aug_type: str, t_base: torch.Tensor, T_max: int, device: torch.device) -> torch.Tensor:
+        """
+        Choose the timestep at which to evaluate the teacher.
+        Power and threshold use a high-noise T so the teacher's uncertainty map is
+        spatially rich; vanilla and perlin use the batch's t_base (their T_field
+        formula anchors on t_base anyway).
+        """
+        if aug_type in ("power", "threshold"):
+            t_lo = int(T_max * self.model_cfg.teacher_t_min_frac)
+            return torch.randint(t_lo, T_max, t_base.shape, device=device).float()
+        return t_base
+
+    def _augment_mask(
+        self,
+        U: torch.Tensor,  # (B, 1, lH, lW) teacher uncertainty in [0,1]
+        aug_type: str,
+        t_base: torch.Tensor,  # (B,) — used only for vanilla / perlin
+        lH: int,
+        lW: int,
+        T_max: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Returns a T_field (B, 1, lH, lW) directly — callers no longer call _make_t_field.
+
+        vanilla  — make_t_field(t_base, tau_student, U)
+        power    — T = T_max * (1 - progress * (1 - U)), independent of t_base
+        threshold— sort pixels by U rank, assign n sampled T values (ascending),
+                   vectorised via argsort + scatter
+        perlin   — make_t_field(t_base, tau_student, U * Perlin)
+        """
+        cfg = self.model_cfg
         B = U.shape[0]
-        perlin = smooth_noise_field(B, lH, lW, self.model_cfg.f_spatial, device, n_octaves=self.model_cfg.n_octaves)
-        return (U * perlin).clamp(0.0, 1.0)
+
+        if aug_type == "vanilla":
+            return self._make_t_field(t_base, cfg.tau_student, U, T_max)
+
+        if aug_type == "power":
+            progress = cfg.progress_min + torch.rand(1).item() * (cfg.progress_max - cfg.progress_min)
+            T_field = (T_max * (1.0 - progress * (1.0 - U))).clamp(0, T_max - 1)
+            return T_field if cfg.continuous_time else T_field.long()
+
+        if aug_type == "threshold":
+            n = torch.randint(cfg.threshold_n_min, cfg.threshold_n_max + 1, (1,)).item()
+            U_flat = U.reshape(B, -1).float()  # (B, N)
+            N = U_flat.shape[1]
+            order = U_flat.argsort(dim=1)  # (B, N) ascending U — low U = confident
+
+            # n T values per sample, sorted ascending (confident rank → low T)
+            T_vals = (torch.rand(B, n, device=device) * T_max).sort(dim=1).values  # (B, n)
+
+            # Build sorted T map then scatter back to original pixel order
+            T_sorted = torch.zeros(B, N, device=device)
+            bucket_size = N // n
+            for i in range(n):
+                lo = i * bucket_size
+                hi = (i + 1) * bucket_size if i < n - 1 else N
+                T_sorted[:, lo:hi] = T_vals[:, i : i + 1].expand(B, hi - lo)
+
+            T_original = torch.zeros(B, N, device=device)
+            T_original.scatter_(1, order, T_sorted)  # pixel order[b,pos] gets T_sorted[b,pos]
+            T_field = T_original.reshape(B, 1, lH, lW).clamp(0, T_max - 1)
+            return T_field if cfg.continuous_time else T_field.long()
+
+        # perlin
+        perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
+        return self._make_t_field(t_base, cfg.tau_student, (U * perlin).clamp(0, 1), T_max)
 
     def _p_refine(self, step: int) -> float:
         cfg = self.model_cfg
@@ -455,16 +510,20 @@ class SpatialLatentUNet(nn.Module):
                 z_noisy = self._add_noise(z0, torch.randn_like(z0), T_uniform, T_max)
                 x0_pred, log_var = self._run_unet(z_noisy, T_uniform, cond_emb, self.unet)
             else:
-                # Stage 2: uniform noise → teacher → augment mask → structured T_student
-                z_uniform = self._add_noise(z0, torch.randn_like(z0), T_uniform, T_max)
+                # Stage 2: roll augmentation first, then evaluate teacher at the
+                # appropriate T (high-noise for power/threshold; t_base for others).
+                aug_type = self._select_aug(torch.rand(1).item())
+                t_teacher = self._teacher_t(aug_type, t_base, T_max, device)
+                T_teacher_f = t_teacher[:, None, None, None].expand(B, 1, lH, lW)
+                T_teacher = T_teacher_f if self.model_cfg.continuous_time else T_teacher_f.long()
+
+                z_teacher = self._add_noise(z0, torch.randn_like(z0), T_teacher, T_max)
                 with torch.no_grad():
                     _, log_var_t = self._run_unet(
-                        z_uniform, T_uniform, self.teacher_cond_enc(condition_tokens), self.teacher
+                        z_teacher, T_teacher, self.teacher_cond_enc(condition_tokens), self.teacher
                     )
                 U_raw = log_var_t.sigmoid()
-                U_aug = self._augment_mask(U_raw, lH, lW, device)
-
-                T_student = self._make_t_field(t_base, self.model_cfg.tau_student, U_aug, T_max)
+                T_student = self._augment_mask(U_raw, aug_type, t_base, lH, lW, T_max, device)
                 z_s = self._add_noise(z0, torch.randn_like(z0), T_student, T_max)
                 x0_pred, log_var = self._run_unet(z_s, T_student, cond_emb, self.unet)
 
@@ -538,40 +597,32 @@ class SpatialLatentUNet(nn.Module):
         _, _, lH, lW = z0.shape
 
         t_base = torch.randint(0, T_max, (B,), device=device).float()
+        t_cond = self.teacher_cond_enc(condition_tokens)
+
+        def _eval_teacher_at(t_vec):
+            """Evaluate teacher at uniform t_vec (B,), return U = log_var.sigmoid()."""
+            T_f = t_vec[:, None, None, None].expand(B, 1, lH, lW)
+            T_f = T_f if cfg.continuous_time else T_f.long()
+            z_n = self._add_noise(z0, torch.randn_like(z0), T_f, T_max)
+            _, lv = self._run_unet(z_n, T_f, t_cond, self.teacher)
+            return lv.sigmoid(), T_f
 
         # ── Teacher-guided mode: one panel set per active aug type ─────────────
         if cfg.noise_mode == "teacher_guided":
-            # Need teacher uncertainty as the base mask
-            T_uniform_f = t_base[:, None, None, None].expand(B, 1, lH, lW)
-            T_uni = T_uniform_f if cfg.continuous_time else T_uniform_f.long()
-            z_noisy = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
-            t_cond = self.teacher_cond_enc(condition_tokens)
-            _, log_var_t = self._run_unet(z_noisy, T_uni, t_cond, self.teacher)
-            U_raw = log_var_t.sigmoid()  # (B, 1, lH, lW) in (0,1)
+            # U at t_base (for vanilla/perlin) and at t_high (for power/threshold)
+            t_high = self._teacher_t("power", t_base, T_max, device)  # representative high T
+            U_base, _ = _eval_teacher_at(t_base)
+            U_high, _ = _eval_teacher_at(t_high)
 
             aug_tfields = {}
-
             if cfg.aug_prob_vanilla > 0:
-                aug_tfields["vanilla"] = self._make_t_field(t_base, cfg.tau_student, U_raw, T_max)
-
+                aug_tfields["vanilla"] = self._augment_mask(U_base, "vanilla", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_power > 0:
-                gamma = (cfg.power_gamma_min + cfg.power_gamma_max) / 2.0
-                aug_tfields["power"] = self._make_t_field(t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
-
+                aug_tfields["power"] = self._augment_mask(U_high, "power", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_threshold > 0:
-                n = max(1, (cfg.threshold_n_min + cfg.threshold_n_max) // 2)
-                mid = (cfg.threshold_val_min + cfg.threshold_val_max) / 2.0
-                splits = torch.linspace(
-                    cfg.threshold_val_min, cfg.threshold_val_max, n, device=device, dtype=torch.float32
-                )
-                bucket = torch.bucketize(U_raw.squeeze(1), splits).float() / n
-                aug_tfields["threshold"] = self._make_t_field(t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
-
+                aug_tfields["threshold"] = self._augment_mask(U_high, "threshold", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_perlin > 0:
-                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
-                aug_tfields["perlin_aug"] = self._make_t_field(
-                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max
-                )
+                aug_tfields["perlin_aug"] = self._augment_mask(U_base, "perlin", t_base, lH, lW, T_max, device)
 
         # ── Perlin mode: show Path A and Path B Perlin fields ──────────────────
         else:

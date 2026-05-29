@@ -464,11 +464,15 @@ class LatentSpatialDiT(nn.Module):
                     z_n = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
                     x0_pred, log_var = self._run_model(z_n, T_uni, puzzle_tokens, self.dit)
                 else:
-                    z_u = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
+                    aug_type = self._select_aug(torch.rand(1).item())
+                    t_teacher = self._teacher_t(aug_type, t_base, T_max, device)
+                    T_tf = t_teacher[:, None, None, None].expand(B, 1, lH, lW)
+                    T_tf = T_tf if self.model_cfg.continuous_time else T_tf.long()
+                    z_teacher = self._add_noise(z0, torch.randn_like(z0), T_tf, T_max)
                     with torch.no_grad():
-                        _, log_var_t = self._run_model(z_u, T_uni, puzzle_tokens, self.teacher)
-                    U_aug = self._augment_mask(log_var_t.sigmoid(), lH, lW, device)
-                    T_s = self._make_t_field(t_base, self.model_cfg.tau_student, U_aug, T_max)
+                        _, log_var_t = self._run_model(z_teacher, T_tf, puzzle_tokens, self.teacher)
+                    U_raw = log_var_t.sigmoid()
+                    T_s = self._augment_mask(U_raw, aug_type, t_base, lH, lW, T_max, device)
                     z_s = self._add_noise(z0, torch.randn_like(z0), T_s, T_max)
                     x0_pred, log_var = self._run_model(z_s, T_s, puzzle_tokens, self.dit)
             else:
@@ -510,30 +514,57 @@ class LatentSpatialDiT(nn.Module):
             metrics["p_refine"] = p_refine
         return metrics, lr, global_step
 
-    def _augment_mask(self, U, lH, lW, device):
-        """Same augmentation roulette as SpatialLatentUNet._augment_mask."""
+    def _select_aug(self, roll: float) -> str:
         cfg = self.model_cfg
-        roll = torch.rand(1).item()
         cum_v = cfg.aug_prob_vanilla
         cum_p = cum_v + cfg.aug_prob_power
         cum_t = cum_p + cfg.aug_prob_threshold
         if roll < cum_v:
-            return U
+            return "vanilla"
         if roll < cum_p:
-            gamma = cfg.power_gamma_min + torch.rand(1).item() * (cfg.power_gamma_max - cfg.power_gamma_min)
-            return U.pow(gamma)
+            return "power"
         if roll < cum_t:
-            n = torch.randint(cfg.threshold_n_min, cfg.threshold_n_max + 1, (1,)).item()
-            splits = sorted(
-                cfg.threshold_val_min + torch.rand(n).tolist()[i] * (cfg.threshold_val_max - cfg.threshold_val_min)
-                for i in range(n)
-            )
-            boundaries = torch.tensor(splits, device=device, dtype=torch.float32)
-            bucket = torch.bucketize(U.squeeze(1), boundaries)
-            return (bucket.float() / n).unsqueeze(1)
+            return "threshold"
+        return "perlin"
+
+    def _teacher_t(self, aug_type: str, t_base: torch.Tensor, T_max: int, device: torch.device) -> torch.Tensor:
+        if aug_type in ("power", "threshold"):
+            t_lo = int(T_max * self.model_cfg.teacher_t_min_frac)
+            return torch.randint(t_lo, T_max, t_base.shape, device=device).float()
+        return t_base
+
+    def _augment_mask(self, U, aug_type, t_base, lH, lW, T_max, device):
+        """Returns T_field directly. See SpatialLatentUNet._augment_mask for full doc."""
+        cfg = self.model_cfg
         B = U.shape[0]
+
+        if aug_type == "vanilla":
+            return self._make_t_field(t_base, cfg.tau_student, U, T_max)
+
+        if aug_type == "power":
+            progress = cfg.progress_min + torch.rand(1).item() * (cfg.progress_max - cfg.progress_min)
+            T_field = (T_max * (1.0 - progress * (1.0 - U))).clamp(0, T_max - 1)
+            return T_field if cfg.continuous_time else T_field.long()
+
+        if aug_type == "threshold":
+            n = torch.randint(cfg.threshold_n_min, cfg.threshold_n_max + 1, (1,)).item()
+            U_flat = U.reshape(B, -1).float()
+            N = U_flat.shape[1]
+            order = U_flat.argsort(dim=1)
+            T_vals = (torch.rand(B, n, device=device) * T_max).sort(dim=1).values
+            T_sorted = torch.zeros(B, N, device=device)
+            bucket_size = N // n
+            for i in range(n):
+                lo = i * bucket_size
+                hi = (i + 1) * bucket_size if i < n - 1 else N
+                T_sorted[:, lo:hi] = T_vals[:, i : i + 1].expand(B, hi - lo)
+            T_original = torch.zeros(B, N, device=device)
+            T_original.scatter_(1, order, T_sorted)
+            T_field = T_original.reshape(B, 1, lH, lW).clamp(0, T_max - 1)
+            return T_field if cfg.continuous_time else T_field.long()
+
         perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
-        return (U * perlin).clamp(0.0, 1.0)
+        return self._make_t_field(t_base, cfg.tau_student, (U * perlin).clamp(0, 1), T_max)
 
     # ── Eval step ──────────────────────────────────────────────────────────────
 
@@ -732,29 +763,27 @@ class LatentSpatialDiT(nn.Module):
         _, _, lH, lW = z0.shape
         t_base = torch.randint(0, T_max, (B,), device=device).float()
 
+        def _eval_teacher_at(t_vec):
+            T_f = t_vec[:, None, None, None].expand(B, 1, lH, lW)
+            T_f = T_f if cfg.continuous_time else T_f.long()
+            z_n = self._add_noise(z0, torch.randn_like(z0), T_f, T_max)
+            _, lv = self._run_model(z_n, T_f, puzzle_tokens, self.teacher)
+            return lv.sigmoid()
+
         if cfg.noise_mode == "teacher_guided":
-            T_uni_f = t_base[:, None, None, None].expand(B, 1, lH, lW)
-            T_uni = T_uni_f if cfg.continuous_time else T_uni_f.long()
-            z_u = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
-            _, log_var_t = self._run_model(z_u, T_uni, puzzle_tokens, self.teacher)
-            U_raw = log_var_t.sigmoid()
+            t_high = self._teacher_t("power", t_base, T_max, device)
+            U_base = _eval_teacher_at(t_base)
+            U_high = _eval_teacher_at(t_high)
 
             aug_tfields = {}
             if cfg.aug_prob_vanilla > 0:
-                aug_tfields["vanilla"] = self._make_t_field(t_base, cfg.tau_student, U_raw, T_max)
+                aug_tfields["vanilla"] = self._augment_mask(U_base, "vanilla", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_power > 0:
-                gamma = (cfg.power_gamma_min + cfg.power_gamma_max) / 2.0
-                aug_tfields["power"] = self._make_t_field(t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
+                aug_tfields["power"] = self._augment_mask(U_high, "power", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_threshold > 0:
-                n = max(1, (cfg.threshold_n_min + cfg.threshold_n_max) // 2)
-                splits = torch.linspace(cfg.threshold_val_min, cfg.threshold_val_max, n, device=device)
-                bucket = torch.bucketize(U_raw.squeeze(1), splits).float() / n
-                aug_tfields["threshold"] = self._make_t_field(t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
+                aug_tfields["threshold"] = self._augment_mask(U_high, "threshold", t_base, lH, lW, T_max, device)
             if cfg.aug_prob_perlin > 0:
-                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)
-                aug_tfields["perlin_aug"] = self._make_t_field(
-                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max
-                )
+                aug_tfields["perlin_aug"] = self._augment_mask(U_base, "perlin", t_base, lH, lW, T_max, device)
         else:
             aug_tfields = {}
             perlin_a = smooth_noise_field(B, lH, lW, cfg.f_spatial, device, n_octaves=cfg.n_octaves)

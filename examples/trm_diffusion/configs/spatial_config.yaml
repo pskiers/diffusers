@@ -94,16 +94,16 @@ model:
   aug_prob_threshold: 0.30
   aug_prob_perlin: 0.20
 
-  # Power scaling: gamma ~ U(power_gamma_min, power_gamma_max)
-  power_gamma_min: 2.0
-  power_gamma_max: 4.0
+  # Power (trajectory simulation): progress ~ U(progress_min, progress_max)
+  progress_min: 0.1
+  progress_max: 0.9
+  # Teacher evaluation min timestep fraction for power & threshold augmentations
+  teacher_t_min_frac: 0.6
 
   # Thresholding: n split points ~ randint(n_min, n_max),
   #   each drawn from U(val_min, val_max) → quantise to n+1 levels
   threshold_n_min: 1
-  threshold_n_max: 3
-  threshold_val_min: 0.2
-  threshold_val_max: 0.8
+  threshold_n_max: 4
 
   cell_size: 16
   painter_size: 144
