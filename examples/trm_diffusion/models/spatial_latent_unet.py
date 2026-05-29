@@ -531,7 +531,7 @@ class SpatialLatentUNet(nn.Module):
                             make_panel_image(
                                 condition=conditions_pixel[j],
                                 generated=generated[j].cpu(),
-                                solution=solutions[j].numpy(),
+                                solution=solutions[j].cpu().numpy(),
                             )
                         )
 
@@ -588,7 +588,7 @@ class SpatialLatentUNet(nn.Module):
                             make_panel_image(
                                 condition=conditions_pixel[j],
                                 generated=generated_u[j].cpu(),
-                                solution=solutions[j].numpy(),
+                                solution=solutions[j].cpu().numpy(),
                             )
                         )
 
