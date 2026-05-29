@@ -102,7 +102,7 @@ def main(cfg: DictConfig):
     )
     eval_dl = DataLoader(
         eval_ds,
-        batch_size=cfg.train.batch_size * 2,
+        batch_size=cfg.eval.get("batch_size", cfg.train.batch_size),
         shuffle=False,
         num_workers=n_workers,
         pin_memory=True,
