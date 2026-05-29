@@ -80,6 +80,7 @@ def _build_model_cfg(cfg: DictConfig) -> SpatialLatentConfig:
         threshold_n_max=int(m.get("threshold_n_max", 3)),
         threshold_val_min=float(m.get("threshold_val_min", 0.2)),
         threshold_val_max=float(m.get("threshold_val_max", 0.8)),
+        continuous_time=bool(m.get("continuous_time", False)),
         cell_size=cell_size,
         painter_size=cell_size * 9,
     )

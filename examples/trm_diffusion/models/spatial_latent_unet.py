@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import UNet2DConditionModel
 from tqdm.auto import tqdm
 
@@ -37,7 +38,9 @@ from models.latent_dit import ConditionEncoder
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.spatial_diffusion_utils import (
     add_noise_spatial,
+    add_noise_spatial_c,
     ddim_step_spatial,
+    ddim_step_spatial_c,
     gaussian_nll_loss,
     make_t_field,
     smooth_noise_field,
@@ -97,6 +100,14 @@ class SpatialLatentConfig:
     threshold_n_max: int = 3  # 3 splits → 4 levels
     threshold_val_min: float = 0.2
     threshold_val_max: float = 0.8
+
+    # Timestep mode
+    # "discrete"   — T_field values are integers in [0, T_max-1], alpha_bar looked up
+    #                from scheduler's alphas_cumprod table (original behaviour).
+    # "continuous" — T_field values are floats in [0, T_max), alpha_bar computed
+    #                analytically from the squaredcos_cap_v2 formula, giving smooth
+    #                spatial noise gradients.
+    continuous_time: bool = False
 
     # EMA teacher
     teacher_ema_rate: float = 0.999
@@ -208,6 +219,24 @@ class SpatialLatentUNet(nn.Module):
     @torch.no_grad()
     def _decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.vae.decode(z / self.scaling_factor).sample.clamp(0.0, 1.0)
+
+    def _make_t_field(self, t_base: torch.Tensor, tau: float, perlin: torch.Tensor, T_max: int) -> torch.Tensor:
+        """Return T_field as long (discrete) or float (continuous) depending on config."""
+        t = t_base[:, None, None, None].float() + tau * perlin
+        t = t.clamp(0, T_max - 1)
+        return t if self.model_cfg.continuous_time else t.long()
+
+    def _add_noise(self, x0: torch.Tensor, noise: torch.Tensor,
+                   T_field: torch.Tensor, T_max: int) -> torch.Tensor:
+        if self.model_cfg.continuous_time:
+            return add_noise_spatial_c(x0, noise, T_field, T_max)
+        return add_noise_spatial(x0, noise, T_field, self.alphas_cumprod)
+
+    def _ddim_step(self, z: torch.Tensor, x0_pred: torch.Tensor,
+                   T_old: torch.Tensor, T_new: torch.Tensor, T_max: int) -> torch.Tensor:
+        if self.model_cfg.continuous_time:
+            return ddim_step_spatial_c(z, x0_pred, T_old, T_new, T_max)
+        return ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
 
     def _augment_mask(self, U: torch.Tensor, lH: int, lW: int, device: torch.device) -> torch.Tensor:
         """
@@ -338,21 +367,21 @@ class SpatialLatentUNet(nn.Module):
             perlin_init = smooth_noise_field(
                 B, lH, lW, self.model_cfg.f_spatial, device, n_octaves=self.model_cfg.n_octaves
             )
-            T_init = make_t_field(t_base, self.model_cfg.tau_init, perlin_init, T_max)
+            T_init = self._make_t_field(t_base, self.model_cfg.tau_init, perlin_init, T_max)
 
             if torch.rand(1).item() < p_refine:
-                z_init = add_noise_spatial(z0, torch.randn_like(z0), T_init, self.alphas_cumprod)
+                z_init = self._add_noise(z0, torch.randn_like(z0), T_init, T_max)
                 with torch.no_grad():
                     _, log_var_t = self._run_unet(z_init, T_init, self.teacher_cond_enc(condition_tokens), self.teacher)
                 U_teacher = log_var_t.sigmoid()
                 perlin_final = smooth_noise_field(
                     B, lH, lW, self.model_cfg.f_spatial, device, n_octaves=self.model_cfg.n_octaves
                 )
-                T_student = make_t_field(t_base, self.model_cfg.tau_student, U_teacher * perlin_final, T_max)
-                z_s = add_noise_spatial(z0, torch.randn_like(z0), T_student, self.alphas_cumprod)
+                T_student = self._make_t_field(t_base, self.model_cfg.tau_student, U_teacher * perlin_final, T_max)
+                z_s = self._add_noise(z0, torch.randn_like(z0), T_student, T_max)
                 x0_pred, log_var = self._run_unet(z_s, T_student, cond_emb, self.unet)
             else:
-                z_noisy = add_noise_spatial(z0, torch.randn_like(z0), T_init, self.alphas_cumprod)
+                z_noisy = self._add_noise(z0, torch.randn_like(z0), T_init, T_max)
                 x0_pred, log_var = self._run_unet(z_noisy, T_init, cond_emb, self.unet)
 
             loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
@@ -404,24 +433,25 @@ class SpatialLatentUNet(nn.Module):
 
             # Uniform base timestep (same for all pixels in this sample)
             t_base = torch.randint(0, T_max, (B,), device=device).float()
-            T_uniform = t_base[:, None, None, None].expand(B, 1, lH, lW).long()
+            T_uniform_f = t_base[:, None, None, None].expand(B, 1, lH, lW)
+            T_uniform = T_uniform_f if self.model_cfg.continuous_time else T_uniform_f.long()
 
             if in_stage1:
                 # Stage 1: plain uniform noise, no teacher
-                z_noisy = add_noise_spatial(z0, torch.randn_like(z0), T_uniform, self.alphas_cumprod)
+                z_noisy = self._add_noise(z0, torch.randn_like(z0), T_uniform, T_max)
                 x0_pred, log_var = self._run_unet(z_noisy, T_uniform, cond_emb, self.unet)
             else:
                 # Stage 2: uniform noise → teacher → augment mask → structured T_student
-                z_uniform = add_noise_spatial(z0, torch.randn_like(z0), T_uniform, self.alphas_cumprod)
+                z_uniform = self._add_noise(z0, torch.randn_like(z0), T_uniform, T_max)
                 with torch.no_grad():
                     _, log_var_t = self._run_unet(
                         z_uniform, T_uniform, self.teacher_cond_enc(condition_tokens), self.teacher
                     )
-                U_raw = log_var_t.sigmoid()  # (B, 1, lH, lW) in (0,1)
-                U_aug = self._augment_mask(U_raw, lH, lW, device)  # augmented mask
+                U_raw = log_var_t.sigmoid()
+                U_aug = self._augment_mask(U_raw, lH, lW, device)
 
-                T_student = make_t_field(t_base, self.model_cfg.tau_student, U_aug, T_max)
-                z_s = add_noise_spatial(z0, torch.randn_like(z0), T_student, self.alphas_cumprod)
+                T_student = self._make_t_field(t_base, self.model_cfg.tau_student, U_aug, T_max)
+                z_s = self._add_noise(z0, torch.randn_like(z0), T_student, T_max)
                 x0_pred, log_var = self._run_unet(z_s, T_student, cond_emb, self.unet)
 
             loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
@@ -439,6 +469,133 @@ class SpatialLatentUNet(nn.Module):
             "stage": 1 if in_stage1 else 2,
             **{k: v / K for k, v in total_comps.items()},
         }, lr, global_step
+
+    # ── T-field visualisation ──────────────────────────────────────────────────
+
+    def _tfield_panels(
+        self,
+        images: torch.Tensor,    # (N, 1, H, W) pixel images [0,1]
+        T_field: torch.Tensor,   # (N, 1, lH, lW) float or long
+        T_max: int,
+    ) -> list:
+        """
+        Build one panel per sample: [original | overlay | heatmap].
+        T_field is upsampled to image resolution, colourised with 'plasma',
+        then blended 50/50 with the greyscale image for the overlay column.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.cm as cm
+
+        B, _, H, W = images.shape
+        t_norm = T_field.float() / (T_max - 1)                           # (N,1,lH,lW) in [0,1]
+        t_up = F.interpolate(t_norm, size=(H, W), mode="bilinear",
+                             align_corners=False).squeeze(1)              # (N,H,W)
+        cmap = cm.get_cmap("plasma")
+        sep = np.full((H, 4, 3), 180, dtype=np.uint8)
+        panels = []
+        for i in range(B):
+            img = (images[i, 0].cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+            img_rgb = np.stack([img] * 3, axis=-1)                        # (H,W,3)
+            heat = (cmap(t_up[i].cpu().numpy())[:, :, :3] * 255).astype(np.uint8)
+            overlay = ((img_rgb / 2.0) + (heat / 2.0)).astype(np.uint8)
+            panels.append(np.concatenate([img_rgb, sep, overlay, sep, heat], axis=1))
+        return panels
+
+    @torch.no_grad()
+    def _log_tfield_panels(self, dataloader, accelerator, step, n_samples, T_max, device):
+        """
+        Visualise T_field for each active augmentation type (teacher_guided mode)
+        or the raw Perlin field (perlin mode) and log to wandb.
+        Does NOT include the standard uniform denoising field.
+        """
+        cfg = self.model_cfg
+        batch = next(iter(dataloader))
+        images = batch["images"][:n_samples].to(device)
+        solution = batch["solution"][:n_samples].to(device)
+        B = images.shape[0]
+        _, _, H, W = images.shape
+
+        condition_tokens = get_solution_tokens(solution)
+        z0 = self._encode(images)
+        _, _, lH, lW = z0.shape
+
+        t_base = torch.randint(0, T_max, (B,), device=device).float()
+
+        # ── Teacher-guided mode: one panel set per active aug type ─────────────
+        if cfg.noise_mode == "teacher_guided":
+            # Need teacher uncertainty as the base mask
+            T_uniform_f = t_base[:, None, None, None].expand(B, 1, lH, lW)
+            T_uni = T_uniform_f if cfg.continuous_time else T_uniform_f.long()
+            z_noisy = self._add_noise(z0, torch.randn_like(z0), T_uni, T_max)
+            t_cond = self.teacher_cond_enc(condition_tokens)
+            _, log_var_t = self._run_unet(z_noisy, T_uni, t_cond, self.teacher)
+            U_raw = log_var_t.sigmoid()   # (B, 1, lH, lW) in (0,1)
+
+            aug_tfields = {}
+
+            if cfg.aug_prob_vanilla > 0:
+                aug_tfields["vanilla"] = self._make_t_field(
+                    t_base, cfg.tau_student, U_raw, T_max)
+
+            if cfg.aug_prob_power > 0:
+                gamma = (cfg.power_gamma_min + cfg.power_gamma_max) / 2.0
+                aug_tfields["power"] = self._make_t_field(
+                    t_base, cfg.tau_student, U_raw.pow(gamma), T_max)
+
+            if cfg.aug_prob_threshold > 0:
+                n = max(1, (cfg.threshold_n_min + cfg.threshold_n_max) // 2)
+                mid = (cfg.threshold_val_min + cfg.threshold_val_max) / 2.0
+                splits = torch.linspace(
+                    cfg.threshold_val_min, cfg.threshold_val_max, n,
+                    device=device, dtype=torch.float32)
+                bucket = torch.bucketize(U_raw.squeeze(1), splits).float() / n
+                aug_tfields["threshold"] = self._make_t_field(
+                    t_base, cfg.tau_student, bucket.unsqueeze(1), T_max)
+
+            if cfg.aug_prob_perlin > 0:
+                perlin = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
+                                            n_octaves=cfg.n_octaves)
+                aug_tfields["perlin_aug"] = self._make_t_field(
+                    t_base, cfg.tau_student, (U_raw * perlin).clamp(0, 1), T_max)
+
+        # ── Perlin mode: show Path A and Path B Perlin fields ──────────────────
+        else:
+            aug_tfields = {}
+            perlin_a = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
+                                          n_octaves=cfg.n_octaves)
+            aug_tfields["perlin_pathA"] = self._make_t_field(
+                t_base, cfg.tau_init, perlin_a, T_max)
+
+            if cfg.p_refine_max > 0:
+                # Simulate Path B: use teacher uncertainty × perlin
+                T_init = aug_tfields["perlin_pathA"]
+                z_init = self._add_noise(z0, torch.randn_like(z0), T_init, T_max)
+                t_cond = self.teacher_cond_enc(condition_tokens)
+                _, log_var_t = self._run_unet(z_init, T_init, t_cond, self.teacher)
+                U_teacher = log_var_t.sigmoid()
+                perlin_b = smooth_noise_field(B, lH, lW, cfg.f_spatial, device,
+                                              n_octaves=cfg.n_octaves)
+                aug_tfields["perlin_pathB"] = self._make_t_field(
+                    t_base, cfg.tau_student, U_teacher * perlin_b, T_max)
+
+        # ── Build wandb log dict ────────────────────────────────────────────────
+        log_dict = {}
+        for aug_name, T_field in aug_tfields.items():
+            panels = self._tfield_panels(images, T_field, T_max)
+            try:
+                import wandb
+                log_dict[f"val/tfield_{aug_name}"] = [wandb.Image(p) for p in panels]
+            except Exception:
+                pass
+
+        if log_dict:
+            try:
+                import wandb
+                tracker = accelerator.get_tracker("wandb", unwrap=True)
+                tracker.log(log_dict, step=step)
+            except Exception:
+                pass
 
     # ── Eval step ──────────────────────────────────────────────────────────────
 
@@ -469,8 +626,8 @@ class SpatialLatentUNet(nn.Module):
 
             t_base = torch.randint(0, T_max, (B,), device=device).float()
             perlin = smooth_noise_field(B, lH, lW, self.model_cfg.f_spatial, device)
-            T_field = make_t_field(t_base, self.model_cfg.tau_init, perlin, T_max)
-            z_noisy = add_noise_spatial(z0, torch.randn_like(z0), T_field, self.alphas_cumprod)
+            T_field = self._make_t_field(t_base, self.model_cfg.tau_init, perlin, T_max)
+            z_noisy = self._add_noise(z0, torch.randn_like(z0), T_field, T_max)
             x0_pred, log_var = self._run_unet(z_noisy, T_field, cond_emb, self.unet)
             loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
             val_losses.append(loss.item())
@@ -506,7 +663,9 @@ class SpatialLatentUNet(nn.Module):
                 null_emb = self.cond_encoder(torch.zeros_like(condition_tokens)) if cfg_scale > 1.0 else None
 
                 z = torch.randn(B, C, lH, lW, device=device)
-                T_field = torch.full((B, 1, lH, lW), T_max - 1, device=device, dtype=torch.long)
+                _t_init = float(T_max - 1)
+                _dtype = torch.float32 if self.model_cfg.continuous_time else torch.long
+                T_field = torch.full((B, 1, lH, lW), _t_init, device=device, dtype=_dtype)
 
                 for _ in range(num_ddim_steps):
                     T_old = T_field.clone()
@@ -518,11 +677,14 @@ class SpatialLatentUNet(nn.Module):
 
                     # Confident pixels advance faster
                     uncertainty = log_var.sigmoid()
-                    T_new = (T_field.float() - dt * (1.0 - uncertainty)).clamp(0, T_max - 1).round().long()
-                    z = ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
+                    T_new = T_field.float() - dt * (1.0 - uncertainty)
+                    T_new = T_new.clamp(0, T_max - 1)
+                    if not self.model_cfg.continuous_time:
+                        T_new = T_new.round().long()
+                    z = self._ddim_step(z, x0_pred, T_old, T_new, T_max)
                     T_field = T_new
 
-                    if T_field.max() == 0:
+                    if T_field.max() < 0.5:
                         break
 
                 generated = self._decode(z)
@@ -572,18 +734,19 @@ class SpatialLatentUNet(nn.Module):
 
                 z = torch.randn(B, C, lH, lW, device=device)
 
+                _dtype = torch.float32 if self.model_cfg.continuous_time else torch.long
                 for s in range(num_ddim_steps):
                     t_val = uniform_ts[s].item()
                     t_next = uniform_ts[s + 1].item()
-                    T_old = torch.full((B, 1, lH, lW), t_val, device=device, dtype=torch.long)
-                    T_new = torch.full((B, 1, lH, lW), t_next, device=device, dtype=torch.long)
+                    T_old = torch.full((B, 1, lH, lW), t_val, device=device, dtype=_dtype)
+                    T_new = torch.full((B, 1, lH, lW), t_next, device=device, dtype=_dtype)
 
                     x0_pred, _ = self._run_unet(z, T_old, cond_emb, self.unet)
                     if cfg_scale > 1.0:
                         x0_uncond, _ = self._run_unet(z, T_old, null_emb, self.unet)
                         x0_pred = x0_uncond + cfg_scale * (x0_pred - x0_uncond)
 
-                    z = ddim_step_spatial(z, x0_pred, T_old, T_new, self.alphas_cumprod)
+                    z = self._ddim_step(z, x0_pred, T_old, T_new, T_max)
 
                 generated_u = self._decode(z)
                 acc_u = evaluate_grids(
@@ -621,6 +784,15 @@ class SpatialLatentUNet(nn.Module):
                     )
                 except Exception:
                     pass
+
+        # T-field visualisation (main process, wandb only)
+        if accelerator.is_main_process and step is not None:
+            self._log_tfield_panels(
+                dataloader, accelerator, step,
+                n_samples=num_log_images,
+                T_max=T_max,
+                device=device,
+            )
 
         self.train()
         return result

@@ -7,8 +7,47 @@ instead of the usual single scalar per sample.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
+
+
+# ── Continuous-time helpers ────────────────────────────────────────────────────
+
+def cosine_alpha_bar(t_norm: torch.Tensor) -> torch.Tensor:
+    """
+    Analytical alpha_bar for the squaredcos_cap_v2 schedule.
+    t_norm: float tensor in [0, 1]  (0 = clean, 1 = maximum noise).
+    Matches the per-step discrete values computed by DDPMScheduler.
+    """
+    return torch.cos((t_norm + 0.008) / 1.008 * math.pi / 2).pow(2).clamp(min=1e-6)
+
+
+def add_noise_spatial_c(
+    x0: torch.Tensor,      # (B, C, H, W)
+    noise: torch.Tensor,   # (B, C, H, W)
+    T_field: torch.Tensor, # (B, 1, H, W) float in [0, T_max)
+    T_max: int,
+) -> torch.Tensor:
+    """Continuous-time forward diffusion with per-pixel timestep."""
+    t_norm = (T_field / T_max).expand_as(x0).clamp(0.0, 1.0)
+    alpha_bar = cosine_alpha_bar(t_norm)
+    return alpha_bar.sqrt() * x0 + (1.0 - alpha_bar).sqrt() * noise
+
+
+def ddim_step_spatial_c(
+    z: torch.Tensor,        # (B, C, H, W)
+    x0_pred: torch.Tensor,  # (B, C, H, W)
+    T_old: torch.Tensor,    # (B, 1, H, W) float in [0, T_max)
+    T_new: torch.Tensor,    # (B, 1, H, W) float in [0, T_max)
+    T_max: int,
+) -> torch.Tensor:
+    """Continuous-time DDIM step with per-pixel timestep."""
+    ab_old = cosine_alpha_bar((T_old / T_max).expand_as(z).clamp(0.0, 1.0))
+    ab_new = cosine_alpha_bar((T_new / T_max).expand_as(z).clamp(0.0, 1.0))
+    eps = (z - ab_old.sqrt() * x0_pred) / (1.0 - ab_old).sqrt().clamp(min=1e-6)
+    return ab_new.sqrt() * x0_pred + (1.0 - ab_new).sqrt() * eps
 
 
 def smooth_noise_field(
