@@ -111,6 +111,7 @@ class SpatialLatentConfig:
     n_layers: int = 6
     mlp_ratio: float = 4.0
     t_freq_dim: int = 256
+    dropout: float = 0.0
 
     # Timestep mode
     # "discrete"   — T_field values are integers in [0, T_max-1], alpha_bar looked up
