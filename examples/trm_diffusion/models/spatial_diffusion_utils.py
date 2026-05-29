@@ -101,16 +101,30 @@ def ddim_step_spatial(
 
 
 def gaussian_nll_loss(
-    x0: torch.Tensor,  # (B, C, H, W) ground-truth clean latent
+    x0: torch.Tensor,       # (B, C, H, W) ground-truth clean latent
     x0_pred: torch.Tensor,  # (B, C, H, W) predicted clean latent
     log_var: torch.Tensor,  # (B, 1, H, W) predicted log-variance
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict]:
     """
     Heteroscedastic Gaussian NLL:
         sum_i [ (x0_i - pred_i)^2 / (2 * exp(log_var_i)) + 0.5 * log_var_i ]
 
     The log term prevents the model from maximising uncertainty everywhere;
     the denominator stops over-penalising blurry but valid predictions.
+
+    Returns (total_loss, components) where components contains scalar floats
+    for the individual terms — useful for logging.
+    Can be negative when the model is confident and accurate (not a bug).
     """
+    sq_err = (x0 - x0_pred).pow(2)                          # (B, C, H, W)
     var = log_var.exp().clamp(min=1e-6)
-    return ((x0 - x0_pred).pow(2) / (2.0 * var) + 0.5 * log_var).mean()
+    recon_term = (sq_err / (2.0 * var)).mean()               # weighted reconstruction
+    uncert_term = (0.5 * log_var).mean()                     # uncertainty regulariser
+    total = recon_term + uncert_term
+    components = {
+        "recon_term": recon_term.item(),
+        "uncert_term": uncert_term.item(),
+        "mse": sq_err.mean().item(),                         # raw unweighted MSE
+        "mean_log_var": log_var.mean().item(),               # model confidence
+    }
+    return total, components

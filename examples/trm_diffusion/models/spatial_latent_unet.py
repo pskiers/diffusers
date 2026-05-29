@@ -23,17 +23,16 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers import UNet2DConditionModel
 from tqdm.auto import tqdm
 
 from datasets.mnist_sudoku_dataset import get_solution_tokens
-from eval.mnist_eval import evaluate_grids, load_or_train_classifier, make_panel_image
+from eval.mnist_eval import evaluate_grids, make_panel_image
 from models.latent_dit import ConditionEncoder
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.spatial_diffusion_utils import (
@@ -319,6 +318,7 @@ class SpatialLatentUNet(nn.Module):
         T_max = self.scheduler.config.num_train_timesteps
         p_refine = self._p_refine(global_step)
         total_loss = 0.0
+        total_comps: dict = {}
 
         for mb in micro_batches:
             images = mb["images"].to(device)
@@ -341,7 +341,6 @@ class SpatialLatentUNet(nn.Module):
             T_init = make_t_field(t_base, self.model_cfg.tau_init, perlin_init, T_max)
 
             if torch.rand(1).item() < p_refine:
-                # Path B: teacher uncertainty → structured T_student
                 z_init = add_noise_spatial(z0, torch.randn_like(z0), T_init, self.alphas_cumprod)
                 with torch.no_grad():
                     _, log_var_t = self._run_unet(z_init, T_init, self.teacher_cond_enc(condition_tokens), self.teacher)
@@ -353,19 +352,24 @@ class SpatialLatentUNet(nn.Module):
                 z_s = add_noise_spatial(z0, torch.randn_like(z0), T_student, self.alphas_cumprod)
                 x0_pred, log_var = self._run_unet(z_s, T_student, cond_emb, self.unet)
             else:
-                # Path A
                 z_noisy = add_noise_spatial(z0, torch.randn_like(z0), T_init, self.alphas_cumprod)
                 x0_pred, log_var = self._run_unet(z_noisy, T_init, cond_emb, self.unet)
 
-            loss = gaussian_nll_loss(z0, x0_pred, log_var)
+            loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
             total_loss += loss.item()
+            for k, v in comps.items():
+                total_comps[k] = total_comps.get(k, 0.0) + v
             accelerator.backward(loss / (global_batch_size * K))
 
         accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1
-        return {"nll_loss": total_loss / K, "p_refine": p_refine}, lr, global_step
+        return {
+            "nll_loss": total_loss / K,
+            "p_refine": p_refine,
+            **{k: v / K for k, v in total_comps.items()},
+        }, lr, global_step
 
     def _train_step_teacher_guided(
         self,
@@ -382,6 +386,7 @@ class SpatialLatentUNet(nn.Module):
         T_max = self.scheduler.config.num_train_timesteps
         in_stage1 = global_step < self.model_cfg.stage1_steps
         total_loss = 0.0
+        total_comps: dict = {}
 
         for mb in micro_batches:
             images = mb["images"].to(device)
@@ -419,22 +424,21 @@ class SpatialLatentUNet(nn.Module):
                 z_s = add_noise_spatial(z0, torch.randn_like(z0), T_student, self.alphas_cumprod)
                 x0_pred, log_var = self._run_unet(z_s, T_student, cond_emb, self.unet)
 
-            loss = gaussian_nll_loss(z0, x0_pred, log_var)
+            loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
             total_loss += loss.item()
+            for k, v in comps.items():
+                total_comps[k] = total_comps.get(k, 0.0) + v
             accelerator.backward(loss / (global_batch_size * K))
 
         accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1
-        return (
-            {
-                "nll_loss": total_loss / K,
-                "stage": 1 if in_stage1 else 2,
-            },
-            lr,
-            global_step,
-        )
+        return {
+            "nll_loss": total_loss / K,
+            "stage": 1 if in_stage1 else 2,
+            **{k: v / K for k, v in total_comps.items()},
+        }, lr, global_step
 
     # ── Eval step ──────────────────────────────────────────────────────────────
 
@@ -452,7 +456,7 @@ class SpatialLatentUNet(nn.Module):
         self.eval()
 
         # Validation loss (Path A, no teacher)
-        val_losses = []
+        val_losses, val_comps = [], {}
         for i, batch in enumerate(tqdm(dataloader, desc="Eval loss", leave=False)):
             if i >= max_batches:
                 break
@@ -468,9 +472,17 @@ class SpatialLatentUNet(nn.Module):
             T_field = make_t_field(t_base, self.model_cfg.tau_init, perlin, T_max)
             z_noisy = add_noise_spatial(z0, torch.randn_like(z0), T_field, self.alphas_cumprod)
             x0_pred, log_var = self._run_unet(z_noisy, T_field, cond_emb, self.unet)
-            val_losses.append(gaussian_nll_loss(z0, x0_pred, log_var).item())
+            loss, comps = gaussian_nll_loss(z0, x0_pred, log_var)
+            val_losses.append(loss.item())
+            for k, v in comps.items():
+                val_comps[k] = val_comps.get(k, 0.0) + v
 
-        result = {"nll_loss": float(np.mean(val_losses))} if val_losses else {}
+        if val_losses:
+            n = len(val_losses)
+            result = {"nll_loss": float(np.mean(val_losses)),
+                      **{k: v / n for k, v in val_comps.items()}}
+        else:
+            result = {}
 
         # Sampling + accuracy eval
         if self.eval_clf is not None and accelerator.is_main_process:
