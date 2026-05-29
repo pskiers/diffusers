@@ -32,13 +32,9 @@ vae:
   norm_num_groups: 32
   act_fn: "silu"
 
-# ── Model type ───────────────────────────────────────────────────────────────
-# "unet" — UNet2DConditionModel with cross-attention puzzle conditioning (original)
-# "dit"  — SpatialDiT with per-token adaLN and channel-concat puzzle conditioning
-model_type: "unet"
-
-# ── UNet backbone (model_type: "unet") ────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
 model:
+  model_type: "unet"   # "unet" | "dit"
   latent_channels: 4
   latent_size: 36
 
