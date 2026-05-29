@@ -312,7 +312,12 @@ class SpatialLatentUNet(nn.Module):
 
         if aug_type == "power":
             progress = cfg.progress_min + torch.rand(1).item() * (cfg.progress_max - cfg.progress_min)
-            T_field = (T_max * (1.0 - progress * (1.0 - U))).clamp(0, T_max - 1)
+            # Normalize U per-batch so the most/least confident pixels always map to
+            # T=T_max*(1-progress) / T=T_max regardless of the absolute confidence level.
+            U_min = U.reshape(B, -1).min(dim=1).values[:, None, None, None]
+            U_max = U.reshape(B, -1).max(dim=1).values[:, None, None, None]
+            U_norm = (U - U_min) / (U_max - U_min + 1e-6)
+            T_field = (T_max * (1.0 - progress * (1.0 - U_norm))).clamp(0, T_max - 1)
             return T_field if cfg.continuous_time else T_field.long()
 
         if aug_type == "threshold":

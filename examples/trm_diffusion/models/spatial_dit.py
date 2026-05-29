@@ -132,7 +132,7 @@ class SpatialDiTBlock(nn.Module):
         self.norm_ff = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(d_model, mult=mlp_ratio, activation_fn="gelu-approximate", dropout=dropout)
 
-    def _condition_forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _condition_forward(self, hidden_states: torch.Tensor, **_kwargs) -> torch.Tensor:
         """Override to add cross-attention or other conditioning."""
         return hidden_states
 
@@ -246,7 +246,7 @@ class SpatialDiT(nn.Module):
 
     def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
         """(B, n_patches, p*p*C_out) → (B, C_out, H, W)."""
-        B, n, _ = x.shape
+        B, _, _ = x.shape
         p = self.patch_size
         g = self.latent_size // p
         C = self.out_channels
@@ -543,7 +543,10 @@ class LatentSpatialDiT(nn.Module):
 
         if aug_type == "power":
             progress = cfg.progress_min + torch.rand(1).item() * (cfg.progress_max - cfg.progress_min)
-            T_field = (T_max * (1.0 - progress * (1.0 - U))).clamp(0, T_max - 1)
+            U_min = U.reshape(B, -1).min(dim=1).values[:, None, None, None]
+            U_max = U.reshape(B, -1).max(dim=1).values[:, None, None, None]
+            U_norm = (U - U_min) / (U_max - U_min + 1e-6)
+            T_field = (T_max * (1.0 - progress * (1.0 - U_norm))).clamp(0, T_max - 1)
             return T_field if cfg.continuous_time else T_field.long()
 
         if aug_type == "threshold":
