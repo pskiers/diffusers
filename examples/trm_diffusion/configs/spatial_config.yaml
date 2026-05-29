@@ -71,9 +71,10 @@ model:
   teacher_ema_rate: 0.999
 
   # ── DiT backbone (model_type: "dit") ────────────────────────────────────────
+  # attention_head_dim is shared with UNet (above). Default is 8 for UNet;
+  # override to 64 when using DiT: model.attention_head_dim=64
   patch_size: 4              # 36/4=9x9=81 patches — one per sudoku cell
   n_heads: 8
-  attention_head_dim: 64     # d_model = 8*64 = 512
   n_layers: 6
   mlp_ratio: 4.0
   t_freq_dim: 256            # sinusoidal embedding channels before MLP

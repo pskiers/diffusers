@@ -84,7 +84,6 @@ def _build_model_cfg(cfg: DictConfig) -> SpatialLatentConfig:
         model_type=str(m.get("model_type", "unet")),
         patch_size=int(m.get("patch_size", 4)),
         n_heads=int(m.get("n_heads", 8)),
-        attention_head_dim=int(m.get("attention_head_dim", 64)),
         n_layers=int(m.get("n_layers", 6)),
         mlp_ratio=float(m.get("mlp_ratio", 4.0)),
         t_freq_dim=int(m.get("t_freq_dim", 256)),
