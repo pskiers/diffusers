@@ -1,0 +1,66 @@
+# --- Conditioning mode ---
+conditioning: "num_boxes" # "unconditional", "num_boxes", "k_steps"
+num_classes: 4 # num_boxes: 4 classes (1-4 boxes); k_steps: num k list length
+
+# --- Bit-Diffusion ---
+num_bits: 3
+resolution: 12
+ddpm_num_train_timesteps: 1000
+beta_schedule: "squaredcos_cap_v2"  # "linear", "squaredcos_cap_v2"
+prediction_type: "sample"           # "epsilon" (predict noise), "sample" (predict x₀)
+rescale_betas_zero_snr: true        # enforce zero terminal SNR (recommended for sample prediction)
+inference_steps: 400
+self_cond: false
+time_shift_xi: 0.0  # 0.0 = disabled; fraction of T to shift model timestep during sampling
+
+# --- CFG ---
+cfg_drop_rate: 0.1
+guidance_scale: 6.0
+
+# --- Training ---
+num_epochs: 300
+batch_size: 64
+num_workers: 4
+lr: 1e-4
+adam_betas: [0.95, 0.999]
+weight_decay: 1e-6
+warmup_steps: 2000
+ema_decay: 0.9999
+gradient_accumulation_steps: 1
+precision: "16-mixed"
+
+# --- Evaluation ---
+save_every_n_epochs: 50
+eval_every_n_epochs: 50
+num_eval_samples: 128
+
+# --- Paths ---
+output_dir: "outputs/bit_diffusion_sokoban_std"
+run_name: null
+resume_from_checkpoint: null
+
+# --- Sampling (sample.py) ---
+checkpoint_path: "best" # "best" auto-finds best-*.ckpt, or provide explicit path
+num_samples: 256
+sample_batch_size: 64
+
+# --- Model (AdaLNDiT) ---
+model:
+  num_layers: 6
+  patch_size: 1
+  attention_head_dim: 64
+  num_attention_heads: 4
+  cross_attention_dim: null  # null = no cross-attention; set 256 to match old architecture
+  activation_fn: "gelu-approximate"
+  dropout: 0.0
+
+# --- Dataset ---
+dataset:
+  data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4"
+  val_data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-val"
+  test_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-test"
+  total_train_size: 64000
+  total_eval_size: 6400
+  k_values: [3, 8, 10]
+  bot_removal_prob: 0.75
+  use_dihedral_aug: true
