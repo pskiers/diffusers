@@ -313,6 +313,9 @@ def main(cfg: DictConfig):
                 num_samples=int(cfg.eval.num_samples),
                 cfg_scale=float(cfg.eval.cfg_scale),
                 num_log_images=int(cfg.eval.num_log_images),
+                guidance_alpha=float(cfg.eval.get("guidance_alpha", 1.0)),
+                guidance_power=float(cfg.eval.get("guidance_power", 1.0)),
+                guidance_top_m=cfg.eval.get("guidance_top_m", None),
             )
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
             unwrapped.train()

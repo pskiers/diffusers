@@ -139,6 +139,45 @@ def ddim_step_spatial(
     return ab_new.sqrt() * x0_pred + (1.0 - ab_new).sqrt() * eps
 
 
+def compute_denoising_speed(
+    uncertainty: torch.Tensor,   # (B, 1, H, W) in (0, 1); 0=confident, 1=uncertain
+    dt: float,
+    alpha: float = 1.0,
+    power: float = 1.0,
+    top_m: float | None = None,  # fraction of most-confident pixels to advance (None = all)
+) -> torch.Tensor:
+    """
+    Compute per-pixel denoising speed from the model's uncertainty map.
+
+    General formula:
+        speed(x,y) = dt * alpha * confidence(x,y) ^ power
+        where confidence = 1 - uncertainty
+
+    alpha  — overall scale factor.  0 → uniform DDIM (ignore confidence).
+    power  — reshapes the confidence distribution.  p>1 sharpens differences
+             (high-confidence pixels advance much faster than low-confidence);
+             p<1 flattens them (more uniform).  p=1 is the baseline.
+    top_m  — if set (e.g. 0.5), only the top-m fraction of most-confident
+             pixels are allowed to advance; the rest freeze.  This is the
+             hard-threshold limit of alpha→∞.
+
+    Returns (B, 1, H, W) non-negative speed tensor.
+    """
+    confidence = (1.0 - uncertainty).clamp(0.0, 1.0)    # (B, 1, H, W)
+    if power != 1.0:
+        confidence = confidence.pow(power)
+    speed = dt * alpha * confidence
+
+    if top_m is not None and top_m < 1.0:
+        B = uncertainty.shape[0]
+        flat = confidence.reshape(B, -1)                  # (B, N)
+        q = torch.quantile(flat, 1.0 - top_m, dim=1)     # (B,)
+        mask = (flat >= q[:, None]).float().reshape_as(uncertainty)
+        speed = speed * mask
+
+    return speed
+
+
 def gaussian_nll_loss(
     x0: torch.Tensor,       # (B, C, H, W) ground-truth clean latent
     x0_pred: torch.Tensor,  # (B, C, H, W) predicted clean latent

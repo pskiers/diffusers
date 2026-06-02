@@ -135,6 +135,10 @@ eval:
   cfg_scale: 2.0
   num_log_images: 8
   classifier_path: runs/mnist_classifier_cell16.pt
+  # Confidence-driven denoising controls (spatial sampling loop only)
+  guidance_alpha: 1.0   # overall speed scale; 0 = uniform DDIM, 1 = default
+  guidance_power: 1.0   # exponent on confidence; >1 sharpens differences, <1 flattens
+  guidance_top_m: null  # only denoise top-m fraction of most-confident pixels (null = all)
 
 precision:
   mixed_precision: "no"

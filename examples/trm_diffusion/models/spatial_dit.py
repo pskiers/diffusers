@@ -40,6 +40,7 @@ from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.spatial_diffusion_utils import (
     add_noise_spatial,
     add_noise_spatial_c,
+    compute_denoising_speed,
     ddim_step_spatial,
     ddim_step_spatial_c,
     gaussian_nll_loss,
@@ -579,6 +580,12 @@ class LatentSpatialDiT(nn.Module):
         num_samples = kwargs.get("num_samples", 512)
         cfg_scale = kwargs.get("cfg_scale", 1.0)
         num_log_images = kwargs.get("num_log_images", 8)
+        # Confidence-driven denoising controls
+        guidance_alpha = float(kwargs.get("guidance_alpha", 1.0))
+        guidance_power = float(kwargs.get("guidance_power", 1.0))
+        guidance_top_m = kwargs.get("guidance_top_m", None)
+        if guidance_top_m is not None:
+            guidance_top_m = float(guidance_top_m)
 
         device = accelerator.device
         T_max = self.scheduler.config.num_train_timesteps
@@ -639,7 +646,13 @@ class LatentSpatialDiT(nn.Module):
                         x0_uncond, _ = self._run_model(z, T_field, null_tokens, self.dit)
                         x0_pred = x0_uncond + cfg_scale * (x0_pred - x0_uncond)
                     uncertainty = log_var.sigmoid()
-                    T_new = (T_field.float() - dt * (1.0 - uncertainty)).clamp(0, T_max - 1)
+                    speed = compute_denoising_speed(
+                        uncertainty, dt,
+                        alpha=guidance_alpha,
+                        power=guidance_power,
+                        top_m=guidance_top_m,
+                    )
+                    T_new = (T_field.float() - speed).clamp(0, T_max - 1)
                     if not self.model_cfg.continuous_time:
                         T_new = T_new.round().long()
                     z = self._ddim_step(z, x0_pred, T_old, T_new, T_max)
