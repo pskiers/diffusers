@@ -191,8 +191,6 @@ def sample_with_verif(
     x = torch.randn(B, 1, painter_size, painter_size, device=device)
     model.eval_cfg.cfg_scale = cfg_scale
 
-    detach_zh = (guidance_grad == "detach")
-
     i = 0
     while i < len(timesteps):
         t   = int(timesteps[i])
@@ -200,20 +198,24 @@ def sample_with_verif(
 
         # ── Forward pass (with or without guidance gradient) ──────────────────
         if guidance_scale > 0:
+            # "detach" = cheap: only last thinker step in grad graph (n_sup_grad=1)
+            # "full"   = accurate: all n_sup steps in grad graph (n_sup_grad=-1)
+            n_sup_grad = 1 if guidance_grad == "detach" else -1
             with torch.enable_grad():
                 x_in = x.detach().requires_grad_(True)
                 noise_pred, logits, verif_score = model.forward_with_verif(
-                    x_in, ts, condition, detach_zh=detach_zh
+                    x_in, ts, condition, n_sup_grad=n_sup_grad
                 )
                 # ∇_{x_t} log σ(verif) — positive gradient steers toward consistency
                 grad = torch.autograd.grad(verif_score.log().sum(), x_in)[0]
             sigma_t = (1.0 - alphas_cumprod[t]).sqrt()
             # Subtract from noise pred (standard classifier-guidance convention)
             noise_pred = (noise_pred - guidance_scale * sigma_t * grad.detach()).detach()
+            verif_score = verif_score.detach()
         else:
             with torch.no_grad():
                 noise_pred, logits, verif_score = model.forward_with_verif(
-                    x, ts, condition, detach_zh=True
+                    x, ts, condition, n_sup_grad=1  # no grad needed, run 1 step for score
                 )
 
         # Standard DDIM step

@@ -1473,14 +1473,20 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         timesteps: torch.Tensor,
         condition: torch.Tensor,
         puzzle_ids=None,
-        detach_zh: bool = True,
+        n_sup_grad: int = -1,
     ):
         """
         Single-pass eval forward that also returns the per-sample verifier score.
-        Runs encoder + thinker once (not twice) before branching to painter and verif.
+        Runs encoder + thinker once before branching to painter and verifier.
 
-        detach_zh=True  → gradient flows only through verif_head (cheap).
-        detach_zh=False → gradient flows through all n_sup thinker steps (expensive).
+        n_sup_grad controls the gradient-computation cost for classifier guidance:
+          -1 (default) — all n_sup steps in the gradient graph (accurate, expensive)
+           1           — only the LAST thinker step in the gradient graph (cheap
+                         approximation: earlier steps are run with torch.no_grad,
+                         then one more step is run with grad enabled)
+
+        The verifier score always has a valid gradient path back to `noisy`.
+        Use detach() on verif_score externally if you only need the value.
 
         Returns: (noise_pred, sudoku_logits, verif_score)
           verif_score: (B,) float in (0, 1) — P(condition consistent with noisy).
@@ -1490,18 +1496,28 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         z_H, z_L = z_H.to(noisy.device), z_L.to(noisy.device)
         enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
 
+        n_steps = self.n_sup
+        n_no_grad = 0 if n_sup_grad < 0 else max(0, n_steps - n_sup_grad)
+
         logits = None
-        for _ in range(self.n_sup):
+        # Steps without gradient (warm up carry state cheaply)
+        if n_no_grad > 0:
+            with torch.no_grad():
+                for _ in range(n_no_grad):
+                    logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
+            z_H = z_H.detach()
+            z_L = z_L.detach()
+
+        # Steps with gradient (gradient flows from verif_score through these)
+        for _ in range(n_steps - n_no_grad):
             logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
 
-        # Verifier branch — optionally detach z_H so grad only flows through verif_head
+        # Verifier branch — always connected to the computation graph
         seq_len = self.thinker.inner.config.seq_len
         z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)  # (B, hidden_size)
-        if detach_zh:
-            z_H_feats = z_H_feats.detach()
         verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))  # (B,)
 
-        # Painter branch (standard CFG logic mirrors parent forward)
+        # Painter branch (mirrors parent forward)
         spatial_cond = self._logits_to_spatial(logits.float())
         if not self.training and self.eval_cfg.cfg_scale > 1.0:
             null = torch.zeros_like(spatial_cond)
