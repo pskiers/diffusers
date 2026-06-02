@@ -1467,6 +1467,52 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
 
         return corrupted
 
+    def forward_with_verif(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        condition: torch.Tensor,
+        puzzle_ids=None,
+        detach_zh: bool = True,
+    ):
+        """
+        Single-pass eval forward that also returns the per-sample verifier score.
+        Runs encoder + thinker once (not twice) before branching to painter and verif.
+
+        detach_zh=True  → gradient flows only through verif_head (cheap).
+        detach_zh=False → gradient flows through all n_sup thinker steps (expensive).
+
+        Returns: (noise_pred, sudoku_logits, verif_score)
+          verif_score: (B,) float in (0, 1) — P(condition consistent with noisy).
+        """
+        B = noisy.shape[0]
+        z_H, z_L = self.get_initial_states(B)
+        z_H, z_L = z_H.to(noisy.device), z_L.to(noisy.device)
+        enc_emb = self._get_enc_emb(condition, noisy, timesteps=timesteps)
+
+        logits = None
+        for _ in range(self.n_sup):
+            logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
+
+        # Verifier branch — optionally detach z_H so grad only flows through verif_head
+        seq_len = self.thinker.inner.config.seq_len
+        z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)  # (B, hidden_size)
+        if detach_zh:
+            z_H_feats = z_H_feats.detach()
+        verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))  # (B,)
+
+        # Painter branch (standard CFG logic mirrors parent forward)
+        spatial_cond = self._logits_to_spatial(logits.float())
+        if not self.training and self.eval_cfg.cfg_scale > 1.0:
+            null = torch.zeros_like(spatial_cond)
+            pred_cond = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_uncond = self._run_painter(noisy, null, timesteps)
+            noise_pred = pred_uncond + self.eval_cfg.cfg_scale * (pred_cond - pred_uncond)
+        else:
+            noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+
+        return noise_pred, logits, verif_score
+
     def _thinker_forward(
         self,
         condition: torch.Tensor,
