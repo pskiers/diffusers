@@ -95,7 +95,7 @@ def build_model(args, scheduler) -> ThinkerWithFrozenPainterV1Verif:
         painter_dtype=args.painter_dtype,
     )
     thinker_cfg = ThinkerModelConfig(
-        vocab_size=9, seq_len=args.seq_len, hidden_size=args.hidden_size,
+        vocab_size=args.vocab_size, seq_len=args.seq_len, hidden_size=args.hidden_size,
         n_heads=args.n_heads, L_layers=args.L_layers, L_cycles=args.L_cycles,
         H_cycles=args.H_cycles, n_sup=args.n_sup, batch_size=args.batch_size,
         forward_dtype=args.forward_dtype, expansion=args.expansion,
@@ -362,6 +362,9 @@ def parse_args():
                    help="Max re-noise iterations per step (iterative mode).")
 
     # ── Model arch (must match checkpoint) ────────────────────────────────────
+    p.add_argument("--vocab_size",   type=int,   default=11,
+                   help="Thinker vocabulary size — 11 for v1_verif (data.vocab_size), "
+                        "9 for digit-class-only thinkers.")
     p.add_argument("--seq_len",      type=int,   default=81)
     p.add_argument("--hidden_size",  type=int,   default=512)
     p.add_argument("--n_heads",      type=int,   default=8)
