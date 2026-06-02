@@ -165,14 +165,18 @@ class SpatialTRM(BaseModel):
         puzzle_ids: Optional[torch.Tensor] = None,
         H_cycles: Optional[int] = None,
         L_cycles: Optional[int] = None,
+        keep_carry_grad: bool = False,
     ):
         """
         One supervision step. Internally runs H_cycles-1 no-grad cycles then one full-grad cycle.
 
         H_cycles / L_cycles: override the config values for this call only.
+        keep_carry_grad: if True, z_H/z_L in the returned carry are NOT detached,
+          so gradients flow back to `inputs` (used for classifier guidance in eval).
+          Leave False during training to avoid accumulating graph across n_sup steps.
 
-        Returns: (logits, z_H_detached, z_L_detached)
-          logits: (B, seq_len, vocab_size) — gradients attached
+        Returns: (logits, z_H, z_L) — z_H/z_L detached unless keep_carry_grad=True.
+          logits: (B, seq_len, vocab_size) — gradients always attached.
         """
         bs = inputs.shape[0]
         if puzzle_ids is None:
@@ -186,10 +190,12 @@ class SpatialTRM(BaseModel):
             self.inner.config.L_cycles = L_cycles
         try:
             carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
+            self.inner._keep_carry_grad = keep_carry_grad
             new_carry, logits, _ = self.inner(carry, {"inputs": inputs, "puzzle_identifiers": puzzle_ids})
         finally:
             self.inner.config.H_cycles = orig_H
             self.inner.config.L_cycles = orig_L
+            self.inner._keep_carry_grad = False
 
         return logits, new_carry.z_H, new_carry.z_L
 

@@ -216,7 +216,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        # Carry is detached by default so the recurrent state doesn't accumulate
+        # a gradient graph across n_sup steps (too expensive). Pass
+        # keep_carry_grad=True only when you need ∇_{input} through z_H (e.g.
+        # classifier guidance in eval — only for the last reasoning step).
+        if getattr(self, '_keep_carry_grad', False):
+            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
+        else:
+            new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])

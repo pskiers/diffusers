@@ -1508,9 +1508,14 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
             z_H = z_H.detach()
             z_L = z_L.detach()
 
-        # Steps with gradient (gradient flows from verif_score through these)
-        for _ in range(n_steps - n_no_grad):
-            logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
+        # Steps with gradient — last step keeps carry undetached so verif_score
+        # can receive gradient back through z_H → enc_emb → noisy (x_t).
+        n_with_grad = n_steps - n_no_grad
+        for step in range(n_with_grad):
+            is_last = (step == n_with_grad - 1)
+            logits, z_H, z_L = self.thinker.reasoning_step(
+                enc_emb, z_H, z_L, puzzle_ids, keep_carry_grad=is_last
+            )
 
         # Verifier branch — always connected to the computation graph
         seq_len = self.thinker.inner.config.seq_len
