@@ -472,6 +472,12 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         painter_state = strip_compiled_prefix(ckpt["model_state"])
         model_keys = set(frozen_painter.state_dict().keys())
         painter_state = {k: v for k, v in painter_state.items() if k in model_keys}
+        # New ConditioningPyramid zero-conv keys may be absent from old checkpoints.
+        # Supply them as explicit zeros — they must be zero anyway for ControlNet
+        # identity initialisation.  All other missing keys still raise an error.
+        for k, v in frozen_painter.state_dict().items():
+            if k not in painter_state and ("zero_conv" in k):
+                painter_state[k] = torch.zeros_like(v)
         frozen_painter.load_state_dict(painter_state)
         thinker_optim_cfg = _thinker_optim_cfg(cfg)
         painter_optim_cfg = _painter_optim_cfg(cfg)

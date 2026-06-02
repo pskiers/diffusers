@@ -145,6 +145,12 @@ class ConditioningPyramid(nn.Module):
     """
     Extracts multi-scale features from a spatial blueprint for ControlNet-style
     injection. Dynamically unrolls to match the target UNet's exact layer counts.
+
+    Zero convolutions (1×1 convs, weight and bias initialised to 0) are applied
+    at every residual output point and at the mid-block output.  This is the key
+    ControlNet trick: at init the pyramid injects exactly zero into the frozen
+    backbone, so the backbone behaves identically to how it was trained.
+    Gradients gradually "unlock" the zero convs during fine-tuning.
     """
 
     def __init__(self, in_channels, block_out_channels=(128, 256, 512, 512), layers_per_block=2):
@@ -156,6 +162,9 @@ class ConditioningPyramid(nn.Module):
 
         self.blocks = nn.ModuleList()
         current_channels = block_out_channels[0]
+
+        # Track output channel at each residual point to build zero-conv list.
+        residual_channels: list[int] = [block_out_channels[0]]  # conv_in output
 
         for i, out_channels in enumerate(block_out_channels):
             block_modules = nn.ModuleList()
@@ -176,10 +185,12 @@ class ConditioningPyramid(nn.Module):
                         nn.SiLU(),
                     )
                 )
+                residual_channels.append(current_channels)
 
             # C. Downsampler (if not the last block)
             if i < len(block_out_channels) - 1:
                 block_modules.append(nn.Conv2d(current_channels, current_channels, kernel_size=3, stride=2, padding=1))
+                residual_channels.append(current_channels)
 
             self.blocks.append(block_modules)
 
@@ -190,12 +201,25 @@ class ConditioningPyramid(nn.Module):
             nn.SiLU(),
         )
 
+        # 3. Zero convolutions — one per residual output + one for mid.
+        #    All weights and biases initialised to exactly zero so the pyramid
+        #    injects nothing at the start of training.
+        self.zero_convs = nn.ModuleList([
+            nn.Conv2d(c, c, kernel_size=1) for c in residual_channels
+        ])
+        self.mid_zero_conv = nn.Conv2d(current_channels, current_channels, kernel_size=1)
+        for m in list(self.zero_convs) + [self.mid_zero_conv]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
     def forward(self, blueprint):
         residuals = []
+        zero_idx = 0
 
         # Initial layer
         x = self.conv_in(blueprint)
-        residuals.append(x)
+        residuals.append(self.zero_convs[zero_idx](x))
+        zero_idx += 1
 
         # Down blocks
         for i, block in enumerate(self.blocks):
@@ -203,17 +227,19 @@ class ConditioningPyramid(nn.Module):
 
             for j in range(self.layers_per_block):
                 x = x + block[1 + j](x)  # Lightweight residual step
-                residuals.append(x)
+                residuals.append(self.zero_convs[zero_idx](x))
+                zero_idx += 1
 
             if i < len(self.blocks) - 1:
                 downsampler = block[1 + self.layers_per_block]
                 x = downsampler(x)
-                residuals.append(x)
+                residuals.append(self.zero_convs[zero_idx](x))
+                zero_idx += 1
 
         # Mid block
         mid_res = x + self.mid_block(x)
 
-        return residuals, mid_res
+        return residuals, self.mid_zero_conv(mid_res)
 
 
 class SpatialBridge(nn.Module):
