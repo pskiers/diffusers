@@ -1473,24 +1473,29 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         timesteps: torch.Tensor,
         condition: torch.Tensor,
         puzzle_ids=None,
-        n_sup_grad: int = -1,
+        n_sup_grad: int = 1,
     ):
         """
-        Single-pass eval forward that also returns the per-sample verifier score.
-        Runs encoder + thinker once before branching to painter and verifier.
+        Eval forward that returns (noise_pred, sudoku_logits, verif_score).
 
-        n_sup_grad controls the gradient-computation cost for classifier guidance:
-          -1 (default) — all n_sup steps in the gradient graph (accurate, expensive)
-           1           — only the LAST thinker step in the gradient graph (cheap
-                         approximation: earlier steps are run with torch.no_grad,
-                         then one more step is run with grad enabled)
+        noise_pred is obtained via the standard forward() so it is identical to
+        what training eval produces — no risk of subtle divergence.
 
-        The verifier score always has a valid gradient path back to `noisy`.
-        Use detach() on verif_score externally if you only need the value.
+        verif_score is computed by a separate thinker pass where the last step
+        keeps z_H undetached, enabling gradient back to noisy for classifier guidance.
+
+        n_sup_grad — steps in the gradient graph for verif_score:
+          1  (default): only the last step with grad (cheap)
+         -1           : all n_sup steps with grad (accurate, expensive)
 
         Returns: (noise_pred, sudoku_logits, verif_score)
           verif_score: (B,) float in (0, 1) — P(condition consistent with noisy).
         """
+        # Noise prediction: delegate entirely to the inherited forward so it is
+        # identical to training eval (correct CFG, correct thinker path, etc.)
+        noise_pred, logits = self(noisy, timesteps, condition, puzzle_ids=puzzle_ids)
+
+        # Verifier score: separate thinker forward, last step keeps z_H gradient.
         B = noisy.shape[0]
         z_H, z_L = self.get_initial_states(B)
         z_H, z_L = z_H.to(noisy.device), z_L.to(noisy.device)
@@ -1499,38 +1504,23 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
         n_steps = self.n_sup
         n_no_grad = 0 if n_sup_grad < 0 else max(0, n_steps - n_sup_grad)
 
-        logits = None
-        # Steps without gradient (warm up carry state cheaply)
         if n_no_grad > 0:
             with torch.no_grad():
                 for _ in range(n_no_grad):
-                    logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
+                    _, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
             z_H = z_H.detach()
             z_L = z_L.detach()
 
-        # Steps with gradient — last step keeps carry undetached so verif_score
-        # can receive gradient back through z_H → enc_emb → noisy (x_t).
         n_with_grad = n_steps - n_no_grad
         for step in range(n_with_grad):
             is_last = (step == n_with_grad - 1)
-            logits, z_H, z_L = self.thinker.reasoning_step(
+            _, z_H, z_L = self.thinker.reasoning_step(
                 enc_emb, z_H, z_L, puzzle_ids, keep_carry_grad=is_last
             )
 
-        # Verifier branch — always connected to the computation graph
         seq_len = self.thinker.inner.config.seq_len
-        z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)  # (B, hidden_size)
-        verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))  # (B,)
-
-        # Painter branch (mirrors parent forward)
-        spatial_cond = self._logits_to_spatial(logits.float())
-        if not self.training and self.eval_cfg.cfg_scale > 1.0:
-            null = torch.zeros_like(spatial_cond)
-            pred_cond = self._run_painter(noisy, spatial_cond, timesteps)
-            pred_uncond = self._run_painter(noisy, null, timesteps)
-            noise_pred = pred_uncond + self.eval_cfg.cfg_scale * (pred_cond - pred_uncond)
-        else:
-            noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+        z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)   # (B, hidden_size)
+        verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))   # (B,)
 
         return noise_pred, logits, verif_score
 
