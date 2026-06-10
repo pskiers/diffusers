@@ -134,6 +134,57 @@ class SokobanDatasetTokens(Dataset):
                    bot_removal_prob=bot_removal_prob)
 
     @classmethod
+    def for_new_k_steps_conditioning_generation(cls, data_path: str, total_dataset_size: int, k_values: List[int], bot_removal_prob: float = 0.75, seed=None):
+        data_dir_files = glob(os.path.join(data_path, "*"))
+        if not data_dir_files:
+            raise ValueError(f"No files in {data_path}")
+
+        candidates_by_k = {k: [] for k in k_values}
+        trajectories = []
+
+        with tqdm(desc="Loading K-step candidates [random boards version]") as pbar:
+            for f in data_dir_files:
+                data: dict = joblib.load(f)
+
+                for trajectory in data.values():
+                    traj_np = np.argmax(trajectory, axis=3).astype(np.uint8)
+                    traj_len = len(traj_np)
+
+                    traj_id = len(trajectories)
+                    trajectories.append(traj_np)
+
+                    for start_idx in range(traj_len):
+                        for k in k_values:
+                            if start_idx + k < traj_len:
+                                candidates_by_k[k].append((traj_id, start_idx))
+
+                        pbar.update(1)
+
+        available_k = [k for k, pool in candidates_by_k.items() if len(pool) > 0]
+        if not available_k:
+            raise ValueError("No valid (condition, target) pairs found")
+
+        samples = []
+
+        with tqdm(total=total_dataset_size, desc="Building K-step Conditional") as pbar:
+            while len(samples) < total_dataset_size:
+                k = np.random.choice(available_k)
+                traj_id, start_idx = candidates_by_k[k][
+                    np.random.randint(len(candidates_by_k[k]))
+                ]
+                traj_np = trajectories[traj_id]
+                samples.append(
+                    {
+                        "condition": traj_np[start_idx].copy(),
+                        "target": traj_np[start_idx + k].copy(),
+                        "k": int(k),
+                    }
+                )
+                pbar.update(1)
+
+        return cls("conditional_k_steps", data_path, len(samples), samples=samples, bot_removal_prob=bot_removal_prob)
+
+    @classmethod
     def for_unconditional(cls, data_path: str, total_dataset_size: int, bot_removal_prob: float = 0.75):
         data_dir_files = glob(os.path.join(data_path, "*"))
         if not data_dir_files:

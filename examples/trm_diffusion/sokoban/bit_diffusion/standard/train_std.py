@@ -227,6 +227,7 @@ class SokobanBitDiffusion(L.LightningModule):
         class_labels: torch.Tensor | None = None,
         cond_board: torch.Tensor | None = None,
         guidance_scale: float | None = None,
+        generator: torch.Generator | None = None
     ) -> torch.Tensor:
         """Generate boards via iterative denoising with DDPMScheduler and optional CFG.
         Returns bit predictions (B, num_bits, H, W) as floats.
@@ -235,7 +236,7 @@ class SokobanBitDiffusion(L.LightningModule):
             guidance_scale = self.guidance_scale
         use_cfg = guidance_scale > 1.0 and class_labels is not None and self.conditioning != "unconditional"
 
-        x_t = torch.randn(batch_size, self.num_bits, self.resolution, self.resolution, device=device)
+        x_t = torch.randn(batch_size, self.num_bits, self.resolution, self.resolution, generator=generator, device=device)
         x_pred = None  # for self-conditioning carry-over
         x_pred_step = x_t  # fallback; overwritten in loop
 
@@ -297,6 +298,9 @@ class SokobanBitDiffusion(L.LightningModule):
             num_samples = self.num_eval_samples
         batch_size = min(50, num_samples)
 
+        val_generator = torch.Generator(device=device)
+        val_generator.manual_seed(42)
+
         all_gen_bits = []
         all_gen_boards = []
         all_cond_boards = []
@@ -329,6 +333,7 @@ class SokobanBitDiffusion(L.LightningModule):
                 device=device,
                 class_labels=class_labels,
                 cond_board=cond_board,
+                generator=val_generator
             )
             all_gen_bits.append(gen_bits.cpu())
 
@@ -486,6 +491,15 @@ class SokobanBitDataModule(L.LightningDataModule):
                 self.val_data_path, self.total_eval_size
             )
         elif self.conditioning == "k_steps":
+            self.train_ds = SokobanBitsDataset.for_new_k_steps_conditioning_generation(
+                self.data_path, self.total_train_size, k_values=self.k_values,
+                bot_removal_prob=self.bot_removal_prob,
+            )
+            self.val_ds = SokobanBitsDataset.for_new_k_steps_conditioning_generation(
+                self.val_data_path, self.total_eval_size, k_values=self.k_values,
+                bot_removal_prob=self.bot_removal_prob,
+            )
+        elif self.conditioning == "k_steps_old":
             self.train_ds = SokobanBitsDataset.for_conditioning_k_steps_generation(
                 self.data_path, self.total_train_size, k_values=self.k_values,
                 bot_removal_prob=self.bot_removal_prob,
@@ -507,6 +521,7 @@ class SokobanBitDataModule(L.LightningDataModule):
         self.train_ds.num_bits = self.num_bits
         self.val_ds.num_bits = self.num_bits
         self.train_ds.use_dihedral_aug = self.use_dihedral_aug
+        self.val_ds.use_dihedral_aug = False
 
     def train_dataloader(self):
         return DataLoader(
@@ -523,6 +538,9 @@ class SokobanBitDataModule(L.LightningDataModule):
 
 @hydra.main(version_base=None, config_path="../config", config_name="standard_diffusion")
 def main(cfg: DictConfig):
+    seed = cfg.get("seed", 42)
+    L.seed_everything(seed, workers=True)
+
     num_bits = cfg.num_bits
     k_values = cfg.dataset.get("k_values", [1, 3, 5, 8, 10])
     num_classes = len(k_values) if cfg.conditioning == "k_steps" else cfg.num_classes
