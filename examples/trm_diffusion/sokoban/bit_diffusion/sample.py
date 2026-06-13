@@ -22,10 +22,10 @@ from omegaconf import DictConfig
 from PIL import Image
 from tqdm.auto import tqdm
 
-from diffusers import Transformer2DModel
+from diffusers import DDPMScheduler, Transformer2DModel
 
-from bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
-from bit_diffusion.train_trm import SokobanTRMBitDiffusion, TRMDiT
+from sokoban.bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
+from sokoban.bit_diffusion.train_trm import SokobanTRMBitDiffusion, TRMDiT
 
 
 def find_best_checkpoint(output_dir: str, run_name: str, is_trm: bool) -> str:
@@ -48,7 +48,7 @@ def find_best_checkpoint(output_dir: str, run_name: str, is_trm: bool) -> str:
     return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="trm_diffusion")
+@hydra.main(version_base=None, config_path="config", config_name="trm_diffusion")
 def main(cfg: DictConfig):
     # Inicjalizacja ziarna dla powtarzalności wyników
     seed = cfg.get("seed", 42)
@@ -98,6 +98,16 @@ def main(cfg: DictConfig):
         norm_type="ada_norm_zero",
     )
 
+    # Rekonstrukcja harmonogramu szumu (nie polegamy na obiekcie zapiklowanym w .ckpt)
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=cfg.get("ddpm_num_train_timesteps", 1000),
+        beta_schedule=cfg.get("beta_schedule", "squaredcos_cap_v2"),
+        prediction_type=cfg.get("prediction_type", "sample"),
+        rescale_betas_zero_snr=cfg.get("rescale_betas_zero_snr", True),
+        clip_sample=True,
+        clip_sample_range=1.0,
+    )
+
     # Inicjalizacja modelu PyTorch Lightning (Wagi EMA ładują się natywnie z .ckpt)
     if is_trm:
         model = TRMDiT(
@@ -109,13 +119,13 @@ def main(cfg: DictConfig):
             use_grid_pos_embed=cfg.trm.get("use_grid_pos_embed", True),
         )
         lit_model = SokobanTRMBitDiffusion.load_from_checkpoint(
-            ckpt_path, model=model, map_location=device,
+            ckpt_path, model=model, noise_scheduler=noise_scheduler, map_location=device,
         )
         print("Wczytano model TRM (wagi EMA wbudowane w plik .ckpt).")
     else:
         model = core_model
         lit_model = SokobanBitDiffusion.load_from_checkpoint(
-            ckpt_path, model=model, map_location=device,
+            ckpt_path, model=model, noise_scheduler=noise_scheduler, map_location=device,
         )
         print("Wczytano model Standardowej Dyfuzji (wagi EMA wbudowane w plik .ckpt).")
 
@@ -174,5 +184,6 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    sys.argv = [a for a in sys.argv if not a.startswith("--")]
+    # Strip launcher-injected flags (e.g. accelerate) but keep Hydra's --config-name/--config-path
+    sys.argv = [a for a in sys.argv if not a.startswith("--") or a.startswith("--config")]
     main()

@@ -23,7 +23,6 @@ from pathlib import Path
 
 import hydra
 import lightning as L
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,11 +34,8 @@ from typing import Optional, Tuple
 from diffusers import Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from diffusers.training_utils import EMAModel
 
-from dataset.sokoban_dataset import SokobanBitsDataset
-from dataset.evaluate_sokoban_boards import generate_metrics
-from examples.trm_diffusion.sokoban.bit_diffusion.train_std import SokobanBitDataModule, EMACallback, SokobanBitDiffusion
+from sokoban.bit_diffusion.train_std import SokobanBitDataModule, EMACallback, SokobanBitDiffusion
 
 
 def n_sup_schedule(t: torch.Tensor, n_min: int, n_max: int) -> torch.Tensor:
@@ -315,7 +311,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         self.carry_recycle_prob = carry_recycle_prob
         self.use_carry_persistence = use_carry_persistence
 
-    def _model_forward(self, model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps, opt):
+    def _trm_supervised_step(self, model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps, opt):
         total_diff_loss = 0.0
         total_q_loss = 0.0
         total_active = 0
@@ -360,18 +356,21 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             else:
                 raise ValueError(f"Unsupported prediction_type: {prediction_type}")
 
-            # Focal Loss dla Q_head
+            # Q_head: predict the board-level accuracy of the current x0 estimate.
+            # NOTE: with this bit encoding "all bits exactly correct" == "board exactly
+            # correct", which is unreachable at medium/high noise -> the binary label is
+            # ~always 0, the head collapses to q->0, and inference ACT never halts.
+            # A graded (soft) target gives a dense, reachable signal at every noise level,
+            # so sigmoid(q) becomes a calibrated confidence that drives the halting decision.
             q_logit_a = self.model.q_head(y_final_a.mean(dim=1)).squeeze(-1)
             with torch.no_grad():
-                bit_accuracy = (x_0_prediction_a.sign() == x_bits_a).float().mean(dim=(1, 2, 3))
-                is_correct = (bit_accuracy >= 1.0).float()
+                # a board cell is correct iff all of its bits have the right sign
+                cell_correct = (x_0_prediction_a.sign() == x_bits_a).all(dim=1)  # (A, H, W)
+                board_accuracy = cell_correct.float().mean(dim=(1, 2))           # (A,) in [0, 1]
 
-            # Parametr gamma dla Focal Loss
-            gamma = 2.0
-            bce_loss = F.binary_cross_entropy_with_logits(q_logit_a, is_correct, reduction="none")
-            pt = torch.exp(-bce_loss)
-            focal_loss = ((1.0 - pt) ** gamma) * bce_loss
-            q_loss = focal_loss.mean()
+            # Soft-label BCE: regress confidence onto board accuracy (noise difficulty is
+            # already encoded in the target, so no explicit time gate is needed).
+            q_loss = F.binary_cross_entropy_with_logits(q_logit_a, board_accuracy)
 
             # Złożenie straty i manualny krok optymalizatora na etapie TRM
             loss = diffusion_loss + self.q_loss_weight * q_loss
@@ -439,7 +438,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         y, z = carry_init if carry_init is not None else self.model._get_initial_states(B)
 
         opt = self.optimizers()
-        train_loss, q_loss = self._model_forward(
+        train_loss, q_loss = self._trm_supervised_step(
             model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps, opt
         )
 
@@ -480,6 +479,8 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             loss = F.mse_loss(x_pred_final.float(), x_bits.float())
         elif prediction_type == "epsilon":
             loss = F.mse_loss(x_pred_final.float(), noise.float())
+        else:
+            raise ValueError(f"Unsupported prediction_type: {prediction_type}")
 
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
 
@@ -593,13 +594,21 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         }
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="trm_diffusion")
+@hydra.main(version_base=None, config_path="config", config_name="trm_diffusion")
 def main(cfg: DictConfig):
+    L.seed_everything(cfg.get("seed", 42), workers=True)
+
     num_bits = cfg.num_bits
+    # For k_steps the class label indexes the k-value list, so the embedding table must
+    # be sized len(k_values) (+1 for the CFG/unconditional token), not cfg.num_classes.
+    k_values = cfg.dataset.get("k_values", [3, 8, 10])
+    num_classes = len(k_values) if cfg.conditioning == "k_steps" else cfg.num_classes
+    use_self_cond = cfg.get("self_cond", True)
+    self_cond_mult = 2 if use_self_cond else 1  # noisy + [self_cond]
     if cfg.conditioning == "k_steps":
-        in_channels = num_bits * 3
+        in_channels = num_bits * self_cond_mult + num_bits  # + spatial condition board
     else:
-        in_channels = num_bits * 2
+        in_channels = num_bits * self_cond_mult
 
     # Build core Transformer2DModel
     core_model = Transformer2DModel(
@@ -613,7 +622,7 @@ def main(cfg: DictConfig):
         cross_attention_dim=None,
         activation_fn=cfg.model.get("activation_fn", "gelu-approximate"),
         dropout=cfg.model.get("dropout", 0.0),
-        num_embeds_ada_norm=cfg.num_classes + 1,
+        num_embeds_ada_norm=num_classes + 1,
         norm_type="ada_norm_zero",
     )
 
@@ -641,7 +650,7 @@ def main(cfg: DictConfig):
         model=model,
         noise_scheduler=noise_scheduler,
         conditioning=cfg.conditioning,
-        num_classes=cfg.num_classes,
+        num_classes=num_classes,
         num_bits=num_bits,
         resolution=cfg.resolution,
         inference_steps=cfg.get("inference_steps", cfg.get("diffusion_steps", 400)),
@@ -654,6 +663,7 @@ def main(cfg: DictConfig):
         num_epochs=cfg.num_epochs,
         eval_every_n_epochs=cfg.eval_every_n_epochs,
         num_eval_samples=cfg.num_eval_samples,
+        k_values=k_values if cfg.conditioning == "k_steps" else None,
         # Q_head
         q_loss_weight=cfg.get("q_loss_weight", 0.1),
         # n_sup(t) schedule

@@ -1,0 +1,89 @@
+# Hydra config for Embedded-TRM Bit-Diffusion (TRM recursion strictly inside the block)
+#
+# Usage:
+#   python train_trm_embedded.py conditioning=unconditional
+#   python train_trm_embedded.py conditioning=num_boxes
+#   python train_trm_embedded.py conditioning=k_steps
+
+# --- Reproducibility ---
+seed: 42
+
+# --- Conditioning mode ---
+conditioning: "unconditional"
+num_classes: 0
+
+# --- Bit-Diffusion ---
+num_bits: 3
+resolution: 12
+ddpm_num_train_timesteps: 1000
+beta_schedule: "squaredcos_cap_v2"
+prediction_type: "sample" # "sample" (predict x0) or "epsilon"
+rescale_betas_zero_snr: true
+inference_steps: 300
+self_cond: true
+
+# --- CFG ---
+cfg_drop_rate: 0.1
+guidance_scale: 4.0 # conditional modes only; sweep 1.5-7.5
+
+# --- Asymmetric time intervals (sampling only) ---
+time_shift_xi: 0.0
+
+# --- Embedded-TRM recursion (lives INSIDE the transformer block) ---
+trm:
+  n_inner: 6 # N-loop: z-updates per latent recursion
+  T: 3 # deep recursion depth (T-1 no-grad + 1 with-grad = 1-step gradient)
+  num_inner_layers: 1 # transformer sub-layers per z-/y-stack (kept "tiny")
+  use_grid_pos_embed: true
+
+# --- n_sup(t) deep-supervision schedule ---
+# n_sup(t) = n_min + (n_max - n_min) * sin(pi * t); loss accumulated, single opt.step()
+n_sup_min: 2
+n_sup_max: 6
+
+# --- Q_head (ACT, inference-only halting) ---
+# Trained to regress board accuracy (graded soft target). threshold(t) = 0.95 - 0.4*t
+q_loss_weight: 0.15
+
+# --- EMA (one update per batch; valid now that we take one opt.step per batch) ---
+ema_decay: 0.9999
+
+# --- Training ---
+num_epochs: 300
+batch_size: 32
+num_workers: 4
+lr: 1e-4
+adam_betas: [0.9, 0.999]
+weight_decay: 1e-4
+warmup_steps: 500
+precision: "16-mixed"
+
+# --- Evaluation ---
+eval_every_n_epochs: 50
+num_eval_samples: 128
+save_every_n_epochs: 50
+
+# --- Paths ---
+output_dir: "outputs/embedded_trm_bit_diffusion_sokoban"
+run_name: null
+resume_from_checkpoint: null
+
+# --- Model (transformer backbone; hidden = num_attention_heads * attention_head_dim = 256) ---
+model:
+  patch_size: 1
+  attention_head_dim: 64
+  num_attention_heads: 4
+  ffn_mult: 4
+  activation_fn: "gelu-approximate"
+  dropout: 0.0 # keep 0: dropout inside the recursion injects noise across iterations
+
+# --- Dataset ---
+dataset:
+  data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4"
+  val_data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-val"
+  test_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-test"
+  total_train_size: 1000
+  total_eval_size: 200
+  k_values: [3, 8, 10]
+  bot_removal_prob: 0.75
+  use_dihedral_aug: true # random D4 transform per __getitem__ (on-the-fly)

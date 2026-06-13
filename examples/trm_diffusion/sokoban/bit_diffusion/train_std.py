@@ -536,7 +536,7 @@ class SokobanBitDataModule(L.LightningDataModule):
         )
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="standard_diffusion")
+@hydra.main(version_base=None, config_path="config", config_name="standard_diffusion")
 def main(cfg: DictConfig):
     seed = cfg.get("seed", 42)
     L.seed_everything(seed, workers=True)

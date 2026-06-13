@@ -5,6 +5,9 @@
 #   python train_trm.py conditioning=num_boxes
 #   python train_trm.py conditioning=k_steps
 
+# --- Reproducibility ---
+seed: 42
+
 # --- Conditioning mode ---
 conditioning: "unconditional"
 num_classes: 0
@@ -17,22 +20,22 @@ self_cond: true
 
 # --- CFG ---
 cfg_drop_rate: 0.1
-guidance_scale: 6.0
+guidance_scale: 4.0 # only used for conditional modes; sweep 1.5-7.5 (6+ tends to oversaturate bits)
 
 # --- Asymmetric time intervals (sampling only) ---
 time_shift_xi: 0.0 # offset for model timestep; 0.0 = disabled
 
 # --- TRM Parameters ---
 trm:
-  n: 4 # latent recursion iterations (z-loop)
-  T: 2 # deep recursion depth (T-1 no-grad + 1 with-grad)
+  n: 6 # latent recursion iterations (z-loop); paper-aligned reasoning depth
+  T: 3 # deep recursion depth (T-1 no-grad + 1 with-grad)
   use_grid_pos_embed: true # learnable pos embed for grid tasks; disable for natural images
 
 # --- n_sup(t) Schedule ---
 # n_sup(t) = n_min + (n_max - n_min) * sin(pi * t)
 # t≈0 (clean): n_min steps | t≈0.5 (medium noise): n_max | t≈1 (noisy): n_min
-n_sup_min: 1
-n_sup_max: 4
+n_sup_min: 2
+n_sup_max: 6
 
 # --- EMA ---
 use_ema: true
@@ -42,9 +45,9 @@ ema_inv_gamma: 1.0
 ema_power: 0.75 # reaches 0.999 at ~10K steps (good for <1M total steps)
 
 # --- Q_head (ACT — inference only) ---
-# Trained on "100% correct reconstruction". Halting only at inference.
-# Time-dependent threshold: threshold(t) = 0.95 - 0.4*t
-q_loss_weight: 0.15 # weight of BCE(q_hat, is_correct) relative to MSE
+# Trained to regress the board accuracy of the current x0 estimate (graded soft target).
+# Halting only at inference. Time-dependent threshold: threshold(t) = 0.95 - 0.4*t
+q_loss_weight: 0.15 # weight of BCE(q_hat, board_accuracy) relative to MSE
 
 # --- Carry Recycling ---
 # Self-conditioning for hidden states (y, z) — warm-start from a no-grad forward pass
@@ -57,7 +60,7 @@ num_epochs: 300
 batch_size: 32
 num_workers: 4
 lr: 1e-4
-weight_decay: 1e-5
+weight_decay: 1e-4 # mild reg for small-data regime (TRM relies on EMA + aug + wd)
 precision: "16-mixed"
 
 # --- Evaluation ---
@@ -76,13 +79,14 @@ num_samples: 256
 sample_batch_size: 64
 
 # --- Model (Transformer2DModel backbone) ---
+# hidden width = num_attention_heads * attention_head_dim = 256 (TRM stays "tiny": ~2-3M params).
 model:
   num_layers: 2
   patch_size: 1
-  attention_head_dim: 32
-  num_attention_heads: 2
+  attention_head_dim: 64
+  num_attention_heads: 4
   activation_fn: "gelu-approximate"
-  dropout: 0.0
+  dropout: 0.0 # keep 0: dropout inside the recursion injects noise across z/y iterations
 
 # --- Dataset ---
 dataset:
@@ -92,4 +96,4 @@ dataset:
   total_train_size: 1000 # TRM paper: small dataset + dihedral augmentation
   total_eval_size: 200
   k_values: [3, 8, 10]
-  use_dihedral_aug: true # 8× D4 augmentation (rotations + flips) → effective 8000 samples
+  use_dihedral_aug: true # random D4 transform per __getitem__ (on-the-fly, not an 8x len expansion)

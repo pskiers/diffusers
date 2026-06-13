@@ -17,7 +17,7 @@ time_shift_xi: 0.0 # 0.0 = disabled; fraction of T to shift model timestep durin
 
 # --- CFG ---
 cfg_drop_rate: 0.1
-guidance_scale: 6.0
+guidance_scale: 4.0 # sweep 1.5-7.5; 6+ tends to oversaturate bit signs
 
 # --- Training ---
 num_epochs: 600

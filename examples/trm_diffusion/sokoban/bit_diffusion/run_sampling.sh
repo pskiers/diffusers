@@ -35,7 +35,8 @@ for SHIFT in "${SHIFTS[@]}"; do
     echo "---------------------------------------------------"
 
     # Przekazanie zmiennych do skryptu za pomocą składni Hydra
-    srun python sokoban/bit_diffusion/standard/sample.py \
+    srun python sokoban/bit_diffusion/sample.py \
+        --config-name=standard_diffusion \
         run_name="$RUN_NAME" \
         time_shift_xi=$SHIFT
 done

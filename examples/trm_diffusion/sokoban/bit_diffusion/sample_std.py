@@ -15,9 +15,9 @@ import torch
 from omegaconf import DictConfig
 from PIL import Image
 from tqdm.auto import tqdm
-from examples.trm_diffusion.sokoban.bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
+from sokoban.bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
 
-from diffusers import Transformer2DModel
+from diffusers import DDPMScheduler, Transformer2DModel
 
 
 def find_best_checkpoint(output_dir: str, run_name: str) -> str:
@@ -71,8 +71,16 @@ def main(cfg: DictConfig):
         num_embeds_ada_norm=num_classes + 1,
         norm_type="ada_norm_zero",
     )
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=cfg.get("ddpm_num_train_timesteps", 1000),
+        beta_schedule=cfg.get("beta_schedule", "squaredcos_cap_v2"),
+        prediction_type=cfg.get("prediction_type", "sample"),
+        rescale_betas_zero_snr=cfg.get("rescale_betas_zero_snr", True),
+        clip_sample=True,
+        clip_sample_range=1.0,
+    )
     lit_model = SokobanBitDiffusion.load_from_checkpoint(
-        ckpt_path, model=model, map_location=device,
+        ckpt_path, model=model, noise_scheduler=noise_scheduler, map_location=device,
     )
     lit_model.eval()
     lit_model.to(device)
