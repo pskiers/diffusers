@@ -28,7 +28,6 @@ wheel
 setuptools
 packaging
 ninja
-flash_attn
 einops
 timm
 sentencepiece

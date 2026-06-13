@@ -15,7 +15,7 @@ import torch
 from omegaconf import DictConfig
 from PIL import Image
 from tqdm.auto import tqdm
-from train_std import SokobanBitDataModule, SokobanBitDiffusion
+from examples.trm_diffusion.sokoban.bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
 
 from diffusers import Transformer2DModel
 

@@ -12,7 +12,7 @@ Logs Sokoban-specific metrics (validity, solvability, diversity) via evaluate_so
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import hydra
 import lightning as L
@@ -65,7 +65,7 @@ class SokobanBitDiffusion(L.LightningModule):
         num_epochs: int = 300,
         eval_every_n_epochs: int = 50,
         num_eval_samples: int = 100,
-        k_values: List[int] | None = None,
+        k_values: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["model", "noise_scheduler"])
@@ -109,7 +109,7 @@ class SokobanBitDiffusion(L.LightningModule):
         out = self.model(hidden_states=x_input, timestep=t, class_labels=class_labels)
         return out.sample if hasattr(out, "sample") else out
 
-    def _apply_cfg_dropout(self, class_labels: torch.Tensor, cond_board: torch.Tensor | None = None):
+    def _apply_cfg_dropout(self, class_labels: torch.Tensor, cond_board: Optional[torch.Tensor] = None):
         """Randomly drop labels (and zero-out spatial condition) for CFG training."""
         if self.cfg_drop_rate <= 0 or class_labels is None:
             return class_labels, cond_board
@@ -123,7 +123,7 @@ class SokobanBitDiffusion(L.LightningModule):
 
         return class_labels, cond_board
 
-    def _build_model_input(self, x_t: torch.Tensor, x_pred: torch.Tensor | None = None, cond_board: torch.Tensor | None = None):
+    def _build_model_input(self, x_t: torch.Tensor, x_pred: Optional[torch.Tensor] = None, cond_board: Optional[torch.Tensor] = None):
         parts = [x_t]
         if self.self_cond:
             parts.append(x_pred if x_pred is not None else torch.zeros_like(x_t))
@@ -139,7 +139,7 @@ class SokobanBitDiffusion(L.LightningModule):
         return res.expand(broadcast_shape)
 
     # Training & Validation
-    def _compute_loss(self, x_bits, class_labels: torch.Tensor | None = None, cond_board: torch.Tensor | None = None):
+    def _compute_loss(self, x_bits, class_labels: Optional[torch.Tensor] = None, cond_board: Optional[torch.Tensor] = None):
         """Bit-diffusion training loss with SNR weighting (x₀ prediction).
         x_bits: (B, num_bits, H, W) with values in {-1, 1}
         """
@@ -224,10 +224,10 @@ class SokobanBitDiffusion(L.LightningModule):
         self,
         batch_size: int,
         device: torch.device,
-        class_labels: torch.Tensor | None = None,
-        cond_board: torch.Tensor | None = None,
-        guidance_scale: float | None = None,
-        generator: torch.Generator | None = None
+        class_labels: Optional[torch.Tensor] = None,
+        cond_board: Optional[torch.Tensor] = None,
+        guidance_scale: Optional[float] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Generate boards via iterative denoising with DDPMScheduler and optional CFG.
         Returns bit predictions (B, num_bits, H, W) as floats.
@@ -287,7 +287,7 @@ class SokobanBitDiffusion(L.LightningModule):
 
     # Sokoban Evaluation
     @torch.no_grad()
-    def evaluate(self, val_dataloader, num_samples: int | None = None):
+    def evaluate(self, val_dataloader, num_samples: Optional[int] = None):
         """Generate boards and compute metrics.
         Returns:
             metrics: dict of sokoban metric name -> float
@@ -420,7 +420,7 @@ class EMACallback(Callback):
         self.decay = decay
         self.inv_gamma = inv_gamma
         self.power = power
-        self.ema_model: EMAModel | None = None
+        self.ema_model: Optional[EMAModel] = None
 
     def on_fit_start(self, trainer, pl_module):
         self.ema_model = EMAModel(
@@ -458,14 +458,14 @@ class SokobanBitDataModule(L.LightningDataModule):
     def __init__(
         self,
         data_path: str,
-        val_data_path: str | None = None,
+        val_data_path: Optional[str] = None,
         conditioning: str = "unconditional",
         total_train_size: int = 64000,
         total_eval_size: int = 6400,
         batch_size: int = 64,
         num_workers: int = 4,
         num_bits: int = 3,
-        k_values: List[int] | None = None,
+        k_values: Optional[List[int]] = None,
         use_dihedral_aug: bool = False,
         bot_removal_prob: float = 0.75,
     ):

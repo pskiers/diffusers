@@ -6,8 +6,8 @@
 #   python train_trm.py conditioning=k_steps
 
 # --- Conditioning mode ---
-conditioning: "num_boxes"
-num_classes: 4
+conditioning: "unconditional"
+num_classes: 0
 
 # --- Bit-Diffusion ---
 num_bits: 3
@@ -17,22 +17,22 @@ self_cond: true
 
 # --- CFG ---
 cfg_drop_rate: 0.1
-guidance_scale: 4.0
+guidance_scale: 6.0
 
 # --- Asymmetric time intervals (sampling only) ---
-time_shift_xi: 0.1 # ξ offset for model timestep; 0.0 = disabled
+time_shift_xi: 0.0 # offset for model timestep; 0.0 = disabled
 
 # --- TRM Parameters ---
 trm:
-  n: 6 # latent recursion iterations (z-loop)
-  T: 3 # deep recursion depth (T-1 no-grad + 1 with-grad)
+  n: 4 # latent recursion iterations (z-loop)
+  T: 2 # deep recursion depth (T-1 no-grad + 1 with-grad)
   use_grid_pos_embed: true # learnable pos embed for grid tasks; disable for natural images
 
 # --- n_sup(t) Schedule ---
 # n_sup(t) = n_min + (n_max - n_min) * sin(pi * t)
 # t≈0 (clean): n_min steps | t≈0.5 (medium noise): n_max | t≈1 (noisy): n_min
-n_sup_min: 2
-n_sup_max: 12
+n_sup_min: 1
+n_sup_max: 4
 
 # --- EMA ---
 use_ema: true
@@ -44,7 +44,7 @@ ema_power: 0.75 # reaches 0.999 at ~10K steps (good for <1M total steps)
 # --- Q_head (ACT — inference only) ---
 # Trained on "100% correct reconstruction". Halting only at inference.
 # Time-dependent threshold: threshold(t) = 0.95 - 0.4*t
-q_loss_weight: 0.1 # weight of BCE(q_hat, is_correct) relative to MSE
+q_loss_weight: 0.15 # weight of BCE(q_hat, is_correct) relative to MSE
 
 # --- Carry Recycling ---
 # Self-conditioning for hidden states (y, z) — warm-start from a no-grad forward pass
@@ -62,7 +62,7 @@ precision: "16-mixed"
 
 # --- Evaluation ---
 eval_every_n_epochs: 50
-num_eval_samples: 100
+num_eval_samples: 128
 save_every_n_epochs: 50
 
 # --- Paths ---
@@ -72,8 +72,8 @@ resume_from_checkpoint: null
 
 # --- Sampling (sample.py) ---
 checkpoint_path: "best"
-num_samples: 200
-sample_batch_size: 50
+num_samples: 256
+sample_batch_size: 64
 
 # --- Model (Transformer2DModel backbone) ---
 model:
@@ -86,9 +86,9 @@ model:
 
 # --- Dataset ---
 dataset:
-  data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4"
-  val_data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-val"
-  test_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-test"
+  data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4"
+  val_data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-val"
+  test_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-test"
   total_train_size: 1000 # TRM paper: small dataset + dihedral augmentation
   total_eval_size: 200
   k_values: [3, 8, 10]

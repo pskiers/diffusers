@@ -58,9 +58,9 @@ model:
 
 # --- Dataset ---
 dataset:
-  data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4"
-  val_data_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-val"
-  test_path: "/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion/sokoban/data/raw/12-12-4-test"
+  data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4"
+  val_data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-val"
+  test_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-test"
   total_train_size: 64000
   total_eval_size: 6400
   k_values: [3, 8, 10]

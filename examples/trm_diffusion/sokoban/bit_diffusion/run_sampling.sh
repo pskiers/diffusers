@@ -5,11 +5,11 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
-#SBATCH --account=plgdynamic3-gpu-gh200
-#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --account=plgdyplomancipw3tt-gpu-a100
+#SBATCH --partition=plgrid-gpu-a100
 #SBATCH --gres=gpu:1
-#SBATCH --output=/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/slurm_outputs/stdout/sokoban_eval_%j.out
-#SBATCH --error=/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/slurm_outputs/stderr/sokoban_eval_%j.err
+#SBATCH --output=/net/tscratch/people/plgmgrzanka/trm_sokoban/stdout/sokoban_std_%j.out
+#SBATCH --error=/net/tscratch/people/plgmgrzanka/trm_sokoban/stderr/sokoban_std_%j.err
 
 if [ -z "$1" ]; then
     echo "USage: sbatch eval_shifts.sh [train run name]"
@@ -19,13 +19,12 @@ fi
 RUN_NAME=$1
 
 module load ML-bundle/24.06a
-source /net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/venv/bin/activate
+source /net/tscratch/people/plgmgrzanka/trm_sokoban/venv/bin/activate
 
-export SSL_CERT_FILE=/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/cacert.pem
 export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PYTHONPATH:/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/src:/net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
+export PYTHONPATH=$PYTHONPATH:/net/tscratch/people/plgmgrzanka/trm_sokoban/diffusers/src:/net/tscratch/people/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
 
-cd /net/scratch/hscra/plgrid/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
+cd /net/tscratch/people/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
 
 SHIFTS=(0.0 0.05 0.1 0.2 0.25)
 
