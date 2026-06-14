@@ -20,4 +20,4 @@ export PYTHONPATH=$PYTHONPATH:/net/tscratch/people/plgmgrzanka/trm_sokoban/diffu
 
 cd /net/tscratch/people/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
 
-srun python sokoban/bit_diffusion/train_std.py
+srun python sokoban/bit_diffusion/train_std.py  #TODO: path in parameters

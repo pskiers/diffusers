@@ -20,6 +20,7 @@ ACT at inference:
 import math
 import sys
 from pathlib import Path
+from typing import Optional, Tuple
 
 import hydra
 import lightning as L
@@ -28,14 +29,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
-from omegaconf import DictConfig
-from typing import Optional, Tuple
+from omegaconf import DictConfig, OmegaConf
 
 from diffusers import Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-
-from sokoban.bit_diffusion.train_std import SokobanBitDataModule, EMACallback, SokobanBitDiffusion
+from sokoban.bit_diffusion.train_std import EMACallback, SokobanBitDataModule, SokobanBitDiffusion
 
 
 def n_sup_schedule(t: torch.Tensor, n_min: int, n_max: int) -> torch.Tensor:
@@ -99,15 +98,13 @@ class TRMDiT(nn.Module):
         self.norm_y = nn.LayerNorm(dim)
         self.norm_z = nn.LayerNorm(dim)
 
-        # Q_head: predicts confidence that current output is 100% correct
-        # Initialized to output -5 → sigmoid(-5) ≈ 0.007 (start with "never halt")
+        # Q_head: predicts confidence that current output is 100% correct, initialized to sigmoid(-1) = 0.268
         self.q_head = nn.Linear(dim, 1)
         with torch.no_grad():
             nn.init.zeros_(self.q_head.weight)
-            self.q_head.bias.fill_(-5.0)
+            self.q_head.bias.fill_(-1.0)
 
-        # Learnable grid positional embedding
-        # Useful for structured-grid tasks (Sokoban, Sudoku); disable for natural images
+        # Learnable grid positional embedding, useful for structured-grid tasks (Sokoban, Sudoku); disable for natural images
         seq_len = self.h_p * self.w_p
         if self.use_grid_pos_embed:
             self.grid_pos_embed = nn.Parameter(torch.zeros(1, seq_len, dim))
@@ -115,7 +112,7 @@ class TRMDiT(nn.Module):
         else:
             self.grid_pos_embed = None
 
-        # Initial states (fixed random, not trained)
+        # Initial states (fixed random from N(0,1), not trained)
         self.register_buffer("y_init", torch.randn(1, seq_len, dim))
         self.register_buffer("z_init", torch.randn(1, seq_len, dim))
 
@@ -191,7 +188,7 @@ class TRMDiT(nn.Module):
         carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         n_steps: Optional[int] = None,
     ):
-        """Full TRM forward pass (runs n_steps supervised iterations, no halting)."""
+        """Full TRM forward pass (runs n_steps supervised iterations, no halting). Used in training self-conditioning and carry recycling."""
         if n_steps is None:
             n_steps = self.n_sup_max
         bsz = sample.shape[0]
@@ -217,7 +214,7 @@ class TRMDiT(nn.Module):
         carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         n_steps: Optional[int] = None,
     ):
-        """TRM forward with Q_head-based early stopping."""
+        """TRM forward with Q_head-based early stopping. Used at inference time."""
         if n_steps is None:
             n_steps = self.n_sup_max
         bsz = sample.shape[0]
@@ -274,10 +271,8 @@ class _TRMOutput:
 
 
 class TRMEMACallback(EMACallback):
-    """
-    Rozszerzenie EMACallback dla TRM.
-    Wyłącza automatyczny krok na końcu batcha. Krok EMA jest wymuszany ręcznie
-    wewnętrz pętli n_sup, synchronicznie z opt.step().
+    """Extension of EMACallback for TRM. Disables automatic EMA step at the end of each training batch.
+    Reason: In TRM optimization happens inside n_sup iteration and EMA step should be performed synchronously with optimizer.step() inside the TRM loop.
     """
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         pass
@@ -311,80 +306,81 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         self.carry_recycle_prob = carry_recycle_prob
         self.use_carry_persistence = use_carry_persistence
 
-    def _trm_supervised_step(self, model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps, opt):
+    def _diffusion_loss(self, x_0_pred, x_bits, noise, t):
+        """SNR-weighted x0 (or epsilon) diffusion loss. Shared by training and validation."""
+        prediction_type = self.noise_scheduler.config.prediction_type
+        if prediction_type == "sample":
+            alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(self.device)
+            alpha_t = self._extract_into_tensor(alphas_cumprod, t, x_bits.shape)
+            snr = alpha_t / (1.0 - alpha_t).clamp(min=1e-5)
+            snr_weights = snr.clamp(max=5.0)
+            return (snr_weights * F.mse_loss(x_0_pred.float(), x_bits.float(), reduction="none")).mean()
+        elif prediction_type == "epsilon":
+            return F.mse_loss(x_0_pred.float(), noise.float())
+        raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+
+    def _q_head_loss(self, y_final, x_0_pred, x_bits):
+        """BCE of the Q_head logit against graded board accuracy (fraction of fully-correct cells)."""
+        q_logit = self.model.q_head(y_final.mean(dim=1)).squeeze(-1)
+        with torch.no_grad():
+            # A board cell is correct if all of its bits have the right sign
+            cell_correct = (x_0_pred.sign() == x_bits).all(dim=1)   # (A, H, W)
+            board_accuracy = cell_correct.float().mean(dim=(1, 2))  # (A,) in [0, 1]
+        return F.binary_cross_entropy_with_logits(q_logit, board_accuracy)
+
+    def _run_supervised_loop(self, model_input, timesteps, class_labels, x_bits, noise, y, z,
+                             n_sup_steps, optimize, opt=None, sch=None):
+        """Shared TRM n_sup deep-supervision loop used by BOTH training and validation.
+        1. For each supervised step it runs deep recursion, computes the diffusion
+        loss and Q_head loss, and detaches the carry (y, z) for the next step.
+        2. When optimize=True it additionally performs the per-step backward / clip / opt.step /
+        LR-step / EMA-step (TRM per-step optimization). When optimize=False (validation) it
+        only accumulates the same losses.
+
+        Returns (mean diffusion loss, mean Q_head loss).
+        """
         total_diff_loss = 0.0
         total_q_loss = 0.0
         total_active = 0
-        # BEZPIECZEŃSTWO: ensure gradients and optimizer state are clean before TRM loop
-        opt.zero_grad()
+        if optimize:
+            opt.zero_grad()  # ensure grads/optimizer state are clean before the loop
 
         max_steps = int(n_sup_steps.max().item())
         for sup_step in range(max_steps):
             active_mask = sup_step < n_sup_steps
-            # `.any()` returns a tensor scalar — use `.item()` for a Python bool
             if not active_mask.any().item():
                 break
 
             active_idx = active_mask.nonzero(as_tuple=True)[0]
-            model_input_a = model_input[active_idx]
             t_a = timesteps[active_idx]
-            cls_a = class_labels_train[active_idx]
+            cls_a = class_labels[active_idx]
             x_bits_a = x_bits[active_idx]
             noise_a = noise[active_idx]
-            y_a = y[active_idx]
-            z_a = z[active_idx]
 
-            x_high_a, ts_a, embedded_ts_a = self.model._patchify(model_input_a, t_a)
-            y_final_a, y_new_a, z_new_a = self.model._deep_recursion(x_high_a, y_a, z_a, ts_a, cls_a)
+            x_high_a, ts_a, embedded_ts_a = self.model._patchify(model_input[active_idx], t_a)
+            y_final_a, y_new_a, z_new_a = self.model._deep_recursion(
+                x_high_a, y[active_idx], z[active_idx], ts_a, cls_a
+            )
+            x_0_prediction_a = self.model._unpatchify(y_final_a, ts_a, cls_a, embedded_ts_a)
 
             y[active_idx] = y_new_a
             z[active_idx] = z_new_a
 
-            x_0_prediction_a = self.model._unpatchify(y_final_a, ts_a, cls_a, embedded_ts_a)
+            diffusion_loss = self._diffusion_loss(x_0_prediction_a, x_bits_a, noise_a, t_a)
+            q_loss = self._q_head_loss(y_final_a, x_0_prediction_a, x_bits_a)
 
-            # Strata Dyfuzji
-            prediction_type = self.noise_scheduler.config.prediction_type
-            if prediction_type == "sample":
-                alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(self.device)
-                alpha_t = self._extract_into_tensor(alphas_cumprod, t_a, x_bits_a.shape)
-                snr = alpha_t / (1.0 - alpha_t).clamp(min=1e-5)
-                snr_weights = snr.clamp(max=5.0)
-                loss_diff = snr_weights * F.mse_loss(x_0_prediction_a.float(), x_bits_a.float(), reduction="none")
-                diffusion_loss = loss_diff.mean()
-            elif prediction_type == "epsilon":
-                diffusion_loss = F.mse_loss(x_0_prediction_a.float(), noise_a.float())
-            else:
-                raise ValueError(f"Unsupported prediction_type: {prediction_type}")
-
-            # Q_head: predict the board-level accuracy of the current x0 estimate.
-            # NOTE: with this bit encoding "all bits exactly correct" == "board exactly
-            # correct", which is unreachable at medium/high noise -> the binary label is
-            # ~always 0, the head collapses to q->0, and inference ACT never halts.
-            # A graded (soft) target gives a dense, reachable signal at every noise level,
-            # so sigmoid(q) becomes a calibrated confidence that drives the halting decision.
-            q_logit_a = self.model.q_head(y_final_a.mean(dim=1)).squeeze(-1)
-            with torch.no_grad():
-                # a board cell is correct iff all of its bits have the right sign
-                cell_correct = (x_0_prediction_a.sign() == x_bits_a).all(dim=1)  # (A, H, W)
-                board_accuracy = cell_correct.float().mean(dim=(1, 2))           # (A,) in [0, 1]
-
-            # Soft-label BCE: regress confidence onto board accuracy (noise difficulty is
-            # already encoded in the target, so no explicit time gate is needed).
-            q_loss = F.binary_cross_entropy_with_logits(q_logit_a, board_accuracy)
-
-            # Złożenie straty i manualny krok optymalizatora na etapie TRM
-            loss = diffusion_loss + self.q_loss_weight * q_loss
-
-            self.manual_backward(loss)
-            self.clip_gradients(opt, gradient_clip_val=1.0)
-            opt.step()
-            opt.zero_grad()
-
-            # BEZPIECZNA AKTUALIZACJA EMA PO KAŻDYM OPT.STEP()
-            for cb in self.trainer.callbacks:
-                if isinstance(cb, TRMEMACallback) and cb.ema_model is not None:
-                    cb.ema_model.step(self.model.parameters())
-                    break
+            if optimize:
+                loss = diffusion_loss + self.q_loss_weight * q_loss
+                self.manual_backward(loss)
+                self.clip_gradients(opt, gradient_clip_val=1.0)
+                opt.step()
+                if sch is not None:
+                    sch.step()  # advance cosine LR once per optimizer update
+                opt.zero_grad()
+                for cb in self.trainer.callbacks: # EMA update synchronized with each opt.step()
+                    if isinstance(cb, TRMEMACallback) and cb.ema_model is not None:
+                        cb.ema_model.step(self.model.parameters())
+                        break
 
             total_diff_loss += diffusion_loss.detach()
             total_q_loss += q_loss.detach()
@@ -407,13 +403,13 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
 
         class_labels_train, cond_board_train = self._apply_cfg_dropout(class_labels, cond_board)
 
-        # normalize integer timesteps to [0, 1] before schedule
-        num_train_steps = float(self.noise_scheduler.config.num_train_timesteps - 1)
-        t_norm = timesteps.float() / num_train_steps
+        # Normalize integer timesteps to [0, 1] for n_sup_schedule
+        t_max = float(self.noise_scheduler.config.num_train_timesteps - 1)
+        t_norm = timesteps.float() / t_max
         n_sup_steps = n_sup_schedule(t_norm, self.n_sup_min, self.n_sup_max)
         max_steps = int(n_sup_steps.max().item())
 
-        # Ortogonalna ocena prawdopodobieństwa
+        # Self-conditioning and carry recycling logic
         do_self_cond = self.self_cond and (torch.rand(1).item() > 0.5)
         do_recycle = self.use_carry_recycling and (torch.rand(1).item() < self.carry_recycle_prob)
 
@@ -423,7 +419,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         if do_self_cond or do_recycle:
             with torch.no_grad():
                 model_input_init = self._build_model_input(x_t, None, cond_board_train)
-                # Ograniczenie n_steps=1 zabezpiecza wydajność i inicjuje pamięć zgrubnie
+                # Limiting n_steps=1 ensures efficiency and initializes memory coarsely
                 out, (y_sc, z_sc) = self.model(
                     sample=model_input_init, timestep=timesteps, class_labels=class_labels_train,
                     n_steps=1,
@@ -438,14 +434,11 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         y, z = carry_init if carry_init is not None else self.model._get_initial_states(B)
 
         opt = self.optimizers()
-        train_loss, q_loss = self._trm_supervised_step(
-            model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps, opt
-        )
-
-        # Manualny krok harmonogramu uczenia
         sch = self.lr_schedulers()
-        if sch is not None:
-            sch.step()
+        train_loss, q_loss = self._run_supervised_loop(
+            model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps,
+            optimize=True, opt=opt, sch=sch,
+        )
 
         self.log("train/loss", train_loss, prog_bar=True, sync_dist=True)
         self.log("train/q_loss", q_loss, sync_dist=True)
@@ -457,32 +450,25 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         cond_board = batch.get("condition", None)
         B = x_bits.shape[0]
 
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device
-        ).long()
-        noise = torch.randn_like(x_bits)
+        gen = torch.Generator(device=self.device).manual_seed(42 + batch_idx)
+
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (B,), device=self.device, generator=gen).long()
+        noise = torch.randn(x_bits.shape, device=self.device, dtype=x_bits.dtype, generator=gen)
         x_t = self.noise_scheduler.add_noise(x_bits, noise, timesteps)
 
-        x_pred = torch.zeros_like(x_t)
+        x_pred = torch.zeros_like(x_t) if self.self_cond else None
         model_input = self._build_model_input(x_t, x_pred, cond_board)
 
-        num_train_steps = float(self.noise_scheduler.config.num_train_timesteps - 1)
-        t_norm = timesteps.float() / num_train_steps
-        budget = n_sup_schedule(t_norm, self.n_sup_min, self.n_sup_max)
-        max_steps = int(budget.max().item())
+        # normalize timesteps [0, t_max] -> [0, 1] for n_sup schedule
+        t_max = float(self.noise_scheduler.config.num_train_timesteps - 1)
+        n_sup_steps = n_sup_schedule(timesteps.float() / t_max, self.n_sup_min, self.n_sup_max)
+        y, z = self.model._get_initial_states(B)
 
-        out, _ = self.model(sample=model_input, timestep=timesteps, class_labels=class_labels, n_steps=max_steps)
-        x_pred_final = out.sample if hasattr(out, "sample") else out
-
-        prediction_type = self.noise_scheduler.config.prediction_type
-        if prediction_type == "sample":
-            loss = F.mse_loss(x_pred_final.float(), x_bits.float())
-        elif prediction_type == "epsilon":
-            loss = F.mse_loss(x_pred_final.float(), noise.float())
-        else:
-            raise ValueError(f"Unsupported prediction_type: {prediction_type}")
-
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        val_loss, q_loss = self._run_supervised_loop(
+            model_input, timesteps, class_labels, x_bits, noise, y, z, n_sup_steps, optimize=False,
+        )
+        self.log("val/loss", val_loss, prog_bar=True, sync_dist=True)
+        self.log("val/q_loss", q_loss, sync_dist=True)
 
     @torch.no_grad()
     def generate_batch(
@@ -498,7 +484,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             guidance_scale = self.guidance_scale
         use_cfg = guidance_scale > 1.0 and class_labels is not None and self.conditioning != "unconditional"
 
-        x_t = torch.randn(batch_size, self.num_bits, self.resolution, self.resolution, device=device)
+        x_t = torch.randn(batch_size, self.num_bits, self.resolution, self.resolution, device=device, generator=generator)
         x_pred = None
         x_pred_step = x_t
 
@@ -511,19 +497,19 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         for t in self.noise_scheduler.timesteps:
             t_batch = t.expand(batch_size).to(device)
 
+            num_train_timesteps = self.noise_scheduler.config.num_train_timesteps
             if self.time_shift_xi > 0.0:
-                num_train_steps = self.noise_scheduler.config.num_train_timesteps
-                t_model = torch.clamp(t_batch + int(self.time_shift_xi * num_train_steps), max=num_train_steps - 1)
+                t_model = torch.clamp(t_batch + int(self.time_shift_xi * num_train_timesteps), max=num_train_timesteps - 1)
             else:
                 t_model = t_batch
 
-            # Bezpieczne pobieranie skalarów
-            num_train_steps = float(self.noise_scheduler.config.num_train_timesteps - 1)
-            t_scalar_norm = max(0.0, min(1.0, t.item() / num_train_steps))
+            # normalize timesteps [0, t_max] -> [0, 1] for n_sup schedule
+            t_max = float(num_train_timesteps - 1)
+            t_scalar_norm = max(0.0, min(1.0, t.item() / t_max))
             t_tensor_norm = torch.tensor([t_scalar_norm], device=device)
             n_steps = int(n_sup_schedule(t_tensor_norm, self.n_sup_min, self.n_sup_max).item())
 
-            t_model_norm = t_model[0].item() / num_train_steps
+            t_model_norm = t_model[0].item() / t_max
             threshold = halt_threshold(t_model_norm)
 
             if use_cfg:
@@ -570,7 +556,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
                 if is_sample_pred:
                     x_pred_step = x_pred_step.clamp(-1.0, 1.0)
 
-            x_t = self.noise_scheduler.step(x_pred_step, t, x_t).prev_sample
+            x_t = self.noise_scheduler.step(x_pred_step, t, x_t, generator=generator).prev_sample
             x_pred = x_pred_step if self.self_cond else None
 
         return x_pred_step
@@ -581,7 +567,10 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             betas=self.betas, weight_decay=self.weight_decay
         )
         warmup_steps = self.hparams.get("warmup_steps", 500)
-        total_steps = self.trainer.estimated_stepping_batches
+        # The n_sup loop runs max(n_sup) ~= n_sup_max optimizer updates per batch
+        steps_per_batch = self.n_sup_max
+        warmup_steps = int(warmup_steps) * steps_per_batch
+        total_steps = int(self.trainer.estimated_stepping_batches) * steps_per_batch
         scheduler = get_scheduler(
             name="cosine",
             optimizer=optimizer,
@@ -599,8 +588,6 @@ def main(cfg: DictConfig):
     L.seed_everything(cfg.get("seed", 42), workers=True)
 
     num_bits = cfg.num_bits
-    # For k_steps the class label indexes the k-value list, so the embedding table must
-    # be sized len(k_values) (+1 for the CFG/unconditional token), not cfg.num_classes.
     k_values = cfg.dataset.get("k_values", [3, 8, 10])
     num_classes = len(k_values) if cfg.conditioning == "k_steps" else cfg.num_classes
     use_self_cond = cfg.get("self_cond", True)
@@ -635,7 +622,8 @@ def main(cfg: DictConfig):
         n_sup_max=cfg.n_sup_max,
         use_grid_pos_embed=cfg.trm.get("use_grid_pos_embed", True),
     )
-    # Build noise scheduler (same defaults as standard training)
+
+    # Lightning module
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=cfg.get("ddpm_num_train_timesteps", 1000),
         beta_schedule=cfg.get("beta_schedule", "squaredcos_cap_v2"),
@@ -644,8 +632,6 @@ def main(cfg: DictConfig):
         clip_sample=True,
         clip_sample_range=1.0,
     )
-
-    # Lightning module
     lit_model = SokobanTRMBitDiffusion(
         model=model,
         noise_scheduler=noise_scheduler,
@@ -687,19 +673,19 @@ def main(cfg: DictConfig):
         num_bits=num_bits,
         k_values=cfg.dataset.get("k_values", [1, 3, 5, 8, 10]),
         use_dihedral_aug=cfg.dataset.get("use_dihedral_aug", True),
+        bot_removal_prob=cfg.dataset.get("bot_removal_prob", 0.75),
     )
 
     # Logger
     wandb_logger = WandbLogger(
-        project="Sokoban-TRM-BitDiffusion",
+        project=cfg.get("wandb_project", "Sokoban-TRM-BitDiffusion"),
+        group=cfg.get("wandb_group", None),
         name=cfg.get("run_name", None),
         save_dir=cfg.output_dir,
+        config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    # Parametr EMA z configu
     ema_decay = cfg.get("ema_decay", 0.9999)
-
-    # Callbacks z podpiętą klasą TRMEMACallback
     callbacks = [
         TRMEMACallback(decay=ema_decay, inv_gamma=1.0, power=0.75),
         ModelCheckpoint(

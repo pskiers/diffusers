@@ -24,14 +24,14 @@ import wandb
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
-from sokoban.dataset.evaluate_sokoban_boards import generate_metrics
-from sokoban.dataset.sokoban_dataset import SokobanBitsDataset
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
 
 from diffusers import DDPMScheduler, Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
+from sokoban.dataset.evaluate_sokoban_boards import generate_metrics
+from sokoban.dataset.sokoban_dataset import SokobanBitsDataset
 
 
 class SokobanBitDiffusion(L.LightningModule):
@@ -207,7 +207,13 @@ class SokobanBitDiffusion(L.LightningModule):
         class_labels = self._extract_class_labels(batch)
         cond_board = batch.get("condition", None)
 
-        loss = self._compute_loss(x_bits, class_labels, cond_board)
+        # Deterministic validation: fork + fixed-seed the RNG so the timesteps, noise and
+        # self-conditioning coin-flip sampled inside _compute_loss are reproducible and
+        # comparable across epochs (stabilizes the val/loss used for checkpoint selection).
+        fork_devices = [self.device.index] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=fork_devices):
+            torch.manual_seed(42 + batch_idx)
+            loss = self._compute_loss(x_bits, class_labels, cond_board)
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
 
     def on_validation_epoch_end(self):
@@ -279,7 +285,7 @@ class SokobanBitDiffusion(L.LightningModule):
                 if is_sample_pred:
                     x_pred_step = x_pred_step.clamp(-1.0, 1.0)
 
-            x_t = self.noise_scheduler.step(x_pred_step, t, x_t).prev_sample
+            x_t = self.noise_scheduler.step(x_pred_step, t, x_t, generator=generator).prev_sample
 
             x_pred = x_pred_step if self.self_cond else None
 
@@ -615,7 +621,8 @@ def main(cfg: DictConfig):
 
     run_name = cfg.get("run_name", None) or f"standard_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     wandb_logger = WandbLogger(
-        project="Sokoban-BitDiffusion",
+        project=cfg.get("wandb_project", "Sokoban-BitDiffusion"),
+        group=cfg.get("wandb_group", None),
         name=run_name,
         save_dir=cfg.output_dir,
         config=OmegaConf.to_container(cfg, resolve=True),

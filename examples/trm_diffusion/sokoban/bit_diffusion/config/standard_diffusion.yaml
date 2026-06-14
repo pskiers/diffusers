@@ -1,19 +1,22 @@
+# --- Reproducibility ---
 seed: 42
 
 # --- Conditioning mode ---
-conditioning: "num_boxes" # "unconditional", "num_boxes", "k_steps"
-num_classes: 4 # num_boxes: 4 classes (1-4 boxes); k_steps: num k list length
+conditioning: "unconditional" # "unconditional", "num_boxes", "k_steps"
+num_classes: 0 # num_boxes: 4 classes (1-4 boxes); k_steps: num k list length
 
 # --- Bit-Diffusion ---
 num_bits: 3
 resolution: 12
-ddpm_num_train_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2" # "linear", "squaredcos_cap_v2"
 prediction_type: "sample" # "epsilon" (predict noise), "sample" (predict x₀)
-rescale_betas_zero_snr: true # enforce zero terminal SNR (recommended for sample prediction)
-inference_steps: 400
+rescale_betas_zero_snr: true # enforce zero terminal SNR
+ddpm_num_train_timesteps: 1000 # training noise-schedule resolution
+inference_steps: 400 # denoising steps at eval/sampling
 self_cond: true
-time_shift_xi: 0.0 # 0.0 = disabled; fraction of T to shift model timestep during sampling
+
+# --- Asymmetric time intervals (sampling only) ---
+time_shift_xi: 0.0 # offset for model timestep; 0.0 = disabled
 
 # --- CFG ---
 cfg_drop_rate: 0.1
@@ -28,7 +31,7 @@ adam_betas: [0.95, 0.999]
 weight_decay: 1e-4
 warmup_steps: 2000
 ema_decay: 0.9999
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 1
 precision: "16-mixed"
 
 # --- Evaluation ---
@@ -36,9 +39,11 @@ save_every_n_epochs: 50
 eval_every_n_epochs: 50
 num_eval_samples: 192
 
-# --- Paths ---
+# --- W&B ---
 output_dir: "outputs/bit_diffusion_sokoban_std"
 run_name: null
+wandb_project: "Sokoban-BitDiffusion"
+wandb_group: null
 resume_from_checkpoint: null
 
 # --- Sampling (sample.py) ---
@@ -48,11 +53,11 @@ sample_batch_size: 64
 
 # --- Model (AdaLNDiT) ---
 model:
-  num_layers: 12
+  num_layers: 6
   patch_size: 1
   attention_head_dim: 64
-  num_attention_heads: 6
-  cross_attention_dim: null # null = no cross-attention; set 256 to match old architecture
+  num_attention_heads: 4
+  cross_attention_dim: null
   activation_fn: "gelu-approximate"
   dropout: 0.0
 

@@ -1,10 +1,3 @@
-# Hydra config for Embedded-TRM Bit-Diffusion (TRM recursion strictly inside the block)
-#
-# Usage:
-#   python train_trm_embedded.py conditioning=unconditional
-#   python train_trm_embedded.py conditioning=num_boxes
-#   python train_trm_embedded.py conditioning=k_steps
-
 # --- Reproducibility ---
 seed: 42
 
@@ -19,33 +12,31 @@ ddpm_num_train_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2"
 prediction_type: "sample" # "sample" (predict x0) or "epsilon"
 rescale_betas_zero_snr: true
-inference_steps: 300
+inference_steps: 400
 self_cond: true
 
 # --- CFG ---
 cfg_drop_rate: 0.1
-guidance_scale: 4.0 # conditional modes only; sweep 1.5-7.5
+guidance_scale: 4.0
 
 # --- Asymmetric time intervals (sampling only) ---
 time_shift_xi: 0.0
 
-# --- Embedded-TRM recursion (lives INSIDE the transformer block) ---
+#  --- Embedded-TRM recursion ---
 trm:
-  n_inner: 6 # N-loop: z-updates per latent recursion
-  T: 3 # deep recursion depth (T-1 no-grad + 1 with-grad = 1-step gradient)
-  num_inner_layers: 1 # transformer sub-layers per z-/y-stack (kept "tiny")
+  n_inner: 6
+  T: 3
+  num_inner_layers: 1 # transformer layers per z-/y-stack
+  shared_stack: false # true = one shared block stack for z and y
+  weight_tied: false # true = share ONE DiT+TRM layer across all steps
+  refine_residual: true # true = y = x + TRM(...), false = overwrite y each layer
   use_grid_pos_embed: true
 
-# --- n_sup(t) deep-supervision schedule ---
-# n_sup(t) = n_min + (n_max - n_min) * sin(pi * t); loss accumulated, single opt.step()
-n_sup_min: 2
-n_sup_max: 6
+# --- Deep supervision ---
+# Earlier layers get this weight, the final layer always gets 1.0.
+aux_loss_weight: 0.3
 
-# --- Q_head (ACT, inference-only halting) ---
-# Trained to regress board accuracy (graded soft target). threshold(t) = 0.95 - 0.4*t
-q_loss_weight: 0.15
-
-# --- EMA (one update per batch; valid now that we take one opt.step per batch) ---
+# --- EMA (one update per batch) ---
 ema_decay: 0.9999
 
 # --- Training ---
@@ -56,26 +47,29 @@ lr: 1e-4
 adam_betas: [0.9, 0.999]
 weight_decay: 1e-4
 warmup_steps: 500
-precision: "16-mixed"
+precision: "bf16-mixed"
 
 # --- Evaluation ---
 eval_every_n_epochs: 50
 num_eval_samples: 128
 save_every_n_epochs: 50
 
-# --- Paths ---
+# --- W&B ---
 output_dir: "outputs/embedded_trm_bit_diffusion_sokoban"
 run_name: null
+wandb_project: "Sokoban-EmbeddedTRM-BitDiffusion"
+wandb_group: null
 resume_from_checkpoint: null
 
-# --- Model (transformer backbone; hidden = num_attention_heads * attention_head_dim = 256) ---
+# --- DiT backbone ---
 model:
+  num_layers: 2 # number of (DiT layer + TRM block) stages
   patch_size: 1
   attention_head_dim: 64
   num_attention_heads: 4
   ffn_mult: 4
   activation_fn: "gelu-approximate"
-  dropout: 0.0 # keep 0: dropout inside the recursion injects noise across iterations
+  dropout: 0.0
 
 # --- Dataset ---
 dataset:

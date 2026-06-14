@@ -23,7 +23,6 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from diffusers import DDPMScheduler, Transformer2DModel
-
 from sokoban.bit_diffusion.train_std import SokobanBitDataModule, SokobanBitDiffusion
 from sokoban.bit_diffusion.train_trm import SokobanTRMBitDiffusion, TRMDiT
 
