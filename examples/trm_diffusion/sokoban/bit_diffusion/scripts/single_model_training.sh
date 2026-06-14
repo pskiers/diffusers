@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=120G
-#SBATCH --time=24:00:00
+#SBATCH --time=8:00:00
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --gres=gpu:1
@@ -20,4 +20,4 @@ export PYTHONPATH=$PYTHONPATH:/net/tscratch/people/plgmgrzanka/trm_sokoban/diffu
 
 cd /net/tscratch/people/plgmgrzanka/trm_sokoban/diffusers/examples/trm_diffusion
 
-srun python sokoban/bit_diffusion/train_std.py  #TODO: path in parameters
+srun python sokoban/bit_diffusion/train_std.py

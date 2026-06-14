@@ -66,9 +66,11 @@ class SokobanBitDiffusion(L.LightningModule):
         eval_every_n_epochs: int = 50,
         num_eval_samples: int = 100,
         k_values: Optional[List[int]] = None,
+        num_parameters: Optional[int] = None,
+        num_trainable_parameters: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "noise_scheduler"])
+        self.save_hyperparameters(ignore=["model", "noise_scheduler", "num_parameters", "num_trainable_parameters"])
 
         self.model = model
         self.noise_scheduler = noise_scheduler
@@ -420,22 +422,37 @@ class SokobanBitDiffusion(L.LightningModule):
 
 
 class EMACallback(Callback):
-    """EMA callback using diffusers EMAModel with warmup. Swaps EMA weights in for validation."""
+    """EMA via diffusers EMAModel: swaps EMA weights in for validation, bakes them into checkpoints.
+
+    Checkpoints serve both inference and resume: state_dict holds EMA weights (for sample.py), while raw_model_state/ema_optimization_step carry the real training weights and EMA warmup counter so resume continues the true trajectory instead of the smoothed EMA point.
+    """
     def __init__(self, decay: float = 0.9999, inv_gamma: float = 1.0, power: float = 0.75):
         super().__init__()
         self.decay = decay
         self.inv_gamma = inv_gamma
         self.power = power
         self.ema_model: Optional[EMAModel] = None
+        self._pending_raw_state: Optional[dict] = None
+        self._pending_ema_step: Optional[int] = None
 
     def on_fit_start(self, trainer, pl_module):
-        self.ema_model = EMAModel(
-            pl_module.model.parameters(),
-            decay=self.decay,
-            use_ema_warmup=True,
-            inv_gamma=self.inv_gamma,
-            power=self.power,
-        )
+        if self.ema_model is None:
+            self.ema_model = EMAModel(
+                pl_module.model.parameters(),
+                decay=self.decay,
+                use_ema_warmup=True,
+                inv_gamma=self.inv_gamma,
+                power=self.power,
+            )
+        if self._pending_ema_step is not None:
+            self.ema_model.optimization_step = self._pending_ema_step
+            self._pending_ema_step = None
+        if self._pending_raw_state is not None:
+            with torch.no_grad():
+                for name, p in pl_module.model.named_parameters():
+                    if name in self._pending_raw_state:
+                        p.data.copy_(self._pending_raw_state[name].to(p.device))
+            self._pending_raw_state = None
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         assert self.ema_model is not None
@@ -451,13 +468,20 @@ class EMACallback(Callback):
         self.ema_model.restore(pl_module.model.parameters())
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-        """Replace model weights in checkpoint with EMA weights for inference."""
         if self.ema_model is None:
             return
+        checkpoint["raw_model_state"] = {
+            name: p.detach().cpu().clone() for name, p in pl_module.model.named_parameters()
+        }
+        checkpoint["ema_optimization_step"] = self.ema_model.optimization_step
         for i, (name, _) in enumerate(pl_module.model.named_parameters()):
             key = f"model.{name}"
             if key in checkpoint["state_dict"]:
                 checkpoint["state_dict"][key] = self.ema_model.shadow_params[i].clone()
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        self._pending_raw_state = checkpoint.get("raw_model_state", None)
+        self._pending_ema_step = checkpoint.get("ema_optimization_step", None)
 
 
 class SokobanBitDataModule(L.LightningDataModule):
@@ -638,6 +662,7 @@ def main(cfg: DictConfig):
             monitor="val/loss",
             mode="min",
             save_top_k=1,
+            save_last=True,  # last.ckpt for resume
             verbose=True,
         ),
         ModelCheckpoint(

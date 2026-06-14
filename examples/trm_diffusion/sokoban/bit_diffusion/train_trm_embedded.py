@@ -480,7 +480,7 @@ def main(cfg: DictConfig) -> None:
         EMACallback(decay=cfg.get("ema_decay", 0.9999), inv_gamma=1.0, power=0.75),
         ModelCheckpoint(
             dirpath=Path(cfg.output_dir) / "checkpoints",
-            filename="best-{epoch}-{step}", monitor="val/loss", mode="min", save_top_k=1, verbose=True,
+            filename="best-{epoch}-{step}", monitor="val/loss", mode="min", save_top_k=1, save_last=True, verbose=True,
         ),
         ModelCheckpoint(
             dirpath=Path(cfg.output_dir) / "checkpoints",

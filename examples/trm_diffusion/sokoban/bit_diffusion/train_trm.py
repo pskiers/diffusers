@@ -691,9 +691,10 @@ def main(cfg: DictConfig):
         ModelCheckpoint(
             dirpath=Path(cfg.output_dir) / "checkpoints",
             filename="best-{epoch}-{step}",
-            monitor="sokoban/solvability",
-            mode="max",
+            monitor="val/loss",
+            mode="min",
             save_top_k=1,
+            save_last=True,  # last.ckpt for resume
             verbose=True,
         ),
         ModelCheckpoint(
