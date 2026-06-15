@@ -3,7 +3,7 @@ TRM Bit-Diffusion training for Sokoban board generation.
 
 Implements the full TRM algorithm:
   - n_sup(t) schedule: more reasoning steps at medium noise, fewer at extremes
-  - Loss computed + backward + optimizer.step() at EACH n_sup step
+  - Gradients accumulated across all n_sup steps, then ONE optimizer.step() per batch
   - Q_head trained on "100% correct reconstruction" — halting only at inference
   - EMA: exponential moving average of model weights for stable evaluation
   - Carry recycling: reuse (y, z) from self-conditioning pass
@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
 
 from diffusers import Transformer2DModel
@@ -270,16 +271,8 @@ class _TRMOutput:
         self.sample = sample
 
 
-class TRMEMACallback(EMACallback):
-    """Extension of EMACallback for TRM. Disables automatic EMA step at the end of each training batch.
-    Reason: In TRM optimization happens inside n_sup iteration and EMA step should be performed synchronously with optimizer.step() inside the TRM loop.
-    """
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        pass
-
-
 class SokobanTRMBitDiffusion(SokobanBitDiffusion):
-    """TRM Bit-Diffusion with per-step optimization, Q_head, and EMA."""
+    """TRM Bit-Diffusion with gradient accumulation over n_sup steps, Q_head, and EMA."""
     def __init__(
         self,
         # Q_head
@@ -333,9 +326,10 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         """Shared TRM n_sup deep-supervision loop used by BOTH training and validation.
         1. For each supervised step it runs deep recursion, computes the diffusion
         loss and Q_head loss, and detaches the carry (y, z) for the next step.
-        2. When optimize=True it additionally performs the per-step backward / clip / opt.step /
-        LR-step / EMA-step (TRM per-step optimization). When optimize=False (validation) it
-        only accumulates the same losses.
+        2. When optimize=True it accumulates each step's gradient (per-step backward, mean-
+        scaled) and then performs ONE clip / opt.step / LR-step per batch; EMA is stepped once
+        per batch by the EMACallback. When optimize=False (validation) it only accumulates the
+        same losses.
 
         Returns (mean diffusion loss, mean Q_head loss).
         """
@@ -343,7 +337,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         total_q_loss = 0.0
         total_active = 0
         if optimize:
-            opt.zero_grad()  # ensure grads/optimizer state are clean before the loop
+            opt.zero_grad()  # start clean; gradients are accumulated across the whole n_sup loop
 
         max_steps = int(n_sup_steps.max().item())
         for sup_step in range(max_steps):
@@ -371,20 +365,23 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
 
             if optimize:
                 loss = diffusion_loss + self.q_loss_weight * q_loss
-                self.manual_backward(loss)
-                self.clip_gradients(opt, gradient_clip_val=1.0)
-                opt.step()
-                if sch is not None:
-                    sch.step()  # advance cosine LR once per optimizer update
-                opt.zero_grad()
-                for cb in self.trainer.callbacks: # EMA update synchronized with each opt.step()
-                    if isinstance(cb, TRMEMACallback) and cb.ema_model is not None:
-                        cb.ema_model.step(self.model.parameters())
-                        break
+                self.manual_backward(loss / max_steps)
 
             total_diff_loss += diffusion_loss.detach()
             total_q_loss += q_loss.detach()
             total_active += 1
+
+        if optimize:
+            # One optimizer update per batch after the n_sup gradients have accumulated.
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if torch.isfinite(grad_norm):
+                opt.step()
+                if sch is not None:
+                    sch.step()  # advance cosine LR once per batch (num_training_steps = #batches)
+            else:
+                self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
+            opt.zero_grad()
+            # EMA is updated once per batch by the (base) EMACallback.on_train_batch_end.
 
         n_steps_done = max(total_active, 1)
         return total_diff_loss / n_steps_done, total_q_loss / n_steps_done
@@ -566,11 +563,10 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             self.model.parameters(), lr=self.lr,
             betas=self.betas, weight_decay=self.weight_decay
         )
-        warmup_steps = self.hparams.get("warmup_steps", 500)
-        # The n_sup loop runs max(n_sup) ~= n_sup_max optimizer updates per batch
-        steps_per_batch = self.n_sup_max
-        warmup_steps = int(warmup_steps) * steps_per_batch
-        total_steps = int(self.trainer.estimated_stepping_batches) * steps_per_batch
+        # One optimizer update per batch (gradients are accumulated across the n_sup loop),
+        # so the cosine horizon is simply the number of training batches.
+        warmup_steps = int(self.hparams.get("warmup_steps", 500))
+        total_steps = int(self.trainer.estimated_stepping_batches)
         scheduler = get_scheduler(
             name="cosine",
             optimizer=optimizer,
@@ -687,7 +683,7 @@ def main(cfg: DictConfig):
 
     ema_decay = cfg.get("ema_decay", 0.9999)
     callbacks = [
-        TRMEMACallback(decay=ema_decay, inv_gamma=1.0, power=0.75),
+        EMACallback(decay=ema_decay, inv_gamma=1.0, power=0.75),
         ModelCheckpoint(
             dirpath=Path(cfg.output_dir) / "checkpoints",
             filename="best-{epoch}-{step}",
@@ -717,6 +713,15 @@ def main(cfg: DictConfig):
         log_every_n_steps=10,
         val_check_interval=1.0,
     )
+
+    # Persist the W&B run id next to the checkpoints so sample.py can resume this same experiment and log test metrics onto these training charts.
+    if rank_zero_only.rank == 0:
+        try:
+            ckpt_dir = Path(cfg.output_dir) / "checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            (ckpt_dir / "wandb_run_id.txt").write_text(str(wandb_logger.experiment.id))
+        except Exception as e:
+            print(f"Could not save W&B run id: {e}")
 
     ckpt_path = cfg.get("resume_from_checkpoint", None)
     trainer.fit(lit_model, datamodule=data_module, ckpt_path=ckpt_path)

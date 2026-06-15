@@ -50,6 +50,9 @@ resume_from_checkpoint: null
 checkpoint_path: "best" # "best" auto-finds best-*.ckpt, or provide explicit path
 num_samples: 256
 sample_batch_size: 64
+log_to_wandb: true # log test metrics back onto the training run
+wandb_run_id: null # explicit run id to resume (else read from the checkpoint dir)
+wandb_entity: null # set only if the run lives under a team entity
 
 # --- Model (AdaLNDiT) ---
 model:

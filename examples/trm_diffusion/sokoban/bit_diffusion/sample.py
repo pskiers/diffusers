@@ -13,11 +13,13 @@ Usage (TRM diffusion):
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import hydra
 import lightning as L
 import numpy as np
 import torch
+import wandb
 from omegaconf import DictConfig
 from PIL import Image
 from tqdm.auto import tqdm
@@ -41,6 +43,20 @@ def find_best_checkpoint(output_dir: str, run_name: str, is_std: bool) -> str:
     return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
 
+def _resolve_wandb_run_id(cfg: DictConfig, ckpt_path: str) -> Optional[str]:
+    """Resolve the training run's W&B id so sampling logs onto the same experiment.
+
+    Priority: explicit cfg.wandb_run_id, else wandb_run_id.txt saved next to the checkpoints during training.
+    """
+    run_id = cfg.get("wandb_run_id", None)
+    if run_id:
+        return str(run_id)
+    id_file = Path(ckpt_path).parent / "wandb_run_id.txt"
+    if id_file.exists():
+        return id_file.read_text().strip() or None
+    return None
+
+
 @hydra.main(version_base=None, config_path="config", config_name="trm_diffusion")
 def main(cfg: DictConfig):
     seed = cfg.get("seed", 42)
@@ -61,7 +77,7 @@ def main(cfg: DictConfig):
     elif not Path(ckpt_path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    print(f"Ładowanie checkpointu: {ckpt_path}")
+    print(f"Loading checkpoint: {ckpt_path}")
 
     num_bits = cfg.num_bits
     k_values = cfg.dataset.get("k_values", [1, 3, 5, 8, 10])
@@ -186,6 +202,45 @@ def main(cfg: DictConfig):
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"Metrics saved to {metrics_path}")
+
+    # --- Log test metrics back onto the original training run in W&B ---
+    if cfg.get("log_to_wandb", True):
+        run_id = _resolve_wandb_run_id(cfg, ckpt_path)
+        if run_id is None:
+            print(
+                "W&B: no run id found. Pass wandb_run_id=<id> (copy it from the run URL) "
+                "or retrain so wandb_run_id.txt is saved next to the checkpoint. "
+                "Skipping W&B logging."
+            )
+        else:
+            try:
+                shift = lit_model.time_shift_xi
+                wandb.init(
+                    project=cfg.get("wandb_project", None),
+                    entity=cfg.get("wandb_entity", None),
+                    id=run_id,
+                    resume="must",
+                )
+                wandb.define_metric("test/time_shift_xi")
+                wandb.define_metric("test/sokoban/*", step_metric="test/time_shift_xi")
+
+                log_dict = {f"test/{k}": v for k, v in metrics.items()}
+                log_dict["test/time_shift_xi"] = shift
+
+                # Per-shift board panel so renders from different shifts don't overwrite.
+                boards = []
+                for i in range(min(num_samples, 16)):
+                    img = val_ds.render_bit_boards(gen_bits[i])
+                    if isinstance(img, np.ndarray):
+                        img = Image.fromarray(img)
+                    boards.append(wandb.Image(img, caption=f"shift={shift} sample_{i}"))
+                log_dict[f"test/boards_shift_{shift}"] = boards
+
+                wandb.log(log_dict)
+                wandb.finish()
+                print(f"Logged {len(metrics)} test metrics (shift={shift}) to W&B run '{run_id}'.")
+            except Exception as e:
+                print(f"W&B logging failed ({e}). Local artifacts were still saved.")
 
 
 if __name__ == "__main__":

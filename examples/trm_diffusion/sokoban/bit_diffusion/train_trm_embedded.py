@@ -46,6 +46,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
 
 from diffusers import DDPMScheduler
@@ -77,10 +78,12 @@ class TRMRefiner(nn.Module):
         T: int,
         num_inner_layers: int = 1,
         shared_stack: bool = False, # try the same or different networks for the z and y
+        isolate_transform: bool = False, # add only the block's own transform (out - in) to the carry
     ) -> None:
         super().__init__()
         self.n_inner = n_inner
         self.T = T
+        self.isolate_transform = isolate_transform
 
         def _make_stack() -> nn.ModuleList:
             return nn.ModuleList([
@@ -115,10 +118,24 @@ class TRMRefiner(nn.Module):
 
         The patchified noisy image is re-added at every z-update for constant input
         grounding (prevents drift).
+
+        isolate_transform toggles how each block output updates the carry:
+          - False (default): the carry is REPLACED by the (normed) block output. The block has
+            its own internal residual, so the previous carry survives through it once, but the
+            context terms (x, inj, y) are re-summed into the carry on every iteration.
+          - True: only the block's own transformation (out - in) is isolated and ADDED to the
+            carry (z = norm_z(z + (out - in))), keeping x/inj/y as pure context that is not
+            re-accumulated into the state. This is the canonical TRM residual update.
         """
         for _ in range(self.n_inner):
-            z = self.norm_z(self._run(self.z_layers, x + inj + y + z)).float() # float keeps the carry in fp32 across iterations
-        y = self.norm_y(self._run(self.y_layers, y + z)).float()
+            h_in_z = x + inj + y + z
+            h_out_z = self._run(self.z_layers, h_in_z)
+            z_new = z + (h_out_z - h_in_z) if self.isolate_transform else h_out_z
+            z = self.norm_z(z_new).float()  # float keeps the carry in fp32 across iterations
+        h_in_y = y + z
+        h_out_y = self._run(self.y_layers, h_in_y)
+        y_new = y + (h_out_y - h_in_y) if self.isolate_transform else h_out_y
+        y = self.norm_y(y_new).float()
         return y, z
 
     def forward(
@@ -160,6 +177,7 @@ class TRMDiTLayer(nn.Module):
         num_inner_layers: int = 1,
         shared_stack: bool = False,
         refine_residual: bool = True,
+        isolate_transform: bool = False,
     ) -> None:
         super().__init__()
         self.refine_residual = refine_residual
@@ -176,7 +194,7 @@ class TRMDiTLayer(nn.Module):
         )
         self.trm = TRMRefiner(
             dim, num_heads, head_dim, ffn_mult, activation_fn, dropout,
-            n_inner, T, num_inner_layers, shared_stack,
+            n_inner, T, num_inner_layers, shared_stack, isolate_transform,
         )
 
     def forward(
@@ -212,6 +230,7 @@ class EmbeddedTRMDiffusion(nn.Module):
         shared_stack: bool = False,
         weight_tied: bool = False,
         refine_residual: bool = True,
+        isolate_transform: bool = False,
         ffn_mult: int = 4,
         activation_fn: str = "gelu-approximate",
         dropout: float = 0.0,
@@ -245,6 +264,7 @@ class EmbeddedTRMDiffusion(nn.Module):
             TRMDiTLayer(
                 dim, num_attention_heads, attention_head_dim, ffn_mult, activation_fn, dropout,
                 num_embeds_ada_norm, n_inner, T, num_inner_layers, shared_stack, refine_residual,
+                isolate_transform,
             )
             for _ in range(n_distinct)
         ])
@@ -414,6 +434,7 @@ def main(cfg: DictConfig) -> None:
         shared_stack=cfg.trm.get("shared_stack", False),
         weight_tied=cfg.trm.get("weight_tied", False),
         refine_residual=cfg.trm.get("refine_residual", True),
+        isolate_transform=cfg.trm.get("isolate_transform", False),
         ffn_mult=cfg.model.get("ffn_mult", 4),
         activation_fn=cfg.model.get("activation_fn", "gelu-approximate"),
         dropout=cfg.model.get("dropout", 0.0),
@@ -501,6 +522,15 @@ def main(cfg: DictConfig) -> None:
         log_every_n_steps=10,
         val_check_interval=1.0,
     )
+
+    # Persist the W&B run id next to the checkpoints so sample.py can resume this same experiment and log test metrics onto these training charts.
+    if rank_zero_only.rank == 0:
+        try:
+            ckpt_dir = Path(cfg.output_dir) / "checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            (ckpt_dir / "wandb_run_id.txt").write_text(str(wandb_logger.experiment.id))
+        except Exception as e:
+            print(f"Could not save W&B run id: {e}")
 
     trainer.fit(lit_model, datamodule=data_module, ckpt_path=cfg.get("resume_from_checkpoint", None))
 

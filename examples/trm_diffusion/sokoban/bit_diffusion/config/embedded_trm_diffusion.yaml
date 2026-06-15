@@ -30,6 +30,7 @@ trm:
   shared_stack: false # true = one shared block stack for z and y
   weight_tied: false # true = share ONE DiT+TRM layer across all steps
   refine_residual: true # true = y = x + TRM(...), false = overwrite y each layer
+  isolate_transform: false # true = add only the block's transform (out - in) to the carry (canonical TRM residual)
   use_grid_pos_embed: true
 
 # --- Deep supervision ---
@@ -48,6 +49,7 @@ adam_betas: [0.9, 0.999]
 weight_decay: 1e-4
 warmup_steps: 500
 precision: "bf16-mixed"
+gradient_accumulation_steps: 1 # >1 = accumulate this many batches per optimizer update
 
 # --- Evaluation ---
 eval_every_n_epochs: 50
@@ -60,6 +62,14 @@ run_name: null
 wandb_project: "Sokoban-EmbeddedTRM-BitDiffusion"
 wandb_group: null
 resume_from_checkpoint: null
+
+# --- Sampling (sample.py) ---
+checkpoint_path: "best"
+num_samples: 256
+sample_batch_size: 64
+log_to_wandb: true # log test metrics back onto the training run
+wandb_run_id: null # explicit run id to resume (else read from the checkpoint dir)
+wandb_entity: null # set only if the run lives under a team entity
 
 # --- DiT backbone ---
 model:

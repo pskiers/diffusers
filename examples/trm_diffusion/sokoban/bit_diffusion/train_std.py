@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import wandb
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
@@ -456,6 +457,9 @@ class EMACallback(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         assert self.ema_model is not None
+        # Step EMA once per OPTIMIZER update, not once per batch.
+        if (batch_idx + 1) % trainer.accumulate_grad_batches != 0:
+            return
         self.ema_model.step(pl_module.model.parameters())
 
     def on_validation_epoch_start(self, trainer, pl_module):
@@ -686,6 +690,14 @@ def main(cfg: DictConfig):
         log_every_n_steps=10,
         val_check_interval=1.0,
     )
+
+    # Persist the W&B run id next to the checkpoints so sample.py can resume this same experiment and log test metrics onto these training charts.
+    if rank_zero_only.rank == 0:
+        try:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            (ckpt_dir / "wandb_run_id.txt").write_text(str(wandb_logger.experiment.id))
+        except Exception as e:
+            print(f"Could not save W&B run id: {e}")
 
     ckpt_path = cfg.get("resume_from_checkpoint", None)
     trainer.fit(lit_model, datamodule=data_module, ckpt_path=ckpt_path)
