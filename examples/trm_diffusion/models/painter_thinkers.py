@@ -9,7 +9,13 @@ from models.utility_models import SpatialEncoder, AttentiveBridge, SpatialBridge
 import numpy as np
 from tqdm.auto import tqdm
 
-from models.painters import make_painter, StandalonePainter, StandalonePainterControl, compute_losses_painter, classifier_loss as _classifier_loss
+from models.painters import (
+    make_painter,
+    StandalonePainter,
+    StandalonePainterControl,
+    compute_losses_painter,
+    classifier_loss as _classifier_loss,
+)
 from models.diffusion_utils import apply_noisy_swap, x0_from_noise_pred
 from train_noisy_classifier import load_noisy_classifier
 from models.utility_models import ConditioningPyramid
@@ -96,7 +102,9 @@ class PainterThinkerV0Tok(BaseModel):
             if self.clf_cfg.noisy_classifier:
                 self.train_clf = load_noisy_classifier(self.clf_cfg.classifier_path, "cuda")
             else:
-                self.train_clf = load_or_train_classifier(self.clf_cfg.classifier_path, None, model_cfg.cell_size, "cuda")
+                self.train_clf = load_or_train_classifier(
+                    self.clf_cfg.classifier_path, None, model_cfg.cell_size, "cuda"
+                )
             for p in self.train_clf.parameters():
                 p.requires_grad_(False)
 
@@ -758,6 +766,7 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: PainterOptimConfig,
         scheduler,
+        timestep_cfg: Optional[TimestepCondConfig] = None,
     ):
         super().__init__(
             thinker_cfg=thinker_cfg,
@@ -795,6 +804,29 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         else:
             self.logit_expand = None
 
+        # Timestep conditioning — zero-init so the model starts as identity.
+        # enc_film: FiLM on encoder features; thinker_temb_proj: broadcast into
+        # thinker token space; dec_film: FiLM on bridge output.
+        self.enc_timestep_cond = timestep_cfg.enc_timestep_cond if timestep_cfg is not None else False
+        self.thinker_timestep_cond = timestep_cfg.thinker_timestep_cond if timestep_cfg is not None else False
+        self.decoder_timestep_cond = timestep_cfg.decoder_timestep_cond if timestep_cfg is not None else False
+        if timestep_cfg is not None and (
+            timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond or timestep_cfg.decoder_timestep_cond
+        ):
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
+        if timestep_cfg is not None and timestep_cfg.enc_timestep_cond:
+            self.enc_film = nn.Linear(timestep_cfg.temb_dim, 2 * encoder_cfg.enc_channels)
+            nn.init.zeros_(self.enc_film.weight)
+            nn.init.zeros_(self.enc_film.bias)
+        if timestep_cfg is not None and timestep_cfg.thinker_timestep_cond:
+            self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
+            nn.init.zeros_(self.thinker_temb_proj.weight)
+            nn.init.zeros_(self.thinker_temb_proj.bias)
+        if timestep_cfg is not None and timestep_cfg.decoder_timestep_cond:
+            self.dec_film = nn.Linear(timestep_cfg.temb_dim, 2 * model_cfg.bridge_channels)
+            nn.init.zeros_(self.dec_film.weight)
+            nn.init.zeros_(self.dec_film.bias)
+
     def _get_condition(self, mb: dict, device) -> torch.Tensor:
         return mb["conditions"].to(device)
 
@@ -815,15 +847,50 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         proj = self.enc_proj(feat)  # (B, hidden_size, grid, grid)
         return proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
 
+    def _prepare_enc_input(self, condition: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
+        """Return encoder input. V0: condition only. V1 overrides to cat(condition, noisy)."""
+        return condition
+
     def _get_enc_emb(
         self,
         condition: torch.Tensor,
         noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """V0: encode condition only, ignore noisy and timesteps.
-        V1 overrides to use cat(condition, noisy) and optionally the timestep."""
-        return self._encode_image(condition)
+        temb = None
+        if (
+            timesteps is not None
+            and hasattr(self, "timestep_mlp")
+            and (self.enc_timestep_cond or self.thinker_timestep_cond)
+        ):
+            temb = self.timestep_mlp(timesteps)
+
+        feat = self.image_encoder(self._prepare_enc_input(condition, noisy))
+        if temb is not None and self.enc_timestep_cond:
+            scale, shift = self.enc_film(temb).chunk(2, dim=1)
+            feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        proj = self.enc_proj(feat)
+        enc_emb = proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
+
+        if temb is not None and self.thinker_timestep_cond:
+            enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
+
+        return enc_emb
+
+    def _run_painter(self, noisy: torch.Tensor, spatial_cond: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        if not self.decoder_timestep_cond:
+            return super()._run_painter(noisy, spatial_cond, timesteps)
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+        with ctx:
+            bridge_feat = self.bridge(spatial_cond)
+            temb = self.timestep_mlp(timesteps)
+            scale, shift = self.dec_film(temb).chunk(2, dim=1)
+            bridge_feat = bridge_feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+            return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
 
     def reasoning_step(
         self,
@@ -888,7 +955,7 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
 
     Inherits everything from V0; only differences:
       - image_encoder uses SpatialEncoder(2, ...) instead of SpatialEncoder(1, ...)
-      - _get_enc_emb concatenates condition + noisy before encoding
+      - _prepare_enc_input returns cat(condition, noisy) instead of condition only
     """
 
     def __init__(
@@ -912,8 +979,9 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            timestep_cfg=timestep_cfg,
         )
-        # Replace 1-channel encoder with 2-channel (condition + noisy)
+        # Replace 1-channel encoder with 2-channel (condition + noisy).
         self.image_encoder = SpatialEncoder(
             2,
             encoder_cfg.enc_channels,
@@ -921,67 +989,8 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             hidden_channels=tuple(encoder_cfg.enc_hidden_channels),
         )
 
-        # Timestep conditioning.  Both projections are zero-init so the model
-        # starts as the no-timestep identity and gradually learns to use t.
-        self.enc_timestep_cond = timestep_cfg.enc_timestep_cond if timestep_cfg is not None else False
-        self.thinker_timestep_cond = timestep_cfg.thinker_timestep_cond if timestep_cfg is not None else False
-        self.decoder_timestep_cond = timestep_cfg.decoder_timestep_cond if timestep_cfg is not None else False
-        if timestep_cfg is not None and (
-            timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond or timestep_cfg.decoder_timestep_cond
-        ):
-            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
-        if timestep_cfg is not None and timestep_cfg.enc_timestep_cond:
-            self.enc_film = nn.Linear(timestep_cfg.temb_dim, 2 * encoder_cfg.enc_channels)
-            nn.init.zeros_(self.enc_film.weight)
-            nn.init.zeros_(self.enc_film.bias)
-        if timestep_cfg is not None and timestep_cfg.thinker_timestep_cond:
-            self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
-            nn.init.zeros_(self.thinker_temb_proj.weight)
-            nn.init.zeros_(self.thinker_temb_proj.bias)
-        if timestep_cfg is not None and timestep_cfg.decoder_timestep_cond:
-            self.dec_film = nn.Linear(timestep_cfg.temb_dim, 2 * model_cfg.bridge_channels)
-            nn.init.zeros_(self.dec_film.weight)
-            nn.init.zeros_(self.dec_film.bias)
-
-    def _get_enc_emb(
-        self,
-        condition: torch.Tensor,
-        noisy: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Compute shared timestep embedding once (if any conditioning is active).
-        temb = None
-        if timesteps is not None and (self.enc_timestep_cond or self.thinker_timestep_cond):
-            temb = self.timestep_mlp(timesteps)
-
-        # Encode cat(condition, noisy) with optional encoder FiLM.
-        feat = self.image_encoder(torch.cat([condition, noisy], dim=1))
-        if temb is not None and self.enc_timestep_cond:
-            scale, shift = self.enc_film(temb).chunk(2, dim=1)  # (B, enc_channels) each
-            feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
-        proj = self.enc_proj(feat)
-        enc_emb = proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
-
-        # T2: broadcast timestep embedding into thinker token space.
-        if temb is not None and self.thinker_timestep_cond:
-            enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
-
-        return enc_emb
-
-    def _run_painter(self, noisy: torch.Tensor, spatial_cond: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        if not self.decoder_timestep_cond:
-            return super()._run_painter(noisy, spatial_cond, timesteps)
-        ctx = (
-            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
-            if self._painter_dtype is not None
-            else torch.autocast(device_type=noisy.device.type, enabled=False)
-        )
-        with ctx:
-            bridge_feat = self.bridge(spatial_cond)
-            temb = self.timestep_mlp(timesteps)
-            scale, shift = self.dec_film(temb).chunk(2, dim=1)
-            bridge_feat = bridge_feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
-            return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
+    def _prepare_enc_input(self, condition: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
+        return torch.cat([condition, noisy], dim=1)
 
 
 # ── Painter-thinker (V2: no CE supervision) ───────────────────────────────────
@@ -1127,6 +1136,7 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
         painter_optim_cfg: PainterOptimConfig,
         scheduler,
         adapter_in_channels: int = 0,
+        timestep_cfg=None,
     ):
         super().__init__(
             thinker_cfg=thinker_cfg,
@@ -1164,21 +1174,51 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
             # Replace first bridge conv; second conv (bridge_ch→bridge_ch) stays frozen.
             self.bridge_input_conv = nn.Conv2d(adapter_in_channels, bridge_channels, kernel_size=3, padding=1)
 
+        # Token-based path: no image encoder, so enc/thinker timestep cond are
+        # not applicable.  Only decoder_timestep_cond is supported.
+        if timestep_cfg is not None and (timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond):
+            raise ValueError(
+                "ThinkerWithFrozenPainter (token-based) does not have an image encoder. "
+                "Only decoder_timestep_cond is supported; set enc_timestep_cond and "
+                "thinker_timestep_cond to False."
+            )
+        self.enc_timestep_cond = False
+        self.thinker_timestep_cond = False
+        self.decoder_timestep_cond = timestep_cfg.decoder_timestep_cond if timestep_cfg is not None else False
+        if self.decoder_timestep_cond:
+            bridge_ch = painter.bridge.conv[0].out_channels
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
+            self.dec_film = nn.Linear(timestep_cfg.temb_dim, 2 * bridge_ch)
+            nn.init.zeros_(self.dec_film.weight)
+            nn.init.zeros_(self.dec_film.bias)
+
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         if self.logit_projection is not None:
             logits = self.logit_projection(logits)  # (B, 81, adapter_in_channels)
         return super()._logits_to_spatial(logits)
 
     def _run_painter(self, noisy, spatial_cond, timesteps):
-        if self.bridge_input_conv is not None:
-            # Apply new trainable first conv, then the frozen second conv.
-            spatial_cond = F.interpolate(
-                spatial_cond, size=self.bridge.painter_size, mode="bilinear", align_corners=False
-            )
-            spatial_cond = torch.nn.functional.silu(self.bridge_input_conv(spatial_cond))
-            bridge_feat = self.bridge.conv[2](spatial_cond)
+        if not self.bridge_input_conv and not self.decoder_timestep_cond:
+            return super()._run_painter(noisy, spatial_cond, timesteps)
+        ctx = (
+            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
+            if self._painter_dtype is not None
+            else torch.autocast(device_type=noisy.device.type, enabled=False)
+        )
+        with ctx:
+            if self.bridge_input_conv is not None:
+                spatial_cond = F.interpolate(
+                    spatial_cond, size=self.bridge.painter_size, mode="bilinear", align_corners=False
+                )
+                spatial_cond = torch.nn.functional.silu(self.bridge_input_conv(spatial_cond))
+                bridge_feat = self.bridge.conv[2](spatial_cond)
+            else:
+                bridge_feat = self.bridge(spatial_cond)
+            if self.decoder_timestep_cond:
+                temb = self.timestep_mlp(timesteps)
+                scale, shift = self.dec_film(temb).chunk(2, dim=1)
+                bridge_feat = bridge_feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
             return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
-        return super()._run_painter(noisy, spatial_cond, timesteps)
 
     def get_painter_params(self) -> list:
         return []  # frozen — excluded from all optimizers
@@ -1219,6 +1259,7 @@ class ThinkerWithFrozenPainterV0(OriginalTRMRatatouilleV0):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: PainterOptimConfig,
         scheduler,
+        timestep_cfg=None,
     ):
         super().__init__(
             thinker_cfg=thinker_cfg,
@@ -1229,6 +1270,7 @@ class ThinkerWithFrozenPainterV0(OriginalTRMRatatouilleV0):
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            timestep_cfg=timestep_cfg,
         )
         self.painter_optim_cfg = painter_optim_cfg
         self.bridge = painter.bridge
@@ -1513,14 +1555,12 @@ class ThinkerWithFrozenPainterV1Verif(ThinkerWithFrozenPainterV1):
 
         n_with_grad = n_steps - n_no_grad
         for step in range(n_with_grad):
-            is_last = (step == n_with_grad - 1)
-            _, z_H, z_L = self.thinker.reasoning_step(
-                enc_emb, z_H, z_L, puzzle_ids, keep_carry_grad=is_last
-            )
+            is_last = step == n_with_grad - 1
+            _, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids, keep_carry_grad=is_last)
 
         seq_len = self.thinker.inner.config.seq_len
-        z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)   # (B, hidden_size)
-        verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))   # (B,)
+        z_H_feats = z_H[:, :seq_len, :].float().mean(dim=1)  # (B, hidden_size)
+        verif_score = torch.sigmoid(self.verif_head(z_H_feats).squeeze(-1))  # (B,)
 
         return noise_pred, logits, verif_score
 
@@ -1734,9 +1774,7 @@ class ThinkerWithFrozenPainterControlNet(OriginalTRMRatatouilleV0):
         # Fresh ConditioningPyramid — trained to convert thinker logits to
         # control residuals.  Channel count matches _logits_to_spatial output.
         ctrl_in_ch = (
-            encoder_cfg.thinker_out_channels
-            if encoder_cfg.thinker_out_channels is not None
-            else thinker_cfg.vocab_size
+            encoder_cfg.thinker_out_channels if encoder_cfg.thinker_out_channels is not None else thinker_cfg.vocab_size
         )
         self.control_pyramid = ConditioningPyramid(
             in_channels=ctrl_in_ch,
@@ -1775,8 +1813,7 @@ class ThinkerWithFrozenPainterControlNet(OriginalTRMRatatouilleV0):
         frozen_ids = {id(p) for p in self.painter.parameters()}
         thinker_ids = {id(p) for p in self.thinker.parameters()}
         return [
-            p for p in self.parameters()
-            if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
+            p for p in self.parameters() if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
         ]
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:

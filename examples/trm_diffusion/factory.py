@@ -513,6 +513,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 thinker_optim_cfg=thinker_optim_cfg,
                 painter_optim_cfg=painter_optim_cfg,
                 scheduler=scheduler,
+                timestep_cfg=_timestep_cond_cfg(cfg),
             )
 
         if painter_variant in ("v1", "v1_verif"):
@@ -548,6 +549,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
             adapter_in_channels=int(cfg.painter.get("adapter_in_channels", 0)),
+            timestep_cfg=_timestep_cond_cfg(cfg),
         )
 
     # Painter-thinker variants (mode == "painter")
