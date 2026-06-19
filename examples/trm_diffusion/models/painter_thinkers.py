@@ -1174,20 +1174,25 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
             # Replace first bridge conv; second conv (bridge_ch→bridge_ch) stays frozen.
             self.bridge_input_conv = nn.Conv2d(adapter_in_channels, bridge_channels, kernel_size=3, padding=1)
 
-        # Token-based path: no image encoder, so enc/thinker timestep cond are
-        # not applicable.  Only decoder_timestep_cond is supported.
-        if timestep_cfg is not None and (timestep_cfg.enc_timestep_cond or timestep_cfg.thinker_timestep_cond):
+        # Token-based path: no image encoder, so enc_timestep_cond is not applicable.
+        # thinker_timestep_cond injects temb as an addend to token embeddings via
+        # SpatialTRM.reasoning_step(input_emb_bias=...) — no image encoder needed.
+        if timestep_cfg is not None and timestep_cfg.enc_timestep_cond:
             raise ValueError(
-                "ThinkerWithFrozenPainter (token-based) does not have an image encoder. "
-                "Only decoder_timestep_cond is supported; set enc_timestep_cond and "
-                "thinker_timestep_cond to False."
+                "ThinkerWithFrozenPainter (token-based) does not have an image encoder. " "Set enc_timestep_cond=False."
             )
         self.enc_timestep_cond = False
-        self.thinker_timestep_cond = False
+        self.thinker_timestep_cond = timestep_cfg.thinker_timestep_cond if timestep_cfg is not None else False
         self.decoder_timestep_cond = timestep_cfg.decoder_timestep_cond if timestep_cfg is not None else False
+        if timestep_cfg is not None and (self.thinker_timestep_cond or self.decoder_timestep_cond):
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
+        if self.thinker_timestep_cond:
+            # (B, temb_dim) → (B, 1, hidden_size) broadcast-added to all token positions.
+            self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
+            nn.init.zeros_(self.thinker_temb_proj.weight)
+            nn.init.zeros_(self.thinker_temb_proj.bias)
         if self.decoder_timestep_cond:
             bridge_ch = painter.bridge.conv[0].out_channels
-            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
             self.dec_film = nn.Linear(timestep_cfg.temb_dim, 2 * bridge_ch)
             nn.init.zeros_(self.dec_film.weight)
             nn.init.zeros_(self.dec_film.bias)
@@ -1196,6 +1201,49 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
         if self.logit_projection is not None:
             logits = self.logit_projection(logits)  # (B, 81, adapter_in_channels)
         return super()._logits_to_spatial(logits)
+
+    def _get_thinker_emb_bias(self, timesteps: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return (B, 1, hidden_size) temb bias for thinker token embeddings, or None."""
+        if not self.thinker_timestep_cond:
+            return None
+        temb = self.timestep_mlp(timesteps)
+        return self.thinker_temb_proj(temb).unsqueeze(1)  # (B, 1, hidden_size)
+
+    def reasoning_step(
+        self,
+        puzzle_tokens: torch.Tensor,
+        noisy: torch.Tensor,
+        z_H: torch.Tensor,
+        z_L: torch.Tensor,
+        timesteps: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
+    ):
+        emb_bias = self._get_thinker_emb_bias(timesteps)
+        logits, z_H_next, z_L_next = self.thinker.reasoning_step(
+            puzzle_tokens,
+            z_H,
+            z_L,
+            puzzle_ids,
+            H_cycles=H_cycles,
+            L_cycles=L_cycles,
+            input_emb_bias=emb_bias,
+        )
+        spatial_cond = self._logits_to_spatial(logits.float())
+        if self.diff_thinker_weight == 0.0:
+            sc_for_painter = spatial_cond.detach()
+        elif self.diff_thinker_weight != 1.0:
+            sc_for_painter = (
+                self.diff_thinker_weight * spatial_cond + (1.0 - self.diff_thinker_weight) * spatial_cond.detach()
+            )
+        else:
+            sc_for_painter = spatial_cond
+        if self.training and self.train_cfg.cfg_prob > 0:
+            drop = torch.rand(sc_for_painter.shape[0], 1, 1, 1, device=sc_for_painter.device) < self.train_cfg.cfg_prob
+            sc_for_painter = sc_for_painter * (~drop)
+        noise_pred = self._run_painter(noisy, sc_for_painter, timesteps)
+        return noise_pred, logits, z_H_next, z_L_next
 
     def _run_painter(self, noisy, spatial_cond, timesteps):
         if not self.bridge_input_conv and not self.decoder_timestep_cond:
@@ -1220,6 +1268,31 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
                 bridge_feat = bridge_feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
             return self.painter(torch.cat([noisy, bridge_feat], dim=1), timesteps).sample
 
+    def forward(
+        self,
+        noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        puzzle_tokens: torch.Tensor,
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ):
+        bsz = noisy.shape[0]
+        z_H, z_L = self.get_initial_states(bsz)
+        z_H = z_H.to(noisy.device)
+        z_L = z_L.to(noisy.device)
+        emb_bias = self._get_thinker_emb_bias(timesteps)
+        logits = None
+        for _ in range(self.n_sup):
+            logits, z_H, z_L = self.thinker.reasoning_step(puzzle_tokens, z_H, z_L, puzzle_ids, input_emb_bias=emb_bias)
+        spatial_cond = self._logits_to_spatial(logits.float())
+        if not self.training and self.eval_cfg.cfg_scale > 1.0:
+            null = torch.zeros_like(spatial_cond)
+            pred_cond = self._run_painter(noisy, spatial_cond, timesteps)
+            pred_uncond = self._run_painter(noisy, null, timesteps)
+            noise_pred = pred_uncond + self.eval_cfg.cfg_scale * (pred_cond - pred_uncond)
+        else:
+            noise_pred = self._run_painter(noisy, spatial_cond, timesteps)
+        return noise_pred, logits
+
     def get_painter_params(self) -> list:
         return []  # frozen — excluded from all optimizers
 
@@ -1232,6 +1305,12 @@ class ThinkerWithFrozenPainter(PainterThinkerV0Tok):
             params = params + list(self.logit_projection.parameters())
         if self.bridge_input_conv is not None:
             params = params + list(self.bridge_input_conv.parameters())
+        if hasattr(self, "timestep_mlp"):
+            params = params + list(self.timestep_mlp.parameters())
+        if hasattr(self, "thinker_temb_proj"):
+            params = params + list(self.thinker_temb_proj.parameters())
+        if hasattr(self, "dec_film"):
+            params = params + list(self.dec_film.parameters())
         return params
 
 

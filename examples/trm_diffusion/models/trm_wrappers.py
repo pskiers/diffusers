@@ -33,8 +33,15 @@ class SpatialTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
             embedding = input.to(self.forward_dtype)
             if self.config.pos_encodings == "learned":
                 embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
-            return self.embed_scale * embedding
-        return super()._input_embeddings(input, puzzle_identifiers)
+            emb = self.embed_scale * embedding
+        else:
+            emb = super()._input_embeddings(input, puzzle_identifiers)
+        # Optional addend injected by SpatialTRM.reasoning_step (e.g. timestep conditioning).
+        # Uses the same set-then-reset pattern as _keep_carry_grad.
+        emb_bias = getattr(self, "_emb_bias", None)
+        if emb_bias is not None:
+            emb = emb + emb_bias.to(emb.dtype)
+        return emb
 
 
 class SpatialTRM(BaseModel):
@@ -166,6 +173,7 @@ class SpatialTRM(BaseModel):
         H_cycles: Optional[int] = None,
         L_cycles: Optional[int] = None,
         keep_carry_grad: bool = False,
+        input_emb_bias: Optional[torch.Tensor] = None,
     ):
         """
         One supervision step. Internally runs H_cycles-1 no-grad cycles then one full-grad cycle.
@@ -174,6 +182,9 @@ class SpatialTRM(BaseModel):
         keep_carry_grad: if True, z_H/z_L in the returned carry are NOT detached,
           so gradients flow back to `inputs` (used for classifier guidance in eval).
           Leave False during training to avoid accumulating graph across n_sup steps.
+        input_emb_bias: optional (B, 1, hidden_size) or (B, N, hidden_size) tensor added
+          to the input embeddings after embed_scale — used for timestep conditioning in
+          the token-input path (ThinkerWithFrozenPainter).
 
         Returns: (logits, z_H, z_L) — z_H/z_L detached unless keep_carry_grad=True.
           logits: (B, seq_len, vocab_size) — gradients always attached.
@@ -191,11 +202,13 @@ class SpatialTRM(BaseModel):
         try:
             carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
             self.inner._keep_carry_grad = keep_carry_grad
+            self.inner._emb_bias = input_emb_bias
             new_carry, logits, _ = self.inner(carry, {"inputs": inputs, "puzzle_identifiers": puzzle_ids})
         finally:
             self.inner.config.H_cycles = orig_H
             self.inner.config.L_cycles = orig_L
             self.inner._keep_carry_grad = False
+            self.inner._emb_bias = None
 
         return logits, new_carry.z_H, new_carry.z_L
 
