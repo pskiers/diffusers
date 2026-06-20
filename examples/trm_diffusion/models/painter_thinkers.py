@@ -789,6 +789,10 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         scheduler,
         timestep_cfg: Optional[TimestepCondConfig] = None,
     ):
+        # If thinker_grid_size is set, override seq_len before super() creates the TRM.
+        if model_cfg.thinker_grid_size is not None:
+            thinker_cfg.seq_len = model_cfg.thinker_grid_size * model_cfg.thinker_grid_size
+
         super().__init__(
             thinker_cfg=thinker_cfg,
             model_cfg=model_cfg,
@@ -798,6 +802,11 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
         )
+
+        # Override _grid set by PainterThinkerV0Tok (painter_size // cell_size).
+        if model_cfg.thinker_grid_size is not None:
+            self._grid = model_cfg.thinker_grid_size
+
         self.encoder_cfg = encoder_cfg
         self.token_offset = 0
 
@@ -863,10 +872,12 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         return super()._logits_to_spatial(logits)
 
     def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, C, H, W) → float embeddings (B, 81, hidden_size)"""
-        feat = self.image_encoder(x)  # (B, enc_channels, grid, grid)
-        proj = self.enc_proj(feat)  # (B, hidden_size, grid, grid)
-        return proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
+        """(B, C, H, W) → float embeddings (B, _grid², hidden_size)"""
+        feat = self.image_encoder(x)  # (B, enc_channels, natural_grid, natural_grid)
+        proj = self.enc_proj(feat)    # (B, hidden_size, natural_grid, natural_grid)
+        if proj.shape[-1] != self._grid:
+            proj = F.adaptive_avg_pool2d(proj, (self._grid, self._grid))
+        return proj.flatten(2).transpose(1, 2)  # (B, _grid², hidden_size)
 
     def _prepare_enc_input(
         self, condition: torch.Tensor, noisy: torch.Tensor, timesteps: Optional[torch.Tensor] = None

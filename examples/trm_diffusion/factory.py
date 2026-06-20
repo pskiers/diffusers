@@ -223,6 +223,7 @@ def _painter_thinker_cfg(cfg: DictConfig) -> PainterThinkerConfig:
         diff_thinker_weight=float(p.get("diff_thinker_weight", 1.0)),
         thinker_bridge_mode=str(p.get("thinker_bridge_mode", "logits")),
         painter_dtype=cfg.precision.get("painter_dtype", None),
+        thinker_grid_size=int(p.thinker_grid_size) if p.get("thinker_grid_size") is not None else None,
     )
 
 

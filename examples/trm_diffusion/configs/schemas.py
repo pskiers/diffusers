@@ -177,6 +177,9 @@ class PainterThinkerConfig:
     diff_thinker_weight: float = 1.0
     thinker_bridge_mode: str = "logits"
     painter_dtype: Optional[str] = None
+    # If set, TRM operates on a thinker_grid_size×thinker_grid_size grid instead of
+    # painter_size//cell_size.  Encoder output is adaptively pooled to this size.
+    thinker_grid_size: Optional[int] = None
 
 
 @dataclass
