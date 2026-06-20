@@ -121,6 +121,8 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         noisy_swap=_noisy_swap_cfg(cfg),
         classifier_loss=_classifier_loss_cfg(cfg),
         two_stage=_two_stage_cfg(cfg),
+        noisy_dropout_p_max=float(tr.get("noisy_dropout_p_max", 0.0)),
+        minsnr_gamma=float(tr["minsnr_gamma"]) if tr.get("minsnr_gamma") is not None else None,
     )
 
 

@@ -57,6 +57,14 @@ class TrainConfig:
     noisy_swap: Optional[NoisySwapConfig] = None
     classifier_loss: Optional[ClassifierLossConfig] = None
     two_stage: Optional[TwoStageConfig] = None
+    # Noisy channel dropout: zeroes the x_t input to the V1 encoder with probability
+    # p(t) = noisy_dropout_p_max * (1 - t/T).  Highest dropout at t=0 (clean, shortcut
+    # regime), zero dropout at t=T (pure noise, x_t uninformative anyway).
+    noisy_dropout_p_max: float = 0.0
+    # Min-SNR loss weighting (Hang et al. 2023).  When set, per-sample MSE is multiplied
+    # by min(SNR(t), gamma)/SNR(t) for x0-prediction or min(SNR(t), gamma) for
+    # epsilon-prediction, upweighting high-noise steps relative to easy low-noise ones.
+    minsnr_gamma: Optional[float] = None
 
 
 @dataclass

@@ -230,6 +230,22 @@ class PainterThinkerV0Tok(BaseModel):
             )
         return mb_data
 
+    def _minsnr_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """Per-sample min-SNR weights (Hang et al. 2023).
+
+        For x0/sample prediction: w(t) = min(SNR(t), γ) / SNR(t)
+          → downweights easy low-noise steps, upweights hard high-noise steps.
+        For ε prediction:         w(t) = min(SNR(t), γ)
+          → clips the implicit high-SNR dominance from the ε parameterisation.
+        """
+        gamma = self.train_cfg.minsnr_gamma
+        alphas_cumprod = self.scheduler.alphas_cumprod.to(timesteps.device)[timesteps]
+        snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp(min=1e-8)
+        if self.scheduler.config.prediction_type == "epsilon":
+            return snr.clamp(max=gamma)
+        else:  # "sample" / x0 prediction
+            return snr.clamp(max=gamma) / snr.clamp(min=1e-8)
+
     def _compute_step_loss(self, noise_pred, logits, d, device, *, include_sudoku=True):
         sudoku_w = self.train_cfg.sudoku_loss_weight
         mse_w = self.train_cfg.mse_loss_weight
@@ -237,7 +253,12 @@ class PainterThinkerV0Tok(BaseModel):
         diff_loss = sudoku_loss = clf_loss = torch.tensor(0.0, device=device)
 
         if mse_w > 0.0:
-            diff_loss = F.mse_loss(noise_pred.float(), d["target"])
+            if self.train_cfg.minsnr_gamma is not None:
+                per_sample = (noise_pred.float() - d["target"]).pow(2).flatten(1).mean(1)
+                w = self._minsnr_weights(d["timesteps"])
+                diff_loss = (w * per_sample).mean()
+            else:
+                diff_loss = F.mse_loss(noise_pred.float(), d["target"])
             step_loss = step_loss + mse_w * diff_loss
 
         if include_sudoku and logits is not None and sudoku_w > 0:
@@ -847,7 +868,9 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         proj = self.enc_proj(feat)  # (B, hidden_size, grid, grid)
         return proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
 
-    def _prepare_enc_input(self, condition: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
+    def _prepare_enc_input(
+        self, condition: torch.Tensor, noisy: torch.Tensor, timesteps: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Return encoder input. V0: condition only. V1 overrides to cat(condition, noisy)."""
         return condition
 
@@ -865,7 +888,7 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
         ):
             temb = self.timestep_mlp(timesteps)
 
-        feat = self.image_encoder(self._prepare_enc_input(condition, noisy))
+        feat = self.image_encoder(self._prepare_enc_input(condition, noisy, timesteps=timesteps))
         if temb is not None and self.enc_timestep_cond:
             scale, shift = self.enc_film(temb).chunk(2, dim=1)
             feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
@@ -989,7 +1012,18 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
             hidden_channels=tuple(encoder_cfg.enc_hidden_channels),
         )
 
-    def _prepare_enc_input(self, condition: torch.Tensor, noisy: torch.Tensor) -> torch.Tensor:
+    def _prepare_enc_input(
+        self, condition: torch.Tensor, noisy: torch.Tensor, timesteps: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        p_max = self.train_cfg.noisy_dropout_p_max
+        if self.training and p_max > 0.0 and timesteps is not None:
+            T = self.scheduler.config.num_train_timesteps
+            # p(t) = p_max * (1 - t/T): highest dropout at t=0 (clean, shortcut
+            # regime), zero dropout at t=T (pure noise, x_t uninformative anyway).
+            t_norm = timesteps.float() / T
+            p = p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy = noisy * keep[:, None, None, None]
         return torch.cat([condition, noisy], dim=1)
 
 
