@@ -20,3 +20,6 @@ classifier_loss:
   loss_type: "ce"
   noisy_classifier: false
   classifier_path: null
+
+noisy_dropout_p_max: 0.0
+minsnr_gamma: null
