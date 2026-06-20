@@ -904,7 +904,9 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
             scale, shift = self.enc_film(temb).chunk(2, dim=1)
             feat = feat * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
         proj = self.enc_proj(feat)
-        enc_emb = proj.flatten(2).transpose(1, 2)  # (B, 81, hidden_size)
+        if proj.shape[-1] != self._grid:
+            proj = F.adaptive_avg_pool2d(proj, (self._grid, self._grid))
+        enc_emb = proj.flatten(2).transpose(1, 2)  # (B, _grid², hidden_size)
 
         if temb is not None and self.thinker_timestep_cond:
             enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
