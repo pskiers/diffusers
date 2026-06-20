@@ -8,6 +8,7 @@ thinker_bridge_mode: "logits"
 enc_channels: 32
 enc_hidden_channels: [16, 32]
 thinker_out_channels: null
+thinker_grid_size: null
 
 # Timestep conditioning (V1 only)
 enc_timestep_cond: false
