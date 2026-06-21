@@ -131,16 +131,21 @@ def compute_losses_painter(
         ce_labels = solution
     if sudoku_logits is not None and sudoku_loss_weight > 0:
         B_, N, C = sudoku_logits.shape
-        sudoku_loss = F.cross_entropy(
-            sudoku_logits.float().reshape(B_ * N, C),
-            ce_labels[:, :N].reshape(B_ * N).clamp(min=0),
-            ignore_index=IGNORE_LABEL_ID,
-        )
+        if N == ce_labels.shape[1]:
+            sudoku_loss = F.cross_entropy(
+                sudoku_logits.float().reshape(B_ * N, C),
+                ce_labels[:, :N].reshape(B_ * N).clamp(min=0),
+                ignore_index=IGNORE_LABEL_ID,
+            )
 
     total_loss = diff_loss + sudoku_loss_weight * sudoku_loss
 
     thinker_cell_acc = None
     thinker_puzzle_acc = None
+    if sudoku_logits is not None:
+        B_, N, C = sudoku_logits.shape
+        if N != ce_labels.shape[1]:
+            sudoku_logits = None  # TRM grid ≠ Sudoku grid, skip token accuracy
     if sudoku_logits is not None:
         B_, N, C = sudoku_logits.shape
         preds = sudoku_logits.argmax(dim=-1)

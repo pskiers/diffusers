@@ -334,7 +334,7 @@ def sample_grids(
                 best_ts_vals,
             )
 
-            if solutions is not None:
+            if solutions is not None and N_logits <= solutions.shape[1]:
                 tgts    = solutions[:B, :N_logits] + token_offset
                 correct = preds == tgts                        # (B, N)
 

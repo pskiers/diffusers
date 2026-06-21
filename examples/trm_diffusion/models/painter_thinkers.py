@@ -263,11 +263,12 @@ class PainterThinkerV0Tok(BaseModel):
 
         if include_sudoku and logits is not None and sudoku_w > 0:
             B_, N, C = logits.shape
-            sudoku_loss = F.cross_entropy(
-                logits.float().reshape(B_ * N, C),
-                d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
-                ignore_index=IGNORE_LABEL_ID,
-            )
+            if N <= d["ce_labels"].shape[1]:
+                sudoku_loss = F.cross_entropy(
+                    logits.float().reshape(B_ * N, C),
+                    d["ce_labels"][:, :N].reshape(B_ * N).clamp(min=0),
+                    ignore_index=IGNORE_LABEL_ID,
+                )
             step_loss = step_loss + sudoku_w * sudoku_loss
 
         if self.clf_cfg is not None and self.clf_cfg.weight > 0.0 and self.train_clf is not None:
@@ -559,6 +560,8 @@ class PainterThinkerV0Tok(BaseModel):
                     if tp_raw is not None:
                         tp = tp_raw - token_offset
                         N = tp.shape[1]
+                        if N > painter_preds.shape[1]:
+                            continue  # TRM grid ≠ Sudoku grid, skip deviation metric
                         diff = painter_preds[:, :N] != tp
                         if _gm is not None:
                             blank = ~_gm[:, :N]
