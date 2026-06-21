@@ -578,10 +578,13 @@ class PainterThinkerV0Tok(BaseModel):
                         conds_vis = conds_vis.cpu()
                     tp_all = sr.get("best_thinker_preds")
                     tt_all = sr.get("best_thinker_ts")
+                    # Only visualise thinker preds when they are 81-token (9×9 Sudoku grid).
+                    if tp_all is not None and tp_all.shape[1] != 81:
+                        tp_all = None
                     sols_np = solutions.cpu().numpy()
                     for i in range(n_new):
                         tp = (tp_all[i] - token_offset).numpy() if tp_all is not None else None
-                        tt = tt_all[i] if tt_all is not None else None
+                        tt = tt_all[i] if tp_all is not None and tt_all is not None else None
                         cond_img = conds_vis[i] if (conds_vis is not None and conds_vis.dim() == 4) else None
                         panel = make_panel_image(
                             cond_img, sr["generated"][i], sols_np[i], thinker_preds=tp, thinker_t=tt
