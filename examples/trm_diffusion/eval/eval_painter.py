@@ -46,6 +46,7 @@ from configs.schemas import (
     PainterThinkerConfig,
     ThinkerModelConfig,
     ThinkerOptimConfig,
+    TimestepCondConfig,
     TrainConfig,
 )
 from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
@@ -59,11 +60,13 @@ from models.painter_thinkers import (
     OriginalTRMRatatouilleV3,
     OriginalTRMRatatouilleV4,
     ThinkerWithFrozenPainter,
+    ThinkerWithFrozenPainterV0,
+    ThinkerWithFrozenPainterV1,
 )
 from models.painters import StandalonePainter
 
-
 # ── Condition helpers (mirrors train_trm.py) ──────────────────────────────────
+
 
 def _solution_tokens(solution: torch.Tensor) -> torch.Tensor:
     """(B, 81) int [0-8] → (B, 81) long [2-10] token IDs."""
@@ -86,6 +89,22 @@ def _get_full_solution_condition(mb: dict, model, device="cpu") -> torch.Tensor:
 
 # ── Model building ────────────────────────────────────────────────────────────
 
+
+def _timestep_cfg(args):
+    """Build TimestepCondConfig from args, or return None if all flags are off."""
+    enc = getattr(args, "enc_timestep_cond", False)
+    thinker = getattr(args, "thinker_timestep_cond", False)
+    dec = getattr(args, "decoder_timestep_cond", False)
+    if not (enc or thinker or dec):
+        return None
+    return TimestepCondConfig(
+        enc_timestep_cond=enc,
+        thinker_timestep_cond=thinker,
+        decoder_timestep_cond=dec,
+        temb_dim=getattr(args, "temb_dim", 256),
+    )
+
+
 def build_model(args) -> torch.nn.Module:
     """Instantiate the model skeleton from CLI args (no weights loaded yet)."""
     scheduler = DDPMScheduler(
@@ -95,9 +114,7 @@ def build_model(args) -> torch.nn.Module:
     )
 
     # Dummy optim configs — values unused at eval time but required by constructors.
-    thinker_optim = ThinkerOptimConfig(
-        lr=1e-4, weight_decay=1.0, beta1=0.9, beta2=0.95, warmup_steps=0
-    )
+    thinker_optim = ThinkerOptimConfig(lr=1e-4, weight_decay=1.0, beta1=0.9, beta2=0.95, warmup_steps=0)
     painter_optim = PainterOptimConfig(lr=1e-4, weight_decay=1.0, warmup_steps=0)
 
     train_cfg = TrainConfig(seed=0, batch_size=args.batch_size, num_steps=1)
@@ -157,8 +174,8 @@ def build_model(args) -> torch.nn.Module:
         )
 
     if args.mode == "thinker_frozen_painter":
-        # Build a dummy StandalonePainter so ThinkerWithFrozenPainter can
-        # set up its bridge/painter submodules; load_state_dict overwrites weights.
+        # Build a dummy StandalonePainter so the frozen-painter classes can set up
+        # their bridge/painter submodules; load_state_dict overwrites weights.
         dummy_painter = StandalonePainter(
             model_cfg=painter_cfg,
             optim_cfg=painter_optim,
@@ -175,6 +192,45 @@ def build_model(args) -> torch.nn.Module:
             thinker_bridge_mode=args.thinker_bridge_mode,
             painter_dtype=args.painter_dtype,
         )
+        thinker_cfg = _make_thinker_cfg(
+            args.num_classes,
+            puzzle_emb_ndim=args.puzzle_emb_ndim,
+            puzzle_emb_len=args.puzzle_emb_len,
+        )
+        thinker_cfg.puzzle_emb_ndim = 0
+        thinker_cfg.puzzle_emb_len = 0
+        encoder_cfg = ImageEncoderConfig(
+            enc_channels=args.enc_channels,
+            enc_hidden_channels=tuple(args.enc_hidden_channels),
+            thinker_out_channels=args.thinker_out_channels,
+        )
+        painter_variant = getattr(args, "painter_variant", "tok")
+        if painter_variant == "v1":
+            return ThinkerWithFrozenPainterV1(
+                painter=dummy_painter,
+                thinker_cfg=thinker_cfg,
+                encoder_cfg=encoder_cfg,
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim,
+                painter_optim_cfg=painter_optim,
+                scheduler=scheduler,
+                timestep_cfg=_timestep_cfg(args),
+            )
+        if painter_variant == "v0":
+            return ThinkerWithFrozenPainterV0(
+                painter=dummy_painter,
+                thinker_cfg=thinker_cfg,
+                encoder_cfg=encoder_cfg,
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim,
+                painter_optim_cfg=painter_optim,
+                scheduler=scheduler,
+                timestep_cfg=_timestep_cfg(args),
+            )
         return ThinkerWithFrozenPainter(
             painter=dummy_painter,
             thinker_cfg=_make_thinker_cfg(
@@ -189,6 +245,7 @@ def build_model(args) -> torch.nn.Module:
             painter_optim_cfg=painter_optim,
             scheduler=scheduler,
             adapter_in_channels=args.adapter_in_channels,
+            timestep_cfg=_timestep_cfg(args),
         )
 
     # mode == "painter"
@@ -260,13 +317,13 @@ def build_model(args) -> torch.nn.Module:
             **common,
             compression_factor=args.cell_size,
             bridge_num_heads=4,
-            timestep_cfg=None,
+            timestep_cfg=_timestep_cfg(args),
         )
 
     if args.painter_variant == "v0":
-        return cls(**common)
+        return cls(**common, timestep_cfg=_timestep_cfg(args))
 
-    return cls(**common, timestep_cfg=None)
+    return cls(**common, timestep_cfg=_timestep_cfg(args))
 
 
 def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: torch.device):
@@ -283,8 +340,10 @@ def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: to
             if name in param_dict:
                 param_dict[name].data.copy_(tensor)
                 n_applied += 1
-        print(f"Loaded EMA weights from {path} (step={ckpt.get('step', '?')}, "
-              f"{n_applied}/{len(shadow)} shadow params applied)")
+        print(
+            f"Loaded EMA weights from {path} (step={ckpt.get('step', '?')}, "
+            f"{n_applied}/{len(shadow)} shadow params applied)"
+        )
     else:
         print(f"Loaded model weights from {path} (step={ckpt.get('step', '?')})")
     model.to(device)
@@ -293,12 +352,13 @@ def load_checkpoint(model: torch.nn.Module, path: str, use_ema: bool, device: to
 
 # ── Eval loop ─────────────────────────────────────────────────────────────────
 
+
 def run_eval(model, eval_ds, args, device, cfg_scale: float):
     """Run one full eval pass with given cfg_scale. Returns metrics dict."""
     painter_size = 9 * args.cell_size
-    n_total  = args.num_samples
-    n_batch  = args.batch_size
-    n_steps  = args.num_steps
+    n_total = args.num_samples
+    n_batch = args.batch_size
+    n_steps = args.num_steps
     use_ddpm = args.sampler == "ddpm"
 
     # For DDPM sampling, num_steps equals num_train_timesteps (full chain).
@@ -317,39 +377,38 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
         model.eval_cfg.cfg_scale = cfg_scale
 
     model.eval()
-    loader = DataLoader(eval_ds, batch_size=n_batch, shuffle=False,
-                        num_workers=args.num_workers, pin_memory=True)
+    loader = DataLoader(eval_ds, batch_size=n_batch, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    all_cell_acc:   list[float] = []
+    all_cell_acc: list[float] = []
     all_puzzle_acc: list[float] = []
-    all_thinker_cell_best:   list[float] = []
-    all_thinker_cell_mean:   list[float] = []
+    all_thinker_cell_best: list[float] = []
+    all_thinker_cell_mean: list[float] = []
     all_thinker_puzzle_best: list[float] = []
     all_thinker_puzzle_mean: list[float] = []
-    all_thinker_deviation:   list[float] = []
-    all_painter_dev_best:    list[float] = []
-    all_painter_dev_mean:    list[float] = []
+    all_thinker_deviation: list[float] = []
+    all_painter_dev_best: list[float] = []
+    all_painter_dev_mean: list[float] = []
 
-    all_real_cell_acc:   list[float] = []
+    all_real_cell_acc: list[float] = []
     all_real_puzzle_acc: list[float] = []
     do_real_eval = getattr(model, "has_realsolution_eval", False)
 
     n_done = 0
     token_offset = getattr(model, "token_offset", 0)
 
-    for eb in tqdm(loader, desc=f"Sampling (cfg={cfg_scale})",
-                   total=(n_total + n_batch - 1) // n_batch):
+    for eb in tqdm(loader, desc=f"Sampling (cfg={cfg_scale})", total=(n_total + n_batch - 1) // n_batch):
         if n_done >= n_total:
             break
-        B_cur       = eb["solution"].shape[0]
-        sols        = eb["solution"]
-        pids        = eb.get("puzzle_id", None)
+        B_cur = eb["solution"].shape[0]
+        sols = eb["solution"]
+        pids = eb.get("puzzle_id", None)
         given_masks = eb.get("given_mask", None)
-        cond        = _get_condition(eb, model, device="cpu")
+        cond = _get_condition(eb, model, device="cpu")
 
         with torch.no_grad():
             sr = sample_grids(
-                model, cond,
+                model,
+                cond,
                 num_train_timesteps=args.num_train_timesteps,
                 beta_schedule=args.beta_schedule,
                 prediction_type=args.prediction_type,
@@ -362,16 +421,15 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
                 schedule_segments=schedule_segments,
             )
 
-        acc = evaluate_grids(sr["generated"], sols, classifier, args.cell_size,
-                             given_masks=given_masks)
+        acc = evaluate_grids(sr["generated"], sols, classifier, args.cell_size, given_masks=given_masks)
         all_cell_acc.append(acc["cell_acc"])
         all_puzzle_acc.append(acc["puzzle_acc"])
 
         for key, lst in [
-            ("thinker_cell_acc_best",       all_thinker_cell_best),
-            ("thinker_cell_acc_mean",       all_thinker_cell_mean),
-            ("thinker_puzzle_acc_best",     all_thinker_puzzle_best),
-            ("thinker_puzzle_acc_mean",     all_thinker_puzzle_mean),
+            ("thinker_cell_acc_best", all_thinker_cell_best),
+            ("thinker_cell_acc_mean", all_thinker_cell_mean),
+            ("thinker_puzzle_acc_best", all_thinker_puzzle_best),
+            ("thinker_puzzle_acc_mean", all_thinker_puzzle_mean),
             ("thinker_deviation_from_best", all_thinker_deviation),
         ]:
             if key in sr:
@@ -384,13 +442,13 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
             (sr.get("mean_thinker_preds"), all_painter_dev_mean),
         ]:
             if tp_raw is not None:
-                tp   = tp_raw - token_offset
-                N    = tp.shape[1]
+                tp = tp_raw - token_offset
+                N = tp.shape[1]
                 diff = painter_preds[:, :N] != tp
                 if _gm is not None:
                     blank = ~_gm[:, :N]
-                    n_b   = blank.sum()
-                    dev   = diff[blank].float().mean().item() if n_b > 0 else diff.float().mean().item()
+                    n_b = blank.sum()
+                    dev = diff[blank].float().mean().item() if n_b > 0 else diff.float().mean().item()
                 else:
                     dev = diff.float().mean().item()
                 dev_lst.append(dev)
@@ -400,7 +458,8 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
             full_cond = _get_full_solution_condition(eb, model, device="cpu")
             with torch.no_grad():
                 sr_r = sample_grids(
-                    model, full_cond,
+                    model,
+                    full_cond,
                     num_train_timesteps=args.num_train_timesteps,
                     beta_schedule=args.beta_schedule,
                     prediction_type=args.prediction_type,
@@ -412,29 +471,28 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
                     given_masks=given_masks,
                     schedule_segments=schedule_segments,
                 )
-            acc_r = evaluate_grids(sr_r["generated"], sols, classifier, args.cell_size,
-                                   given_masks=given_masks)
+            acc_r = evaluate_grids(sr_r["generated"], sols, classifier, args.cell_size, given_masks=given_masks)
             all_real_cell_acc.append(acc_r["cell_acc"])
             all_real_puzzle_acc.append(acc_r["puzzle_acc"])
 
         n_done += B_cur
 
     metrics = {
-        "cfg_scale":  cfg_scale,
-        "sampler":    args.sampler,
-        "num_steps":  sample_steps,
-        "n_samples":  n_done,
-        "cell_acc":   float(np.mean(all_cell_acc)),
+        "cfg_scale": cfg_scale,
+        "sampler": args.sampler,
+        "num_steps": sample_steps,
+        "n_samples": n_done,
+        "cell_acc": float(np.mean(all_cell_acc)),
         "puzzle_acc": float(np.mean(all_puzzle_acc)),
     }
     if all_real_cell_acc:
-        metrics["realsolution_cell_acc"]   = float(np.mean(all_real_cell_acc))
+        metrics["realsolution_cell_acc"] = float(np.mean(all_real_cell_acc))
         metrics["realsolution_puzzle_acc"] = float(np.mean(all_real_puzzle_acc))
     if all_thinker_cell_best:
-        metrics["thinker_cell_acc_best"]       = float(np.mean(all_thinker_cell_best))
-        metrics["thinker_cell_acc_mean"]       = float(np.mean(all_thinker_cell_mean))
-        metrics["thinker_puzzle_acc_best"]     = float(np.mean(all_thinker_puzzle_best))
-        metrics["thinker_puzzle_acc_mean"]     = float(np.mean(all_thinker_puzzle_mean))
+        metrics["thinker_cell_acc_best"] = float(np.mean(all_thinker_cell_best))
+        metrics["thinker_cell_acc_mean"] = float(np.mean(all_thinker_cell_mean))
+        metrics["thinker_puzzle_acc_best"] = float(np.mean(all_thinker_puzzle_best))
+        metrics["thinker_puzzle_acc_mean"] = float(np.mean(all_thinker_puzzle_mean))
         metrics["thinker_deviation_from_best"] = float(np.mean(all_thinker_deviation))
     if all_painter_dev_best:
         metrics["painter_dev_from_best_thinker"] = float(np.mean(all_painter_dev_best))
@@ -444,93 +502,116 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate a trained painter model.")
 
     # Required
     p.add_argument("--checkpoint", required=True, help="Path to checkpoint .pt file")
-    p.add_argument("--classifier_path", default="runs/mnist_classifier_cell16.pt",
-                   help="Path to (or where to save) the MNIST cell classifier")
+    p.add_argument(
+        "--classifier_path",
+        default="runs/mnist_classifier_cell16.pt",
+        help="Path to (or where to save) the MNIST cell classifier",
+    )
 
     # Mode / variant
-    p.add_argument("--mode", default="standalone_painter",
-                   choices=["standalone_painter", "painter", "thinker_frozen_painter"],
-                   help="Training mode of the checkpoint")
-    p.add_argument("--painter_variant", default="v0tok",
-                   choices=["v0tok", "v0", "v1", "v2", "v3", "v4"],
-                   help="Painter variant (used when mode=painter)")
+    p.add_argument(
+        "--mode",
+        default="standalone_painter",
+        choices=["standalone_painter", "painter", "thinker_frozen_painter"],
+        help="Training mode of the checkpoint",
+    )
+    p.add_argument(
+        "--painter_variant",
+        default="v0tok",
+        choices=["v0tok", "v0", "v1", "v2", "v3", "v4"],
+        help="Painter variant (used when mode=painter)",
+    )
 
     # Data
-    p.add_argument("--sudoku_dir",  default="data/sudoku-extreme-1k-aug-1000")
-    p.add_argument("--mnist_root",  default="data/mnist")
-    p.add_argument("--cell_size",   type=int, default=16)
+    p.add_argument("--sudoku_dir", default="data/sudoku-extreme-1k-aug-1000")
+    p.add_argument("--mnist_root", default="data/mnist")
+    p.add_argument("--cell_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
 
     # Diffusion scheduler
     p.add_argument("--num_train_timesteps", type=int, default=100)
-    p.add_argument("--beta_schedule",       default="squaredcos_cap_v2")
-    p.add_argument("--prediction_type",     default="sample",
-                   choices=["sample", "epsilon"])
+    p.add_argument("--beta_schedule", default="squaredcos_cap_v2")
+    p.add_argument("--prediction_type", default="sample", choices=["sample", "epsilon"])
 
     # Sampling
-    p.add_argument("--sampler",    default="ddim", choices=["ddim", "ddpm"],
-                   help="ddim = DDIM with --num_steps; ddpm = full DDPM chain")
-    p.add_argument("--num_steps",  type=int, default=20,
-                   help="DDIM denoising steps (ignored for ddpm and --schedule_segments)")
-    p.add_argument("--schedule_segments", type=str, nargs="+", default=None,
-                   metavar="N:K",
-                   help="Multi-phase DDIM schedule. Each token 'N:K' takes the first K steps "
-                        "from an N-step DDIM schedule, continuing from where the previous "
-                        "segment left off. E.g. '10:1 100:99' does 1 coarse step then 99 fine "
-                        "steps. Overrides --num_steps when set.")
-    p.add_argument("--num_samples", type=int, default=512,
-                   help="Total samples for eval")
-    p.add_argument("--batch_size",  type=int, default=64)
+    p.add_argument(
+        "--sampler",
+        default="ddim",
+        choices=["ddim", "ddpm"],
+        help="ddim = DDIM with --num_steps; ddpm = full DDPM chain",
+    )
+    p.add_argument(
+        "--num_steps", type=int, default=20, help="DDIM denoising steps (ignored for ddpm and --schedule_segments)"
+    )
+    p.add_argument(
+        "--schedule_segments",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="N:K",
+        help="Multi-phase DDIM schedule. Each token 'N:K' takes the first K steps "
+        "from an N-step DDIM schedule, continuing from where the previous "
+        "segment left off. E.g. '10:1 100:99' does 1 coarse step then 99 fine "
+        "steps. Overrides --num_steps when set.",
+    )
+    p.add_argument("--num_samples", type=int, default=512, help="Total samples for eval")
+    p.add_argument("--batch_size", type=int, default=64)
 
     # CFG sweep
-    p.add_argument("--cfg_scale", type=float, nargs="+", default=[1.0],
-                   help="One or more CFG scale values to evaluate")
+    p.add_argument("--cfg_scale", type=float, nargs="+", default=[1.0], help="One or more CFG scale values to evaluate")
 
     # EMA
-    p.add_argument("--no_ema", action="store_true",
-                   help="Load raw model weights instead of EMA")
+    p.add_argument("--no_ema", action="store_true", help="Load raw model weights instead of EMA")
 
     # Device
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Thinker / painter architecture (must match checkpoint) ───────────────
-    p.add_argument("--vocab_size",  type=int, default=11)
-    p.add_argument("--seq_len",     type=int, default=81)
+    p.add_argument("--vocab_size", type=int, default=11)
+    p.add_argument("--seq_len", type=int, default=81)
     p.add_argument("--hidden_size", type=int, default=512)
-    p.add_argument("--n_heads",     type=int, default=8)
-    p.add_argument("--L_layers",    type=int, default=2)
-    p.add_argument("--L_cycles",    type=int, default=6)
-    p.add_argument("--H_cycles",    type=int, default=3)
-    p.add_argument("--n_sup",       type=int, default=16)
-    p.add_argument("--expansion",   type=float, default=4.0)
+    p.add_argument("--n_heads", type=int, default=8)
+    p.add_argument("--L_layers", type=int, default=2)
+    p.add_argument("--L_cycles", type=int, default=6)
+    p.add_argument("--H_cycles", type=int, default=3)
+    p.add_argument("--n_sup", type=int, default=16)
+    p.add_argument("--expansion", type=float, default=4.0)
     p.add_argument("--forward_dtype", default="bfloat16")
-    p.add_argument("--mlp_t",       action="store_true")
+    p.add_argument("--mlp_t", action="store_true")
     p.add_argument("--pos_encodings", default="rope")
-    p.add_argument("--puzzle_emb_ndim",         type=int, default=0)
-    p.add_argument("--puzzle_emb_len",          type=int, default=16)
-    p.add_argument("--num_puzzle_identifiers",  type=int, default=1000)
-    p.add_argument("--num_classes",             type=int, default=9)
-    p.add_argument("--thinker_out_channels",    type=int, default=None)
-    p.add_argument("--enc_channels",            type=int, default=32)
-    p.add_argument("--enc_hidden_channels",     type=int, nargs="+", default=[16, 32])
-    p.add_argument("--bridge_channels",         type=int, default=16)
-    p.add_argument("--painter_channels",        type=int, nargs="+", default=[32, 64, 64])
+    p.add_argument("--puzzle_emb_ndim", type=int, default=0)
+    p.add_argument("--puzzle_emb_len", type=int, default=16)
+    p.add_argument("--num_puzzle_identifiers", type=int, default=1000)
+    p.add_argument("--num_classes", type=int, default=9)
+    p.add_argument("--thinker_out_channels", type=int, default=None)
+    p.add_argument("--enc_channels", type=int, default=32)
+    p.add_argument("--enc_hidden_channels", type=int, nargs="+", default=[16, 32])
+    p.add_argument("--bridge_channels", type=int, default=16)
+    p.add_argument("--painter_channels", type=int, nargs="+", default=[32, 64, 64])
     p.add_argument("--painter_layers_per_block", type=int, default=2)
-    p.add_argument("--thinker_bridge_mode",     default="logits",
-                   choices=["logits", "onehot", "softmax"])
-    p.add_argument("--adapter_in_channels",     type=int, default=0,
-                   help="thinker_frozen_painter only: adapter projection channels (0=disabled)")
-    p.add_argument("--painter_dtype",           default="bfloat16",
-                   choices=["bfloat16", "float16", "none"])
+    p.add_argument("--thinker_bridge_mode", default="logits", choices=["logits", "onehot", "softmax"])
+    p.add_argument(
+        "--adapter_in_channels",
+        type=int,
+        default=0,
+        help="thinker_frozen_painter only: adapter projection channels (0=disabled)",
+    )
+    p.add_argument("--painter_dtype", default="bfloat16", choices=["bfloat16", "float16", "none"])
+
+    # Timestep conditioning (must match checkpoint training flags)
+    p.add_argument("--enc_timestep_cond", action="store_true")
+    p.add_argument("--thinker_timestep_cond", action="store_true")
+    p.add_argument("--decoder_timestep_cond", action="store_true")
+    p.add_argument("--temb_dim", type=int, default=256)
 
     # Wandb
-    p.add_argument("--wandb_project", default=None,
-                   help="Set to enable wandb logging")
+    p.add_argument("--wandb_project", default=None, help="Set to enable wandb logging")
     p.add_argument("--wandb_run_name", default=None)
 
     return p.parse_args()
@@ -570,6 +651,7 @@ def main():
     if args.wandb_project:
         try:
             import wandb
+
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
@@ -603,15 +685,14 @@ def main():
     if len(args.cfg_scale) > 1:
         print(f"\n{'='*60}")
         print("CFG sweep summary:")
-        header_keys = ["cfg_scale", "cell_acc", "puzzle_acc",
-                       "realsolution_cell_acc", "realsolution_puzzle_acc"]
+        header_keys = ["cfg_scale", "cell_acc", "puzzle_acc", "realsolution_cell_acc", "realsolution_puzzle_acc"]
         cols = [k for k in header_keys if any(k in r for r in all_results)]
         print("  " + "  ".join(f"{c:>28}" for c in cols))
         for r in all_results:
-            print("  " + "  ".join(
-                f"{r[c]:>28.4f}" if isinstance(r.get(c), float) else f"{r.get(c, ''):>28}"
-                for c in cols
-            ))
+            print(
+                "  "
+                + "  ".join(f"{r[c]:>28.4f}" if isinstance(r.get(c), float) else f"{r.get(c, ''):>28}" for c in cols)
+            )
 
     if wandb_run is not None:
         wandb_run.finish()

@@ -140,7 +140,7 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     # Architecture (must match the checkpoint)
-    p.add_argument("--mode", default="painter")
+    p.add_argument("--mode", default="thinker_frozen_painter", choices=["painter", "thinker_frozen_painter"])
     p.add_argument("--painter_variant", default="v1", choices=["v0", "v1", "v2", "v3", "v4", "v0tok"])
     p.add_argument("--vocab_size", type=int, default=11)
     p.add_argument("--seq_len", type=int, default=81)
@@ -157,7 +157,7 @@ def main():
     p.add_argument("--puzzle_emb_ndim", type=int, default=0)
     p.add_argument("--puzzle_emb_len", type=int, default=16)
     p.add_argument("--num_puzzle_identifiers", type=int, default=1000)
-    p.add_argument("--num_classes", type=int, default=9)
+    p.add_argument("--num_classes", type=int, default=11)
     p.add_argument("--thinker_out_channels", type=int, default=None)
     p.add_argument("--enc_channels", type=int, default=32)
     p.add_argument("--enc_hidden_channels", type=int, nargs="+", default=[16, 32])
@@ -167,6 +167,12 @@ def main():
     p.add_argument("--thinker_bridge_mode", default="logits", choices=["logits", "onehot", "softmax"])
     p.add_argument("--adapter_in_channels", type=int, default=0)
     p.add_argument("--painter_dtype", default="bfloat16", choices=["bfloat16", "float16", "none"])
+
+    # Timestep conditioning (must match checkpoint training flags)
+    p.add_argument("--enc_timestep_cond", action="store_true")
+    p.add_argument("--thinker_timestep_cond", action="store_true")
+    p.add_argument("--decoder_timestep_cond", action="store_true")
+    p.add_argument("--temb_dim", type=int, default=256)
 
     args = p.parse_args()
     if args.painter_dtype == "none":
