@@ -255,6 +255,10 @@ def sample_grids(
     painter_size:        int | None               = None,    # required for token-input models
     given_masks:         torch.Tensor | None       = None,   # (B, 81) bool — True = given cell
     schedule_segments:   list[str] | None          = None,   # e.g. ["10:1", "100:99"]
+    noisy_guidance_fn    = None,  # Callable[[int, int], float] | None
+                                  # (t, T) → s; blends: pred = pred_noisy + s*(pred_clean - pred_noisy)
+                                  # pred_clean uses zeros as the noisy encoder input.
+                                  # Requires model to be OriginalTRMRatatouilleV1 or subclass.
 ) -> dict:
     """DDIM-sample and collect thinker stats along the denoising trajectory.
 
@@ -305,10 +309,21 @@ def sample_grids(
     ts_puzzle_acc:  list[tuple[int, float]] = []
     all_preds_list: list[torch.Tensor]      = []   # (B, N) per step, stored on CPU
 
+    T = num_train_timesteps
     model.eval()
     for t, active_sched in tqdm(denoising_schedule):
         ts         = torch.full((B,), t, device=device, dtype=torch.long)
         noise_pred, sudoku_logits = model(x, ts, conditions, puzzle_ids=puzzle_ids)
+
+        if noisy_guidance_fn is not None:
+            s = float(noisy_guidance_fn(int(t), T))
+            if s != 0.0:
+                try:
+                    model._enc_noisy_override = torch.zeros_like(x)
+                    noise_pred_clean, _ = model(x, ts, conditions, puzzle_ids=puzzle_ids)
+                finally:
+                    model._enc_noisy_override = None
+                noise_pred = noise_pred + s * (noise_pred_clean - noise_pred)
 
         if sudoku_logits is not None:
             if not has_logits:

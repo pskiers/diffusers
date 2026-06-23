@@ -880,7 +880,7 @@ class OriginalTRMRatatouilleV0(PainterThinkerV0Tok):
     def _encode_image(self, x: torch.Tensor) -> torch.Tensor:
         """(B, C, H, W) → float embeddings (B, _grid², hidden_size)"""
         feat = self.image_encoder(x)  # (B, enc_channels, natural_grid, natural_grid)
-        proj = self.enc_proj(feat)    # (B, hidden_size, natural_grid, natural_grid)
+        proj = self.enc_proj(feat)  # (B, hidden_size, natural_grid, natural_grid)
         if proj.shape[-1] != self._grid:
             proj = F.adaptive_avg_pool2d(proj, (self._grid, self._grid))
         return proj.flatten(2).transpose(1, 2)  # (B, _grid², hidden_size)
@@ -1034,6 +1034,12 @@ class OriginalTRMRatatouilleV1(OriginalTRMRatatouilleV0):
     def _prepare_enc_input(
         self, condition: torch.Tensor, noisy: torch.Tensor, timesteps: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        # _enc_noisy_override: set externally (e.g. noisy-guidance eval) to replace
+        # the noisy channel fed to the encoder while the UNet still sees the real x_t.
+        # Uses the same set-then-reset pattern as SpatialTRM._emb_bias.
+        override = getattr(self, "_enc_noisy_override", None)
+        if override is not None:
+            return torch.cat([condition, override], dim=1)
         p_max = self.train_cfg.noisy_dropout_p_max
         if self.training and p_max > 0.0 and timesteps is not None:
             T = self.scheduler.config.num_train_timesteps
