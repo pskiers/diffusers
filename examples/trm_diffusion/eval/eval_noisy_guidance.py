@@ -136,6 +136,8 @@ def main():
     p.add_argument("--prediction_type", default="sample", choices=["sample", "epsilon"])
     p.add_argument("--sampler", default="ddim", choices=["ddim", "ddpm"])
     p.add_argument("--num_steps", type=int, default=20)
+    p.add_argument("--cfg_scale", type=float, default=2.0,
+                   help="CFG scale applied during sampling (must match eval.cfg_scale from training)")
     p.add_argument("--no_ema", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -197,6 +199,8 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(args)
+    if hasattr(model, "eval_cfg"):
+        model.eval_cfg.cfg_scale = args.cfg_scale
     model = load_checkpoint(model, args.checkpoint, use_ema=not args.no_ema, device=device)
     model.eval()
 
