@@ -51,7 +51,6 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainter,
     ThinkerWithFrozenPainterV0,
     ThinkerWithFrozenPainterV1,
-    ThinkerWithFrozenPainterImgCond,
     ThinkerWithFrozenPainterV1Verif,
     ThinkerWithFrozenPainterControlNet,
     ThinkerWithFrozenPainterControlNetV2,
