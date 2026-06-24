@@ -283,12 +283,16 @@ def sample_grids(
         num_steps, schedule_segments,
     )
 
-    conditions = conditions.to(device)
+    if isinstance(conditions, dict):
+        conditions = {k: v.to(device) for k, v in conditions.items()}
+        B = next(iter(conditions.values())).shape[0]
+    else:
+        conditions = conditions.to(device)
+        B = conditions.shape[0]
     if puzzle_ids is not None:
         puzzle_ids = puzzle_ids.to(device)
     if solutions is not None:
         solutions = solutions.to(device)
-    B = conditions.shape[0]
     if painter_size is not None:
         x = torch.randn(B, 1, painter_size, painter_size, device=device)
     else:
