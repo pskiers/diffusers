@@ -34,3 +34,12 @@ eval:
   eval_every: 2000
   save_every: 10000
   cfg_scale: 2.0
+
+condition_encoder:
+  _target_: models.condition_encoders.SpatialImageEncoder
+  in_channels: 1
+  enc_channels: 32
+  hidden_channels: [16, 32]
+  output_dim: ${thinker.hidden_size}
+  factor: ${data.cell_size}
+  use_noisy_input: false

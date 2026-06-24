@@ -50,7 +50,8 @@ from configs.schemas import (
     ThinkerOptimConfig,
     TrainConfig,
 )
-from models.clevr_painters import ClevrObjectEncoder, StandaloneClevrDiT
+from models.clevr_painters import StandaloneClevrDiT
+from models.condition_encoders import ConditionEncoderBase
 from models.eval_callbacks import EvalCallbackBase, ImageGenEvalCallback
 from models.optim_utils import DelayedScheduledOptimizer, ScheduledOptimizer, apply_lr_and_step
 from models.painter_thinkers import PainterThinkerV0Tok
@@ -92,40 +93,6 @@ class ClevrIPAdapterCrossAttn(nn.Module):
         return self.out_proj(out.transpose(1, 2).reshape(B, N, -1))
 
 
-# ── Latent encoder for V1 ─────────────────────────────────────────────────────
-
-
-class ClevrLatentEncoder(nn.Module):
-    """
-    Two-block CNN that maps a noisy VAE latent to G×G spatial tokens.
-
-    Input:  (B, latent_channels, latent_size, latent_size)  e.g. (B, 4, 32, 32)
-    Output: (B, G², hidden_size)
-
-    Adaptive average pooling brings the feature map to exactly G×G.
-    Zero-init last conv so the encoder contributes nothing at the start of training.
-    """
-
-    def __init__(self, in_channels: int, hidden_size: int, grid_size: int):
-        super().__init__()
-        mid = hidden_size // 2
-        self.grid_size = grid_size
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(mid, hidden_size, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(),
-        )
-        nn.init.zeros_(self.conv[2].weight)
-        nn.init.zeros_(self.conv[2].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.conv(x)  # (B, hidden, H', W')
-        if feat.shape[-1] != self.grid_size:
-            feat = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
-        return feat.flatten(2).transpose(1, 2)  # (B, G², hidden)
-
-
 # ── Shared base class ─────────────────────────────────────────────────────────
 
 
@@ -149,6 +116,7 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: ClevrDiTOptimConfig,
         scheduler,
+        condition_encoder: ConditionEncoderBase,
         eval_callbacks=None,
     ):
         # PainterThinkerV0Tok needs a PainterThinkerConfig.  The bridge and UNet
@@ -191,17 +159,11 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
         for p in self.painter.parameters():
             p.requires_grad_(False)
 
-        # Trainable object encoder (replaces MNIST CNN encoder)
-        hidden = thinker_cfg.hidden_size
-        cfg = clevr_painter.model_cfg
-        self.clevr_object_encoder = ClevrObjectEncoder(
-            in_dim=cfg.object_feat_dim,
-            hidden_dim=hidden,
-            out_dim=hidden,
-        )
+        # Trainable condition encoder — must be provided; instantiated in factory via Hydra.
+        self.condition_encoder: ConditionEncoderBase = condition_encoder
 
         # Cache DiT config for subclasses
-        self._dit_cfg = cfg
+        self._dit_cfg = clevr_painter.model_cfg
 
         # caption_projection delayed-unfreeze: lr stays 0 until this step.
         # Subclasses (CrossAttn, IPAdapter) call requires_grad_(True) on caption_projection;
@@ -233,7 +195,8 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
     # ── Condition helpers ─────────────────────────────────────────────────────
 
     def _get_condition(self, mb: dict, device) -> torch.Tensor:
-        return mb["conditions"].to(device)  # (B, max_objects, object_feat_dim)
+        key = self.condition_encoder.condition_keys[0]
+        return mb[key].to(device)
 
     def _get_enc_emb(
         self,
@@ -241,8 +204,7 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
         noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Object features → TRM input tokens  (B, max_objects, hidden_size)."""
-        return self.clevr_object_encoder(condition)
+        return self.condition_encoder(condition, noisy, timesteps)
 
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         """Passthrough — DiT uses token sequences, not spatial maps."""
@@ -416,10 +378,9 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
         thinker_ids = {id(p) for p in self.thinker.parameters()}
         caption_proj_ids = {id(p) for p in self.painter.caption_projection.parameters()}
         return [
-            p for p in self.parameters()
-            if p.requires_grad
-            and id(p) not in thinker_ids
-            and id(p) not in caption_proj_ids
+            p
+            for p in self.parameters()
+            if p.requires_grad and id(p) not in thinker_ids and id(p) not in caption_proj_ids
         ]
 
     def build_optimizers(self, world_size, num_steps):
@@ -428,33 +389,33 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
 
         encoder_params = self._get_encoder_params()
         if encoder_params:
-            enc_optim = torch.optim.AdamW(
-                encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay
+            enc_optim = torch.optim.AdamW(encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+            optims.append(
+                ScheduledOptimizer(
+                    enc_optim,
+                    base_lr=self.painter_optim_cfg.lr,
+                    warmup_steps=self.painter_optim_cfg.warmup_steps,
+                    num_steps=num_steps,
+                    min_ratio=self.painter_optim_cfg.lr_min_ratio,
+                )
             )
-            optims.append(ScheduledOptimizer(
-                enc_optim,
-                base_lr=self.painter_optim_cfg.lr,
-                warmup_steps=self.painter_optim_cfg.warmup_steps,
-                num_steps=num_steps,
-                min_ratio=self.painter_optim_cfg.lr_min_ratio,
-            ))
 
         # caption_projection: if unfrozen (by CrossAttn / IPAdapter subclasses), give it
         # its own DelayedScheduledOptimizer.  Setting _caption_proj_freeze_steps to a
         # large value (e.g. 999999) effectively keeps it frozen for the whole run.
         cap_params = [p for p in self.painter.caption_projection.parameters() if p.requires_grad]
         if cap_params:
-            cap_optim = torch.optim.AdamW(
-                cap_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay
+            cap_optim = torch.optim.AdamW(cap_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+            optims.append(
+                DelayedScheduledOptimizer(
+                    cap_optim,
+                    base_lr=self.painter_optim_cfg.lr,
+                    warmup_steps=self.painter_optim_cfg.warmup_steps,
+                    num_steps=num_steps,
+                    min_ratio=self.painter_optim_cfg.lr_min_ratio,
+                    delay_steps=self._caption_proj_freeze_steps,
+                )
             )
-            optims.append(DelayedScheduledOptimizer(
-                cap_optim,
-                base_lr=self.painter_optim_cfg.lr,
-                warmup_steps=self.painter_optim_cfg.warmup_steps,
-                num_steps=num_steps,
-                min_ratio=self.painter_optim_cfg.lr_min_ratio,
-                delay_steps=self._caption_proj_freeze_steps,
-            ))
 
         return optims
 
@@ -475,7 +436,7 @@ class ThinkerWithFrozenClevrDiTV0CrossAttn(ThinkerWithFrozenClevrDiTBase):
     TRM logits → logit_to_cond → encoder_hidden_states for ALL DiT blocks.
     caption_projection is unfrozen so it can adapt to the new token distribution.
 
-    Trainable: SpatialTRM, ClevrObjectEncoder, logit_to_cond, caption_projection.
+    Trainable: SpatialTRM, condition_encoder, logit_to_cond, caption_projection.
     Frozen:    all other DiT weights, VAE.
     """
 
@@ -489,6 +450,7 @@ class ThinkerWithFrozenClevrDiTV0CrossAttn(ThinkerWithFrozenClevrDiTBase):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: ClevrDiTOptimConfig,
         scheduler,
+        condition_encoder: ConditionEncoderBase,
     ):
         super().__init__(
             clevr_painter=clevr_painter,
@@ -499,6 +461,7 @@ class ThinkerWithFrozenClevrDiTV0CrossAttn(ThinkerWithFrozenClevrDiTBase):
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            condition_encoder=condition_encoder,
         )
         cfg = clevr_painter.model_cfg
 
@@ -540,7 +503,7 @@ class ThinkerWithFrozenClevrDiTV0IPAdapter(ThinkerWithFrozenClevrDiTBase):
     All new modules are zero-init on their output projection so training starts
     exactly from the frozen DiT + CrossAttn baseline.
 
-    Trainable: SpatialTRM, ClevrObjectEncoder, logit_to_cond, caption_projection,
+    Trainable: SpatialTRM, condition_encoder, logit_to_cond, caption_projection,
                trm_to_ip, ip_cross_attn (all blocks).
     Frozen:    all other DiT weights, VAE.
     """
@@ -555,6 +518,7 @@ class ThinkerWithFrozenClevrDiTV0IPAdapter(ThinkerWithFrozenClevrDiTBase):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: ClevrDiTOptimConfig,
         scheduler,
+        condition_encoder: ConditionEncoderBase,
     ):
         super().__init__(
             clevr_painter=clevr_painter,
@@ -565,6 +529,7 @@ class ThinkerWithFrozenClevrDiTV0IPAdapter(ThinkerWithFrozenClevrDiTBase):
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            condition_encoder=condition_encoder,
         )
         cfg = clevr_painter.model_cfg
         inner_dim = cfg.num_attention_heads * cfg.attention_head_dim
@@ -631,56 +596,20 @@ class ThinkerWithFrozenClevrDiTV0IPAdapter(ThinkerWithFrozenClevrDiTBase):
 
 class _ClevrV1Mixin:
     """
-    Mixin that adds a noisy-latent encoder to _get_enc_emb.
+    Marker mixin for V1 variants (object + noisy-latent encoder).
 
-    Inheriting classes must call _init_latent_encoder() in their __init__
-    after the base __init__.  The caller must set
-        thinker_cfg.seq_len = max_objects + grid_size²
-    before constructing the model.
+    The encoder itself is fully specified by the condition_encoder config key
+    (typically ClevrNoisyObjectFeatureEncoder).  This mixin exists for factory
+    dispatch and documentation only — no code is added.
     """
-
-    def _init_latent_encoder(
-        self,
-        thinker_cfg: ThinkerModelConfig,
-        clevr_painter: StandaloneClevrDiT,
-        model_cfg: ClevrPainterThinkerConfig,
-    ):
-        hidden = thinker_cfg.hidden_size
-        cfg = clevr_painter.model_cfg
-        g = model_cfg.latent_encoder_grid_size
-        self.clevr_latent_encoder = ClevrLatentEncoder(
-            in_channels=cfg.latent_channels,
-            hidden_size=hidden,
-            grid_size=g,
-        )
-        self._latent_enc_n_tokens: int = g * g
-
-    def _get_enc_emb(
-        self,
-        condition: torch.Tensor,
-        noisy: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        obj_tokens = self.clevr_object_encoder(condition)  # (B, max_objects, hidden)
-
-        noisy_for_enc = noisy
-        p_max = self.train_cfg.noisy_dropout_p_max
-        if self.training and p_max > 0.0 and timesteps is not None:
-            T = self.scheduler.config.num_train_timesteps
-            t_norm = timesteps.float() / T
-            p = p_max * (1.0 - t_norm)
-            keep = (torch.rand(p.shape, device=p.device) > p).float()
-            noisy_for_enc = noisy * keep[:, None, None, None]
-
-        img_tokens = self.clevr_latent_encoder(noisy_for_enc)  # (B, G², hidden)
-        return torch.cat([obj_tokens, img_tokens], dim=1)  # (B, max_objects+G², hidden)
 
 
 class ThinkerWithFrozenClevrDiTV1CrossAttn(_ClevrV1Mixin, ThinkerWithFrozenClevrDiTV0CrossAttn):
     """
     V1 + CrossAttn: TRM sees object embeddings concatenated with noisy-latent tokens.
 
-    thinker_cfg.seq_len must equal max_objects + latent_encoder_grid_size².
+    Encoder type is specified via config (typically ClevrNoisyObjectFeatureEncoder).
+    thinker_cfg.seq_len must equal max_objects + grid_size² of the latent encoder.
     """
 
     def __init__(
@@ -693,6 +622,7 @@ class ThinkerWithFrozenClevrDiTV1CrossAttn(_ClevrV1Mixin, ThinkerWithFrozenClevr
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: ClevrDiTOptimConfig,
         scheduler,
+        condition_encoder: ConditionEncoderBase,
     ):
         super().__init__(
             clevr_painter=clevr_painter,
@@ -703,8 +633,8 @@ class ThinkerWithFrozenClevrDiTV1CrossAttn(_ClevrV1Mixin, ThinkerWithFrozenClevr
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            condition_encoder=condition_encoder,
         )
-        self._init_latent_encoder(thinker_cfg, clevr_painter, model_cfg)
 
 
 class ThinkerWithFrozenClevrDiTV1IPAdapter(_ClevrV1Mixin, ThinkerWithFrozenClevrDiTV0IPAdapter):
@@ -712,7 +642,8 @@ class ThinkerWithFrozenClevrDiTV1IPAdapter(_ClevrV1Mixin, ThinkerWithFrozenClevr
     V1 + IPAdapter: TRM sees object embeddings concatenated with noisy-latent tokens,
     and per-block IP-Adapter modules provide additional per-block conditioning.
 
-    thinker_cfg.seq_len must equal max_objects + latent_encoder_grid_size².
+    Encoder type is specified via config (typically ClevrNoisyObjectFeatureEncoder).
+    thinker_cfg.seq_len must equal max_objects + grid_size² of the latent encoder.
     """
 
     def __init__(
@@ -725,6 +656,7 @@ class ThinkerWithFrozenClevrDiTV1IPAdapter(_ClevrV1Mixin, ThinkerWithFrozenClevr
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: ClevrDiTOptimConfig,
         scheduler,
+        condition_encoder: ConditionEncoderBase,
     ):
         super().__init__(
             clevr_painter=clevr_painter,
@@ -735,5 +667,5 @@ class ThinkerWithFrozenClevrDiTV1IPAdapter(_ClevrV1Mixin, ThinkerWithFrozenClevr
             thinker_optim_cfg=thinker_optim_cfg,
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
+            condition_encoder=condition_encoder,
         )
-        self._init_latent_encoder(thinker_cfg, clevr_painter, model_cfg)

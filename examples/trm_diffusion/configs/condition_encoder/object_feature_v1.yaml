@@ -1,0 +1,9 @@
+_target_: models.condition_encoders.ObjectFeatureEncoderV1
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
+latent_channels: ${clevr_dit.latent_channels}
+hidden_size: ${thinker.hidden_size}
+grid_size: ${clevr_thinker_model.latent_encoder_grid_size}
+noisy_dropout_p_max: ${train.noisy_dropout_p_max}
+num_train_timesteps: 1000

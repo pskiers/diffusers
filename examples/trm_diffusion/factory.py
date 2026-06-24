@@ -51,8 +51,10 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainter,
     ThinkerWithFrozenPainterV0,
     ThinkerWithFrozenPainterV1,
+    ThinkerWithFrozenPainterImgCond,
     ThinkerWithFrozenPainterV1Verif,
     ThinkerWithFrozenPainterControlNet,
+    ThinkerWithFrozenPainterControlNetV2,
 )
 from models.painters import (
     StandalonePainter,
@@ -60,6 +62,7 @@ from models.painters import (
     StandalonePainterSPADE,
 )
 from models.eval_callbacks import SudokuDDIMEvalCallback, SudokuRealSolutionCallback
+from models.losses import build_loss
 from models.trm_wrappers import SpatialTRM
 from models.utility_models import strip_compiled_prefix
 
@@ -488,6 +491,13 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         thinker_cfg.puzzle_emb_ndim = 0
         thinker_cfg.puzzle_emb_len = 0
 
+        if "condition_encoder" not in cfg:
+            raise ValueError(
+                "clevr_thinker requires a 'condition_encoder' key in the config. "
+                "Add a condition_encoder block with _target_ pointing to a ConditionEncoderBase subclass."
+            )
+        condition_encoder = instantiate(cfg.condition_encoder)
+
         return cls(
             clevr_painter=frozen_painter,
             thinker_cfg=thinker_cfg,
@@ -497,6 +507,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             thinker_optim_cfg=_thinker_optim_cfg(cfg),
             painter_optim_cfg=_clevr_dit_optim_cfg(cfg),
             scheduler=scheduler,
+            condition_encoder=condition_encoder,
         )
 
     if mode == "latent_dit":
@@ -583,7 +594,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
 
         painter_variant = str(cfg.get("painter_variant", "v0tok"))
 
-        if painter_variant == "controlnet":
+        if painter_variant in ("controlnet", "controlnet_v2"):
             frozen_painter = StandalonePainterControl(
                 model_cfg=_painter_cfg(cfg),
                 optim_cfg=_painter_optim_cfg(cfg),
@@ -615,6 +626,14 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         model_cfg = _painter_thinker_cfg(cfg)
         sudoku_cbs = _build_sudoku_eval_callbacks(eval_cfg, model_cfg.cell_size)
 
+        if painter_variant in ("v0", "v1", "v1_verif", "controlnet", "controlnet_v2"):
+            if "condition_encoder" not in cfg:
+                raise ValueError(
+                    "thinker_frozen_painter requires a 'condition_encoder' key in the config. "
+                    "Add a condition_encoder block with _target_ pointing to a ConditionEncoderBase subclass."
+                )
+            condition_encoder = instantiate(cfg.condition_encoder)
+
         if painter_variant == "controlnet":
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
@@ -622,13 +641,33 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             model = ThinkerWithFrozenPainterControlNet(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
-                encoder_cfg=_image_encoder_cfg(cfg),
                 model_cfg=model_cfg,
                 train_cfg=train_cfg,
                 eval_cfg=eval_cfg,
                 thinker_optim_cfg=thinker_optim_cfg,
                 painter_optim_cfg=painter_optim_cfg,
                 scheduler=scheduler,
+                condition_encoder=condition_encoder,
+            )
+            model.eval_callbacks = sudoku_cbs
+            return model
+
+        if painter_variant == "controlnet_v2":
+            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
+            thinker_cfg.puzzle_emb_ndim = 0
+            thinker_cfg.puzzle_emb_len = 0
+            loss = build_loss(train_cfg, scheduler, model_cfg.cell_size)
+            model = ThinkerWithFrozenPainterControlNetV2(
+                painter=frozen_painter,
+                thinker_cfg=thinker_cfg,
+                model_cfg=model_cfg,
+                train_cfg=train_cfg,
+                eval_cfg=eval_cfg,
+                thinker_optim_cfg=thinker_optim_cfg,
+                painter_optim_cfg=painter_optim_cfg,
+                scheduler=scheduler,
+                cond_encoder_cfg=cfg.condition_encoder,
+                loss=loss,
             )
             model.eval_callbacks = sudoku_cbs
             return model
@@ -637,17 +676,16 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
-            model = ThinkerWithFrozenPainterV0(
+            model = ThinkerWithFrozenPainterImgCond(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
-                encoder_cfg=_image_encoder_cfg(cfg),
                 model_cfg=model_cfg,
                 train_cfg=train_cfg,
                 eval_cfg=eval_cfg,
                 thinker_optim_cfg=thinker_optim_cfg,
                 painter_optim_cfg=painter_optim_cfg,
                 scheduler=scheduler,
-                timestep_cfg=_timestep_cond_cfg(cfg),
+                condition_encoder=condition_encoder,
             )
             model.eval_callbacks = sudoku_cbs
             return model
@@ -656,24 +694,32 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
-            cls = ThinkerWithFrozenPainterV1Verif if painter_variant == "v1_verif" else ThinkerWithFrozenPainterV1
-            extra = {}
             if painter_variant == "v1_verif":
-                extra["verif_weight"] = float(cfg.painter.get("verif_weight", 0.1))
-                extra["verif_max_corruptions"] = int(cfg.painter.get("verif_max_corruptions", 5))
-            model = cls(
-                painter=frozen_painter,
-                thinker_cfg=thinker_cfg,
-                encoder_cfg=_image_encoder_cfg(cfg),
-                model_cfg=model_cfg,
-                train_cfg=train_cfg,
-                eval_cfg=eval_cfg,
-                thinker_optim_cfg=thinker_optim_cfg,
-                painter_optim_cfg=painter_optim_cfg,
-                scheduler=scheduler,
-                timestep_cfg=_timestep_cond_cfg(cfg),
-                **extra,
-            )
+                model = ThinkerWithFrozenPainterV1Verif(
+                    painter=frozen_painter,
+                    thinker_cfg=thinker_cfg,
+                    model_cfg=model_cfg,
+                    train_cfg=train_cfg,
+                    eval_cfg=eval_cfg,
+                    thinker_optim_cfg=thinker_optim_cfg,
+                    painter_optim_cfg=painter_optim_cfg,
+                    scheduler=scheduler,
+                    condition_encoder=condition_encoder,
+                    verif_weight=float(cfg.painter.get("verif_weight", 0.1)),
+                    verif_max_corruptions=int(cfg.painter.get("verif_max_corruptions", 5)),
+                )
+            else:
+                model = ThinkerWithFrozenPainterImgCond(
+                    painter=frozen_painter,
+                    thinker_cfg=thinker_cfg,
+                    model_cfg=model_cfg,
+                    train_cfg=train_cfg,
+                    eval_cfg=eval_cfg,
+                    thinker_optim_cfg=thinker_optim_cfg,
+                    painter_optim_cfg=painter_optim_cfg,
+                    scheduler=scheduler,
+                    condition_encoder=condition_encoder,
+                )
             model.eval_callbacks = sudoku_cbs
             return model
 

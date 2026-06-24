@@ -1,0 +1,4 @@
+_target_: models.condition_encoders.ObjectFeatureEncoder
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
