@@ -40,6 +40,36 @@ class ScheduledOptimizer:
         )
 
 
+class DelayedScheduledOptimizer(ScheduledOptimizer):
+    """
+    ScheduledOptimizer with a hard-zero phase before the warmup begins.
+
+    lr = 0 for the first `delay_steps` steps; after that the normal
+    warmup+cosine schedule runs as if training started at step 0.
+
+    Setting delay_steps=0 is identical to ScheduledOptimizer.
+    Setting delay_steps to a very large number (e.g. 999999) keeps lr=0
+    for the entire training run, effectively freezing the parameter group.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        base_lr: float,
+        warmup_steps: int,
+        num_steps: int,
+        min_ratio: float = 0.0,
+        delay_steps: int = 0,
+    ):
+        super().__init__(optimizer, base_lr, warmup_steps, num_steps, min_ratio)
+        self.delay_steps = delay_steps
+
+    def compute_lr(self, current_step: int, num_cycles: float = 0.5):
+        if current_step < self.delay_steps:
+            return 0.0
+        return super().compute_lr(current_step - self.delay_steps, num_cycles)
+
+
 def apply_lr_and_step(optimizers: list[ScheduledOptimizer], global_step: int):
     """Update LR for all optimizers, step them. Returns lr of last optimizer."""
     lr_now = None

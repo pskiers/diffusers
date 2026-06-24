@@ -19,20 +19,10 @@ from models.painters import (
 from models.diffusion_utils import apply_noisy_swap, x0_from_noise_pred
 from train_noisy_classifier import load_noisy_classifier
 from models.utility_models import ConditioningPyramid
+from models.eval_callbacks import EvalCallbackBase
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from datasets.sudoku_dataset import IGNORE_LABEL_ID, make_tok_labels
-from eval.mnist_eval import (
-    sample_grids,
-    evaluate_grids,
-    load_or_train_classifier,
-    make_panel_image,
-    plot_thinker_ts_curve,
-)
-
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
+from eval.mnist_eval import load_or_train_classifier
 from configs.schemas import (
     ThinkerModelConfig,
     PainterThinkerConfig,
@@ -64,6 +54,7 @@ class PainterThinkerV0Tok(BaseModel):
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: PainterOptimConfig,
         scheduler,
+        eval_callbacks=None,
     ):
         super().__init__()
         self.thinker_cfg = thinker_cfg
@@ -87,15 +78,9 @@ class PainterThinkerV0Tok(BaseModel):
             else None
         )
 
-        self.eval_clf = None
-        if eval_cfg.classifier_path is not None:
-            self.eval_clf = load_or_train_classifier(eval_cfg.classifier_path, None, model_cfg.cell_size, "cuda")
-            for p in self.eval_clf.parameters():
-                p.requires_grad_(False)
-
         # Training classifier — loaded from train.classifier_loss.classifier_path,
-        # kept separate from eval_clf so a noisy/different classifier can be used
-        # for the loss without polluting the evaluation metric.
+        # kept separate from the eval classifier so a noisy/different classifier
+        # can be used for the loss without polluting the evaluation metric.
         self.train_clf = None
         self.clf_cfg: Optional[ClassifierLossConfig] = train_cfg.classifier_loss
         if self.clf_cfg is not None and self.clf_cfg.classifier_path is not None:
@@ -107,6 +92,8 @@ class PainterThinkerV0Tok(BaseModel):
                 )
             for p in self.train_clf.parameters():
                 p.requires_grad_(False)
+
+        self.eval_callbacks: list[EvalCallbackBase] = list(eval_callbacks) if eval_callbacks is not None else []
 
         self.thinker = SpatialTRM(
             optim_cfg=thinker_optim_cfg,
@@ -195,7 +182,7 @@ class PainterThinkerV0Tok(BaseModel):
         mb_data = []
         for mb in micro_batches:
             images = mb["images"].to(device)
-            solution = mb["solution"].to(device)
+            solution = mb["solution"].to(device) if "solution" in mb else None
             puzzle_ids = mb["puzzle_id"].to(device) if "puzzle_id" in mb else None
             bsz = images.shape[0]
 
@@ -219,7 +206,7 @@ class PainterThinkerV0Tok(BaseModel):
                     "images": images,
                     "condition": self._get_condition(mb, device),
                     "solution": solution,
-                    "ce_labels": self._make_ce_labels(solution),
+                    "ce_labels": self._make_ce_labels(solution) if solution is not None else None,
                     "puzzle_ids": puzzle_ids,
                     "noisy": noisy,
                     "timesteps": timesteps,
@@ -261,7 +248,7 @@ class PainterThinkerV0Tok(BaseModel):
                 diff_loss = F.mse_loss(noise_pred.float(), d["target"])
             step_loss = step_loss + mse_w * diff_loss
 
-        if include_sudoku and logits is not None and sudoku_w > 0:
+        if include_sudoku and logits is not None and sudoku_w > 0 and d.get("ce_labels") is not None:
             B_, N, C = logits.shape
             if N <= d["ce_labels"].shape[1]:
                 sudoku_loss = F.cross_entropy(
@@ -489,159 +476,8 @@ class PainterThinkerV0Tok(BaseModel):
         result = {k: float(np.mean(v)) for k, v in metrics.items() if v}
 
         # ── Sampling eval (slow, only when classifier provided) ───────────────
-        if self.eval_clf is not None and accelerator.is_main_process:
-            cell_size = self.model_cfg.cell_size
-            painter_size = self.model_cfg.painter_size
-            n_total = self.eval_cfg.num_samples
-            n_ddim = self.eval_cfg.num_ddim_steps
-            n_log = self.eval_cfg.num_log_images
-            token_offset = getattr(self, "token_offset", 0)
-
-            all_cell_acc, all_puzzle_acc = [], []
-            all_thinker_cell_best, all_thinker_cell_mean = [], []
-            all_thinker_puzzle_best, all_thinker_puzzle_mean = [], []
-            all_thinker_deviation = []
-            all_painter_dev_best, all_painter_dev_mean = [], []
-            ts_cell_accs: dict[int, list] = {}
-            ts_puzzle_accs: dict[int, list] = {}
-            panels: list = []
-            n_done = 0
-
-            n_batches = (n_total + self.eval_cfg.batch_size - 1) // self.eval_cfg.batch_size
-            for batch in tqdm(dataloader, "Sampling eval", total=n_batches):
-                if n_done >= n_total:
-                    break
-                solutions = batch["solution"]
-                given_masks = batch.get("given_mask")
-                puzzle_ids = batch.get("puzzle_id")
-                if puzzle_ids is not None:
-                    puzzle_ids = puzzle_ids.to(accelerator.device)
-                B_cur = solutions.shape[0]
-
-                sr = sample_grids(
-                    self,
-                    self._get_condition(batch, accelerator.device),
-                    num_train_timesteps=self.scheduler.config.num_train_timesteps,
-                    beta_schedule=self.scheduler.config.beta_schedule,
-                    prediction_type=self.scheduler.config.prediction_type,
-                    num_steps=n_ddim,
-                    device=accelerator.device,
-                    puzzle_ids=puzzle_ids,
-                    solutions=solutions,
-                    painter_size=painter_size,
-                    given_masks=given_masks,
-                )
-                acc = evaluate_grids(sr["generated"], solutions, self.eval_clf, cell_size, given_masks=given_masks)
-                all_cell_acc.append(acc["cell_acc"])
-                all_puzzle_acc.append(acc["puzzle_acc"])
-
-                for key, lst in [
-                    ("thinker_cell_acc_best", all_thinker_cell_best),
-                    ("thinker_cell_acc_mean", all_thinker_cell_mean),
-                    ("thinker_puzzle_acc_best", all_thinker_puzzle_best),
-                    ("thinker_puzzle_acc_mean", all_thinker_puzzle_mean),
-                    ("thinker_deviation_from_best", all_thinker_deviation),
-                ]:
-                    if key in sr:
-                        lst.append(sr[key])
-
-                for t_step, a in sr.get("ts_cell_acc", []):
-                    ts_cell_accs.setdefault(t_step, []).append(a)
-                for t_step, a in sr.get("ts_puzzle_acc", []):
-                    ts_puzzle_accs.setdefault(t_step, []).append(a)
-
-                # Painter deviation from thinker (all CPU: preds are .cpu(), gm must match)
-                painter_preds = acc["preds"]
-                _gm = given_masks[:B_cur].cpu() if given_masks is not None else None
-                for tp_raw, dev_lst in [
-                    (sr.get("best_thinker_preds"), all_painter_dev_best),
-                    (sr.get("mean_thinker_preds"), all_painter_dev_mean),
-                ]:
-                    if tp_raw is not None:
-                        tp = tp_raw - token_offset
-                        N = tp.shape[1]
-                        if N > painter_preds.shape[1]:
-                            continue  # TRM grid ≠ Sudoku grid, skip deviation metric
-                        diff = painter_preds[:, :N] != tp
-                        if _gm is not None:
-                            blank = ~_gm[:, :N]
-                            dev = diff[blank].float().mean().item() if blank.any() else diff.float().mean().item()
-                        else:
-                            dev = diff.float().mean().item()
-                        dev_lst.append(dev)
-
-                # Image panels for wandb
-                if _wandb is not None and len(panels) < n_log:
-                    n_new = min(n_log - len(panels), B_cur)
-                    conds_vis = batch.get("conditions", batch.get("puzzle_tokens", None))
-                    if conds_vis is not None and conds_vis.dim() == 4:
-                        conds_vis = conds_vis.cpu()
-                    tp_all = sr.get("best_thinker_preds")
-                    tt_all = sr.get("best_thinker_ts")
-                    # Only visualise thinker preds when they are 81-token (9×9 Sudoku grid).
-                    if tp_all is not None and tp_all.shape[1] != 81:
-                        tp_all = None
-                    sols_np = solutions.cpu().numpy()
-                    for i in range(n_new):
-                        tp = (tp_all[i] - token_offset).numpy() if tp_all is not None else None
-                        tt = tt_all[i] if tp_all is not None and tt_all is not None else None
-                        cond_img = conds_vis[i] if (conds_vis is not None and conds_vis.dim() == 4) else None
-                        panel = make_panel_image(
-                            cond_img, sr["generated"][i], sols_np[i], thinker_preds=tp, thinker_t=tt
-                        )
-                        panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
-
-                n_done += B_cur
-
-            result["cell_acc"] = float(np.mean(all_cell_acc))
-            result["puzzle_acc"] = float(np.mean(all_puzzle_acc))
-            if all_thinker_cell_best:
-                result["thinker_cell_acc_best"] = float(np.mean(all_thinker_cell_best))
-                result["thinker_cell_acc_mean"] = float(np.mean(all_thinker_cell_mean))
-                result["thinker_puzzle_acc_best"] = float(np.mean(all_thinker_puzzle_best))
-                result["thinker_puzzle_acc_mean"] = float(np.mean(all_thinker_puzzle_mean))
-                result["thinker_deviation_from_best"] = float(np.mean(all_thinker_deviation))
-            if all_painter_dev_best:
-                result["painter_dev_from_best_thinker"] = float(np.mean(all_painter_dev_best))
-                result["painter_dev_from_mean_thinker"] = float(np.mean(all_painter_dev_mean))
-            if panels:
-                result["samples"] = panels
-            if ts_cell_accs:
-                result["thinker_vs_timestep"] = _wandb.Image(plot_thinker_ts_curve(ts_cell_accs, ts_puzzle_accs))
-
-            # Real-solution eval
-            if self.has_realsolution_eval:
-                all_real_cell, all_real_puzzle = [], []
-                n_real = 0
-                for batch in tqdm(dataloader, "Realsolution eval", total=n_batches):
-                    if n_real >= n_total:
-                        break
-                    solutions = batch["solution"]
-                    given_masks = batch.get("given_mask")
-                    puzzle_ids = batch.get("puzzle_id")
-                    if puzzle_ids is not None:
-                        puzzle_ids = puzzle_ids.to(accelerator.device)
-                    sr_r = sample_grids(
-                        self,
-                        self._get_teacher_condition(batch, accelerator.device),
-                        num_train_timesteps=self.scheduler.config.num_train_timesteps,
-                        beta_schedule=self.scheduler.config.beta_schedule,
-                        prediction_type=self.scheduler.config.prediction_type,
-                        num_steps=n_ddim,
-                        device=accelerator.device,
-                        puzzle_ids=puzzle_ids,
-                        solutions=solutions,
-                        painter_size=painter_size,
-                        given_masks=given_masks,
-                    )
-                    acc_r = evaluate_grids(
-                        sr_r["generated"], solutions, self.eval_clf, cell_size, given_masks=given_masks
-                    )
-                    all_real_cell.append(acc_r["cell_acc"])
-                    all_real_puzzle.append(acc_r["puzzle_acc"])
-                    n_real += solutions.shape[0]
-                result["real_cell_acc"] = float(np.mean(all_real_cell))
-                result["real_puzzle_acc"] = float(np.mean(all_real_puzzle))
+        for cb in self.eval_callbacks:
+            result.update(cb(self, dataloader, accelerator, **kwargs))
 
         self.train()
         return result

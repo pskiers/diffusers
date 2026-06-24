@@ -1,0 +1,95 @@
+# @package _global_
+# Stage 2: TRM thinker (V0, CrossAttn) with frozen CLEVR DiT.
+# Train on CLEVR reduced mode; DiT was pre-trained on relative mode.
+#
+# V0 = TRM sees only object embeddings (no noisy latent).
+# CrossAttn = single logit_to_cond projection + unfrozen caption_projection.
+#
+# Usage:
+#   python train_trm.py experiment=clevr_thinker_v0_cross_attn data=clevr \
+#     clevr_painter_checkpoint=runs/clevr_dit_painter/checkpoint_final.pt
+
+mode: "clevr_thinker"
+painter_variant: "v0_cross_attn"
+
+defaults:
+  - override /data: clevr
+
+run:
+  output_dir: "runs/clevr_thinker_v0_cross_attn"
+
+# Override data to reduced mode for stage 2
+data:
+  mode: "reduced"
+
+clevr_painter_checkpoint: null   # REQUIRED: path to StandaloneClevrDiT checkpoint
+
+# DiT architecture — must match the painter checkpoint
+clevr_dit:
+  vae_model_name: "stabilityai/sd-vae-ft-mse"
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  num_attention_heads: 12
+  attention_head_dim: 64
+  num_layers: 12
+  dropout: 0.0
+  cond_embed_dim: 768
+  image_size: 256
+
+  optim:
+    lr: 3e-5          # lower lr for the encoder/projection modules
+    weight_decay: 0.0
+    warmup_steps: 1000
+    lr_min_ratio: 0.1
+
+# TRM: seq_len = max_objects = 10
+thinker:
+  seq_len: 10
+  hidden_size: 512
+  n_heads: 8
+  L_layers: 2
+  L_cycles: 6
+  H_cycles: 3
+  n_sup: 16
+  expansion: 4.0
+  pos_encodings: "rope"
+  mlp_t: false
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+  num_puzzle_identifiers: 1
+  halt_exploration_prob: 0.0
+  freeze_weights: false
+  optim:
+    lr: 1e-4
+    lr_min_ratio: 0.1
+    weight_decay: 1.0
+    beta1: 0.9
+    beta2: 0.95
+    warmup_steps: 2000
+
+# ClevrPainterThinkerConfig
+clevr_thinker_model:
+  diff_thinker_weight: 1.0
+  painter_dtype: "bfloat16"
+  latent_encoder_grid_size: 4   # unused for V0 but kept for config completeness
+  # caption_proj_freeze_steps: how many steps to hold lr=0 for caption_projection.
+  # 999999 ≈ never unfreeze (Option A); 0 = train from step 0; N = delayed warmup after N steps.
+  caption_proj_freeze_steps: 999999
+
+train:
+  batch_size: 32
+  num_steps: 150000
+  gradient_accumulation_steps: 4
+  cfg_prob: 0.0
+  sudoku_loss_weight: 0.0
+  mse_loss_weight: 1.0
+  noisy_dropout_p_max: 0.0
+
+eval:
+  eval_every: 3000
+  save_every: 15000
+  log_every: 200
+  cfg_scale: 2.0
+  num_ddim_steps: 20
+  num_log_images: 8

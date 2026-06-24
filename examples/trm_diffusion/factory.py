@@ -12,11 +12,15 @@ from typing import Optional
 
 import torch
 from diffusers import DDPMScheduler
+from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.data import Dataset, random_split
 
 from configs.schemas import (
     ClassifierLossConfig,
+    ClevrDiTConfig,
+    ClevrDiTOptimConfig,
+    ClevrPainterThinkerConfig,
     EvalConfig,
     ImageEncoderConfig,
     LatentDiTConfig,
@@ -55,8 +59,20 @@ from models.painters import (
     StandalonePainterControl,
     StandalonePainterSPADE,
 )
+from models.eval_callbacks import SudokuDDIMEvalCallback, SudokuRealSolutionCallback
 from models.trm_wrappers import SpatialTRM
 from models.utility_models import strip_compiled_prefix
+
+
+def _build_sudoku_eval_callbacks(eval_cfg: EvalConfig, cell_size: int) -> list:
+    """Build the standard Sudoku sampling eval callbacks from eval config."""
+    if eval_cfg.classifier_path is None:
+        return []
+    return [
+        SudokuDDIMEvalCallback(classifier_path=eval_cfg.classifier_path, cell_size=cell_size),
+        SudokuRealSolutionCallback(classifier_path=eval_cfg.classifier_path, cell_size=cell_size),
+    ]
+
 
 # ── Sub-config builders ────────────────────────────────────────────────────────
 
@@ -274,6 +290,44 @@ def _latent_dit_cfg(cfg: DictConfig) -> LatentDiTConfig:
     )
 
 
+def _clevr_dit_cfg(cfg: DictConfig) -> ClevrDiTConfig:
+    d = cfg.clevr_dit
+    return ClevrDiTConfig(
+        vae_model_name=str(d.get("vae_model_name", "stabilityai/sd-vae-ft-mse")),
+        latent_channels=int(d.get("latent_channels", 4)),
+        latent_size=int(d.get("latent_size", 32)),
+        patch_size=int(d.get("patch_size", 2)),
+        num_attention_heads=int(d.get("num_attention_heads", 12)),
+        attention_head_dim=int(d.get("attention_head_dim", 64)),
+        num_layers=int(d.get("num_layers", 12)),
+        dropout=float(d.get("dropout", 0.0)),
+        object_feat_dim=int(cfg.data.get("object_feat_dim", 55)),
+        max_objects=int(cfg.data.get("max_objects", 10)),
+        cond_embed_dim=int(d.get("cond_embed_dim", 768)),
+        image_size=int(d.get("image_size", 256)),
+    )
+
+
+def _clevr_dit_optim_cfg(cfg: DictConfig) -> ClevrDiTOptimConfig:
+    o = cfg.clevr_dit.optim
+    return ClevrDiTOptimConfig(
+        lr=float(o.lr),
+        weight_decay=float(o.get("weight_decay", 0.0)),
+        warmup_steps=int(o.get("warmup_steps", 2000)),
+        lr_min_ratio=float(o.get("lr_min_ratio", 0.1)),
+    )
+
+
+def _clevr_painter_thinker_cfg(cfg: DictConfig) -> ClevrPainterThinkerConfig:
+    m = cfg.get("clevr_thinker_model", {})
+    return ClevrPainterThinkerConfig(
+        diff_thinker_weight=float(m.get("diff_thinker_weight", 1.0)),
+        painter_dtype=m.get("painter_dtype", "bfloat16") or None,
+        latent_encoder_grid_size=int(m.get("latent_encoder_grid_size", 4)),
+        caption_proj_freeze_steps=int(m.get("caption_proj_freeze_steps", 0)),
+    )
+
+
 def _latent_dit_optim_cfg(cfg: DictConfig) -> LatentDiTOptimConfig:
     o = cfg.latent_dit.optim
     return LatentDiTOptimConfig(
@@ -315,6 +369,11 @@ def build_scheduler(cfg: DictConfig) -> Optional[DDPMScheduler]:
 
 
 def build_datasets(cfg: DictConfig) -> tuple[Dataset, Dataset]:
+    # Preferred path: data config declares train_dataset/val_dataset with _target_.
+    if "train_dataset" in cfg.data and "val_dataset" in cfg.data:
+        return instantiate(cfg.data.train_dataset), instantiate(cfg.data.val_dataset)
+
+    # ── Legacy fallback (configs that predate _target_ style) ─────────────────
     if cfg.mode == "sudoku":
         train_dir = os.path.join(cfg.data.sudoku_dir, "train")
         test_dir = os.path.join(cfg.data.sudoku_dir, "test")
@@ -370,6 +429,75 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     mode = str(cfg.mode)
     train_cfg = _train_cfg(cfg)
     eval_cfg = _eval_cfg(cfg)
+
+    if mode == "clevr_painter":
+        from models.clevr_painters import StandaloneClevrDiT
+
+        return StandaloneClevrDiT(
+            model_cfg=_clevr_dit_cfg(cfg),
+            optim_cfg=_clevr_dit_optim_cfg(cfg),
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            scheduler=scheduler,
+        )
+
+    if mode == "clevr_thinker":
+        from models.clevr_painters import StandaloneClevrDiT
+        from models.clevr_painter_thinkers import (
+            ThinkerWithFrozenClevrDiTV0CrossAttn,
+            ThinkerWithFrozenClevrDiTV0IPAdapter,
+            ThinkerWithFrozenClevrDiTV1CrossAttn,
+            ThinkerWithFrozenClevrDiTV1IPAdapter,
+        )
+
+        _CLEVR_THINKER_VARIANTS = {
+            "v0_cross_attn": ThinkerWithFrozenClevrDiTV0CrossAttn,
+            "v0_ip_adapter": ThinkerWithFrozenClevrDiTV0IPAdapter,
+            "v1_cross_attn": ThinkerWithFrozenClevrDiTV1CrossAttn,
+            "v1_ip_adapter": ThinkerWithFrozenClevrDiTV1IPAdapter,
+        }
+        painter_variant = str(cfg.get("painter_variant", "v0_cross_attn"))
+        cls = _CLEVR_THINKER_VARIANTS.get(painter_variant)
+        if cls is None:
+            raise ValueError(
+                f"Unknown clevr thinker painter_variant: {painter_variant!r}. "
+                f"Choose from: {list(_CLEVR_THINKER_VARIANTS)}"
+            )
+
+        painter_ckpt_path = cfg.get("clevr_painter_checkpoint", None)
+        if painter_ckpt_path is None:
+            raise ValueError("clevr_thinker requires clevr_painter_checkpoint to be set.")
+
+        # Build frozen painter (no gradient, just architecture + weights)
+        clevr_dit_cfg = _clevr_dit_cfg(cfg)
+        frozen_painter = StandaloneClevrDiT(
+            model_cfg=clevr_dit_cfg,
+            optim_cfg=_clevr_dit_optim_cfg(cfg),
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            scheduler=scheduler,
+        )
+        ckpt = torch.load(painter_ckpt_path, map_location="cpu", weights_only=False)
+        painter_state = strip_compiled_prefix(ckpt["model_state"])
+        model_keys = set(frozen_painter.state_dict().keys())
+        painter_state = {k: v for k, v in painter_state.items() if k in model_keys}
+        frozen_painter.load_state_dict(painter_state, strict=False)
+
+        vocab_size = int(cfg.data.get("object_feat_dim", 55))  # TRM vocab = object feat dim
+        thinker_cfg = _thinker_model_cfg(cfg, vocab_size=vocab_size)
+        thinker_cfg.puzzle_emb_ndim = 0
+        thinker_cfg.puzzle_emb_len = 0
+
+        return cls(
+            clevr_painter=frozen_painter,
+            thinker_cfg=thinker_cfg,
+            model_cfg=_clevr_painter_thinker_cfg(cfg),
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            thinker_optim_cfg=_thinker_optim_cfg(cfg),
+            painter_optim_cfg=_clevr_dit_optim_cfg(cfg),
+            scheduler=scheduler,
+        )
 
     if mode == "latent_dit":
         from models.latent_dit import LatentDiT
@@ -485,12 +613,13 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         thinker_optim_cfg = _thinker_optim_cfg(cfg)
         painter_optim_cfg = _painter_optim_cfg(cfg)
         model_cfg = _painter_thinker_cfg(cfg)
+        sudoku_cbs = _build_sudoku_eval_callbacks(eval_cfg, model_cfg.cell_size)
 
         if painter_variant == "controlnet":
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
-            return ThinkerWithFrozenPainterControlNet(
+            model = ThinkerWithFrozenPainterControlNet(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
                 encoder_cfg=_image_encoder_cfg(cfg),
@@ -501,12 +630,14 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 painter_optim_cfg=painter_optim_cfg,
                 scheduler=scheduler,
             )
+            model.eval_callbacks = sudoku_cbs
+            return model
 
         if painter_variant == "v0":
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
             thinker_cfg.puzzle_emb_ndim = 0
             thinker_cfg.puzzle_emb_len = 0
-            return ThinkerWithFrozenPainterV0(
+            model = ThinkerWithFrozenPainterV0(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
                 encoder_cfg=_image_encoder_cfg(cfg),
@@ -518,6 +649,8 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 scheduler=scheduler,
                 timestep_cfg=_timestep_cond_cfg(cfg),
             )
+            model.eval_callbacks = sudoku_cbs
+            return model
 
         if painter_variant in ("v1", "v1_verif"):
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
@@ -528,7 +661,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             if painter_variant == "v1_verif":
                 extra["verif_weight"] = float(cfg.painter.get("verif_weight", 0.1))
                 extra["verif_max_corruptions"] = int(cfg.painter.get("verif_max_corruptions", 5))
-            return cls(
+            model = cls(
                 painter=frozen_painter,
                 thinker_cfg=thinker_cfg,
                 encoder_cfg=_image_encoder_cfg(cfg),
@@ -541,8 +674,10 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 timestep_cfg=_timestep_cond_cfg(cfg),
                 **extra,
             )
+            model.eval_callbacks = sudoku_cbs
+            return model
 
-        return ThinkerWithFrozenPainter(
+        model = ThinkerWithFrozenPainter(
             painter=frozen_painter,
             thinker_cfg=_thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size)),
             model_cfg=model_cfg,
@@ -554,6 +689,8 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             adapter_in_channels=int(cfg.painter.get("adapter_in_channels", 0)),
             timestep_cfg=_timestep_cond_cfg(cfg),
         )
+        model.eval_callbacks = sudoku_cbs
+        return model
 
     # Painter-thinker variants (mode == "painter")
     painter_variant = str(cfg.get("painter_variant", "v0tok"))
@@ -567,8 +704,10 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     thinker_optim_cfg = _thinker_optim_cfg(cfg)
     painter_optim_cfg = _painter_optim_cfg(cfg)
 
+    sudoku_cbs = _build_sudoku_eval_callbacks(eval_cfg, model_cfg.cell_size)
+
     if painter_variant == "v0tok":
-        return cls(
+        model = cls(
             thinker_cfg=_thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size)),
             model_cfg=model_cfg,
             train_cfg=train_cfg,
@@ -577,6 +716,8 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             painter_optim_cfg=painter_optim_cfg,
             scheduler=scheduler,
         )
+        model.eval_callbacks = sudoku_cbs
+        return model
 
     # Image-conditioned variants (V0–V4).
     # V2/V3/V4: vocab_size = thinker_out_channels (latent, no CE supervision).
@@ -594,7 +735,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     encoder_cfg = _image_encoder_cfg(cfg)
 
     if painter_variant == "v4":
-        return cls(
+        model = cls(
             thinker_cfg=thinker_cfg,
             encoder_cfg=encoder_cfg,
             model_cfg=model_cfg,
@@ -607,10 +748,12 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             bridge_num_heads=int(cfg.painter.get("bridge_num_heads", 4)),
             timestep_cfg=_timestep_cond_cfg(cfg),
         )
+        model.eval_callbacks = sudoku_cbs
+        return model
 
     # V0, V1, V2, V3 — V1+ accept timestep_cfg (None = disabled)
     timestep_cfg = _timestep_cond_cfg(cfg) if painter_variant != "v0" else None
-    return cls(
+    model = cls(
         thinker_cfg=thinker_cfg,
         encoder_cfg=encoder_cfg,
         model_cfg=model_cfg,
@@ -621,3 +764,5 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         scheduler=scheduler,
         **({"timestep_cfg": timestep_cfg} if painter_variant != "v0" else {}),
     )
+    model.eval_callbacks = sudoku_cbs
+    return model

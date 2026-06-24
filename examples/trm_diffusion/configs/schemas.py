@@ -182,6 +182,47 @@ class PainterThinkerConfig:
     thinker_grid_size: Optional[int] = None
 
 
+# ── CLEVR DiT configs ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class ClevrDiTConfig:
+    # VAE: use a pretrained public VAE (no local checkpoint path needed)
+    vae_model_name: str = "stabilityai/sd-vae-ft-mse"
+    latent_channels: int = 4
+    latent_size: int = 32   # 256 / 8 (8× downsampling by the VAE)
+    patch_size: int = 2     # 32/2 → 16×16 = 256 patches
+    num_attention_heads: int = 12
+    attention_head_dim: int = 64  # inner_dim = 12*64 = 768
+    num_layers: int = 12
+    dropout: float = 0.0
+    object_feat_dim: int = 55     # raw dim per object slot (21=absolute, 55=relative/reduced)
+    max_objects: int = 10         # MAX_OBJECTS from clevr_dataset.py
+    cond_embed_dim: int = 768     # must equal inner_dim; no extra projection in DiT
+    image_size: int = 256
+
+
+@dataclass
+class ClevrDiTOptimConfig:
+    lr: float = 1e-4
+    weight_decay: float = 0.0
+    warmup_steps: int = 2000
+    lr_min_ratio: float = 0.1
+
+
+@dataclass
+class ClevrPainterThinkerConfig:
+    """Config for CLEVR frozen-DiT + TRM thinker training."""
+    diff_thinker_weight: float = 1.0
+    painter_dtype: Optional[str] = "bfloat16"
+    # latent_encoder used only by V1 (encodes noisy latent into image tokens)
+    latent_encoder_grid_size: int = 4   # V1: CNN encodes latent to G×G tokens; seq_len += G²
+    # caption_projection delayed unfreeze: keep lr=0 for this many steps before allowing
+    # caption_projection to train.  Set to a large value (e.g. 999999) to keep it frozen
+    # for the entire run (Option A); set to 0 for immediate training (no delay).
+    caption_proj_freeze_steps: int = 0
+
+
 @dataclass
 class ThinkerModelConfig:
     vocab_size: int
