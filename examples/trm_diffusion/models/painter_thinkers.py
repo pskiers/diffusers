@@ -1885,7 +1885,7 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         # ── Thinker ───────────────────────────────────────────────────────────
         self.thinker = SpatialTRM(
-            optim_cfg=thinker_cfg,
+            optim_cfg=thinker_optim_cfg,
             vocab_size=thinker_cfg.vocab_size,
             seq_len=thinker_cfg.seq_len,
             hidden_size=thinker_cfg.hidden_size,
