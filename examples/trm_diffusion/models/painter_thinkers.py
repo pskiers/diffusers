@@ -1907,7 +1907,9 @@ class ThinkerFrozenPainterBase(BaseModel):
         )
 
         # ── Frozen painter ────────────────────────────────────────────────────
-        self.painter = painter
+        # Unwrap to the inner UNet so run_painter can pass translator kwargs
+        # (e.g. down_block_additional_residuals) directly to the UNet forward.
+        self.painter = painter.painter if hasattr(painter, "painter") else painter
         for p in self.painter.parameters():
             p.requires_grad_(False)
 
