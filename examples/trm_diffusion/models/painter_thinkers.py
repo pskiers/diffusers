@@ -2213,8 +2213,10 @@ class ThinkerFrozenPainterBase(BaseModel):
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
         max_batches = kwargs.get("max_batches", 100)
-        self.eval()
 
+        # Loss loop runs in train mode so forward() skips the CFG double-painter
+        # call (which is for sampling only, not loss evaluation).
+        self.train()
         metric_accum: dict[str, float] = {}
         n_batches = 0
 
@@ -2261,6 +2263,8 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         result = {k: v / n_batches for k, v in metric_accum.items()} if n_batches > 0 else {}
 
+        # Callbacks do DDIM sampling — switch to eval mode so CFG is active.
+        self.eval()
         for cb in self.eval_callbacks:
             result.update(cb(self, dataloader, accelerator, **kwargs))
 
