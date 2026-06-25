@@ -336,8 +336,6 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         total_diff_loss = 0.0
         total_q_loss = 0.0
         total_active = 0
-        if optimize:
-            opt.zero_grad()  # start clean; gradients are accumulated across the whole n_sup loop
 
         max_steps = int(n_sup_steps.max().item())
         for sup_step in range(max_steps):
@@ -370,18 +368,6 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             total_diff_loss += diffusion_loss.detach()
             total_q_loss += q_loss.detach()
             total_active += 1
-
-        if optimize:
-            # One optimizer update per batch after the n_sup gradients have accumulated.
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            if torch.isfinite(grad_norm):
-                opt.step()
-                if sch is not None:
-                    sch.step()  # advance cosine LR once per batch (num_training_steps = #batches)
-            else:
-                self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
-            opt.zero_grad()
-            # EMA is updated once per batch by the (base) EMACallback.on_train_batch_end.
 
         n_steps_done = max(total_active, 1)
         return total_diff_loss / n_steps_done, total_q_loss / n_steps_done
@@ -436,6 +422,16 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             model_input, timesteps, class_labels_train, x_bits, noise, y, z, n_sup_steps,
             optimize=True, opt=opt, sch=sch,
         )
+
+        if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if torch.isfinite(grad_norm):
+                opt.step()
+                if sch is not None:
+                    sch.step()
+            else:
+                self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
+            opt.zero_grad()
 
         self.log("train/loss", train_loss, prog_bar=True, sync_dist=True)
         self.log("train/q_loss", q_loss, sync_dist=True)
@@ -712,6 +708,7 @@ def main(cfg: DictConfig):
         callbacks=callbacks,
         log_every_n_steps=10,
         val_check_interval=1.0,
+        accumulate_grad_batches=cfg.get("gradient_accumulation_steps", 4),
     )
 
     # Persist the W&B run id next to the checkpoints so sample.py can resume this same experiment and log test metrics onto these training charts.

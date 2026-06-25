@@ -10,16 +10,6 @@
 #SBATCH --gres=gpu:1
 #SBATCH --output=/net/tscratch/people/plgmgrzanka/trm_sokoban/stdout/abl_%x_%j.out
 #SBATCH --error=/net/tscratch/people/plgmgrzanka/trm_sokoban/stderr/abl_%x_%j.err
-#
-# Generic ablation job — invoked by ablations_training.sh (the launcher overrides
-# --job-name per run). Not meant to be sbatch'ed directly.
-#
-# Args:
-#   $1      train script, relative to examples/trm_diffusion
-#   $2      run_name      -> Hydra run_name= (also the W&B run name)
-#   $3      wandb_group   -> Hydra wandb_group= (method bucket in the W&B panel)
-#   ${@:4}  extra Hydra overrides (key=value ...)
-
 TRAIN_SCRIPT="$1"
 RUN_NAME="$2"
 WANDB_GROUP="$3"

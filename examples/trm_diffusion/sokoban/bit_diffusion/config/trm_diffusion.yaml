@@ -26,13 +26,13 @@ time_shift_xi: 0.0 # offset for model timestep; 0.0 = disabled
 
 # --- TRM Parameters ---
 trm:
-  n: 6 # latent recursion iterations (z-loop)
+  n: 4 # latent recursion iterations (z-loop)
   T: 3 # T-1 no-grad + 1 with-grad
   use_grid_pos_embed: true # learnable pos embed for grid tasks (disable for natural images)
 
 # n_sup(t) = n_min + (n_max - n_min) * sin(pi * t)
 n_sup_min: 2
-n_sup_max: 6
+n_sup_max: 4
 
 # --- Q_head (ACT — inference only) ---
 q_loss_weight: 0.15 # weight of BCE(q_hat, board_accuracy) relative to MSE
@@ -52,6 +52,7 @@ lr: 1e-4
 weight_decay: 1e-4
 warmup_steps: 500
 precision: "bf16-mixed"
+gradient_accumulation_steps: 1
 
 # --- Evaluation ---
 eval_every_n_epochs: 50
