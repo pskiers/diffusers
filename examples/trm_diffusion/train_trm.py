@@ -133,7 +133,10 @@ def main(cfg: DictConfig):
 
     # Don't prepare optimizers — accelerate wraps them in AcceleratedOptimizer
     # which passes closure to step(), but AdamATan2/SignSGD don't accept it.
-    model, train_dl, eval_dl = accelerator.prepare(model, train_dl, eval_dl)
+    # eval_dl is intentionally NOT prepared: accelerate wraps it in a
+    # DataLoaderDispatcher which races with persistent_workers when iterated
+    # twice per eval call (loss loop then sampling callback).
+    model, train_dl = accelerator.prepare(model, train_dl)
 
     # ── EMA ───────────────────────────────────────────────────────────────────
     ema_helper = None
