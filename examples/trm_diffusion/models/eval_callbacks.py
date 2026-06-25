@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from diffusers import DDIMScheduler
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
@@ -26,9 +25,17 @@ except ImportError:
     _wandb = None
 
 try:
-    from eval.mnist_eval import evaluate_grids, load_or_train_classifier, make_panel_image, plot_thinker_ts_curve, sample_grids
+    from eval.mnist_eval import (
+        evaluate_grids,
+        load_or_train_classifier,
+        make_panel_image,
+        plot_thinker_ts_curve,
+        sample_grids,
+    )
 except ImportError:
     evaluate_grids = load_or_train_classifier = make_panel_image = plot_thinker_ts_curve = sample_grids = None
+
+from datasets.data_sample import DataSample
 
 
 class EvalCallbackBase:
@@ -43,61 +50,61 @@ class EvalCallbackBase:
 
 class ImageGenEvalCallback(EvalCallbackBase):
     """
-    DDIM sampling + side-by-side WandB logging for latent DiT models (CLEVR etc.).
+    DDIM sampling + side-by-side WandB logging for latent painters (CLEVR etc.).
 
-    Reads from the model at call time:
+    Uses SamplingPipeline + CFGPredictor from models.sampling with the
+    DataSample interface.  Reads from the model at call time:
       model.eval_cfg.{num_ddim_steps, cfg_scale, num_log_images}
       model.scheduler
-      model._noise_shape   — (C, H, W) tuple, no batch dim
-      model(noisy, ts, cond) -> (noise_pred, ...)
+      model._noise_shape     — (C, H, W) tuple, no batch dim
       model._decode_for_eval(z) -> Tensor in [0, 1]
-      batch[condition_key] — conditioning tensor
-      batch[image_key]     — GT images in [-1, 1]
+      model.condition_keys   — DataSample fields to pull from batch
+      model.null_condition_sample(sample) -> DataSample
     """
-
-    def __init__(self, condition_key: str = "conditions", image_key: str = "images"):
-        self.condition_key = condition_key
-        self.image_key = image_key
 
     @torch.no_grad()
     def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
         if not accelerator.is_main_process or _wandb is None:
             return {}
 
+        from models.sampling import CFGPredictor, DirectPredictor, SamplingPipeline, SchedulerConfig
+
         step = kwargs.get("step", None)
         device = accelerator.device
         n_log = model.eval_cfg.num_log_images
+        cfg_scale = model.eval_cfg.cfg_scale
 
-        ddim = DDIMScheduler(
+        sched_cfg = SchedulerConfig(
             num_train_timesteps=model.scheduler.config.num_train_timesteps,
             beta_schedule=model.scheduler.config.beta_schedule,
             prediction_type=model.scheduler.config.prediction_type,
+            num_inference_steps=model.eval_cfg.num_ddim_steps,
+            sampler="ddim",
         )
-        ddim.set_timesteps(model.eval_cfg.num_ddim_steps)
-        cfg_scale = model.eval_cfg.cfg_scale
+        pipeline = SamplingPipeline(sched_cfg)
+        predictor = CFGPredictor(cfg_scale) if cfg_scale > 1.0 else DirectPredictor()
 
         sample_images, gt_images = [], []
         for batch in dataloader:
             if len(sample_images) >= n_log:
                 break
-            B = min(batch[self.condition_key].shape[0], n_log - len(sample_images))
-            conditions = batch[self.condition_key][:B].to(device)
-            null_cond = torch.zeros_like(conditions)
+            B = min(batch["images"].shape[0], n_log - len(sample_images))
 
-            z = torch.randn(B, *model._noise_shape, device=device)
+            sample_kwargs = {}
+            for k in model.condition_keys:
+                val = batch.get(k) if hasattr(batch, "get") else batch.get(k, None)
+                if val is not None:
+                    sample_kwargs[k] = val[:B].to(device)
+            emb_mask = batch.get("embedding_mask") if hasattr(batch, "get") else None
+            if emb_mask is not None:
+                sample_kwargs["embedding_mask"] = emb_mask[:B].to(device)
 
-            for t in ddim.timesteps:
-                ts = torch.full((B,), t, device=device, dtype=torch.long)
-                noise_pred, _ = model(z, ts, conditions)
-                if cfg_scale > 1.0:
-                    noise_uncond, _ = model(z, ts, null_cond)
-                    noise_pred = noise_uncond + cfg_scale * (noise_pred - noise_uncond)
-                z = ddim.step(noise_pred, t, z).prev_sample
-
-            imgs = model._decode_for_eval(z)
+            base_sample = DataSample(**sample_kwargs)
+            latents = pipeline.sample(model, base_sample, predictor, shape=(B, *model._noise_shape), device=device)
+            imgs = model._decode_for_eval(latents)
             sample_images.extend(imgs.cpu().unbind(0))
 
-            gt_raw = batch[self.image_key][:B]
+            gt_raw = batch["images"][:B]
             gt_images.extend(((gt_raw + 1.0) / 2.0).clamp(0.0, 1.0).cpu().unbind(0))
 
         if sample_images and step is not None:
@@ -176,23 +183,20 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
                 break
             solutions = batch["solution"]
             given_masks = batch.get("given_mask")
-            puzzle_ids = batch.get("puzzle_id")
-            if puzzle_ids is not None:
-                puzzle_ids = puzzle_ids.to(device)
             B_cur = solutions.shape[0]
 
             sr = sample_grids(
                 model,
-                model._get_condition(batch, device),
+                model._batch_to_sample(batch, device),
                 num_train_timesteps=model.scheduler.config.num_train_timesteps,
                 beta_schedule=model.scheduler.config.beta_schedule,
                 prediction_type=model.scheduler.config.prediction_type,
                 num_steps=n_ddim,
                 device=device,
-                puzzle_ids=puzzle_ids,
                 solutions=solutions,
                 painter_size=painter_size,
                 given_masks=given_masks,
+                cfg_scale=model.eval_cfg.cfg_scale,
             )
             acc = evaluate_grids(sr["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_cell_acc.append(acc["cell_acc"])
@@ -247,9 +251,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
                     tp = (tp_all[i] - token_offset).numpy() if tp_all is not None else None
                     tt = tt_all[i] if tp_all is not None and tt_all is not None else None
                     cond_img = conds_vis[i] if (conds_vis is not None and conds_vis.dim() == 4) else None
-                    panel = make_panel_image(
-                        cond_img, sr["generated"][i], sols_np[i], thinker_preds=tp, thinker_t=tt
-                    )
+                    panel = make_panel_image(cond_img, sr["generated"][i], sols_np[i], thinker_preds=tp, thinker_t=tt)
                     panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
 
             n_done += B_cur
@@ -318,26 +320,21 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
                 break
             solutions = batch["solution"]
             given_masks = batch.get("given_mask")
-            puzzle_ids = batch.get("puzzle_id")
-            if puzzle_ids is not None:
-                puzzle_ids = puzzle_ids.to(device)
 
             sr_r = sample_grids(
                 model,
-                model._get_teacher_condition(batch, device),
+                model._batch_to_sample(batch, device),
                 num_train_timesteps=model.scheduler.config.num_train_timesteps,
                 beta_schedule=model.scheduler.config.beta_schedule,
                 prediction_type=model.scheduler.config.prediction_type,
                 num_steps=n_ddim,
                 device=device,
-                puzzle_ids=puzzle_ids,
                 solutions=solutions,
                 painter_size=painter_size,
                 given_masks=given_masks,
+                cfg_scale=model.eval_cfg.cfg_scale,
             )
-            acc_r = evaluate_grids(
-                sr_r["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks
-            )
+            acc_r = evaluate_grids(sr_r["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_real_cell.append(acc_r["cell_acc"])
             all_real_puzzle.append(acc_r["puzzle_acc"])
             n_real += solutions.shape[0]

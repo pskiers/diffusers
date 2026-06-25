@@ -60,7 +60,7 @@ from models.painters import (
     StandalonePainterControl,
     StandalonePainterSPADE,
 )
-from models.eval_callbacks import SudokuDDIMEvalCallback, SudokuRealSolutionCallback
+from models.eval_callbacks import ImageGenEvalCallback, SudokuDDIMEvalCallback, SudokuRealSolutionCallback
 from models.losses import build_loss
 from models.trm_wrappers import SpatialTRM
 from models.utility_models import strip_compiled_prefix
@@ -431,6 +431,12 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     mode = str(cfg.mode)
     train_cfg = _train_cfg(cfg)
     eval_cfg = _eval_cfg(cfg)
+
+    if mode == "painter_base":
+        # Generic path: model fully specified by cfg.model via Hydra _target_.
+        # train_cfg / eval_cfg / scheduler are injected here; everything else
+        # (architecture, vae, condition_encoder, optim_cfg, …) lives in cfg.model.
+        return instantiate(cfg.model, scheduler=scheduler, train_cfg=train_cfg, eval_cfg=eval_cfg)
 
     if mode == "clevr_painter":
         from models.clevr_painters import StandaloneClevrDiT

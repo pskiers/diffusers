@@ -2,15 +2,16 @@
 models/translators.py — Thinker-to-painter translator modules.
 
 A ThinkerPainterTranslatorBase subclass:
-  - takes thinker logits (B, N, vocab_size) and optional timesteps
-  - produces a dict of kwargs to be unpacked into the frozen painter's forward call
+  - takes TRMOutput plus any DataSample fields it declares in ``condition_keys``
+  - produces a ThinkerSteering subclass instance
 
 The translator owns the logits-to-spatial conversion (mode: logits/onehot/softmax)
 and any trainable conditioning modules (e.g. ConditioningPyramid for ControlNet).
 
 Calling convention (model's run_painter):
-    tpt_out = self.thinker_painter_translator(logits, timesteps)
-    self.painter(noisy, timesteps, **tpt_out, **painter_cond).sample
+    extra = {k: getattr(sample, k) for k in translator.condition_keys}
+    steering = self.thinker_painter_translator(trm_output, **extra)
+    self.painter(x_noisy, timesteps, **steering.to_painter_kwargs(), **painter_cond).sample
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.interfaces import ControlNetSteering, ThinkerSteering, TRMOutput
 from models.utility_models import ConditioningPyramid
 
 
@@ -34,6 +36,11 @@ class ThinkerPainterTranslatorBase(nn.Module):
         bridge_mode: how to convert logits to spatial map —
                      "logits" (raw floats), "softmax", or "onehot"
     """
+
+    condition_keys: list[str] = []
+    """DataSample fields this translator needs beyond TRMOutput.
+    The model passes ``{k: getattr(sample, k) for k in condition_keys}``
+    as keyword arguments to forward."""
 
     def __init__(self, grid: int, bridge_mode: str = "logits"):
         super().__init__()
@@ -54,14 +61,15 @@ class ThinkerPainterTranslatorBase(nn.Module):
             return logits.float().transpose(1, 2).reshape(B, C, self._grid, self._grid)
 
     @abstractmethod
-    def forward(self, logits: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> dict:
+    def forward(self, trm_output: TRMOutput, **kwargs) -> ThinkerSteering:
         """
         Args:
-            logits:    (B, N, vocab_size) thinker output
-            timesteps: (B,) diffusion timesteps, may be None
+            trm_output: output of the thinker
+            **kwargs:   DataSample fields listed in ``condition_keys``,
+                        passed by the model as keyword arguments.
 
         Returns:
-            dict of kwargs to unpack into the frozen painter's forward call
+            ThinkerSteering subclass instance
         """
         pass
 
@@ -74,9 +82,7 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
       1. Optional logit_expand (Linear) if thinker_out_channels != vocab_size
       2. _logits_to_spatial: (B, N, C) → (B, C, grid, grid)
       3. Bilinear upsample to painter_size
-      4. ConditioningPyramid → (down_residuals, mid_residual)
-
-    The output dict matches the HuggingFace UNet2DConditionModel ControlNet kwargs.
+      4. ConditioningPyramid → ControlNetSteering
     """
 
     def __init__(
@@ -105,13 +111,14 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
             layers_per_block=layers_per_block,
         )
 
-    def forward(self, logits, timesteps=None):
+    def forward(self, trm_output: TRMOutput, **_) -> ControlNetSteering:
+        logits = trm_output.logits
         if self.logit_expand is not None:
             logits = self.logit_expand(logits.float())
         spatial = self._logits_to_spatial(logits)
         spatial = F.interpolate(spatial, size=self.painter_size, mode="bilinear", align_corners=False)
         down_res, mid_res = self.control_pyramid(spatial)
-        return {
-            "down_block_additional_residuals": down_res,
-            "mid_block_additional_residual": mid_res,
-        }
+        return ControlNetSteering(
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        )

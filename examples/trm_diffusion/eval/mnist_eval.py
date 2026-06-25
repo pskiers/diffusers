@@ -11,6 +11,7 @@ Provides:
   plot_thinker_ts_curve    – plots thinker accuracy vs denoising timestep (mean ± std).
 """
 
+import dataclasses
 import logging
 import os
 
@@ -244,23 +245,25 @@ def _build_denoising_schedule(
 @torch.no_grad()
 def sample_grids(
     model,
-    conditions:          torch.Tensor,               # (B, 1, H, W) or (B, 81) long for token models
+    base_sample,                                   # DataSample with static condition fields
     num_train_timesteps: int,
     beta_schedule:       str,
     num_steps:           int,
     device:              torch.device,
     prediction_type:     str                       = "epsilon",
-    puzzle_ids:          torch.Tensor | None       = None,   # (B,) long
     solutions:           torch.Tensor | None       = None,   # (B, 81) int64 [0-8]
-    painter_size:        int | None               = None,    # required for token-input models
+    painter_size:        int | None               = None,
     given_masks:         torch.Tensor | None       = None,   # (B, 81) bool — True = given cell
     schedule_segments:   list[str] | None          = None,   # e.g. ["10:1", "100:99"]
+    cfg_scale:           float                    = 1.0,
     noisy_guidance_fn    = None,  # Callable[[int, int], float] | None
-                                  # (t, T) → s; blends: pred = pred_noisy + s*(pred_clean - pred_noisy)
-                                  # pred_clean uses zeros as the noisy encoder input.
-                                  # Requires model to be OriginalTRMRatatouilleV1 or subclass.
+                                  # (t, T) → s; blends pred = pred_v1 + s*(pred_v0 - pred_v1)
+                                  # pred_v0 uses enc_x_noisy=zeros; painter still denoises real x_t
 ) -> dict:
     """DDIM-sample and collect thinker stats along the denoising trajectory.
+
+    base_sample should contain static condition fields (e.g. spatial_conditions,
+    puzzle_id).  x_noisy and timesteps are overwritten per step.
 
     Returns dict:
       'generated'                  : (B, 1, H, W) float32 [0, 1]
@@ -283,26 +286,29 @@ def sample_grids(
         num_steps, schedule_segments,
     )
 
-    if isinstance(conditions, dict):
-        conditions = {k: v.to(device) for k, v in conditions.items()}
-        B = next(iter(conditions.values())).shape[0]
-    else:
-        conditions = conditions.to(device)
-        B = conditions.shape[0]
-    if puzzle_ids is not None:
-        puzzle_ids = puzzle_ids.to(device)
+    # Move static condition fields to device
+    base_sample = dataclasses.replace(base_sample, **{
+        f.name: getattr(base_sample, f.name).to(device)
+        for f in dataclasses.fields(base_sample)
+        if getattr(base_sample, f.name) is not None
+    })
+    B = next(
+        getattr(base_sample, f.name).shape[0]
+        for f in dataclasses.fields(base_sample)
+        if getattr(base_sample, f.name) is not None
+    )
+
     if solutions is not None:
         solutions = solutions.to(device)
-    if painter_size is not None:
-        x = torch.randn(B, 1, painter_size, painter_size, device=device)
-    else:
-        x = torch.randn_like(conditions)
 
-    # Some models (e.g. token-input TRM) output logits in a shifted token space
-    # where predictions are offset from raw 0-based solution labels.
+    if painter_size is None:
+        painter_size = getattr(getattr(model, "model_cfg", None), "painter_size", None)
+    if painter_size is None:
+        raise ValueError("painter_size is required (or set model.model_cfg.painter_size)")
+    x = torch.randn(B, 1, painter_size, painter_size, device=device)
+
     token_offset = getattr(model, "token_offset", 0)
 
-    # Lazy-initialised on first encounter of sudoku_logits
     has_logits   = False
     best_conf    = None
     best_preds   = None
@@ -311,23 +317,33 @@ def sample_grids(
 
     ts_cell_acc:    list[tuple[int, float]] = []
     ts_puzzle_acc:  list[tuple[int, float]] = []
-    all_preds_list: list[torch.Tensor]      = []   # (B, N) per step, stored on CPU
+    all_preds_list: list[torch.Tensor]      = []
 
     T = num_train_timesteps
     model.eval()
     for t, active_sched in tqdm(denoising_schedule):
-        ts         = torch.full((B,), t, device=device, dtype=torch.long)
-        noise_pred, sudoku_logits = model(x, ts, conditions, puzzle_ids=puzzle_ids)
+        ts = torch.full((B,), t, device=device, dtype=torch.long)
+        step_sample = dataclasses.replace(base_sample, x_noisy=x, timesteps=ts)
 
+        result = model(step_sample)
+        noise_pred = result.pred
+        sudoku_logits = result.logits
+
+        # CFG blend
+        if cfg_scale > 1.0:
+            null_result = model(model.null_condition_sample(step_sample))
+            noise_pred = null_result.pred + cfg_scale * (noise_pred - null_result.pred)
+
+        # Noisy-image guidance: encoder sees zeros, painter still denoises real x_t
         if noisy_guidance_fn is not None:
             s = float(noisy_guidance_fn(int(t), T))
             if s != 0.0:
-                try:
-                    model._enc_noisy_override = torch.zeros_like(x)
-                    noise_pred_clean, _ = model(x, ts, conditions, puzzle_ids=puzzle_ids)
-                finally:
-                    model._enc_noisy_override = None
-                noise_pred = noise_pred + s * (noise_pred_clean - noise_pred)
+                clean_sample = dataclasses.replace(step_sample, enc_x_noisy=torch.zeros_like(x))
+                clean_pred = model(clean_sample).pred
+                if cfg_scale > 1.0:
+                    clean_null_pred = model(model.null_condition_sample(clean_sample)).pred
+                    clean_pred = clean_null_pred + cfg_scale * (clean_pred - clean_null_pred)
+                noise_pred = noise_pred + s * (clean_pred - noise_pred)
 
         if sudoku_logits is not None:
             if not has_logits:

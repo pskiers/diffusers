@@ -91,6 +91,8 @@ def main(cfg: DictConfig):
     train_ds, eval_ds = build_datasets(cfg)
 
     n_workers = cfg.data.num_workers
+    train_collate_fn = getattr(type(train_ds), "collate_fn", None)
+    eval_collate_fn = getattr(type(eval_ds), "collate_fn", None)
     train_dl = DataLoader(
         train_ds,
         batch_size=cfg.train.batch_size,
@@ -99,6 +101,7 @@ def main(cfg: DictConfig):
         drop_last=True,
         pin_memory=True,
         persistent_workers=(n_workers > 0),
+        collate_fn=train_collate_fn,
     )
     eval_dl = DataLoader(
         eval_ds,
@@ -108,6 +111,7 @@ def main(cfg: DictConfig):
         pin_memory=True,
         persistent_workers=(n_workers > 0),
         timeout=120 if n_workers > 0 else 0,
+        collate_fn=eval_collate_fn,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────

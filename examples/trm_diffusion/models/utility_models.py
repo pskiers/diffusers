@@ -9,6 +9,19 @@ def strip_compiled_prefix(state_dict: dict) -> dict:
     return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
 
 
+def load_frozen_vae(pretrained_model_name_or_path: str):
+    """Load an AutoencoderKL from a pretrained checkpoint and freeze it.
+
+    Thin wrapper so Hydra instantiate can build the VAE via _target_.
+    """
+    from diffusers import AutoencoderKL
+
+    vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path)
+    for p in vae.parameters():
+        p.requires_grad_(False)
+    return vae
+
+
 class TimestepMLP(nn.Module):
     """
     Sinusoidal timestep embedding followed by a two-layer MLP.
@@ -204,9 +217,7 @@ class ConditioningPyramid(nn.Module):
         # 3. Zero convolutions — one per residual output + one for mid.
         #    All weights and biases initialised to exactly zero so the pyramid
         #    injects nothing at the start of training.
-        self.zero_convs = nn.ModuleList([
-            nn.Conv2d(c, c, kernel_size=1) for c in residual_channels
-        ])
+        self.zero_convs = nn.ModuleList([nn.Conv2d(c, c, kernel_size=1) for c in residual_channels])
         self.mid_zero_conv = nn.Conv2d(current_channels, current_channels, kernel_size=1)
         for m in list(self.zero_convs) + [self.mid_zero_conv]:
             nn.init.zeros_(m.weight)

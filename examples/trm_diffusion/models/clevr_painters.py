@@ -192,8 +192,8 @@ class StandaloneClevrDiT(BaseModel):
 
         for mb in micro_batches:
             images = mb["images"].to(device)
-            conditions = mb["conditions"].to(device)
-            masks = mb["masks"].to(device) if "masks" in mb else None
+            conditions = mb["embedding_conditions"].to(device)
+            masks = mb["embedding_mask"].to(device) if "embedding_mask" in mb else None
 
             z = self._encode(images)
             B = z.shape[0]
@@ -232,8 +232,8 @@ class StandaloneClevrDiT(BaseModel):
             if i >= max_batches:
                 break
             images = batch["images"].to(device)
-            conditions = batch["conditions"].to(device)
-            masks = batch["masks"].to(device) if "masks" in batch else None
+            conditions = batch["embedding_conditions"].to(device)
+            masks = batch["embedding_mask"].to(device) if "embedding_mask" in batch else None
             z = self._encode(images)
             B = z.shape[0]
             noise = torch.randn_like(z)
@@ -260,8 +260,8 @@ class StandaloneClevrDiT(BaseModel):
             for batch in dataloader:
                 if len(sample_images) >= n_log:
                     break
-                conditions = batch["conditions"].to(device)
-                masks = batch["masks"].to(device) if "masks" in batch else None
+                conditions = batch["embedding_conditions"].to(device)
+                masks = batch["embedding_mask"].to(device) if "embedding_mask" in batch else None
                 B = conditions.shape[0]
                 B = min(B, n_log - len(sample_images))
                 conditions = conditions[:B]

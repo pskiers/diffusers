@@ -11,6 +11,7 @@ import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import Dataset
 
+from datasets.data_sample import DataSample, collate_data_samples
 
 # Constants aligned with CLEVR
 COLORS = ["gray", "red", "blue", "green", "brown", "purple", "cyan", "yellow"]
@@ -112,7 +113,7 @@ def make_mask_from_scene(scene_dict, mask_size=32, H_inv=None):
             # measure the resulting pixel displacement.
             x3, y3 = obj["3d_coords"][0], obj["3d_coords"][1]
             uv_center = _project_3d_to_pixel(x3, y3, H_inv)
-            uv_edge   = _project_3d_to_pixel(x3 + r_3d, y3, H_inv)
+            uv_edge = _project_3d_to_pixel(x3 + r_3d, y3, H_inv)
             r_pix = float(np.linalg.norm(uv_edge - uv_center))
             # Scale from original pixel space to mask pixel space
             sigma = max(r_pix / ORIG_W * mask_size, 0.5)
@@ -121,7 +122,7 @@ def make_mask_from_scene(scene_dict, mask_size=32, H_inv=None):
             # The projected radius in mask pixels is therefore:
             sigma = max(r_3d / 6.0 * mask_size, 0.5)
 
-        blob = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma ** 2))
+        blob = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma**2))
 
         mask[COLOR2ID[obj["color"]]] = mask[COLOR2ID[obj["color"]]].maximum(blob)
         mask[8 + SHAPE2ID[obj["shape"]]] = mask[8 + SHAPE2ID[obj["shape"]]].maximum(blob)
@@ -350,7 +351,7 @@ def make_tensor_from_scene(scene_dict):
             for (a, b), heads in zip(left_coords, coins):
                 if a < MAX_OBJECTS and b < MAX_OBJECTS:
                     if heads:
-                        left_g[a, b] = 1.0   # "b is left of a"
+                        left_g[a, b] = 1.0  # "b is left of a"
                     else:
                         right_g[b, a] = 1.0  # equivalent: "a is right of b"
 
@@ -360,7 +361,7 @@ def make_tensor_from_scene(scene_dict):
             for (a, b), heads in zip(front_coords, coins):
                 if a < MAX_OBJECTS and b < MAX_OBJECTS:
                     if heads:
-                        front_g[a, b] = 1.0   # "b is in front of a"
+                        front_g[a, b] = 1.0  # "b is in front of a"
                     else:
                         behind_g[b, a] = 1.0  # equivalent: "a is behind b"
 
@@ -429,6 +430,7 @@ def make_tensor_from_scene(scene_dict):
 
 class CLEVRHybridDataset(Dataset):
     URL = "https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip"
+    collate_fn = staticmethod(collate_data_samples)
 
     def __init__(self, root_dir, split="train", mode="absolute", image_size=256, download=True, n_reduced_samples=16):
         """
@@ -504,7 +506,7 @@ class CLEVRHybridDataset(Dataset):
 
         if self.mode == "mask":
             spatial_mask = make_mask_from_scene(scene, self.mask_size, self.H_inv)
-            return {"images": self.transform(image), "conditions": spatial_mask}
+            return DataSample(images=self.transform(image), spatial_conditions=spatial_mask)
 
         # Temporarily inject the mode so our shared function knows how to process it
         scene["mode"] = self.mode
@@ -512,4 +514,8 @@ class CLEVRHybridDataset(Dataset):
         # Get tensors. make_tensor_from_scene adds a batch dim of 1, so we strip it off here.
         cond_tensor, mask = make_tensor_from_scene(scene)
 
-        return {"images": self.transform(image), "conditions": cond_tensor[0], "masks": mask[0]}
+        return DataSample(
+            images=self.transform(image),
+            embedding_conditions=cond_tensor[0],
+            embedding_mask=mask[0],
+        )
