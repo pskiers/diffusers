@@ -606,12 +606,24 @@ class DiTPainter(PainterBase, BaseModel):
             diff_losses.append(F.mse_loss(result.pred.float(), target.float()).item())
         self.train()
         metrics = {"diff_loss": float(np.mean(diff_losses))} if diff_losses else {}
-        for cb in self.eval_callbacks:
-            metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        # Swap to the uncompiled dit for callbacks: the compiled dit can fail to
+        # recompile when eval batch size coincidentally equals the conditioning
+        # sequence length (inductor bakes seq_len as a constant and then can't
+        # resolve seq_len // batch_size symbolically on recompile).
+        # _orig_mod is a zero-cost reference — no weight duplication.
+        orig_mod = getattr(self.dit, "_orig_mod", None)
+        if orig_mod is not None:
+            self.dit, _compiled = orig_mod, self.dit
+        try:
+            for cb in self.eval_callbacks:
+                metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        finally:
+            if orig_mod is not None:
+                self.dit = _compiled
         return metrics
 
     def compile_submodules(self):
-        self.dit = torch.compile(self.dit, fullgraph=False, dynamic=True)
+        self.dit = torch.compile(self.dit, fullgraph=False)
         if self.condition_encoder is not None:
             self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
 
