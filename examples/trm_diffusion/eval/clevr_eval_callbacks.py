@@ -56,6 +56,7 @@ def _batch_to_device(samples: list[DataSample], device: torch.device) -> DataSam
     )
 
 
+@torch._dynamo.disable
 def _generate_images(model, samples: list[DataSample], device: torch.device, cfg_scale: float) -> torch.Tensor:
     """Generate and decode images for a list of conditioning DataSamples."""
     from models.sampling import CFGPredictor, DirectPredictor, SamplingPipeline, SchedulerConfig
@@ -72,7 +73,7 @@ def _generate_images(model, samples: list[DataSample], device: torch.device, cfg
 
     batch = _batch_to_device(samples, device)
     B = len(samples)
-    with torch.no_grad(), torch._dynamo.disable():
+    with torch.no_grad():
         latents = pipeline.sample(model, batch, predictor, shape=(B, *model._noise_shape), device=device)
     return model._decode_for_eval(latents)  # (B, C, H, W) in [0, 1]
 
