@@ -611,9 +611,9 @@ class DiTPainter(PainterBase, BaseModel):
         return metrics
 
     def compile_submodules(self):
-        self.dit = torch.compile(self.dit, fullgraph=False)
+        self.dit = torch.compile(self.dit, fullgraph=False, dynamic=True)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
 
 
 # ── Frozen DiT wrapper for TRM steering ──────────────────────────────────────
