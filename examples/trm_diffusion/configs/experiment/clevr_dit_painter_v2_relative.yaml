@@ -41,7 +41,17 @@ model:
     hidden_dim: 768
     out_dim: 768
   eval_callbacks:
-    - _target_: models.eval_callbacks.ImageGenEvalCallback
+    - _target_: eval.clevr_eval_callbacks.ClevrImageLogCallback
+      root_dir: "${data.clevr_root}"
+      mode: "${data.mode}"   # matches data.mode
+      n_scenes: 8
+      min_objects: 3
+      max_objects: 8
+    - _target_: eval.clevr_eval_callbacks.ClevrMetricsCallback
+      root_dir: "${data.clevr_root}"
+      mode: "${data.mode}"
+      n_samples: 1000
+      batch_size: 64
   optim_cfg:
     _target_: configs.schemas.PainterOptimConfig
     lr: 1e-4
