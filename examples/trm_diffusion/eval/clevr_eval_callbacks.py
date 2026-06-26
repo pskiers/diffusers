@@ -72,7 +72,7 @@ def _generate_images(model, samples: list[DataSample], device: torch.device, cfg
 
     batch = _batch_to_device(samples, device)
     B = len(samples)
-    with torch.no_grad():
+    with torch.no_grad(), torch._dynamo.disable():
         latents = pipeline.sample(model, batch, predictor, shape=(B, *model._noise_shape), device=device)
     return model._decode_for_eval(latents)  # (B, C, H, W) in [0, 1]
 
