@@ -147,6 +147,16 @@ class UNetPainter(PainterBase, BaseModel):
             return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
         return latents.clamp(0.0, 1.0)
 
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        """Convert dataset batch images → [0, 1] for display.
+
+        Latent-space models receive [-1, 1] images from the dataset (VAE convention).
+        Pixel-space models receive [0, 1] images directly.
+        """
+        if self.vae is not None:
+            return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+        return images.clamp(0.0, 1.0)
+
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         """Encode pixel images to scaled latents. Requires VAE."""
         if self.vae is None:
@@ -451,6 +461,10 @@ class DiTPainter(PainterBase, BaseModel):
     def _decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode latents → [0, 1] pixel images for logging."""
         return self.decode(latents)
+
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        """Convert dataset batch images → [0, 1] for display."""
+        return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():

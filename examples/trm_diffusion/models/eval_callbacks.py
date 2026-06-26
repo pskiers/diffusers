@@ -105,7 +105,7 @@ class ImageGenEvalCallback(EvalCallbackBase):
             sample_images.extend(imgs.cpu().unbind(0))
 
             gt_raw = batch["images"][:B]
-            gt_images.extend(((gt_raw + 1.0) / 2.0).clamp(0.0, 1.0).cpu().unbind(0))
+            gt_images.extend(model.images_to_log(gt_raw).cpu().unbind(0))
 
         if sample_images and step is not None:
             try:
