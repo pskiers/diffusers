@@ -16,11 +16,10 @@ data:
 
 model:
   _target_: models.painter_base.DiTPainter
-  scaling_factor: 0.18215
   condition_field: "embedding_conditions"
   vae:
     _target_: models.utility_models.load_frozen_vae
-    pretrained_model_name_or_path: "stabilityai/sd-vae-ft-mse"
+    pretrained_model_name_or_path: "stabilityai/sdxl-vae"
   dit:
     _target_: diffusers.Transformer2DModel
     num_attention_heads: 12

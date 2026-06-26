@@ -112,7 +112,6 @@ class UNetPainter(PainterBase, BaseModel):
         train_cfg: TrainConfig,
         eval_cfg: EvalConfig,
         vae: Optional[nn.Module] = None,
-        scaling_factor: float = 0.18215,
         condition_encoder: Optional[nn.Module] = None,
         condition_field: str = "embedding_conditions",
         eval_callbacks: Optional[list] = None,
@@ -124,7 +123,7 @@ class UNetPainter(PainterBase, BaseModel):
         self.train_cfg = train_cfg
         self.eval_cfg = eval_cfg
         self.vae = vae
-        self.scaling_factor = scaling_factor
+        self.scaling_factor = vae.config.scaling_factor if vae is not None else 1.0
         self.condition_encoder = condition_encoder
         self.condition_field = condition_field
         if condition_encoder is not None:
@@ -423,7 +422,6 @@ class DiTPainter(PainterBase, BaseModel):
         self,
         dit: nn.Module,
         vae: nn.Module,
-        scaling_factor: float,
         scheduler,
         optim_cfg: PainterOptimConfig,
         train_cfg: TrainConfig,
@@ -435,7 +433,7 @@ class DiTPainter(PainterBase, BaseModel):
         super().__init__()
         self.dit = dit
         self.vae = vae
-        self.scaling_factor = scaling_factor
+        self.scaling_factor = vae.config.scaling_factor
         self.scheduler = scheduler
         self.optim_cfg = optim_cfg
         self.train_cfg = train_cfg
