@@ -271,7 +271,8 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
 
             if _wandb is not None and len(panels) < n_log:
                 n_new = min(n_log - len(panels), B_cur)
-                conds_vis = batch.get("spatial_conditions") or batch.get("token_conditions")
+                _sc = batch.get("spatial_conditions")
+                conds_vis = _sc if _sc is not None else batch.get("token_conditions")
                 if conds_vis is not None and conds_vis.dim() == 4:
                     conds_vis = conds_vis.cpu()
                 tp_all = sr.get("best_thinker_preds")
