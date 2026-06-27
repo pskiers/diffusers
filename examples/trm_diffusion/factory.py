@@ -53,7 +53,6 @@ from models.painter_thinkers import (
     ThinkerWithFrozenPainterV1,
     ThinkerWithFrozenPainterV1Verif,
     ThinkerWithFrozenPainterControlNet,
-    ThinkerWithFrozenPainterControlNetV2,
 )
 from models.painters import (
     StandalonePainter,
@@ -664,24 +663,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             return model
 
         if painter_variant == "controlnet_v2":
-            thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
-            thinker_cfg.puzzle_emb_ndim = 0
-            thinker_cfg.puzzle_emb_len = 0
-            loss = build_loss(train_cfg, scheduler, model_cfg.cell_size)
-            model = ThinkerWithFrozenPainterControlNetV2(
-                painter=frozen_painter,
-                thinker_cfg=thinker_cfg,
-                model_cfg=model_cfg,
-                train_cfg=train_cfg,
-                eval_cfg=eval_cfg,
-                thinker_optim_cfg=thinker_optim_cfg,
-                painter_optim_cfg=painter_optim_cfg,
-                scheduler=scheduler,
-                cond_encoder_cfg=cfg.condition_encoder,
-                loss=loss,
-            )
-            model.eval_callbacks = sudoku_cbs
-            return model
+            raise NotImplementedError("painter_variant='controlnet_v2' is not implemented.")
 
         if painter_variant == "v0":
             thinker_cfg = _thinker_model_cfg(cfg, vocab_size=int(cfg.data.vocab_size))
