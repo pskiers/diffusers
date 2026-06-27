@@ -249,14 +249,19 @@ class UNetPainter(PainterBase, BaseModel):
     def _batch_to_sample(self, batch: DataSample, device: torch.device) -> DataSample:
         """Build a static-condition DataSample from a batch for use in sampling.
 
-        Only copies fields that the model's condition_encoder uses (condition_keys).
-        For unconditional models returns an empty DataSample.
+        Copies all non-runtime DataSample fields (excludes x_noisy, timesteps,
+        target, enc_x_noisy which are set per-step by the sampling loop).
+        This ensures sample_grids can determine batch size even for unconditional
+        models, and thinker models receive puzzle_id / solution / solution_mask.
         """
+        _RUNTIME = {"x_noisy", "timesteps", "target", "enc_x_noisy"}
         kwargs: dict = {}
-        for k in self.condition_keys:
-            val = batch.get(k) if hasattr(batch, "get") else batch.get(k, None)
+        for f in dataclasses.fields(DataSample):
+            if f.name in _RUNTIME:
+                continue
+            val = batch.get(f.name) if hasattr(batch, "get") else None
             if val is not None:
-                kwargs[k] = val.to(device) if isinstance(val, torch.Tensor) else val
+                kwargs[f.name] = val.to(device) if isinstance(val, torch.Tensor) else val
         return DataSample(**kwargs)
 
     # ── Training / eval / optimizer ─────────────────────────────────────────
