@@ -316,29 +316,41 @@ class UNetPainter(PainterBase, BaseModel):
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
         max_batches = kwargs.get("max_batches", 100)
         self.eval()
-        loss_sums: dict[str, float] = {}
-        n_batches = 0
-        for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
-            if i >= max_batches:
-                break
-            sample = self._prepare_training_sample(batch, accelerator.device)
-            result = self(sample)
-            _, components = self.loss_fn(result.pred, result.logits, sample)
-            for k, v in components.items():
-                loss_sums[k] = loss_sums.get(k, 0.0) + v
-            n_batches += 1
-        self.train()
-        metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
-        for cb in self.eval_callbacks:
-            metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        # Swap to uncompiled unet for eval: compiled graph bakes batch size into
+        # attention mask shapes and breaks when eval batch size != train batch size.
+        orig_unet = getattr(self.unet, "_orig_mod", None)
+        if orig_unet is not None:
+            self.unet, _compiled_unet = orig_unet, self.unet
+        orig_ce = getattr(self.condition_encoder, "_orig_mod", None) if self.condition_encoder is not None else None
+        if orig_ce is not None:
+            self.condition_encoder, _compiled_ce = orig_ce, self.condition_encoder
+        try:
+            loss_sums: dict[str, float] = {}
+            n_batches = 0
+            for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
+                if i >= max_batches:
+                    break
+                sample = self._prepare_training_sample(batch, accelerator.device)
+                result = self(sample)
+                _, components = self.loss_fn(result.pred, result.logits, sample)
+                for k, v in components.items():
+                    loss_sums[k] = loss_sums.get(k, 0.0) + v
+                n_batches += 1
+            self.train()
+            metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
+            for cb in self.eval_callbacks:
+                metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        finally:
+            if orig_unet is not None:
+                self.unet = _compiled_unet
+            if orig_ce is not None:
+                self.condition_encoder = _compiled_ce
         return metrics
 
     def compile_submodules(self):
-        # dynamic=True: batch size changes between training and eval; without it
-        # inductor bakes B into mask-reshape expressions (e.g. 24//B) and breaks.
-        self.unet = torch.compile(self.unet, fullgraph=False, dynamic=True)
+        self.unet = torch.compile(self.unet, fullgraph=False)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
 
 
 # ── Frozen UNet wrapper for TRM steering ─────────────────────────────────────
@@ -600,9 +612,9 @@ class DiTPainter(PainterBase, BaseModel):
         return metrics
 
     def compile_submodules(self):
-        self.dit = torch.compile(self.dit, fullgraph=False, dynamic=True)
+        self.dit = torch.compile(self.dit, fullgraph=False)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
 
 
 # ── Frozen DiT wrapper for TRM steering ──────────────────────────────────────
