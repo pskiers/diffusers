@@ -1,5 +1,5 @@
 _target_: models.eval_callbacks.SudokuDDIMEvalCallback
-classifier_path: runs/standalone_painter/checkpoint_final.pt
+classifier_path: runs/mnist_classifier_cell16.pt
 cell_size: 16
 include_thinker_metrics: false
 num_samples: 7680
