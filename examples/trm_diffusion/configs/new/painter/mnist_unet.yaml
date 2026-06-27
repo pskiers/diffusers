@@ -1,5 +1,6 @@
 # Trainable MNIST UNetPainter (pixel-space, unconditional).
 _target_: models.painter_base.UNetPainter
+_recursive_: false
 unet: ${backbone}
 painter_dtype: null
 eval_callbacks: ${eval_callbacks}

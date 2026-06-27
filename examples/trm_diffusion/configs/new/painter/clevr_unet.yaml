@@ -1,5 +1,6 @@
 # Trainable CLEVR UNetPainter (stage-1).
 _target_: models.painter_base.UNetPainter
+_recursive_: false
 unet: ${backbone}
 vae: ${vae}
 condition_encoder: ${condition_encoder}

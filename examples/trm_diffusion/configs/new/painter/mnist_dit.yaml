@@ -1,5 +1,6 @@
 # Latent DiTPainter for MNIST Sudoku (unconditional, no condition_encoder).
 _target_: models.painter_base.DiTPainter
+_recursive_: false
 dit: ${backbone}
 vae: ${vae}
 painter_dtype: null

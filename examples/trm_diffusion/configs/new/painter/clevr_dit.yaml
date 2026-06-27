@@ -1,6 +1,7 @@
 # Trainable CLEVR DiTPainter (stage-1).
 # backbone and vae are composed from /backbone and /vae groups in the experiment.
 _target_: models.painter_base.DiTPainter
+_recursive_: false
 dit: ${backbone}
 vae: ${vae}
 condition_encoder: ${condition_encoder}
