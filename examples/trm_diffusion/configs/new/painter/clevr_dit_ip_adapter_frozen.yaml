@@ -1,6 +1,7 @@
 # Frozen CLEVR DiTPainter with per-block IP-Adapter conditioning (stage-2).
 # checkpoint must be set as a command-line override.
 _target_: models.painter_base.IPAdapterSteeredDiTPainter
+_recursive_: false
 checkpoint: ???         # REQUIRED: path to DiTPainter checkpoint
 painter_dtype: "bfloat16"
 dit: ${backbone}

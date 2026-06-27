@@ -2,6 +2,6 @@
 # Used inside the painter (DiTPainter.condition_encoder), not the thinker.
 _target_: models.clevr_painters.ClevrObjectEncoder
 in_dim: ${data.object_feat_dim}
-hidden_dim: 512
-out_dim: 512
+hidden_dim: ${backbone.cross_attention_dim}
+out_dim: ${backbone.cross_attention_dim}
 with_timestep_emb: false
