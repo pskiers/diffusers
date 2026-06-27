@@ -2,10 +2,13 @@
 MNISTSudokuDataset – renders Sudoku puzzles as grids of MNIST digit images.
 
 Each sample contains:
-  "images"    – (1, 9*cell_size, 9*cell_size) float32 [0,1]
-                  Complete solved sudoku rendered as MNIST digits.
-  "conditions" – same shape; blank cells are filled with zeros (black image).
-  "solution"  – (81,) int64; digit class indices 0-8 (digit 1→0, …, digit 9→8).
+  images             – (1, 9*cell_size, 9*cell_size) float32 [0,1]
+                         Complete solved sudoku rendered as MNIST digits.
+  spatial_conditions – same shape; blank cells are filled with zeros (black image).
+  token_conditions   – (81,) int64; puzzle token sequence (1=blank, 2-10=digit 1-9).
+  solution           – (81,) int64; digit class indices 0-8 (digit 1→0, …, digit 9→8).
+  solution_mask      – (81,) bool; True = given cell (visible in puzzle input).
+  puzzle_id          – () int64; puzzle identifier.
 
 Token convention (from sudoku_dataset.py):
   0   – PAD  (never appears in real puzzles)
@@ -29,6 +32,7 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
 from datasets.sudoku_dataset import SudokuDataset, PAD_ID
+from datasets.data_sample import DataSample, collate_data_samples
 
 
 class MNISTSudokuDataset(Dataset):
@@ -139,7 +143,7 @@ class MNISTSudokuDataset(Dataset):
 
         return grid
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> DataSample:
         sudoku_item = self.sudoku[idx]
         inputs_tok  = sudoku_item["inputs"].numpy()   # (81,) tokens
         labels_tok  = sudoku_item["labels"].numpy()   # (81,) tokens (solution, full)
@@ -184,14 +188,16 @@ class MNISTSudokuDataset(Dataset):
         # puzzle acc evaluates all cells.
         given_mask = (inputs_tok >= 2) & (inputs_tok <= 10)  # (81,) bool
 
-        return {
-            "images":        torch.from_numpy(image_grid).unsqueeze(0),   # (1,H,W)
-            "conditions":    torch.from_numpy(cond_grid).unsqueeze(0),    # (1,H,W)
-            "solution":      torch.from_numpy(solution),                   # (81,)
-            "puzzle_id":     sudoku_item["puzzle_id"],                     # scalar
-            "puzzle_tokens": torch.from_numpy(inputs_tok.copy()),          # (81,) long
-            "given_mask":    torch.from_numpy(given_mask),                 # (81,) bool
-        }
+        return DataSample(
+            images=torch.from_numpy(image_grid).unsqueeze(0),          # (1,H,W)
+            spatial_conditions=torch.from_numpy(cond_grid).unsqueeze(0),# (1,H,W)
+            solution=torch.from_numpy(solution),                        # (81,)
+            puzzle_id=sudoku_item["puzzle_id"],                         # scalar
+            token_conditions=torch.from_numpy(inputs_tok.copy()),       # (81,) long
+            solution_mask=torch.from_numpy(given_mask),                 # (81,) bool
+        )
+
+    collate_fn = staticmethod(collate_data_samples)
 
 
 def get_solution_tokens(solution: torch.Tensor) -> torch.Tensor:

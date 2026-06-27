@@ -214,7 +214,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
             if n_done >= n_total:
                 break
             solutions = batch["solution"]
-            given_masks = batch.get("given_mask")
+            given_masks = batch.get("solution_mask")
             B_cur = solutions.shape[0]
 
             sr = sample_grids(
@@ -271,7 +271,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
 
             if _wandb is not None and len(panels) < n_log:
                 n_new = min(n_log - len(panels), B_cur)
-                conds_vis = batch.get("conditions", batch.get("puzzle_tokens", None))
+                conds_vis = batch.get("spatial_conditions") or batch.get("token_conditions")
                 if conds_vis is not None and conds_vis.dim() == 4:
                     conds_vis = conds_vis.cpu()
                 tp_all = sr.get("best_thinker_preds")
@@ -377,7 +377,7 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
             if n_real >= n_total:
                 break
             solutions = batch["solution"]
-            given_masks = batch.get("given_mask")
+            given_masks = batch.get("solution_mask")
 
             sr_r = sample_grids(
                 model,

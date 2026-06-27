@@ -246,6 +246,19 @@ class UNetPainter(PainterBase, BaseModel):
                 updates[k] = val * (~mask).to(val.dtype)
         return dataclasses.replace(sample, **updates) if updates else sample
 
+    def _batch_to_sample(self, batch: DataSample, device: torch.device) -> DataSample:
+        """Build a static-condition DataSample from a batch for use in sampling.
+
+        Only copies fields that the model's condition_encoder uses (condition_keys).
+        For unconditional models returns an empty DataSample.
+        """
+        kwargs: dict = {}
+        for k in self.condition_keys:
+            val = batch.get(k) if hasattr(batch, "get") else batch.get(k, None)
+            if val is not None:
+                kwargs[k] = val.to(device) if isinstance(val, torch.Tensor) else val
+        return DataSample(**kwargs)
+
     # ── Training / eval / optimizer ─────────────────────────────────────────
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
