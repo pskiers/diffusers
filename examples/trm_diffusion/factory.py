@@ -434,8 +434,14 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
 
     if mode == "painter_base":
         # Generic path: model fully specified by cfg.model via Hydra _target_.
-        # train_cfg / eval_cfg / scheduler are injected here; everything else
-        # (architecture, vae, condition_encoder, optim_cfg, …) lives in cfg.model.
+        # New-style configs (configs/new/) put the model under cfg.painter instead
+        # of cfg.model, so fall back to that if cfg.model is absent.
+        model_cfg = cfg.get("model") or cfg.get("painter")
+        return instantiate(model_cfg, scheduler=scheduler, train_cfg=train_cfg, eval_cfg=eval_cfg)
+
+    if mode == "thinker_base":
+        # New-style thinker path: ThinkerFrozenPainterBase fully specified by
+        # cfg.model in the experiment file. scheduler/train_cfg/eval_cfg injected here.
         return instantiate(cfg.model, scheduler=scheduler, train_cfg=train_cfg, eval_cfg=eval_cfg)
 
     if mode == "clevr_painter":

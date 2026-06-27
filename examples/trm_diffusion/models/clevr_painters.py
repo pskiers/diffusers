@@ -24,8 +24,10 @@ from diffusers import AutoencoderKL, DDIMScheduler, Transformer2DModel
 from tqdm.auto import tqdm
 
 from configs.schemas import ClevrDiTConfig, ClevrDiTOptimConfig, EvalConfig, TrainConfig
+from datasets.data_sample import DataSample
 from models.base import BaseModel
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.utility_models import TimestepMLP
 
 # ── Object encoder ────────────────────────────────────────────────────────────
 
@@ -34,15 +36,21 @@ class ClevrObjectEncoder(nn.Module):
     """
     MLP that maps raw per-object feature vectors to DiT cross-attention tokens.
 
-    Input:  (B, max_objects, object_feat_dim)  — zeros for padding slots
-    Output: (B, max_objects, out_dim)
+    Input:  DataSample with embedding_conditions (B, max_objects, object_feat_dim)
+            and optional embedding_mask (B, max_objects).
+    Output: dict with "encoder_hidden_states" and optionally "encoder_attention_mask".
 
     The final linear is zero-initialised so the null conditioning signal
     (all-zero input) starts out exactly zero — meaning CFG dropout at the
     start of training produces well-defined unconditioned predictions.
+
+    condition_keys = ["embedding_conditions"] — only this field is zeroed for
+    CFG dropout; embedding_mask is structural and is NOT zeroed.
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+    condition_keys: list[str] = ["embedding_conditions"]
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, with_timestep_emb: bool = False):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -53,9 +61,18 @@ class ClevrObjectEncoder(nn.Module):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)  # (B, max_objects, out_dim)
+    def forward(self, sample: DataSample) -> dict:
+        hidden = self.net(sample.embedding_conditions)
+        if self.with_timestep_emb and sample.timesteps is not None:
+            hidden = hidden + self.timestep_mlp(sample.timesteps).unsqueeze(1)
+        result: dict = {"encoder_hidden_states": hidden}
+        if sample.embedding_mask is not None:
+            result["encoder_attention_mask"] = sample.embedding_mask.bool()
+        return result
 
 
 # ── Standalone CLEVR DiT painter ──────────────────────────────────────────────

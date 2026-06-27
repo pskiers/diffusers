@@ -1,0 +1,7 @@
+# Painter-side condition encoder: maps CLEVR object features → DiT/UNet cross-attn tokens.
+# Used inside the painter (DiTPainter.condition_encoder), not the thinker.
+_target_: models.clevr_painters.ClevrObjectEncoder
+in_dim: ${data.object_feat_dim}
+hidden_dim: 512
+out_dim: 512
+with_timestep_emb: false

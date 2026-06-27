@@ -87,6 +87,12 @@ class DataSample:
     True / 1.0 = real object slot, False / 0.0 = padding.
     Shape: (N,) matching the token axis of ``embedding_conditions``."""
 
+    # ── Diffusion target (populated by the training loop / model) ────────────
+    target: Optional[Tensor] = None
+    """Diffusion target for the MSE loss — noise (epsilon) or x0, in
+    latent space for VAE models.  Populated by _prepare_training_sample;
+    never stored in the raw dataset."""
+
     # ── Dict-style access (backwards-compat with code that uses mb["key"]) ──
 
     def __getitem__(self, key: str):

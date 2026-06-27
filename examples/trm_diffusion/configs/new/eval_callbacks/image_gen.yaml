@@ -1,0 +1,4 @@
+- _target_: models.eval_callbacks.ImageGenEvalCallback
+  num_ddim_steps: 20
+  num_log_images: 8
+  cfg_scale: 1.0

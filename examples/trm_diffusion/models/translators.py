@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.interfaces import ControlNetSteering, ThinkerSteering, TRMOutput
-from models.utility_models import ConditioningPyramid
+from models.interfaces import ControlNetSteering, CrossAttnSteering, IPAdapterSteering, ThinkerSteering, TRMOutput
+from models.utility_models import ConditioningPyramid, TimestepMLP
 
 
 class ThinkerPainterTranslatorBase(nn.Module):
@@ -74,6 +74,56 @@ class ThinkerPainterTranslatorBase(nn.Module):
         pass
 
 
+class CrossAttnTranslator(ThinkerPainterTranslatorBase):
+    """Projects thinker logits to encoder_hidden_states for DiT cross-attention.
+
+    in_dim: should match the TRM's output dim (vocab_size or hidden_size).
+    out_dim: must match the painter's cross_attention_dim.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, with_timestep_emb: bool = False):
+        super().__init__(grid=1, bridge_mode="logits")
+        self.proj = nn.Linear(in_dim, out_dim)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> CrossAttnSteering:
+        states = self.proj(trm_output.logits.float())  # (B, N, out_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            states = states + self.timestep_mlp(timesteps.float()).unsqueeze(1)
+        return CrossAttnSteering(encoder_hidden_states=states)
+
+
+class IPAdapterTranslator(ThinkerPainterTranslatorBase):
+    """Projects thinker logits to IP-adapter tokens for per-block DiT injection.
+
+    in_dim: should match the TRM's output dim (vocab_size or hidden_size).
+    out_dim: must match the DiT hidden dim (num_attention_heads * attention_head_dim).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, with_timestep_emb: bool = False):
+        super().__init__(grid=1, bridge_mode="logits")
+        self.proj = nn.Linear(in_dim, out_dim)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> IPAdapterSteering:
+        ip_states = self.proj(trm_output.logits.float())  # (B, N, out_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            ip_states = ip_states + self.timestep_mlp(timesteps.float()).unsqueeze(1)
+        return IPAdapterSteering(ip_hidden_states=ip_states)
+
+
 class ControlNetTranslator(ThinkerPainterTranslatorBase):
     """
     Translates thinker logits into ControlNet residuals via a ConditioningPyramid.
@@ -94,6 +144,7 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         grid: int,
         bridge_mode: str = "logits",
         thinker_out_channels: Optional[int] = None,
+        with_timestep_emb: bool = False,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode)
         self.painter_size = painter_size
@@ -110,14 +161,23 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
             block_out_channels=painter_channels,
             layers_per_block=layers_per_block,
         )
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=painter_channels[-1])
 
-    def forward(self, trm_output: TRMOutput, **_) -> ControlNetSteering:
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> ControlNetSteering:
         logits = trm_output.logits
         if self.logit_expand is not None:
             logits = self.logit_expand(logits.float())
         spatial = self._logits_to_spatial(logits)
         spatial = F.interpolate(spatial, size=self.painter_size, mode="bilinear", align_corners=False)
         down_res, mid_res = self.control_pyramid(spatial)
+        if self.with_timestep_emb and timesteps is not None:
+            mid_res = mid_res + self.timestep_mlp(timesteps).unsqueeze(-1).unsqueeze(-1)
         return ControlNetSteering(
             down_block_additional_residuals=down_res,
             mid_block_additional_residual=mid_res,

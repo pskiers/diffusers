@@ -1,0 +1,6 @@
+# Thinker-side condition encoder V0: maps object features → TRM tokens (no noisy input).
+_target_: models.condition_encoders.ObjectFeatureEncoder
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
+with_timestep_emb: true

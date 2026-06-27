@@ -1,0 +1,11 @@
+_target_: diffusers.Transformer2DModel
+num_attention_heads: 8
+attention_head_dim: 64       # inner_dim = 8*64 = 512
+in_channels: 4
+out_channels: 4
+num_layers: 8
+sample_size: 36
+patch_size: 4
+norm_type: "ada_norm_single"
+attention_bias: true
+activation_fn: "gelu-approximate"

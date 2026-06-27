@@ -1,0 +1,35 @@
+# Base config for the new config structure.
+# Select an experiment with: experiment=<name>
+#
+# Usage:
+#   python train_trm.py +config_dir=configs/new experiment=clevr_dit_painter
+
+defaults:
+  - _self_
+  - data: null
+  - diffusion: ddpm
+  - train: default
+  - eval: default
+  - thinker: null
+  - backbone: null
+  - vae: null
+  - condition_encoder: null
+  - painter: null
+  - translator: null
+  - loss: null
+  - eval_callbacks: null
+  - experiment: null
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/new"
+  resume_from_checkpoint: null
+  wandb_project: small-llm-diffusion
+
+ema:
+  enabled: true
+  rate: 0.999
+
+precision:
+  mixed_precision: "no"

@@ -72,6 +72,45 @@ class ThinkerSteering:
 
 
 @dataclass
+class CrossAttnSteering(ThinkerSteering):
+    """Steering produced by a translator for CrossAttnSteeredDiTPainter.
+
+    Replaces (or supplements) the condition encoder's encoder_hidden_states
+    with translator-produced tokens fed into the DiT's cross-attention.
+    """
+
+    encoder_hidden_states: Tensor
+    """(B, N, D) — steering tokens injected into DiT cross-attention."""
+
+    encoder_attention_mask: Optional[Tensor] = None
+    """(B, N) bool mask — True for real tokens, False for padding."""
+
+    def to_painter_kwargs(self) -> dict:
+        result: dict = {"encoder_hidden_states": self.encoder_hidden_states}
+        if self.encoder_attention_mask is not None:
+            result["encoder_attention_mask"] = self.encoder_attention_mask
+        return result
+
+
+@dataclass
+class IPAdapterSteering(ThinkerSteering):
+    """Steering produced by a translator for IPAdapterSteeredDiTPainter.
+
+    IP tokens are injected into each DiT transformer block via a separate
+    trainable cross-attention layer that sits on top of the frozen block.
+    The condition encoder still runs normally; this adds extra conditioning
+    rather than replacing it.
+    """
+
+    ip_hidden_states: Tensor
+    """(B, N, D) — IP tokens for per-block cross-attention injection.
+    D must match the DiT hidden dim (num_attention_heads * attention_head_dim)."""
+
+    def to_painter_kwargs(self) -> dict:
+        return {"cross_attention_kwargs": {"ip_hidden_states": self.ip_hidden_states}}
+
+
+@dataclass
 class ControlNetSteering(ThinkerSteering):
     """Steering produced by ControlNetTranslator for a ControlNet UNet."""
 

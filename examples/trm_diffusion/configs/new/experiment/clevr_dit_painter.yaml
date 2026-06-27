@@ -1,0 +1,22 @@
+# @package _global_
+# Stage 1: Trainable CLEVR DiTPainter.
+# Usage: python train_trm.py +config_dir=configs/new experiment=clevr_dit_painter
+
+defaults:
+  - override /data: clevr
+  - override /train: clevr
+  - override /eval: clevr
+  - override /backbone: clevr_dit
+  - override /vae: sdxl
+  - override /condition_encoder: clevr_object
+  - override /painter: clevr_dit
+  - override /eval_callbacks: clevr
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/clevr_dit_painter"
+
+data:
+  mode: "reduced"

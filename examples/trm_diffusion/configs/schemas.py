@@ -243,3 +243,4 @@ class ThinkerModelConfig:
     num_puzzle_identifiers: int = 1
     halt_exploration_prob: float = 0.0
     freeze_weights: bool = False
+    with_timestep_emb: bool = False

@@ -155,15 +155,29 @@ class ClassifierLoss(LossBase):
 class CombinedLoss(LossBase):
     """Weighted sum of multiple LossBase components."""
 
-    def __init__(self, *losses: LossBase):
+    def __init__(self, *losses: LossBase, diff_thinker_weight: float = 1.0):
         super().__init__()
+        self.diff_thinker_weight = diff_thinker_weight
         self.losses = nn.ModuleList(losses)
 
+    def scale_logits_for_painter(self, logits: torch.Tensor) -> torch.Tensor:
+        """Scale diffusion gradient back through thinker logits.
+
+        w=1: full gradient; w=0: stop gradient; w in (0,1): partial gradient.
+        """
+        w = self.diff_thinker_weight
+        if w == 0.0:
+            return logits.detach()
+        if w != 1.0:
+            return w * logits + (1.0 - w) * logits.detach()
+        return logits
+
     def forward(self, noise_pred, logits, batch_dict):
+        scaled_logits = self.scale_logits_for_painter(logits) if logits is not None else None
         total = torch.tensor(0.0, device=noise_pred.device)
         breakdown: dict[str, float] = {}
         for loss_fn in self.losses:
-            t, d = loss_fn(noise_pred, logits, batch_dict)
+            t, d = loss_fn(noise_pred, scaled_logits, batch_dict)
             total = total + t
             breakdown.update(d)
         return total, breakdown

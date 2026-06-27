@@ -1,0 +1,7 @@
+_target_: models.losses.CombinedLoss
+diff_thinker_weight: 1.0
+_args_:
+  - _target_: models.losses.MSELoss
+    weight: 1.0
+  - _target_: models.losses.ThinkerCELoss
+    weight: 1.0

@@ -9,6 +9,42 @@ def strip_compiled_prefix(state_dict: dict) -> dict:
     return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
 
 
+def load_frozen_custom_kl_vae(
+    checkpoint_path: str,
+    in_channels: int = 1,
+    out_channels: int = 1,
+    down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+    up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+    block_out_channels=(32, 64, 128),
+    layers_per_block: int = 2,
+    latent_channels: int = 4,
+    norm_num_groups: int = 32,
+    act_fn: str = "silu",
+):
+    """Construct an AutoencoderKL from scratch and load weights from a local checkpoint.
+
+    Intended for custom-trained VAEs (e.g. MNIST pixel-space) saved by train_vae.py.
+    """
+    from diffusers import AutoencoderKL
+
+    vae = AutoencoderKL(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        down_block_types=list(down_block_types),
+        up_block_types=list(up_block_types),
+        block_out_channels=list(block_out_channels),
+        layers_per_block=layers_per_block,
+        latent_channels=latent_channels,
+        norm_num_groups=norm_num_groups,
+        act_fn=act_fn,
+    )
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    vae.load_state_dict(strip_compiled_prefix(ckpt["model_state"]))
+    for p in vae.parameters():
+        p.requires_grad_(False)
+    return vae
+
+
 def load_frozen_vae(pretrained_model_name_or_path: str):
     """Load an AutoencoderKL from a pretrained checkpoint and freeze it.
 

@@ -1,9 +1,11 @@
 from abc import abstractmethod
+import dataclasses
 from typing import Optional
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from hydra.utils import instantiate
 
 from models.trm_wrappers import SpatialTRM
 from models.utility_models import SpatialEncoder, AttentiveBridge, SpatialBridge, TimestepMLP
@@ -1823,27 +1825,24 @@ class ThinkerFrozenPainterBase(BaseModel):
     thinker reasons over a condition image and its output is translated
     into conditioning signals for a frozen painter (UNet or DiT).
 
-    Subclasses must implement:
-        _build_thinker_painter_translator() -> ThinkerPainterTranslatorBase
-
-    The translator encapsulates all logits-to-painter-conditioning logic
-    (logits_to_spatial, optional expansion, bridge/pyramid/attention).
+    All submodules (painter, condition_encoder, loss, thinker_painter_translator,
+    eval_callbacks) are instantiated from Hydra configs passed to __init__.
+    The painter is expected to own its scheduler, painter_dtype, condition_keys,
+    and _prepare_training_sample (which handles VAE encode, noise, noisy_swap, etc.).
 
     Constructor args
     ----------------
-    painter            : frozen painter nn.Module (pre-extracted from checkpoint)
-    thinker_cfg        : ThinkerModelConfig
-    model_cfg          : PainterThinkerConfig
-    train_cfg          : TrainConfig
-    eval_cfg           : EvalConfig
-    thinker_optim_cfg  : ThinkerOptimConfig
-    painter_optim_cfg  : PainterOptimConfig  (governs encoder/translator LR)
-    scheduler          : diffusion noise scheduler
-    cond_encoder_cfg   : Hydra DictConfig with _target_ pointing to a
-                         ConditionEncoderBase subclass -- instantiated here
-    loss               : LossBase instance (built by factory via build_loss())
-    eval_callbacks     : list of EvalCallbackBase (assigned by factory)
-    timestep_cfg       : optional TimestepCondConfig; enables thinker_temb_proj
+    painter                   : Hydra config → PainterBase (e.g. CrossAttnSteeredDiTPainter)
+    thinker_cfg               : ThinkerModelConfig
+    train_cfg                 : TrainConfig
+    eval_cfg                  : EvalConfig
+    thinker_optim_cfg         : ThinkerOptimConfig
+    painter_optim_cfg         : PainterOptimConfig  (governs encoder/translator LR)
+    condition_encoder         : Hydra config → ConditionEncoderBase subclass
+    loss                      : Hydra config → LossBase subclass
+    thinker_painter_translator: Hydra config → ThinkerPainterTranslatorBase subclass
+    eval_callbacks            : list of Hydra configs → EvalCallbackBase instances
+    timestep_cfg              : optional TimestepCondConfig; enables thinker_temb_proj
     """
 
     token_input: bool = False
@@ -1852,38 +1851,25 @@ class ThinkerFrozenPainterBase(BaseModel):
 
     def __init__(
         self,
-        painter: nn.Module,
+        painter,
         thinker_cfg: ThinkerModelConfig,
-        model_cfg: PainterThinkerConfig,
         train_cfg: TrainConfig,
         eval_cfg: EvalConfig,
         thinker_optim_cfg: ThinkerOptimConfig,
         painter_optim_cfg: PainterOptimConfig,
-        scheduler,
-        cond_encoder_cfg,
-        loss: LossBase,
+        condition_encoder,
+        loss,
+        thinker_painter_translator,
         eval_callbacks=None,
-        timestep_cfg: Optional[TimestepCondConfig] = None,
     ):
         super().__init__()
 
         # ── Store configs ─────────────────────────────────────────────────────
         self.thinker_cfg = thinker_cfg
-        self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.eval_cfg = eval_cfg
         self.thinker_optim_cfg = thinker_optim_cfg
         self.painter_optim_cfg = painter_optim_cfg
-        self.scheduler = scheduler
-
-        # ── Derived parameters ────────────────────────────────────────────────
-        self._grid = model_cfg.painter_size // model_cfg.cell_size
-        self.diff_thinker_weight = model_cfg.diff_thinker_weight
-        self._painter_dtype: Optional[torch.dtype] = (
-            {"bfloat16": torch.bfloat16, "float16": torch.float16}[model_cfg.painter_dtype]
-            if model_cfg.painter_dtype is not None
-            else None
-        )
 
         # ── Thinker ───────────────────────────────────────────────────────────
         self.thinker = SpatialTRM(
@@ -1908,67 +1894,48 @@ class ThinkerFrozenPainterBase(BaseModel):
             freeze_weights=thinker_cfg.freeze_weights,
         )
 
-        # ── Frozen painter ────────────────────────────────────────────────────
-        # Expects a PainterBase (e.g. ControlNetSteeredUNetPainter) whose forward
-        # accepts (DataSample, steering) and returns DiffusionPrediction.
-        self.painter = painter
-        for p in self.painter.parameters():
-            p.requires_grad_(False)
+        # ── Painter (instantiated from Hydra config; owns scheduler/dtype) ───
+        self.painter = instantiate(painter)
 
-        # ── Condition encoder (instantiated from Hydra config) ────────────────
-        from hydra.utils import instantiate as _hydra_instantiate
-
-        self.condition_encoder: ConditionEncoderBase = _hydra_instantiate(cond_encoder_cfg)
+        # ── Condition encoder, loss, translator, eval callbacks ───────────────
+        self.condition_encoder: ConditionEncoderBase = instantiate(condition_encoder)
+        self.loss_fn: LossBase = instantiate(loss)
+        self.thinker_painter_translator: ThinkerPainterTranslatorBase = instantiate(thinker_painter_translator)
+        self.eval_callbacks: list[EvalCallbackBase] = (
+            [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
+        )
 
         # ── Optional timestep projection into thinker token space ────────────
-        if timestep_cfg is not None and timestep_cfg.thinker_timestep_cond:
-            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=timestep_cfg.temb_dim)
-            self.thinker_temb_proj = nn.Linear(timestep_cfg.temb_dim, thinker_cfg.hidden_size)
+        if thinker_cfg.with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=256)
+            self.thinker_temb_proj = nn.Linear(256, thinker_cfg.hidden_size)
             nn.init.zeros_(self.thinker_temb_proj.weight)
             nn.init.zeros_(self.thinker_temb_proj.bias)
 
-        # ── Loss and callbacks ────────────────────────────────────────────────
-        self.loss_fn = loss
-        self.eval_callbacks: list[EvalCallbackBase] = list(eval_callbacks) if eval_callbacks is not None else []
+    # ── Delegated properties ──────────────────────────────────────────────────
 
-        # ── Translator (subclasses provide via _build_thinker_painter_translator) ──
-        self.thinker_painter_translator: ThinkerPainterTranslatorBase = self._build_thinker_painter_translator()
+    @property
+    def scheduler(self):
+        return self.painter.scheduler
+
+    @property
+    def noise_shape(self) -> tuple:
+        return self.painter.noise_shape
+
+    def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.painter.decode_for_eval(latents)
+
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        return self.painter.images_to_log(images)
 
     @property
     def n_sup(self) -> int:
         return self.thinker.n_sup
 
-    # ── Abstract method ───────────────────────────────────────────────────────
-
-    @abstractmethod
-    def _build_thinker_painter_translator(self) -> ThinkerPainterTranslatorBase:
-        """Build and return the translator converting thinker logits to painter
-        conditioning.  Called at end of __init__; self.thinker_cfg, self.model_cfg
-        etc. are fully set at that point."""
-        pass
-
     # ── Condition helpers ─────────────────────────────────────────────────────
 
-    def _get_condition(self, mb: dict, device) -> dict:
-        """
-        Extract primary condition tensors from a batch dict.
-
-        Returns a dict keyed by condition_encoder.condition_keys, moving each
-        tensor to device.  Also includes puzzle_ids if the thinker uses puzzle
-        embeddings and the batch provides them.
-        """
-        d = {k: mb[k].to(device) for k in self.condition_encoder.condition_keys if k in mb}
-        if self.thinker_cfg.puzzle_emb_ndim > 0 and "puzzle_id" in mb:
-            d["puzzle_ids"] = mb["puzzle_id"].to(device)
-        return d
-
     def _encode_condition(self, sample: DataSample) -> torch.Tensor:
-        """Encode condition fields from a DataSample into thinker token embeddings.
-
-        Handles enc_x_noisy override: when set, the encoder uses that instead of
-        x_noisy as its noisy channel (used by NoisyGuidancePredictor for the
-        V0-equivalent pass, so the painter still receives the real x_t).
-        """
+        """Encode condition fields from a DataSample into thinker token embeddings."""
         enc_keys = self.condition_encoder.condition_keys
         primary = getattr(sample, enc_keys[0])
         extra: dict = {}
@@ -1983,98 +1950,40 @@ class ThinkerFrozenPainterBase(BaseModel):
             enc_emb = enc_emb + self.thinker_temb_proj(temb).unsqueeze(1)
         return enc_emb
 
-    def get_enc_emb(
-        self,
-        condition_dict: dict,
-        noisy: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Encode condition into thinker-compatible token embeddings.
-
-        Training-path wrapper: converts old-style (condition_dict, noisy, timesteps)
-        args into a DataSample and delegates to _encode_condition.
-        """
-        enc_keys = self.condition_encoder.condition_keys
-        sample_kwargs: dict = {"x_noisy": noisy, "timesteps": timesteps}
-        for k in enc_keys:
-            if k != "x_noisy" and k != "timesteps":
-                val = condition_dict.get(k)
-                if val is not None:
-                    sample_kwargs[k] = val
-        return self._encode_condition(DataSample(**sample_kwargs))
-
-    def _get_painter_cond(self, mb: dict, device) -> dict:
-        """
-        Extra kwargs to pass to the frozen painter's forward call.
-
-        Default: unconditional painter (empty dict).
-        Override for conditional painters (e.g. DiT encoder_hidden_states).
-        """
-        return {}
-
-    def _get_teacher_condition(self, mb: dict, device) -> dict:
-        return self._get_condition(mb, device)
-
     # ── Core model methods ────────────────────────────────────────────────────
 
     def get_initial_states(self, bsz: int):
         return self.thinker.get_initial_states(bsz)
 
-    def run_painter(
-        self,
-        noisy: torch.Tensor,
-        logits: torch.Tensor,
-        timesteps: torch.Tensor,
-        painter_cond: Optional[dict] = None,
-    ) -> torch.Tensor:
-        """Translate thinker logits to conditioning, then run the frozen painter.
-
-        Both the translator and painter run inside the painter autocast context.
-        painter_cond is kept for backward compatibility but is unused when the
-        painter is a PainterBase (condition routing goes through DataSample).
-        """
+    def run_painter(self, sample: DataSample, logits: torch.Tensor) -> torch.Tensor:
+        """Translate thinker logits to conditioning, then run the frozen painter."""
+        painter_dtype = getattr(self.painter, "painter_dtype", None)
         ctx = (
-            torch.autocast(device_type=noisy.device.type, dtype=self._painter_dtype)
-            if self._painter_dtype is not None
-            else torch.autocast(device_type=noisy.device.type, enabled=False)
+            torch.autocast(device_type=sample.x_noisy.device.type, dtype=painter_dtype)
+            if painter_dtype is not None
+            else torch.autocast(device_type=sample.x_noisy.device.type, enabled=False)
         )
         with ctx:
-            steering = self.thinker_painter_translator(TRMOutput(logits=logits))
-            painter_sample = DataSample(x_noisy=noisy, timesteps=timesteps)
-            return self.painter(painter_sample, steering).pred
+            translator_extra = {k: getattr(sample, k) for k in self.thinker_painter_translator.condition_keys}
+            steering = self.thinker_painter_translator(TRMOutput(logits=logits), **translator_extra)
+            return self.painter(sample, steering).pred
 
-    def reasoning_step(
-        self,
-        condition_dict: dict,
-        noisy: torch.Tensor,
-        z_H: torch.Tensor,
-        z_L: torch.Tensor,
-        timesteps: torch.Tensor,
-        painter_cond: Optional[dict] = None,
-    ):
+    def reasoning_step(self, sample: DataSample, z_H: torch.Tensor, z_L: torch.Tensor):
         """One supervision step: encode -> think -> translate -> paint.
 
         Returns: (noise_pred, logits, z_H_next, z_L_next)
         """
-        enc_emb = self.get_enc_emb(condition_dict, noisy, timesteps)
-        puzzle_ids = condition_dict.get("puzzle_ids")
+        enc_emb = self._encode_condition(sample)
+        logits, z_H_next, z_L_next = self.thinker.reasoning_step(enc_emb, z_H, z_L, sample.puzzle_id)
 
-        logits, z_H_next, z_L_next = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
+        scale_fn = getattr(self.loss_fn, "scale_logits_for_painter", None)
+        logits_for_tpt = scale_fn(logits) if scale_fn is not None else logits
 
-        # Scale gradient from diffusion loss back through the thinker
-        if self.diff_thinker_weight == 0.0:
-            logits_for_tpt = logits.detach()
-        elif self.diff_thinker_weight != 1.0:
-            logits_for_tpt = self.diff_thinker_weight * logits + (1.0 - self.diff_thinker_weight) * logits.detach()
-        else:
-            logits_for_tpt = logits
-
-        # CFG training dropout: zero conditioning for a random subset of samples
         if self.training and self.train_cfg.cfg_prob > 0:
             drop = torch.rand(logits.shape[0], device=logits.device) < self.train_cfg.cfg_prob
             logits_for_tpt = logits_for_tpt * (~drop[:, None, None]).float()
 
-        noise_pred = self.run_painter(noisy, logits_for_tpt, timesteps, painter_cond)
+        noise_pred = self.run_painter(sample, logits_for_tpt)
         return noise_pred, logits, z_H_next, z_L_next
 
     def forward(self, sample: DataSample, **kwargs) -> DiffusionPrediction:
@@ -2095,9 +2004,10 @@ class ThinkerFrozenPainterBase(BaseModel):
         for _ in range(self.n_sup):
             logits, z_H, z_L = self.thinker.reasoning_step(enc_emb, z_H, z_L, puzzle_ids)
 
+        painter_dtype = getattr(self.painter, "painter_dtype", None)
         ctx = (
-            torch.autocast(device_type=sample.x_noisy.device.type, dtype=self._painter_dtype)
-            if self._painter_dtype is not None
+            torch.autocast(device_type=sample.x_noisy.device.type, dtype=painter_dtype)
+            if painter_dtype is not None
             else torch.autocast(device_type=sample.x_noisy.device.type, enabled=False)
         )
         with ctx:
@@ -2107,49 +2017,53 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         return DiffusionPrediction(
             pred=noise_pred,
-            pred_type=self.scheduler.config.prediction_type,
+            pred_type=self.painter.scheduler.config.prediction_type,
             logits=logits,
         )
 
     def null_condition_sample(self, sample: DataSample) -> DataSample:
-        """Return a copy with all condition encoder fields zeroed for the CFG
-        unconditional pass.  enc_x_noisy is also zeroed when set."""
-        import dataclasses as _dc
+        """Return a copy with all condition fields zeroed for the CFG unconditional pass.
 
+        Zeros both thinker condition_encoder keys and painter condition_keys so both
+        the thinker encoding and the painter cross-attention receive null input.
+        enc_x_noisy is also zeroed when set.
+        """
+        all_keys = set(self.condition_encoder.condition_keys) | set(self.painter.condition_keys)
         updates = {
             k: torch.zeros_like(getattr(sample, k))
-            for k in self.condition_encoder.condition_keys
-            if getattr(sample, k) is not None
+            for k in all_keys
+            if getattr(sample, k, None) is not None
         }
         if sample.enc_x_noisy is not None:
             updates["enc_x_noisy"] = torch.zeros_like(sample.enc_x_noisy)
-        return _dc.replace(sample, **updates)
+        return dataclasses.replace(sample, **updates)
 
     # ── Parameter groups ──────────────────────────────────────────────────────
 
     def get_painter_params(self) -> list:
-        """Painter is frozen; no trainable painter parameters."""
-        return []
+        """Return trainable painter parameters (non-empty for IP-Adapter variants)."""
+        return [p for p in self.painter.parameters() if p.requires_grad]
 
     def get_thinker_params(self) -> list:
         return list(self.thinker.parameters())
 
     def get_encoder_params(self) -> list:
-        """All trainable parameters except the thinker (encoder + translator)."""
-        frozen_ids = {id(p) for p in self.painter.parameters()}
+        """All trainable parameters except the thinker and painter."""
+        painter_ids = {id(p) for p in self.painter.parameters()}
         thinker_ids = {id(p) for p in self.thinker.parameters()}
         return [
-            p for p in self.parameters() if id(p) not in frozen_ids and id(p) not in thinker_ids and p.requires_grad
+            p for p in self.parameters()
+            if id(p) not in painter_ids and id(p) not in thinker_ids and p.requires_grad
         ]
 
     # ── Optimizers ────────────────────────────────────────────────────────────
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
         thinker_optims = self.thinker.build_optimizers(world_size, num_steps)
-        encoder_params = self.get_encoder_params()
-        if not encoder_params:
+        extra_params = self.get_painter_params() + self.get_encoder_params()
+        if not extra_params:
             return thinker_optims
-        enc_optim = torch.optim.AdamW(encoder_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
+        enc_optim = torch.optim.AdamW(extra_params, lr=0, weight_decay=self.painter_optim_cfg.weight_decay)
         enc_scheduled = ScheduledOptimizer(
             enc_optim,
             base_lr=self.painter_optim_cfg.lr,
@@ -2161,50 +2075,25 @@ class ThinkerFrozenPainterBase(BaseModel):
 
     # ── Data preparation ──────────────────────────────────────────────────────
 
-    def prep_mb_data(self, micro_batches, device) -> list:
-        """Pre-process micro-batches for training.
+    def prep_mb_data(self, micro_batches, device) -> list[dict]:
+        """Prepare all per-microbatch data for a training step.
 
-        Assumes each batch has "images" and optionally "solution".
-        Condition and painter conditioning are resolved via get_condition()
-        and get_painter_cond() respectively.
+        Delegates image encoding, noise sampling, noisy_swap, and condition
+        field routing to painter._prepare_training_sample.  Also initialises
+        the thinker recurrent states so train_step has everything in one place.
+
+        Returns a list of dicts with:
+            "sample": DataSample (x_noisy, timesteps, target, all condition fields)
+            "z_H":    initial thinker H state on device
+            "z_L":    initial thinker L state on device
         """
-        mb_data = []
+        result = []
         for mb in micro_batches:
-            images = mb["images"].to(device)
-            solution = mb["solution"].to(device) if "solution" in mb else None
-            bsz = images.shape[0]
-
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(
-                0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
-            )
-            noisy = self.scheduler.add_noise(images, noise, timesteps)
-            target = noise if self.scheduler.config.prediction_type == "epsilon" else images
-            noisy, target = apply_noisy_swap(
-                images=images,
-                noisy=noisy,
-                target=target,
-                timesteps=timesteps,
-                scheduler=self.scheduler,
-                swap_cfg=self.train_cfg.noisy_swap,
-            )
+            sample = self.painter._prepare_training_sample(mb, device)
+            bsz = sample.x_noisy.shape[0]
             z_H, z_L = self.get_initial_states(bsz)
-
-            mb_data.append(
-                {
-                    "images": images,
-                    "solution": solution,
-                    "ce_labels": solution,
-                    "condition": self._get_condition(mb, device),
-                    "painter_cond": self._get_painter_cond(mb, device),
-                    "noisy": noisy,
-                    "timesteps": timesteps,
-                    "target": target,
-                    "z_H": z_H.to(device),
-                    "z_L": z_L.to(device),
-                }
-            )
-        return mb_data
+            result.append({"sample": sample, "z_H": z_H.to(device), "z_L": z_L.to(device)})
+        return result
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -2228,9 +2117,9 @@ class ThinkerFrozenPainterBase(BaseModel):
         for _ in range(self.n_sup):
             for d in mb_data:
                 noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
-                    d["condition"], d["noisy"], d["z_H"], d["z_L"], d["timesteps"], d["painter_cond"]
+                    d["sample"], d["z_H"], d["z_L"]
                 )
-                step_loss, loss_dict = self.loss_fn(noise_pred, logits, d)
+                step_loss, loss_dict = self.loss_fn(noise_pred, logits, d["sample"])
                 for k, v in loss_dict.items():
                     total_losses[k] = total_losses.get(k, 0.0) + v
                 if step_loss.requires_grad:
@@ -2251,31 +2140,6 @@ class ThinkerFrozenPainterBase(BaseModel):
 
     # ── Evaluation ────────────────────────────────────────────────────────────
 
-    def _batch_to_sample(
-        self,
-        batch: dict,
-        device,
-        noisy: torch.Tensor | None = None,
-        timesteps: torch.Tensor | None = None,
-    ) -> DataSample:
-        """Build a DataSample from a batch dict.
-
-        Populates condition encoder fields from the batch.  noisy and timesteps
-        are optional: omit them to get a static base sample for the eval DDIM
-        loop (they are set per step with dataclasses.replace()).
-        """
-        sample_kwargs: dict = {}
-        if noisy is not None:
-            sample_kwargs["x_noisy"] = noisy
-        if timesteps is not None:
-            sample_kwargs["timesteps"] = timesteps
-        for k in self.condition_encoder.condition_keys:
-            if k in batch and k not in ("x_noisy", "timesteps"):
-                sample_kwargs[k] = batch[k].to(device)
-        if self.thinker_cfg.puzzle_emb_ndim > 0 and "puzzle_id" in batch:
-            sample_kwargs["puzzle_id"] = batch["puzzle_id"].to(device)
-        return DataSample(**sample_kwargs)
-
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
         max_batches = kwargs.get("max_batches", 100)
@@ -2287,37 +2151,17 @@ class ThinkerFrozenPainterBase(BaseModel):
         for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
             if i >= max_batches:
                 break
-            device = accelerator.device
-            images = batch["images"].to(device)
-            solution = batch["solution"].to(device) if "solution" in batch else None
-            bsz = images.shape[0]
-
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(
-                0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
-            )
-            noisy = self.scheduler.add_noise(images, noise, timesteps)
-            target = noise if self.scheduler.config.prediction_type == "epsilon" else images
-
-            sample = self._batch_to_sample(batch, device, noisy=noisy, timesteps=timesteps)
-            result = self(sample)
+            [d] = self.prep_mb_data([batch], accelerator.device)
+            result = self(d["sample"])
             noise_pred, logits = result.pred, result.logits
 
-            batch_dict = {
-                "images": images,
-                "solution": solution,
-                "ce_labels": solution,
-                "noisy": noisy,
-                "timesteps": timesteps,
-                "target": target,
-            }
-            _, loss_dict = self.loss_fn(noise_pred, logits, batch_dict)
+            _, loss_dict = self.loss_fn(noise_pred, logits, d["sample"])
 
-            if logits is not None and solution is not None:
+            if logits is not None and d["sample"].solution is not None:
                 B_, N, _ = logits.shape
-                if N <= solution.shape[1]:
+                if N <= d["sample"].solution.shape[1]:
                     preds = logits.argmax(dim=-1)
-                    correct = preds == solution[:B_, :N]
+                    correct = preds == d["sample"].solution[:B_, :N]
                     loss_dict["thinker_puzzle_acc"] = correct.all(dim=1).float().mean().item()
                     loss_dict["thinker_cell_acc"] = correct.float().mean().item()
 
@@ -2340,24 +2184,11 @@ class ThinkerFrozenPainterBase(BaseModel):
         self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False)
         if hasattr(self.painter, "compile_submodules"):
             self.painter.compile_submodules()
-        self.condition_encoder = torch.compile(self.condition_encoder)
-        self.thinker_painter_translator = torch.compile(self.thinker_painter_translator)
-
-
-class ThinkerWithFrozenPainterControlNetV2(ThinkerFrozenPainterBase):
-    """
-    Frozen-painter thinker that conditions the UNet via ControlNet residuals.
-
-    Implements _build_thinker_painter_translator by wiring a ControlNetTranslator
-    that converts thinker logits into down/mid block residuals for the frozen painter.
-    """
-
-    def _build_thinker_painter_translator(self) -> ThinkerPainterTranslatorBase:
-        return ControlNetTranslator(
-            in_channels=self.thinker_cfg.vocab_size,
-            painter_channels=tuple(self.model_cfg.painter_channels),
-            layers_per_block=self.model_cfg.painter_layers_per_block,
-            painter_size=self.model_cfg.painter_size,
-            grid=self._grid,
-            bridge_mode=self.model_cfg.thinker_bridge_mode,
-        )
+        if hasattr(self.condition_encoder, "compile_submodules"):
+            self.condition_encoder.compile_submodules()
+        else:
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+        if hasattr(self.thinker_painter_translator, "compile_submodules"):
+            self.thinker_painter_translator.compile_submodules()
+        else:
+            self.thinker_painter_translator = torch.compile(self.thinker_painter_translator, fullgraph=False)

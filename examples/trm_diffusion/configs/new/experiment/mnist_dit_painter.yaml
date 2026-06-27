@@ -1,0 +1,19 @@
+# @package _global_
+# Latent DiT painter for MNIST Sudoku (needs trained VAE at runs/vae/checkpoint_step-4000.pt).
+# Usage:
+#   python train_trm.py --config-path configs/new --config-name config \
+#     experiment=mnist_dit_painter
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_dit
+  - override /vae: mnist_kl
+  - override /painter: mnist_dit
+  - override /train: mnist
+  - override /eval_callbacks: mnist
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_dit_painter"

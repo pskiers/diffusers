@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.interfaces import TRMInput
-from models.utility_models import SpatialEncoder
+from models.utility_models import SpatialEncoder, TimestepMLP
 
 
 class ConditionEncoderBase(nn.Module):
@@ -81,13 +81,19 @@ class SpatialConditionEncoder(ConditionEncoderBase):
         hidden_channels: list[int],
         output_dim: int,
         factor: int,
+        with_timestep_emb: bool = False,
     ):
         super().__init__()
         self.enc, self.proj = _build_spatial_enc(in_channels, enc_channels, hidden_channels, output_dim, factor)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=output_dim)
 
-    def forward(self, condition: torch.Tensor, **_) -> TRMInput:
+    def forward(self, condition: torch.Tensor, timesteps=None, **_) -> TRMInput:
         feat = self.enc(condition)
         emb = self.proj(feat).flatten(2).transpose(1, 2)  # (B, grid², output_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
         return TRMInput(enc_emb=emb)
 
 
@@ -115,11 +121,15 @@ class NoisySpatialConditionEncoder(ConditionEncoderBase):
         factor: int,
         noisy_dropout_p_max: float = 0.0,
         num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
     ):
         super().__init__()
         self.noisy_dropout_p_max = noisy_dropout_p_max
         self.num_train_timesteps = num_train_timesteps
         self.enc, self.proj = _build_spatial_enc(in_channels, enc_channels, hidden_channels, output_dim, factor)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=output_dim)
 
     def forward(
         self,
@@ -135,6 +145,8 @@ class NoisySpatialConditionEncoder(ConditionEncoderBase):
             noisy_in = x_noisy * keep[:, None, None, None]
         feat = self.enc(torch.cat([condition, noisy_in], dim=1))
         emb = self.proj(feat).flatten(2).transpose(1, 2)  # (B, grid², output_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
         return TRMInput(enc_emb=emb)
 
 
@@ -157,7 +169,7 @@ class ObjectFeatureEncoder(ConditionEncoderBase):
 
     condition_keys: list[str] = ["embedding_conditions"]
 
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, with_timestep_emb: bool = False):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -168,9 +180,15 @@ class ObjectFeatureEncoder(ConditionEncoderBase):
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
 
-    def forward(self, condition: torch.Tensor, **_) -> TRMInput:
-        return TRMInput(enc_emb=self.net(condition))  # (B, max_objects, out_dim)
+    def forward(self, condition: torch.Tensor, timesteps=None, **_) -> TRMInput:
+        emb = self.net(condition)  # (B, max_objects, out_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=emb)
 
 
 class ClevrLatentEncoder(nn.Module):
@@ -233,12 +251,16 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
         grid_size: int,
         noisy_dropout_p_max: float = 0.0,
         num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
     ):
         super().__init__()
-        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim)
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
         self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
         self.noisy_dropout_p_max = noisy_dropout_p_max
         self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
 
     def forward(
         self,
@@ -256,7 +278,10 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
             noisy_for_enc = x_noisy * keep[:, None, None, None]
 
         img_tokens = self.latent_encoder(noisy_for_enc)  # (B, G², hidden)
-        return TRMInput(enc_emb=torch.cat([obj_tokens, img_tokens], dim=1))
+        enc_emb = torch.cat([obj_tokens, img_tokens], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
 
 
 # ── Backward-compatible aliases ───────────────────────────────────────────────

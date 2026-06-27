@@ -1,0 +1,14 @@
+# Trainable CLEVR DiTPainter (stage-1).
+# backbone and vae are composed from /backbone and /vae groups in the experiment.
+_target_: models.painter_base.DiTPainter
+dit: ${backbone}
+vae: ${vae}
+condition_encoder: ${condition_encoder}
+painter_dtype: null     # training uses accelerator mixed precision
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

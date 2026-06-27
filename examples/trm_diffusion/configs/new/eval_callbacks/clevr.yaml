@@ -1,0 +1,12 @@
+# Both CLEVR eval callbacks as a list.
+- _target_: eval.clevr_eval_callbacks.ClevrImageLogCallback
+  root_dir: ${data.clevr_root}
+  mode: ${data.mode}
+  n_scenes: 8
+  min_objects: 3
+  max_objects: 8
+- _target_: eval.clevr_eval_callbacks.ClevrMetricsCallback
+  root_dir: ${data.clevr_root}
+  mode: ${data.mode}
+  n_samples: 7680
+  batch_size: 384

@@ -1,0 +1,6 @@
+# Painter-side condition encoder for UNet (512-dim cross-attn).
+_target_: models.clevr_painters.ClevrObjectEncoder
+in_dim: ${data.object_feat_dim}
+hidden_dim: 512
+out_dim: 512
+with_timestep_emb: false

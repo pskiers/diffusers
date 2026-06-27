@@ -184,7 +184,7 @@ class ThinkerWithFrozenClevrDiTBase(PainterThinkerV0Tok):
     # ── Decode / noise-shape helpers (used by ImageGenEvalCallback) ───────────
 
     @property
-    def _noise_shape(self) -> tuple:
+    def noise_shape(self) -> tuple:
         """Shape of one noise sample (no batch dim). Used by ImageGenEvalCallback."""
         return (self._dit_cfg.latent_channels, self._dit_cfg.latent_size, self._dit_cfg.latent_size)
 

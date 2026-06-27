@@ -1,0 +1,10 @@
+# MNIST eval callback: DDIM sampling + classifier accuracy (no thinker metrics).
+- _target_: models.eval_callbacks.SudokuDDIMEvalCallback
+  classifier_path: runs/standalone_painter/checkpoint_final.pt
+  cell_size: 16
+  include_thinker_metrics: false
+  num_samples: 7680
+  batch_size: 384
+  num_ddim_steps: 20
+  num_log_images: 8
+  cfg_scale: 1.0

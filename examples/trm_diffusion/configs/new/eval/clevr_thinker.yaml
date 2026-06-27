@@ -1,0 +1,8 @@
+eval_every: 3000
+save_every: 15000
+log_every: 200
+cfg_scale: 2.0
+num_samples: 7680
+batch_size: 384
+num_ddim_steps: 20
+num_log_images: 8

@@ -1,0 +1,31 @@
+# CLEVR V0: TRM sees object embeddings only.
+# seq_len = max_objects = 10
+_target_: configs.schemas.ThinkerModelConfig
+vocab_size: 10        # placeholder; thinker output tokens (overridden per translator)
+seq_len: 10
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+num_puzzle_identifiers: 1
+halt_exploration_prob: 0.0
+freeze_weights: false
+batch_size: 32
+
+optim:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 0.1
+with_timestep_emb: false

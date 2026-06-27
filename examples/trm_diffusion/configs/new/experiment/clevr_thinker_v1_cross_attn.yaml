@@ -1,0 +1,30 @@
+# @package _global_
+# Stage 2: TRM thinker (V1, CrossAttn) with frozen CLEVR DiT.
+# V1 = TRM sees object embeddings + noisy latent tokens (seq_len=26).
+#
+# Usage:
+#   python train_trm.py +config_dir=configs/new \
+#     experiment=clevr_thinker_v1_cross_attn \
+#     painter.checkpoint=runs/clevr_dit_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: clevr
+  - override /train: clevr_thinker
+  - override /eval: clevr_thinker
+  - override /thinker: clevr_v1
+  - override /backbone: clevr_dit
+  - override /vae: sdxl
+  - override /condition_encoder: object_feature_v1
+  - override /painter: clevr_dit_cross_attn_frozen
+  - override /translator: cross_attn_clevr
+  - override /loss: combined_mse
+  - override /eval_callbacks: clevr_image_log
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/clevr_thinker_v1_cross_attn"
+
+data:
+  mode: "reduced"

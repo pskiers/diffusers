@@ -1,0 +1,13 @@
+# Trainable CLEVR UNetPainter (stage-1).
+_target_: models.painter_base.UNetPainter
+unet: ${backbone}
+vae: ${vae}
+condition_encoder: ${condition_encoder}
+painter_dtype: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

@@ -1,0 +1,6 @@
+# IP-Adapter translator: projects thinker hidden states → per-block DiT IP tokens.
+# out_dim must match the DiT hidden dim (768 for clevr_dit).
+_target_: models.translators.IPAdapterTranslator
+in_dim: ${thinker.hidden_size}
+out_dim: 512
+with_timestep_emb: true

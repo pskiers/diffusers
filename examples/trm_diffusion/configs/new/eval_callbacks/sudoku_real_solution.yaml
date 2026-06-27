@@ -1,0 +1,3 @@
+_target_: models.eval_callbacks.SudokuRealSolutionCallback
+classifier_path: runs/standalone_painter/checkpoint_final.pt
+cell_size: 16

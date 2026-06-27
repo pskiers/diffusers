@@ -1,0 +1,25 @@
+clevr_root: "data/clevr"
+mode: "relative"          # "absolute" | "relative" | "reduced"
+image_size: 256
+num_workers: 4
+n_reduced_samples: 16     # per-scene pre-computed reduced samples (mode=reduced only)
+
+# These are read by factory.py to configure the CLEVR DiT
+object_feat_dim: 55       # 55 for relative/reduced, 21 for absolute
+max_objects: 10
+
+train_dataset:
+  _target_: datasets.clevr_dataset.CLEVRHybridDataset
+  root_dir: "${data.clevr_root}"
+  split: "train"
+  mode: "${data.mode}"
+  image_size: "${data.image_size}"
+  n_reduced_samples: "${data.n_reduced_samples}"
+
+val_dataset:
+  _target_: datasets.clevr_dataset.CLEVRHybridDataset
+  root_dir: "${data.clevr_root}"
+  split: "validation"
+  mode: "${data.mode}"
+  image_size: "${data.image_size}"
+  n_reduced_samples: "${data.n_reduced_samples}"

@@ -1,0 +1,22 @@
+# @package _global_
+# Stage 1: Trainable CLEVR UNetPainter.
+# Usage: python train_trm.py +config_dir=configs/new experiment=clevr_unet_painter
+
+defaults:
+  - override /data: clevr
+  - override /train: clevr
+  - override /eval: clevr
+  - override /backbone: clevr_unet
+  - override /vae: sdxl
+  - override /condition_encoder: clevr_object_unet
+  - override /painter: clevr_unet
+  - override /eval_callbacks: clevr
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/clevr_unet_painter"
+
+data:
+  mode: "reduced"

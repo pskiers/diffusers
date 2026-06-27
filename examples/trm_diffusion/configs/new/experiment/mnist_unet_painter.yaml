@@ -1,0 +1,16 @@
+# @package _global_
+# Unconditional MNIST UNetPainter.
+# Usage: python train_trm.py +config_dir=configs/new experiment=mnist_unet_painter
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_unet
+  - override /painter: mnist_unet
+  - override /train: mnist
+  - override /eval_callbacks: mnist
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_unet_painter"

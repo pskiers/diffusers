@@ -1,0 +1,6 @@
+# CrossAttn translator: projects thinker hidden states → DiT encoder_hidden_states.
+# out_dim must match the painter's cross_attention_dim (768 for clevr_dit).
+_target_: models.translators.CrossAttnTranslator
+in_dim: ${thinker.hidden_size}
+out_dim: 512
+with_timestep_emb: true
