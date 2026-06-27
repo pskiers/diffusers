@@ -334,9 +334,11 @@ class UNetPainter(PainterBase, BaseModel):
         return metrics
 
     def compile_submodules(self):
-        self.unet = torch.compile(self.unet, fullgraph=False)
+        # dynamic=True: batch size changes between training and eval; without it
+        # inductor bakes B into mask-reshape expressions (e.g. 24//B) and breaks.
+        self.unet = torch.compile(self.unet, fullgraph=False, dynamic=True)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
 
 
 # ── Frozen UNet wrapper for TRM steering ─────────────────────────────────────
@@ -598,9 +600,9 @@ class DiTPainter(PainterBase, BaseModel):
         return metrics
 
     def compile_submodules(self):
-        self.dit = torch.compile(self.dit, fullgraph=False)
+        self.dit = torch.compile(self.dit, fullgraph=False, dynamic=True)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=True)
 
 
 # ── Frozen DiT wrapper for TRM steering ──────────────────────────────────────
