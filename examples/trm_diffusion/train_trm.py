@@ -110,7 +110,7 @@ def main(cfg: DictConfig):
         num_workers=n_workers,
         pin_memory=True,
         persistent_workers=(n_workers > 0),
-        timeout=120 if n_workers > 0 else 0,
+        timeout=0,
         collate_fn=eval_collate_fn,
     )
 
