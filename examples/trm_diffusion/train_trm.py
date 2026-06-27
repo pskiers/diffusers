@@ -27,6 +27,8 @@ from pathlib import Path
 
 import hydra
 import torch
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True  # fall back to eager on inductor failures
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from omegaconf import DictConfig, OmegaConf
