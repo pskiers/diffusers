@@ -184,10 +184,13 @@ class TRMDiTLayer(nn.Module):
         shared_stack: bool = False,
         refine_residual: bool = True,
         isolate_transform: bool = False,
+        use_gate: bool = False
     ) -> None:
         super().__init__()
         self.refine_residual = refine_residual
-        self.gate = nn.Parameter(torch.zeros(dim))
+        self.use_gate = use_gate
+        if self.use_gate:
+            self.gate = nn.Parameter(torch.zeros(dim))
         self.dit = BasicTransformerBlock(
             dim=dim,
             num_attention_heads=num_heads,
@@ -211,10 +214,11 @@ class TRMDiTLayer(nn.Module):
         x = self.dit(y, timestep=timestep, class_labels=class_labels)  # conditioned injection (residual)
         y_trm, z = self.trm(x, inj, y, z)                              # TRM refines, grounded by inj
 
+        trm_out = self.gate * y_trm if self.use_gate else y_trm
         if self.refine_residual:
-            y = x + (self.gate * y_trm)
+            y = x + trm_out
         else:
-            y = self.gate * y_trm
+            y = trm_out
 
         return y, z
 
@@ -246,6 +250,7 @@ class EmbeddedTRMDiffusion(nn.Module):
         dropout: float = 0.0,
         patch_size: int = 1,
         use_grid_pos_embed: bool = True,
+        use_gate: bool = False
     ) -> None:
         super().__init__()
         dim = num_attention_heads * attention_head_dim
@@ -274,7 +279,7 @@ class EmbeddedTRMDiffusion(nn.Module):
             TRMDiTLayer(
                 dim, num_attention_heads, attention_head_dim, ffn_mult, activation_fn, dropout,
                 num_embeds_ada_norm, n_inner, T, num_inner_layers, shared_stack, refine_residual,
-                isolate_transform,
+                isolate_transform, use_gate
             )
             for _ in range(n_distinct)
         ])
@@ -450,6 +455,7 @@ def main(cfg: DictConfig) -> None:
         dropout=cfg.model.get("dropout", 0.0),
         patch_size=cfg.model.get("patch_size", 1),
         use_grid_pos_embed=cfg.trm.get("use_grid_pos_embed", True),
+        use_gate=cfg.trm.get("use_gate", False),
     )
 
     noise_scheduler = DDPMScheduler(
