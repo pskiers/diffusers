@@ -74,6 +74,9 @@ log_to_wandb: true # log test metrics back onto the training run
 wandb_run_id: null # explicit run id to resume (else read from the checkpoint dir)
 wandb_entity: null # set only if the run lives under a team entity
 
+# --- Loss ---
+use_q_loss: true
+
 # --- Model (Transformer2DModel backbone) ---
 model:
   num_layers: 2

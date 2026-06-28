@@ -83,13 +83,14 @@ class TRMDiT(nn.Module):
     - predicts whether current output is 100% correct (for inference halting).
     - Trained with BCE loss during training, used for early stopping only at inference.
     """
-    def __init__(self, core_model: Transformer2DModel, resolution: int, n: int = 6, T: int = 3, n_sup_max: int = 12, use_grid_pos_embed: bool = True):
+    def __init__(self, core_model: Transformer2DModel, resolution: int, n: int = 6, T: int = 3, n_sup_max: int = 12, use_grid_pos_embed: bool = True, use_q_loss: bool = True):
         super().__init__()
         self.core_model = core_model
         self.n = n
         self.T = T
         self.n_sup_max = n_sup_max
         self.use_grid_pos_embed = use_grid_pos_embed
+        self.use_q_loss = use_q_loss
 
         dim = core_model.config.num_attention_heads * core_model.config.attention_head_dim
         patch_size = getattr(core_model.config, "patch_size", 1)
@@ -100,10 +101,11 @@ class TRMDiT(nn.Module):
         self.norm_z = nn.LayerNorm(dim)
 
         # Q_head: predicts confidence that current output is 100% correct, initialized to sigmoid(-1) = 0.268
-        self.q_head = nn.Linear(dim, 1)
-        with torch.no_grad():
-            nn.init.zeros_(self.q_head.weight)
-            self.q_head.bias.fill_(-1.0)
+        if self.use_q_loss:
+            self.q_head = nn.Linear(dim, 1)
+            with torch.no_grad():
+                nn.init.zeros_(self.q_head.weight)
+                self.q_head.bias.fill_(-1.0)
 
         # Learnable grid positional embedding, useful for structured-grid tasks (Sokoban, Sudoku); disable for natural images
         seq_len = self.h_p * self.w_p
@@ -204,7 +206,7 @@ class TRMDiT(nn.Module):
             y_final, y, z = self._deep_recursion(x_high, y, z, ts, class_labels)
 
         output = self._unpatchify(y_final, ts, class_labels, embedded_ts)
-        return _TRMOutput(sample=output), (y.detach(), z.detach())
+        return _TRMOutput(sample=output), None, (y.detach(), z.detach())
 
     def forward_with_early_stop(
         self,
@@ -216,6 +218,10 @@ class TRMDiT(nn.Module):
         n_steps: Optional[int] = None,
     ):
         """TRM forward with Q_head-based early stopping. Used at inference time."""
+        if not self.use_q_loss:
+            print("Q-loss not supported here")
+            return self(sample, timestep, class_labels, carry, n_steps)
+
         if n_steps is None:
             n_steps = self.n_sup_max
         bsz = sample.shape[0]
@@ -284,6 +290,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         use_carry_recycling: bool = False,
         carry_recycle_prob: float = 0.5,
         use_carry_persistence: bool = False,
+        use_q_loss: bool = True,
         **base_kwargs,  # the same like in SokobanBitDiffusion
     ) -> None:
         super().__init__(**base_kwargs)
@@ -291,6 +298,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         self.automatic_optimization = False # manual step after every n_sup
 
         self.q_loss_weight = q_loss_weight
+        self.use_q_loss = use_q_loss
 
         self.n_sup_min = n_sup_min
         self.n_sup_max = n_sup_max
@@ -359,15 +367,16 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             z[active_idx] = z_new_a
 
             diffusion_loss = self._diffusion_loss(x_0_prediction_a, x_bits_a, noise_a, t_a)
-            q_loss = self._q_head_loss(y_final_a, x_0_prediction_a, x_bits_a)
+            q_loss = self._q_head_loss(y_final_a, x_0_prediction_a, x_bits_a) if self.use_q_loss else None
 
             if optimize:
-                loss = diffusion_loss + self.q_loss_weight * q_loss
+                loss = diffusion_loss + self.q_loss_weight * (q_loss or 0)
                 scaled_loss = loss / (max_steps * self.trainer.accumulate_grad_batches)
                 self.manual_backward(scaled_loss)
 
             total_diff_loss += diffusion_loss.detach()
-            total_q_loss += q_loss.detach()
+            if q_loss is not None:
+                total_q_loss += q_loss.detach()
             total_active += 1
 
         n_steps_done = max(total_active, 1)
@@ -404,7 +413,7 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             with torch.no_grad():
                 model_input_init = self._build_model_input(x_t, None, cond_board_train)
                 # Limiting n_steps=1 ensures efficiency and initializes memory coarsely
-                out, (y_sc, z_sc) = self.model(
+                out, _, (y_sc, z_sc) = self.model(
                     sample=model_input_init, timestep=timesteps, class_labels=class_labels_train,
                     n_steps=1,
                 )
@@ -432,7 +441,8 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             opt.zero_grad()
 
         self.log("train/loss", train_loss, prog_bar=True, sync_dist=True)
-        self.log("train/q_loss", q_loss, sync_dist=True)
+        if self.use_q_loss:
+            self.log("train/q_loss", q_loss, sync_dist=True)
         self.log("train/max_steps", float(max_steps), sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
@@ -459,7 +469,8 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
             model_input, timesteps, class_labels, x_bits, noise, y, z, n_sup_steps, optimize=False,
         )
         self.log("val/loss", val_loss, prog_bar=True, sync_dist=True)
-        self.log("val/q_loss", q_loss, sync_dist=True)
+        if self.use_q_loss:
+            self.log("val/q_loss", q_loss, sync_dist=True)
 
     @torch.no_grad()
     def generate_batch(
@@ -611,6 +622,7 @@ def main(cfg: DictConfig):
         T=cfg.trm.T,
         n_sup_max=cfg.n_sup_max,
         use_grid_pos_embed=cfg.trm.get("use_grid_pos_embed", True),
+        use_q_loss = cfg.get("use_q_loss", True)
     )
 
     # Lightning module
@@ -649,6 +661,7 @@ def main(cfg: DictConfig):
         use_carry_recycling=cfg.get("use_carry_recycling", False),
         carry_recycle_prob=cfg.get("carry_recycle_prob", 0.5),
         use_carry_persistence=cfg.get("use_carry_persistence", False),
+        use_q_loss = cfg.get("use_q_loss", True)
     )
 
     # Data

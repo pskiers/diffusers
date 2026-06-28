@@ -15,7 +15,8 @@ RUN_NAME="$2"
 WANDB_GROUP="$3"
 shift 3
 
-module load ML-bundle/24.06a
+# module load ML-bundle/24.06a
+module load Miniconda3/23.3.1-0
 source /net/tscratch/people/plgmgrzanka/trm_sokoban/venv/bin/activate
 
 export PYTHONUNBUFFERED=1

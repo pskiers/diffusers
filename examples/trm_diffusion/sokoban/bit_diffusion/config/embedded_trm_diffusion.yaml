@@ -27,10 +27,11 @@ trm:
   n_inner: 6
   T: 3
   num_inner_layers: 1 # transformer layers per z-/y-stack
-  shared_stack: false # true = one shared block stack for z and y
+  shared_stack: true # true = one shared block stack for z and y
   weight_tied: false # true = share ONE DiT+TRM layer across all steps
   refine_residual: true # true = y = x + TRM(...), false = overwrite y each layer
   isolate_transform: false # true = add only the block's transform (out - in) to the carry (canonical TRM residual)
+  use_gate: false
   use_grid_pos_embed: true
 
 # --- Deep supervision ---

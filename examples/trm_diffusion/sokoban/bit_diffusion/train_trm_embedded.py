@@ -132,9 +132,15 @@ class TRMRefiner(nn.Module):
             h_out_z = self._run(self.z_layers, h_in_z)
             z_new = z + (h_out_z - h_in_z) if self.isolate_transform else h_out_z
             z = self.norm_z(z_new).float()  # float keeps the carry in fp32 across iterations
+
         h_in_y = y + z
         h_out_y = self._run(self.y_layers, h_in_y)
-        y_new = y + (h_out_y - h_in_y) if self.isolate_transform else h_out_y
+
+        if self.isolate_transform:
+            y_new = y + (h_out_y - h_in_y)
+        else:
+            y_new = h_out_y
+
         y = self.norm_y(y_new).float()
         return y, z
 
@@ -181,6 +187,7 @@ class TRMDiTLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.refine_residual = refine_residual
+        self.gate = nn.Parameter(torch.zeros(dim))
         self.dit = BasicTransformerBlock(
             dim=dim,
             num_attention_heads=num_heads,
@@ -203,9 +210,12 @@ class TRMDiTLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.dit(y, timestep=timestep, class_labels=class_labels)  # conditioned injection (residual)
         y_trm, z = self.trm(x, inj, y, z)                              # TRM refines, grounded by inj
-        # Residual refine: ADD the TRM correction to the DiT output instead of overwriting the
-        # stream.
-        y = x + y_trm if self.refine_residual else y_trm
+
+        if self.refine_residual:
+            y = x + (self.gate * y_trm)
+        else:
+            y = self.gate * y_trm
+
         return y, z
 
 
