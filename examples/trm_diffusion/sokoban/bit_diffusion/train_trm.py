@@ -363,7 +363,8 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
 
             if optimize:
                 loss = diffusion_loss + self.q_loss_weight * q_loss
-                self.manual_backward(loss / max_steps)
+                scaled_loss = loss / (max_steps * self.trainer.accumulate_grad_batches)
+                self.manual_backward(scaled_loss)
 
             total_diff_loss += diffusion_loss.detach()
             total_q_loss += q_loss.detach()
@@ -424,13 +425,10 @@ class SokobanTRMBitDiffusion(SokobanBitDiffusion):
         )
 
         if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            if torch.isfinite(grad_norm):
-                opt.step()
-                if sch is not None:
-                    sch.step()
-            else:
-                self._nonfinite_steps = getattr(self, "_nonfinite_steps", 0) + 1
+            self.clip_gradients(opt, gradient_clip_val=1.0)
+            opt.step()
+            if sch is not None:
+                sch.step()
             opt.zero_grad()
 
         self.log("train/loss", train_loss, prog_bar=True, sync_dist=True)

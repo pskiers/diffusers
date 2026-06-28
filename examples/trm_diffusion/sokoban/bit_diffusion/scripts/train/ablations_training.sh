@@ -53,7 +53,7 @@ echo
 
 
 # 2) DIFFUSION-TRM
-# submit "$TRM" trm trm_no_cr        use_carry_recycling=false
+submit "$TRM" trm trm        use_carry_recycling=true use_carry_persistence=true
 # submit "$TRM" trm trm_cr_75        use_carry_recycling=true carry_recycle_prob=0.75
 # submit "$TRM" trm trm_cr_50        use_carry_recycling=true carry_recycle_prob=0.5
 # submit "$TRM" trm trm_cr_25        use_carry_recycling=true carry_recycle_prob=0.25
@@ -63,15 +63,15 @@ echo
 # submit "$TRM" trm trm_n_6          use_carry_recycling=true carry_recycle_prob=0.5 trm.n=6
 
 # 3) EMBEDDED-TRM  (group: embedded)
-submit "$EMB" embedded emb_isolate_transform \
-  trm.shared_stack=true self_cond=true model.num_layers=4 aux_loss_weight=0.5 \
-  gradient_accumulation_steps=4 trm.isolate_transform=true
+# submit "$EMB" embedded emb_isolate_transform \
+#   trm.shared_stack=true self_cond=true model.num_layers=4 aux_loss_weight=0.5 \
+#   gradient_accumulation_steps=4 trm.isolate_transform=true
 
-submit "$EMB" embedded emb_big \
-  trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=true resume_from_checkpoint=/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond/emb_big/checkpoints/best-epoch=58-step=60416.ckpt
+# submit "$EMB" embedded emb_big \
+#   trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=true resume_from_checkpoint=/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond/emb_big/checkpoints/best-epoch=58-step=60416.ckpt
 
-submit "$EMB" embedded emb_big_no_self_cond \
-  trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=false
+# submit "$EMB" embedded emb_big_no_self_cond \
+#   trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=false
 
 echo
 echo "submitted. monitor: squeue --me   |   logs: trm_sokoban/stdout & stderr"
