@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=8:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --gres=gpu:1
