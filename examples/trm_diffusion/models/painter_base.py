@@ -82,6 +82,24 @@ class PainterBase(nn.Module):
         }
         return dataclasses.replace(sample, **updates)
 
+    def _batch_to_sample(self, batch: DataSample, device: torch.device) -> DataSample:
+        """Build a static-condition DataSample from a batch for use in sampling.
+
+        Copies all non-runtime DataSample fields (excludes x_noisy, timesteps,
+        target, enc_x_noisy which are set per-step by the sampling loop).
+        This ensures sample_grids can determine batch size even for unconditional
+        models, and thinker models receive puzzle_id / solution / solution_mask.
+        """
+        _RUNTIME = {"x_noisy", "timesteps", "target", "enc_x_noisy"}
+        kwargs: dict = {}
+        for f in dataclasses.fields(DataSample):
+            if f.name in _RUNTIME:
+                continue
+            val = batch.get(f.name) if hasattr(batch, "get") else None
+            if val is not None:
+                kwargs[f.name] = val.to(device) if isinstance(val, torch.Tensor) else val
+        return DataSample(**kwargs)
+
 
 # ── Generic trainable UNet painter ───────────────────────────────────────────
 
@@ -246,24 +264,6 @@ class UNetPainter(PainterBase, BaseModel):
                 updates[k] = val * (~mask).to(val.dtype)
         return dataclasses.replace(sample, **updates) if updates else sample
 
-    def _batch_to_sample(self, batch: DataSample, device: torch.device) -> DataSample:
-        """Build a static-condition DataSample from a batch for use in sampling.
-
-        Copies all non-runtime DataSample fields (excludes x_noisy, timesteps,
-        target, enc_x_noisy which are set per-step by the sampling loop).
-        This ensures sample_grids can determine batch size even for unconditional
-        models, and thinker models receive puzzle_id / solution / solution_mask.
-        """
-        _RUNTIME = {"x_noisy", "timesteps", "target", "enc_x_noisy"}
-        kwargs: dict = {}
-        for f in dataclasses.fields(DataSample):
-            if f.name in _RUNTIME:
-                continue
-            val = batch.get(f.name) if hasattr(batch, "get") else None
-            if val is not None:
-                kwargs[f.name] = val.to(device) if isinstance(val, torch.Tensor) else val
-        return DataSample(**kwargs)
-
     # ── Training / eval / optimizer ─────────────────────────────────────────
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
@@ -318,8 +318,11 @@ class UNetPainter(PainterBase, BaseModel):
         self.eval()
         loss_sums: dict[str, float] = {}
         n_batches = 0
-        for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
-            if i >= max_batches:
+        dl_iter = iter(dataloader)
+        for i in tqdm(range(max_batches), "Eval"):
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
                 break
             sample = self._prepare_training_sample(batch, accelerator.device)
             result = self(sample)
@@ -327,6 +330,7 @@ class UNetPainter(PainterBase, BaseModel):
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
+        del dl_iter  # release workers before callbacks re-iterate the dataloader
         self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
         for cb in self.eval_callbacks:
@@ -570,8 +574,11 @@ class DiTPainter(PainterBase, BaseModel):
         self.eval()
         loss_sums: dict[str, float] = {}
         n_batches = 0
-        for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
-            if i >= max_batches:
+        dl_iter = iter(dataloader)
+        for i in tqdm(range(max_batches), "Eval"):
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
                 break
             sample = self._prepare_training_sample(batch, accelerator.device)
             result = self(sample)
@@ -579,6 +586,7 @@ class DiTPainter(PainterBase, BaseModel):
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
+        del dl_iter  # release workers before callbacks re-iterate the dataloader
         self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
         for cb in self.eval_callbacks:
