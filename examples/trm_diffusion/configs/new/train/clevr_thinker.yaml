@@ -1,10 +1,10 @@
 seed: 42
 compile: true
 
-batch_size: 384
+batch_size: 256
 num_steps: 150000
-gradient_accumulation_steps: 2
-cfg_prob: 0.1
+gradient_accumulation_steps: 3
+cfg_prob: 0.0
 
 noisy_swap:
   prob: 0.0

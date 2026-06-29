@@ -9,4 +9,4 @@
   root_dir: ${data.clevr_root}
   mode: ${data.mode}
   n_samples: 7680
-  batch_size: 384
+  batch_size: 256

@@ -109,10 +109,8 @@ def main(cfg: DictConfig):
         eval_ds,
         batch_size=cfg.eval.get("batch_size", cfg.train.batch_size),
         shuffle=False,
-        num_workers=n_workers,
-        pin_memory=True,
-        persistent_workers=False,  # eval iterates the dataloader twice; persistent workers cause fork issues
-        timeout=0,
+        num_workers=0,  # eval iterates the dataloader twice; forking after CUDA init causes worker segfaults
+        pin_memory=False,
         collate_fn=eval_collate_fn,
     )
 
