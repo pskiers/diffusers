@@ -1,6 +1,6 @@
 # MNIST Sudoku TRM.
 # seq_len = 81 (one token per cell)
-_target_: configs.schemas.ThinkerModelConfig
+_target_: models.trm_wrappers.SpatialTRM
 vocab_size: 11
 seq_len: 81
 hidden_size: 512
@@ -20,7 +20,7 @@ halt_exploration_prob: 0.0
 freeze_weights: false
 batch_size: 384
 
-optim:
+optim_cfg:
   _target_: configs.schemas.ThinkerOptimConfig
   lr: 1e-4
   weight_decay: 1.0

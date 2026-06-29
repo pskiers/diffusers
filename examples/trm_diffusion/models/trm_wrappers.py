@@ -12,6 +12,7 @@ from typing import Any, Optional
 from configs.schemas import ThinkerOptimConfig
 from datasets.sudoku_dataset import IGNORE_LABEL_ID
 from models.base import BaseModel
+from models.utility_models import TimestepMLP
 from models.trm.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1_Inner,
     TinyRecursiveReasoningModel_ACTV1Config,
@@ -70,12 +71,20 @@ class SpatialTRM(BaseModel):
         halt_exploration_prob: float = 0.0,
         batch_size: int = 1,
         freeze_weights: bool = False,
+        with_timestep_emb: bool = False,
     ):
         super().__init__()
         self.n_sup = n_sup
         self.vocab_size = vocab_size
         self.freeze_weights = freeze_weights
+        self.with_timestep_emb = with_timestep_emb
         self.optim_cfg = optim_cfg
+
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=256)
+            self.thinker_temb_proj = nn.Linear(256, hidden_size)
+            nn.init.zeros_(self.thinker_temb_proj.weight)
+            nn.init.zeros_(self.thinker_temb_proj.bias)
 
         # puzzle_emb_len is only meaningful when puzzle_emb_ndim > 0
         effective_puzzle_emb_len = puzzle_emb_len if puzzle_emb_ndim > 0 else 0
@@ -174,6 +183,7 @@ class SpatialTRM(BaseModel):
         L_cycles: Optional[int] = None,
         keep_carry_grad: bool = False,
         input_emb_bias: Optional[torch.Tensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
     ):
         """
         One supervision step. Internally runs H_cycles-1 no-grad cycles then one full-grad cycle.
@@ -183,12 +193,17 @@ class SpatialTRM(BaseModel):
           so gradients flow back to `inputs` (used for classifier guidance in eval).
           Leave False during training to avoid accumulating graph across n_sup steps.
         input_emb_bias: optional (B, 1, hidden_size) or (B, N, hidden_size) tensor added
-          to the input embeddings after embed_scale — used for timestep conditioning in
-          the token-input path (ThinkerWithFrozenPainter).
+          to the input embeddings after embed_scale.
+        timesteps: optional (B,) timestep tensor; if with_timestep_emb=True, projected
+          into an embedding bias added to all input tokens.
 
         Returns: (logits, z_H, z_L) — z_H/z_L detached unless keep_carry_grad=True.
           logits: (B, seq_len, vocab_size) — gradients always attached.
         """
+        if self.with_timestep_emb and timesteps is not None:
+            t_bias = self.thinker_temb_proj(self.timestep_mlp(timesteps)).unsqueeze(1)
+            input_emb_bias = (input_emb_bias + t_bias) if input_emb_bias is not None else t_bias
+
         bs = inputs.shape[0]
         if puzzle_ids is None:
             puzzle_ids = torch.zeros(bs, dtype=torch.int32, device=inputs.device)
@@ -310,6 +325,9 @@ class SpatialTRM(BaseModel):
 
     def compile_submodules(self):
         self.inner.L_level = torch.compile(self.inner.L_level, fullgraph=False)
+        if self.with_timestep_emb:
+            self.timestep_mlp = torch.compile(self.timestep_mlp, fullgraph=False)
+            self.thinker_temb_proj = torch.compile(self.thinker_temb_proj, fullgraph=False)
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:

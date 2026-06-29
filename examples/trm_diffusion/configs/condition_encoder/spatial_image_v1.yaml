@@ -1,9 +1,0 @@
-_target_: models.condition_encoders.SpatialImageEncoder
-in_channels: 2
-enc_channels: 32
-hidden_channels: [16, 32]
-output_dim: ${thinker.hidden_size}
-factor: ${data.cell_size}
-use_noisy_input: true
-noisy_dropout_p_max: ${train.noisy_dropout_p_max}
-num_train_timesteps: 1000

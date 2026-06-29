@@ -34,7 +34,7 @@ from tqdm.auto import tqdm
 
 from datasets.mnist_sudoku_dataset import get_solution_tokens  # kept for eval metrics only
 from eval.mnist_eval import evaluate_grids, make_panel_image
-from models.latent_dit import ConditionEncoder
+from models.condition_encoders import ObjectFeatureEncoder
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.spatial_diffusion_utils import (
     add_noise_spatial,
@@ -194,9 +194,9 @@ class SpatialLatentUNet(nn.Module):
             act_fn="silu",
         )
 
-        self.cond_encoder = ConditionEncoder(
-            vocab_size=model_cfg.vocab_size,
-            embed_dim=model_cfg.cond_embed_dim,
+        self.cond_encoder = ObjectFeatureEncoder(
+            in_dim=model_cfg.vocab_size,
+            hidden_dim=model_cfg.cond_embed_dim,
             out_dim=model_cfg.cond_embed_dim,
         )
 

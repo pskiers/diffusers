@@ -35,7 +35,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from factory import build_model, build_datasets, build_scheduler
+from factory import build_model, build_datasets
+from hydra.utils import instantiate
 from models.trm.ema import EMAHelper
 from models.utility_models import strip_compiled_prefix
 
@@ -89,7 +90,7 @@ def main(cfg: DictConfig):
     torch.manual_seed(cfg.train.seed + accelerator.process_index)
 
     # ── Dataset & scheduler ───────────────────────────────────────────────────
-    scheduler = build_scheduler(cfg)
+    scheduler = instantiate(cfg.diffusion)
     train_ds, eval_ds = build_datasets(cfg)
 
     n_workers = cfg.data.num_workers

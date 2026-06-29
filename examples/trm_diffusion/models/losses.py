@@ -18,7 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from datasets.sudoku_dataset import IGNORE_LABEL_ID
-from models.diffusion_utils import x0_from_noise_pred
+from models.diffusion_utils import x0_from_noise_pred, ddim_prev_sample
+from configs.schemas import ClassifierLossConfig
 
 
 class LossBase(nn.Module):
@@ -211,3 +212,38 @@ def build_loss(train_cfg, scheduler, cell_size: Optional[int] = None) -> LossBas
     if len(components) == 1:
         return components[0]
     return CombinedLoss(*components)
+
+
+def classifier_loss(
+    x0_pred, noisy, images, solution, timesteps, cell_size, classifier, scheduler, loss_cfg: ClassifierLossConfig
+):
+    """
+    Classifier-based training loss on predicted images.
+    """
+    eligible = (timesteps < loss_cfg.t_max).nonzero(as_tuple=True)[0]
+    if eligible.numel() == 0:
+        return x0_pred.sum() * 0.0
+
+    x0_sel = x0_pred[eligible]
+    noi_sel = noisy[eligible]
+    ts_sel = timesteps[eligible]
+    sol_sel = solution[eligible].to(x0_pred.device)
+    N = eligible.numel()
+
+    img_sel = ddim_prev_sample(x0_sel, noi_sel, ts_sel, scheduler) if loss_cfg.target == "x_tm1" else x0_sel
+
+    cells = img_sel.unfold(2, cell_size, cell_size).unfold(3, cell_size, cell_size)
+    cells = cells.permute(0, 2, 3, 1, 4, 5).contiguous().reshape(N * 81, 1, cell_size, cell_size)
+
+    if loss_cfg.loss_type == "perceptual":
+        clean_sel = images[eligible]
+        clean_cells = clean_sel.unfold(2, cell_size, cell_size).unfold(3, cell_size, cell_size)
+        clean_cells = clean_cells.permute(0, 2, 3, 1, 4, 5).contiguous().reshape(N * 81, 1, cell_size, cell_size)
+        feats_pred = classifier.encoder(cells)
+        with torch.no_grad():
+            feats_ref = classifier.encoder(clean_cells)
+        return F.mse_loss(feats_pred.flatten(1), feats_ref.flatten(1))
+
+    logits = classifier(cells)
+    labels = sol_sel.reshape(N * 81)
+    return F.cross_entropy(logits, labels, ignore_index=IGNORE_LABEL_ID)

@@ -1,3 +1,0 @@
-num_train_timesteps: 100
-beta_schedule: "squaredcos_cap_v2"
-prediction_type: "sample"

@@ -1,6 +1,6 @@
 # CLEVR V1: TRM sees object embeddings + noisy-latent tokens.
 # seq_len = max_objects(10) + grid_size²(16) = 26
-_target_: configs.schemas.ThinkerModelConfig
+_target_: models.trm_wrappers.SpatialTRM
 vocab_size: 10        # placeholder; thinker output tokens
 seq_len: 26
 hidden_size: 512
@@ -20,7 +20,7 @@ halt_exploration_prob: 0.0
 freeze_weights: false
 batch_size: 32
 
-optim:
+optim_cfg:
   _target_: configs.schemas.ThinkerOptimConfig
   lr: 1e-4
   weight_decay: 1.0
