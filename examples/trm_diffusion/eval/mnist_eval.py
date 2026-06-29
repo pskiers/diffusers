@@ -303,9 +303,14 @@ def sample_grids(
 
     if painter_size is None:
         painter_size = getattr(getattr(model, "model_cfg", None), "painter_size", None)
-    if painter_size is None:
-        raise ValueError("painter_size is required (or set model.model_cfg.painter_size)")
-    x = torch.randn(B, 1, painter_size, painter_size, device=device)
+    # Use model.noise_shape when available (handles latent-space models like DiT).
+    # Fall back to pixel-space (1, painter_size, painter_size) for legacy callers.
+    noise_shape = getattr(model, "noise_shape", None)
+    if noise_shape is None:
+        if painter_size is None:
+            raise ValueError("painter_size is required when model has no noise_shape")
+        noise_shape = (1, painter_size, painter_size)
+    x = torch.randn(B, *noise_shape, device=device)
 
     token_offset = getattr(model, "token_offset", 0)
 
@@ -391,7 +396,11 @@ def sample_grids(
 
         x = active_sched.step(noise_pred, t, x).prev_sample
 
-    result: dict = {"generated": x.clamp(0.0, 1.0)}
+    if hasattr(model, "decode_for_eval"):
+        generated = model.decode_for_eval(x)
+    else:
+        generated = x.clamp(0.0, 1.0)
+    result: dict = {"generated": generated}
     if has_logits:
         best_preds_cpu = best_preds.cpu()
         result["best_thinker_preds"] = best_preds_cpu
