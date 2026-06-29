@@ -111,7 +111,7 @@ def main(cfg: DictConfig):
         shuffle=False,
         num_workers=n_workers,
         pin_memory=True,
-        persistent_workers=(n_workers > 0),
+        persistent_workers=False,  # eval iterates the dataloader twice; persistent workers cause fork issues
         timeout=0,
         collate_fn=eval_collate_fn,
     )
