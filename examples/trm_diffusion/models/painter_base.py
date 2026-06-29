@@ -417,6 +417,7 @@ class DiTPainter(PainterBase, BaseModel):
         condition_encoder=None,
         eval_callbacks=None,
         painter_dtype: Optional[str] = None,
+        vae_pixel_range: str = "[-1,1]",
     ):
         super().__init__()
         self.dit: nn.Module = instantiate(dit)
@@ -436,6 +437,9 @@ class DiTPainter(PainterBase, BaseModel):
             if painter_dtype is not None
             else None
         )
+        # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
+        # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
+        self._vae_tanh = vae_pixel_range == "[-1,1]"
 
         for p in self.vae.parameters():
             p.requires_grad_(False)
@@ -455,11 +459,16 @@ class DiTPainter(PainterBase, BaseModel):
 
     def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode latents → [0, 1] pixel images for logging."""
-        return ((self.vae.decode(latents / self.scaling_factor).sample + 1.0) / 2.0).clamp(0.0, 1.0)
+        pixels = self.vae.decode(latents / self.scaling_factor).sample
+        if self._vae_tanh:
+            return ((pixels + 1.0) / 2.0).clamp(0.0, 1.0)
+        return pixels.clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
-        """Convert dataset batch images [-1, 1] → [0, 1] for display."""
-        return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+        """Convert dataset batch images → [0, 1] for display."""
+        if self._vae_tanh:
+            return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+        return images.clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
