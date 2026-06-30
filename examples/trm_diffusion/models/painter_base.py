@@ -357,8 +357,8 @@ class ControlNetSteeredUNetPainter(UNetPainter):
     condition_encoder.  The VAE remains frozen via the parent class.
 
     Can be instantiated directly from Hydra config — no factory wrapper needed.
-    ControlNet residuals and any condition_encoder conditioning are both applied
-    in the inherited forward(); steering residuals are passed via ThinkerSteering.
+    UNet2DModel doesn't accept ControlNet kwargs natively, so forward() manually
+    walks the UNet blocks and injects residuals between the down and up passes.
 
     Args:
         checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
@@ -375,6 +375,77 @@ class ControlNetSteeredUNetPainter(UNetPainter):
         if self.condition_encoder is not None:
             for p in self.condition_encoder.parameters():
                 p.requires_grad_(False)
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        # Extract ControlNet residuals from steering (if any).
+        down_res = mid_res = None
+        if steering is not None:
+            pk = steering.to_painter_kwargs()
+            down_res = pk.get("down_block_additional_residuals")
+            mid_res = pk.get("mid_block_additional_residual")
+
+        if down_res is None and mid_res is None:
+            return super().forward(sample, steering=None)
+
+        # UNet2DModel doesn't natively support ControlNet kwargs, so we manually
+        # walk the blocks and inject residuals between the down and up passes.
+        unet = self.unet
+        x, t = sample.x_noisy, sample.timesteps
+
+        # Time embedding (mirrors UNet2DModel.forward).
+        if not torch.is_tensor(t):
+            t = torch.tensor([t], dtype=torch.long, device=x.device)
+        elif t.ndim == 0:
+            t = t[None].to(x.device)
+        t = t * torch.ones(x.shape[0], dtype=t.dtype, device=t.device)
+        emb = unet.time_embedding(unet.time_proj(t).to(dtype=unet.dtype))
+
+        # conv_in
+        x = unet.conv_in(x)
+
+        # Down pass — collect skip connections.
+        skip_sample = sample.x_noisy
+        down_block_res = (x,)
+        for blk in unet.down_blocks:
+            if hasattr(blk, "skip_conv"):
+                x, res, skip_sample = blk(hidden_states=x, temb=emb, skip_sample=skip_sample)
+            else:
+                x, res = blk(hidden_states=x, temb=emb)
+            down_block_res += res
+
+        # Inject ControlNet down-block residuals.
+        if down_res is not None:
+            down_block_res = tuple(d + r for d, r in zip(down_block_res, down_res))
+
+        # Mid block + ControlNet mid residual.
+        if unet.mid_block is not None:
+            x = unet.mid_block(x, emb)
+        if mid_res is not None:
+            x = x + mid_res
+
+        # Up pass.
+        skip_sample_up = None
+        for blk in unet.up_blocks:
+            n = len(blk.resnets)
+            res = down_block_res[-n:]
+            down_block_res = down_block_res[:-n]
+            if hasattr(blk, "skip_conv"):
+                x, skip_sample_up = blk(x, res, emb, skip_sample_up)
+            else:
+                x = blk(x, res, emb)
+
+        # Post-process.
+        x = unet.conv_norm_out(x)
+        x = unet.conv_act(x)
+        x = unet.conv_out(x)
+        if skip_sample_up is not None:
+            x = x + skip_sample_up
+
+        return DiffusionPrediction(pred=x, pred_type=self.scheduler.config.prediction_type)
 
 
 # ── Generic trainable DiT painter ────────────────────────────────────────────
