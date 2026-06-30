@@ -1,8 +1,9 @@
 """
 models/sampling.py — SamplingPipeline and NoisePredictor hierarchy.
 
-SamplingPipeline owns the DDIM/DDPM denoising loop and builds its scheduler
-from a SchedulerConfig.  Guidance is pluggable via NoisePredictor subclasses:
+SamplingPipeline owns the DDIM/DDPM denoising loop and uses the model's own
+scheduler (model.scheduler) for inference.  Guidance is pluggable via
+NoisePredictor subclasses:
 
     DirectPredictor              — single model call, no guidance
     CFGPredictor(scale)          — classifier-free guidance (2 calls per step)
@@ -11,9 +12,15 @@ from a SchedulerConfig.  Guidance is pluggable via NoisePredictor subclasses:
 These compose: NoisyGuidancePredictor(CFGPredictor(...)) gives CFG + noisy-image
 guidance at 4 model calls per step.
 
+Schedule callables (for NoisyGuidancePredictor.schedule):
+    ConstantSchedule(scale)              — constant weight at every step
+    LinearSchedule(noisy_end, clean_end) — linear interpolation t≈T → t≈0
+
 The model must expose:
     model(sample: DataSample) -> DiffusionPrediction       (forward)
     model.null_condition_sample(sample: DataSample) -> DataSample
+    model.scheduler  (DDPMScheduler / DDIMScheduler with .config and .set_timesteps)
+    model.noise_shape  (C, H, W) tuple, no batch dim
 
 V0 / V1 noisy-guidance separation
 ----------------------------------
@@ -34,7 +41,7 @@ from typing import Callable, Optional
 import torch
 from torch import Tensor
 
-from datasets.data_sample import DataSample
+from datasets.data_sample import DataSample, collate_data_samples
 from models.interfaces import DiffusionPrediction
 
 # ── NoisePredictor hierarchy ──────────────────────────────────────────────────
@@ -51,7 +58,7 @@ class NoisePredictor(ABC):
     def predict(self, model, sample: DataSample, t: int, T: int) -> Tensor:
         """
         Args:
-            model:  exposes predict_noise(DataSample) -> DiffusionPrediction
+            model:  exposes forward(DataSample) -> DiffusionPrediction
                     and null_condition_sample(DataSample) -> DataSample
             sample: DataSample with x_noisy and timesteps already set for step t
             t:      current integer timestep value
@@ -127,111 +134,146 @@ class NoisyGuidancePredictor(NoisePredictor):
 # ── Built-in guidance schedules ───────────────────────────────────────────────
 
 
-def constant_schedule(scale: float) -> Callable[[int, int], float]:
+@dataclass
+class ConstantSchedule:
     """Constant guidance weight at every step."""
-    return lambda t, T: scale
+    scale: float = 1.0
 
-
-def linear_schedule(noisy_end: float, clean_end: float) -> Callable[[int, int], float]:
-    """Linear schedule from noisy_end (t≈T) to clean_end (t≈0).
-
-    Equivalent to the _lin(a, b) helper in eval_noisy_guidance.py:
-        _lin(a, b)  ↔  linear_schedule(noisy_end=a+b, clean_end=a)
-    """
-    return lambda t, T: noisy_end + (clean_end - noisy_end) * (1.0 - t / T)
-
-
-# ── Scheduler config ──────────────────────────────────────────────────────────
+    def __call__(self, t: int, T: int) -> float:
+        return self.scale
 
 
 @dataclass
-class SchedulerConfig:
-    num_train_timesteps: int = 1000
-    beta_schedule: str = "squaredcos_cap_v2"
-    prediction_type: str = "epsilon"
-    num_inference_steps: int = 50
-    sampler: str = "ddim"
+class LinearSchedule:
+    """Linear schedule from noisy_end (t≈T) to clean_end (t≈0).
+
+    Equivalent to the _lin(a, b) helper in eval_noisy_guidance.py:
+        _lin(a, b)  ↔  LinearSchedule(noisy_end=a+b, clean_end=a)
+    """
+    noisy_end: float = 0.0
+    clean_end: float = 1.0
+
+    def __call__(self, t: int, T: int) -> float:
+        return self.noisy_end + (self.clean_end - self.noisy_end) * (1.0 - t / T)
 
 
 # ── SamplingPipeline ──────────────────────────────────────────────────────────
 
 
 class SamplingPipeline:
-    """Owns the DDIM/DDPM denoising loop and builds its scheduler from config.
+    """Owns the DDIM/DDPM denoising loop using the model's own scheduler.
 
     The pipeline is model-agnostic: it only calls
-        model.predict_noise(DataSample) -> DiffusionPrediction
+        model(DataSample) -> DiffusionPrediction
         model.null_condition_sample(DataSample) -> DataSample
+        model.scheduler  (set_timesteps + step)
+        model.noise_shape
+
+    Two entry points:
+        sample_one_batch — for pre-batched DataSamples (e.g. from a dataloader)
+        generate         — for a list of DataSamples; batches them internally
 
     Example — DDIM with CFG:
-        pipeline = SamplingPipeline(SchedulerConfig(sampler="ddim", ...))
-        predictor = CFGPredictor(scale=2.0)
-        images = pipeline.sample(model, sample, predictor, shape=(B,C,H,W), device=device)
+        pipeline = SamplingPipeline(num_inference_steps=20, batch_size=8,
+                                    predictor=CFGPredictor(scale=2.0))
+        images = pipeline.sample_one_batch(model, conditions, device)
 
-    Example — DDIM with CFG + noisy-image guidance:
-        predictor = NoisyGuidancePredictor(
-            inner=CFGPredictor(scale=2.0),
-            schedule=linear_schedule(noisy_end=0.0, clean_end=1.0),
+    Example — CFG + noisy-image guidance:
+        pipeline = SamplingPipeline(
+            num_inference_steps=20, batch_size=8,
+            predictor=NoisyGuidancePredictor(
+                inner=CFGPredictor(scale=2.0),
+                schedule=LinearSchedule(noisy_end=0.0, clean_end=1.0),
+            ),
         )
-        images = pipeline.sample(model, sample, predictor, shape=..., device=...)
     """
 
-    def __init__(self, scheduler_cfg: SchedulerConfig):
-        self.cfg = scheduler_cfg
-        self._scheduler = self._build_scheduler()
+    def __init__(
+        self,
+        num_inference_steps: int = 20,
+        batch_size: int = 8,
+        predictor: Optional[NoisePredictor] = None,
+    ):
+        self.num_inference_steps = num_inference_steps
+        self.batch_size = batch_size
+        self.predictor = predictor if predictor is not None else DirectPredictor()
 
-    def _build_scheduler(self):
-        from diffusers import DDIMScheduler, DDPMScheduler
-
-        kwargs = dict(
-            num_train_timesteps=self.cfg.num_train_timesteps,
-            beta_schedule=self.cfg.beta_schedule,
-            prediction_type=self.cfg.prediction_type,
-        )
-        if self.cfg.sampler == "ddim":
-            return DDIMScheduler(**kwargs)
-        elif self.cfg.sampler == "ddpm":
-            return DDPMScheduler(**kwargs)
-        else:
-            raise ValueError(f"Unknown sampler {self.cfg.sampler!r}. Choose 'ddim' or 'ddpm'.")
+    @property
+    def cfg_scale(self) -> float:
+        """CFG scale if predictor is (or wraps) a CFGPredictor, else 1.0."""
+        p = self.predictor
+        if isinstance(p, NoisyGuidancePredictor):
+            p = p.inner
+        return p.scale if isinstance(p, CFGPredictor) else 1.0
 
     @torch.no_grad()
-    def sample(
+    def sample_one_batch(
         self,
         model,
-        sample: DataSample,
-        predictor: NoisePredictor,
-        shape: tuple,
+        conditions: DataSample,
         device: torch.device,
-        num_inference_steps: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
     ) -> Tensor:
-        """Run the full denoising loop.
+        """Denoise one pre-batched DataSample using the model's scheduler.
 
         Args:
-            model:               model with predict_noise / null_condition_sample
-            sample:              DataSample with static condition fields pre-filled;
-                                 x_noisy and timesteps are overwritten each step.
-            predictor:           NoisePredictor controlling guidance strategy.
-            shape:               (B, C, H, W) shape of the tensor to generate.
-            device:              target device.
-            num_inference_steps: overrides cfg.num_inference_steps for this call.
-            generator:           optional RNG for reproducible initial noise.
+            model:      model with scheduler, noise_shape, and forward
+            conditions: DataSample with static condition fields; must already
+                        have a batch dimension.  x_noisy and timesteps are
+                        set per step by this method.
+            device:     target device.
+            generator:  optional RNG for reproducible initial noise.
 
         Returns:
             (B, C, H, W) denoised output tensor on device.
         """
-        steps = num_inference_steps or self.cfg.num_inference_steps
-        self._scheduler.set_timesteps(steps, device=device)
-        T = self.cfg.num_train_timesteps
+        B = _batch_size_of(conditions)
+        shape = (B, *model.noise_shape)
+        T = model.scheduler.config.num_train_timesteps
 
+        model.scheduler.set_timesteps(self.num_inference_steps, device=device)
         x = torch.randn(shape, device=device, generator=generator)
 
-        for t in self._scheduler.timesteps:
-            t_batch = t.expand(shape[0]).to(device)
-            step_sample = dataclasses.replace(sample, x_noisy=x, timesteps=t_batch)
-
-            noise_pred = predictor.predict(model, step_sample, int(t.item()), T)
-            x = self._scheduler.step(noise_pred, t, x).prev_sample
+        for t in model.scheduler.timesteps:
+            t_batch = t.expand(B).to(device)
+            step_sample = dataclasses.replace(conditions, x_noisy=x, timesteps=t_batch)
+            noise_pred = self.predictor.predict(model, step_sample, int(t.item()), T)
+            x = model.scheduler.step(noise_pred, t, x).prev_sample
 
         return x
+
+    @torch.no_grad()
+    def generate(
+        self,
+        model,
+        conditions: list[DataSample],
+        device: torch.device,
+    ) -> Tensor:
+        """Generate images for a list of DataSamples, batching internally.
+
+        Args:
+            model:      model with scheduler, noise_shape, and forward
+            conditions: list of single-sample DataSamples (no batch dim);
+                        batched internally in chunks of self.batch_size.
+            device:     target device.
+
+        Returns:
+            (N, C, H, W) denoised output tensor where N = len(conditions).
+        """
+        results = []
+        for start in range(0, len(conditions), self.batch_size):
+            chunk = conditions[start : start + self.batch_size]
+            batch = collate_data_samples(chunk).to(device)
+            results.append(self.sample_one_batch(model, batch, device))
+        return torch.cat(results, dim=0)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _batch_size_of(sample: DataSample) -> int:
+    for f in dataclasses.fields(sample):
+        val = getattr(sample, f.name)
+        if val is not None and isinstance(val, Tensor):
+            return val.shape[0]
+    raise ValueError("Cannot determine batch size: all DataSample fields are None.")

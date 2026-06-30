@@ -59,12 +59,14 @@ class ThinkerFrozenPainterBase(BaseModel):
         thinker_painter_translator,
         eval_callbacks=None,
         scheduler=None,
+        sampling_pipeline=None,
     ):
         super().__init__()
 
         # ── Store configs ─────────────────────────────────────────────────────
         self.train_cfg = train_cfg
         self.eval_cfg = eval_cfg
+        self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
 
         # ── Thinker (instantiated from Hydra config; owns optim_cfg) ─────────
         self.thinker = instantiate(thinker)

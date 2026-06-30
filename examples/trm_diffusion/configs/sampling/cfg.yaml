@@ -1,0 +1,7 @@
+# CLEVR CFG sampling — classifier-free guidance with scale 2.0.
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 20
+batch_size: 256
+predictor:
+  _target_: models.sampling.CFGPredictor
+  scale: 2.0

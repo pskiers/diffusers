@@ -30,7 +30,7 @@ except ImportError:
     _wandb = None
 
 from models.eval_callbacks import EvalCallbackBase
-from datasets.data_sample import DataSample, collate_data_samples
+from datasets.data_sample import DataSample
 from datasets.clevr_dataset import CLEVRHybridDataset, make_tensor_from_scene, ORIG_W, ORIG_H
 
 
@@ -48,32 +48,10 @@ def _scene_to_data_sample(scene: dict, mode: str) -> DataSample:
     return DataSample(embedding_conditions=cond_tensor[0], embedding_mask=mask[0])
 
 
-def _batch_to_device(samples: list[DataSample], device: torch.device) -> DataSample:
-    batch = collate_data_samples(samples)
-    return DataSample(
-        embedding_conditions=batch.embedding_conditions.to(device),
-        embedding_mask=batch.embedding_mask.to(device) if batch.embedding_mask is not None else None,
-    )
-
-
-def _generate_images(model, samples: list[DataSample], device: torch.device, cfg_scale: float) -> torch.Tensor:
+def _generate_images(model, samples: list[DataSample], device: torch.device) -> torch.Tensor:
     """Generate and decode images for a list of conditioning DataSamples."""
-    from models.sampling import CFGPredictor, DirectPredictor, SamplingPipeline, SchedulerConfig
-
-    sched_cfg = SchedulerConfig(
-        num_train_timesteps=model.scheduler.config.num_train_timesteps,
-        beta_schedule=model.scheduler.config.beta_schedule,
-        prediction_type=model.scheduler.config.prediction_type,
-        num_inference_steps=model.eval_cfg.num_ddim_steps,
-        sampler="ddim",
-    )
-    pipeline = SamplingPipeline(sched_cfg)
-    predictor = CFGPredictor(cfg_scale) if cfg_scale > 1.0 else DirectPredictor()
-
-    batch = _batch_to_device(samples, device)
-    B = len(samples)
     with torch.no_grad():
-        latents = pipeline.sample(model, batch, predictor, shape=(B, *model.noise_shape), device=device)
+        latents = model.sampling_pipeline.generate(model, samples, device)
     return model.decode_for_eval(latents)  # (B, C, H, W) in [0, 1]
 
 
@@ -113,7 +91,7 @@ class ClevrImageLogCallback(EvalCallbackBase):
             return {}
 
         step = kwargs.get("step", None)
-        imgs = _generate_images(model, self._base_samples, accelerator.device, model.eval_cfg.cfg_scale)
+        imgs = _generate_images(model, self._base_samples, accelerator.device)
 
         if step is not None:
             try:
@@ -154,13 +132,11 @@ class ClevrMetricsCallback(EvalCallbackBase):
         n_samples: int = 100,
         min_objects: int = 3,
         max_objects: int = 10,
-        batch_size: int = 8,
         split: str = "val",
     ):
         self._root_dir = root_dir
         self._mode = mode
         self._n_samples = n_samples
-        self._batch_size = batch_size
         self._split = split
         self._min_objects = min_objects
         self._max_objects = max_objects
@@ -212,24 +188,21 @@ class ClevrMetricsCallback(EvalCallbackBase):
         m = {k: 0 for k in ("t_req", "t_pred", "v_matches", "hallucinations",
                               "c_col", "c_sh", "c_mat", "c_sz", "perf", "t_rel", "c_rel")}
 
-        for start in tqdm(range(0, len(selected), self._batch_size), "CLEVR metrics eval"):
-            batch_scenes = selected[start:start + self._batch_size]
-            cond_samples = [_scene_to_data_sample(s, self._mode) for s in batch_scenes]
+        cond_samples = [_scene_to_data_sample(s, self._mode) for s in selected]
+        imgs = _generate_images(model, cond_samples, device)
 
-            imgs = _generate_images(model, cond_samples, device, model.eval_cfg.cfg_scale)
+        for img_tensor, scene in tqdm(zip(imgs, selected), "CLEVR metrics eval", total=len(selected)):
+            pil_img = Image.fromarray(
+                (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            ).resize((ORIG_W, ORIG_H), Image.BILINEAR)
 
-            for img_tensor, scene in zip(imgs, batch_scenes):
-                pil_img = Image.fromarray(
-                    (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                ).resize((ORIG_W, ORIG_H), Image.BILINEAR)
-
-                inc = _score_image(
-                    pil_img, scene["objects"], scene["relationships"],
-                    H, l_vec, f_vec, sz_thresh,
-                    dino_proc, dino_mod, sig_proc, sig_mod, text_embeds,
-                )
-                for k, v in inc.items():
-                    m[k] += v
+            inc = _score_image(
+                pil_img, scene["objects"], scene["relationships"],
+                H, l_vec, f_vec, sz_thresh,
+                dino_proc, dino_mod, sig_proc, sig_mod, text_embeds,
+            )
+            for k, v in inc.items():
+                m[k] += v
 
         v = max(1, m["v_matches"])
         return {

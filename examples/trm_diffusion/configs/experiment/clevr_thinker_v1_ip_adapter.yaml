@@ -18,6 +18,7 @@ defaults:
   - override /painter: clevr_dit_ip_adapter_frozen
   - override /loss: combined_mse
   - override /eval_callbacks: clevr_image_log
+  - override /sampling: cfg
   - _self_
 
 mode: "thinker_base"

@@ -138,6 +138,7 @@ class UNetPainter(PainterBase, BaseModel):
         condition_encoder=None,
         eval_callbacks=None,
         painter_dtype: Optional[str] = None,
+        sampling_pipeline=None,
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -145,6 +146,7 @@ class UNetPainter(PainterBase, BaseModel):
         self.optim_cfg = optim_cfg
         self.train_cfg = train_cfg
         self.eval_cfg = eval_cfg
+        self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
         self.vae: Optional[nn.Module] = instantiate(vae) if vae is not None else None
         self.scaling_factor = self.vae.config.scaling_factor if self.vae is not None else 1.0
         self.condition_encoder: Optional[nn.Module] = (
@@ -418,8 +420,10 @@ class DiTPainter(PainterBase, BaseModel):
         eval_callbacks=None,
         painter_dtype: Optional[str] = None,
         vae_pixel_range: str = "[-1,1]",
+        sampling_pipeline=None,
     ):
         super().__init__()
+        self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
         self.dit: nn.Module = instantiate(dit)
         self.vae: nn.Module = instantiate(vae)
         self.scaling_factor = self.vae.config.scaling_factor

@@ -105,6 +105,14 @@ class DataSample:
         val = getattr(self, key, None)
         return val if val is not None else default
 
+    def to(self, device) -> DataSample:
+        """Return a new DataSample with all tensors moved to device."""
+        kwargs = {}
+        for f in fields(DataSample):
+            val = getattr(self, f.name)
+            kwargs[f.name] = val.to(device) if isinstance(val, Tensor) else val
+        return DataSample(**kwargs)
+
 
 # ── Collation ────────────────────────────────────────────────────────────────
 

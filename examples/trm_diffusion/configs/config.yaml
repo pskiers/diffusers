@@ -18,6 +18,7 @@ defaults:
   - translator: null
   - loss: null
   - eval_callbacks: null
+  - sampling: null
   - experiment: null
 
 mode: "painter_base"

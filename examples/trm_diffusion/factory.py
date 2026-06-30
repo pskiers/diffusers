@@ -129,11 +129,19 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
     train_cfg = _train_cfg(cfg)
     eval_cfg = _eval_cfg(cfg)
 
+    sampling = cfg.get("sampling")
+
     if mode == "painter_base":
         # Full model is declared under cfg.painter (or cfg.model) with _target_.
-        # scheduler / train_cfg / eval_cfg are the only externally injected args.
+        # scheduler / train_cfg / eval_cfg / sampling_pipeline are injected here.
         model_cfg = cfg.get("model") or cfg.get("painter")
-        return instantiate(model_cfg, scheduler=scheduler, train_cfg=train_cfg, eval_cfg=eval_cfg)
+        return instantiate(
+            model_cfg,
+            scheduler=scheduler,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            sampling_pipeline=sampling,
+        )
 
     if mode == "thinker_base":
         # ThinkerFrozenPainterBase is assembled from separate config groups.
@@ -150,6 +158,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             thinker_painter_translator=cfg.translator,
             eval_callbacks=list(cfg.eval_callbacks) if cfg.get("eval_callbacks") else None,
             scheduler=scheduler,
+            sampling_pipeline=sampling,
         )
 
     raise ValueError(

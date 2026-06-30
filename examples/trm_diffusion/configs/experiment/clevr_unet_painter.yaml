@@ -11,6 +11,7 @@ defaults:
   - override /condition_encoder: clevr_object_unet
   - override /painter: clevr_unet
   - override /eval_callbacks: clevr
+  - override /sampling: cfg
   - _self_
 
 mode: "painter_base"

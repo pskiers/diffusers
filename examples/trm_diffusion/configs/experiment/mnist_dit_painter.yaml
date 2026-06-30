@@ -11,6 +11,7 @@ defaults:
   - override /painter: mnist_dit
   - override /train: mnist
   - override /eval_callbacks: mnist
+  - override /sampling: cfg
   - _self_
 
 mode: "painter_base"

@@ -19,6 +19,7 @@ defaults:
   - override /translator: cross_attn_clevr
   - override /loss: combined_mse
   - override /eval_callbacks: clevr_image_log
+  - override /sampling: cfg
   - _self_
 
 mode: "thinker_base"

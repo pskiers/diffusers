@@ -7,11 +7,9 @@ Callbacks have the signature:
 They are invoked from eval_step after generic loss metrics are computed.
 Models accept a list of callbacks and merge all returned dicts.
 
-Eval parameters (num_ddim_steps, cfg_scale, num_log_images, etc.) are passed
-directly to each callback's constructor.  The model is used only for interface
-methods (scheduler, noise_shape, decode_for_eval, condition_keys,
-null_condition_sample, _batch_to_sample).  Heavy resources like classifiers are
-owned by the callback and loaded in __init__.
+Sampling parameters (num_inference_steps, cfg_scale, batch_size) are owned
+by model.sampling_pipeline rather than individual callbacks.  Callbacks own
+only evaluation-specific knobs: num_samples, num_log_images, cell_size, etc.
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ from eval.mnist_eval import (
     plot_thinker_ts_curve,
     sample_grids,
 )
-from models.sampling import CFGPredictor, DirectPredictor, SamplingPipeline, SchedulerConfig
 from datasets.data_sample import DataSample
 
 
@@ -47,29 +44,20 @@ class ImageGenEvalCallback(EvalCallbackBase):
     """
     DDIM sampling + side-by-side WandB logging for latent painters (CLEVR etc.).
 
-    Uses SamplingPipeline + CFGPredictor from models.sampling with the
-    DataSample interface.  Reads from the model at call time:
-      model.scheduler
+    Uses model.sampling_pipeline for all sampling parameters.  Reads from the
+    model at call time:
+      model.sampling_pipeline
       model.noise_shape     — (C, H, W) tuple, no batch dim
       model.decode_for_eval(z) -> Tensor in [0, 1]
       model.condition_keys   — DataSample fields to pull from batch
       model.null_condition_sample(sample) -> DataSample
 
     Args:
-        num_ddim_steps: number of DDIM inference steps.
         num_log_images: number of images to log to WandB.
-        cfg_scale: classifier-free guidance scale (1.0 = no CFG).
     """
 
-    def __init__(
-        self,
-        num_ddim_steps: int = 20,
-        num_log_images: int = 8,
-        cfg_scale: float = 1.0,
-    ):
-        self.num_ddim_steps = num_ddim_steps
+    def __init__(self, num_log_images: int = 8):
         self.num_log_images = num_log_images
-        self.cfg_scale = cfg_scale
 
     @torch.no_grad()
     def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
@@ -79,17 +67,7 @@ class ImageGenEvalCallback(EvalCallbackBase):
         step = kwargs.get("step", None)
         device = accelerator.device
         n_log = self.num_log_images
-        cfg_scale = self.cfg_scale
-
-        sched_cfg = SchedulerConfig(
-            num_train_timesteps=model.scheduler.config.num_train_timesteps,
-            beta_schedule=model.scheduler.config.beta_schedule,
-            prediction_type=model.scheduler.config.prediction_type,
-            num_inference_steps=self.num_ddim_steps,
-            sampler="ddim",
-        )
-        pipeline = SamplingPipeline(sched_cfg)
-        predictor = CFGPredictor(cfg_scale) if cfg_scale > 1.0 else DirectPredictor()
+        pipeline = model.sampling_pipeline
 
         sample_images, gt_images = [], []
         for batch in dataloader:
@@ -107,7 +85,7 @@ class ImageGenEvalCallback(EvalCallbackBase):
                 sample_kwargs["embedding_mask"] = emb_mask[:B].to(device)
 
             base_sample = DataSample(**sample_kwargs)
-            latents = pipeline.sample(model, base_sample, predictor, shape=(B, *model.noise_shape), device=device)
+            latents = pipeline.sample_one_batch(model, base_sample, device)
             imgs = model.decode_for_eval(latents)
             sample_images.extend(imgs.cpu().unbind(0))
 
@@ -133,7 +111,8 @@ class ImageGenEvalCallback(EvalCallbackBase):
 
 class SudokuDDIMEvalCallback(EvalCallbackBase):
     """
-    DDIM sampling eval for MNIST Sudoku models.
+    DDIM sampling eval for MNIST Sudoku models with full thinker trajectory
+    tracking.  Sampling parameters come from model.sampling_pipeline.
 
     Runs sample_grids with the thinker condition, evaluates with a digit
     classifier, and logs WandB panels + the thinker-timestep accuracy curve.
@@ -148,10 +127,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         cell_size: pixel size of each Sudoku cell.
         include_thinker_metrics: set False to skip thinker accuracy metrics.
         num_samples: total number of samples to evaluate.
-        batch_size: batch size for sampling.
-        num_ddim_steps: number of DDIM inference steps.
         num_log_images: number of images to log to WandB.
-        cfg_scale: classifier-free guidance scale (1.0 = no CFG).
         painter_size: pixel size of the full painter image. If None, derived
                       as cell_size * 9.
     """
@@ -162,19 +138,13 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         cell_size: int = 16,
         include_thinker_metrics: bool = True,
         num_samples: int = 1000,
-        batch_size: int = 64,
-        num_ddim_steps: int = 20,
         num_log_images: int = 8,
-        cfg_scale: float = 1.0,
         painter_size: int | None = None,
     ):
         self.cell_size = cell_size
         self.include_thinker_metrics = include_thinker_metrics
         self.num_samples = num_samples
-        self.batch_size = batch_size
-        self.num_ddim_steps = num_ddim_steps
         self.num_log_images = num_log_images
-        self.cfg_scale = cfg_scale
         self.painter_size = painter_size if painter_size is not None else cell_size * 9
         self.eval_clf = None
         if classifier_path is not None:
@@ -193,9 +163,9 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
             return {}
 
         device = accelerator.device
+        pipeline = model.sampling_pipeline
         painter_size = self.painter_size
         n_total = self.num_samples
-        n_ddim = self.num_ddim_steps
         n_log = self.num_log_images
         token_offset = getattr(model, "token_offset", 0)
 
@@ -209,7 +179,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         panels: list = []
         n_done = 0
 
-        n_batches = (n_total + self.batch_size - 1) // self.batch_size
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
         for batch in tqdm(dataloader, "Sampling eval", total=n_batches):
             if n_done >= n_total:
                 break
@@ -223,12 +193,12 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
                 num_train_timesteps=model.scheduler.config.num_train_timesteps,
                 beta_schedule=model.scheduler.config.beta_schedule,
                 prediction_type=model.scheduler.config.prediction_type,
-                num_steps=n_ddim,
+                num_steps=pipeline.num_inference_steps,
                 device=device,
                 solutions=solutions,
                 painter_size=painter_size,
                 given_masks=given_masks,
-                cfg_scale=self.cfg_scale,
+                cfg_scale=pipeline.cfg_scale,
             )
             acc = evaluate_grids(sr["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_cell_acc.append(acc["cell_acc"])
@@ -315,6 +285,7 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
     """
     Oracle eval for MNIST Sudoku: DDIM sampling with real solution tokens as the
     condition (teacher forcing) to establish an accuracy upper bound.
+    Sampling parameters come from model.sampling_pipeline.
 
     Only runs when model.has_realsolution_eval is True.
 
@@ -324,9 +295,6 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
         classifier_path: same semantics as SudokuDDIMEvalCallback.
         cell_size: pixel size of each Sudoku cell.
         num_samples: total number of samples to evaluate.
-        batch_size: batch size for sampling.
-        num_ddim_steps: number of DDIM inference steps.
-        cfg_scale: classifier-free guidance scale (1.0 = no CFG).
         painter_size: pixel size of the full painter image. If None, derived
                       as cell_size * 9.
     """
@@ -336,16 +304,10 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
         classifier_path: str | None = None,
         cell_size: int = 16,
         num_samples: int = 1000,
-        batch_size: int = 64,
-        num_ddim_steps: int = 20,
-        cfg_scale: float = 1.0,
         painter_size: int | None = None,
     ):
         self.cell_size = cell_size
         self.num_samples = num_samples
-        self.batch_size = batch_size
-        self.num_ddim_steps = num_ddim_steps
-        self.cfg_scale = cfg_scale
         self.painter_size = painter_size if painter_size is not None else cell_size * 9
         self.eval_clf = None
         if classifier_path is not None:
@@ -366,13 +328,13 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
             return {}
 
         device = accelerator.device
+        pipeline = model.sampling_pipeline
         painter_size = self.painter_size
         n_total = self.num_samples
-        n_ddim = self.num_ddim_steps
 
         all_real_cell, all_real_puzzle = [], []
         n_real = 0
-        n_batches = (n_total + self.batch_size - 1) // self.batch_size
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
 
         for batch in tqdm(dataloader, "Realsolution eval", total=n_batches):
             if n_real >= n_total:
@@ -386,12 +348,12 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
                 num_train_timesteps=model.scheduler.config.num_train_timesteps,
                 beta_schedule=model.scheduler.config.beta_schedule,
                 prediction_type=model.scheduler.config.prediction_type,
-                num_steps=n_ddim,
+                num_steps=pipeline.num_inference_steps,
                 device=device,
                 solutions=solutions,
                 painter_size=painter_size,
                 given_masks=given_masks,
-                cfg_scale=self.cfg_scale,
+                cfg_scale=pipeline.cfg_scale,
             )
             acc_r = evaluate_grids(sr_r["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_real_cell.append(acc_r["cell_acc"])
@@ -402,3 +364,101 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
             "real_cell_acc": float(np.mean(all_real_cell)),
             "real_puzzle_acc": float(np.mean(all_real_puzzle)),
         }
+
+
+class SudokuEvalCallback(EvalCallbackBase):
+    """
+    Simple DDIM sampling eval for MNIST Sudoku: sample images then evaluate.
+
+    No thinker trajectory tracking.  Uses model.sampling_pipeline for all
+    sampling parameters.  Logs WandB panels (puzzle | generated | solution).
+
+    Returns: cell_acc, puzzle_acc
+
+    Args:
+        classifier_path: path passed to load_or_train_classifier. If None the
+                         callback is a no-op.
+        cell_size: pixel size of each Sudoku cell.
+        num_samples: total number of samples to evaluate.
+        num_log_images: number of panel images to log to WandB.
+        painter_size: pixel size of the full painter image. If None, derived
+                      as cell_size * 9.
+    """
+
+    def __init__(
+        self,
+        classifier_path: str | None = None,
+        cell_size: int = 16,
+        num_samples: int = 1000,
+        num_log_images: int = 8,
+        painter_size: int | None = None,
+    ):
+        self.cell_size = cell_size
+        self.num_samples = num_samples
+        self.num_log_images = num_log_images
+        self.painter_size = painter_size if painter_size is not None else cell_size * 9
+        self.eval_clf = None
+        if classifier_path is not None:
+            self.eval_clf = load_or_train_classifier(classifier_path, None, cell_size, "cuda")
+            for p in self.eval_clf.parameters():
+                p.requires_grad_(False)
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if self.eval_clf is None or not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "SudokuEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_total = self.num_samples
+        n_log = self.num_log_images
+        token_offset = getattr(model, "token_offset", 0)
+
+        all_cell_acc, all_puzzle_acc = [], []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
+        for batch in tqdm(dataloader, "Sudoku eval", total=n_batches):
+            if n_done >= n_total:
+                break
+            solutions = batch["solution"]
+            given_masks = batch.get("solution_mask")
+            B_cur = solutions.shape[0]
+
+            conditions = model._batch_to_sample(batch, device)
+            generated = pipeline.sample_one_batch(model, conditions, device)
+            generated = model.decode_for_eval(generated)  # (B, 1, H, W) in [0, 1]
+
+            acc = evaluate_grids(generated, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
+            all_cell_acc.append(acc["cell_acc"])
+            all_puzzle_acc.append(acc["puzzle_acc"])
+
+            if _wandb is not None and len(panels) < n_log:
+                n_new = min(n_log - len(panels), B_cur)
+                _sc = batch.get("spatial_conditions")
+                conds_vis = _sc if _sc is not None else batch.get("token_conditions")
+                if conds_vis is not None and conds_vis.dim() == 4:
+                    conds_vis = conds_vis.cpu()
+                sols_np = solutions.cpu().numpy()
+                gen_np = generated.cpu()
+                for i in range(n_new):
+                    cond_img = conds_vis[i] if (conds_vis is not None and conds_vis.dim() == 4) else None
+                    panel = make_panel_image(cond_img, gen_np[i], sols_np[i])
+                    panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_cur
+
+        result: dict = {
+            "cell_acc": float(np.mean(all_cell_acc)),
+            "puzzle_acc": float(np.mean(all_puzzle_acc)),
+        }
+        if panels:
+            result["samples"] = panels
+
+        return result
