@@ -1,5 +1,5 @@
 # Painter-side condition encoder for UNet (512-dim cross-attn).
-_target_: models.clevr_painters.ClevrObjectEncoder
+_target_: models.condition_encoders.ObjectFeatureEncoder
 in_dim: ${data.object_feat_dim}
 hidden_dim: ${backbone.cross_attention_dim}
 out_dim: ${backbone.cross_attention_dim}
