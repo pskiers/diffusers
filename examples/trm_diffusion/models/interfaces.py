@@ -39,6 +39,13 @@ class TRMInput:
     enc_emb: Tensor
     """(B, S, H) — condition embedding tokens."""
 
+    def to_painter_kwargs(self, enc_mask: Optional[Tensor] = None) -> dict:
+        """Convert to DiT/UNet cross-attention kwargs (mirrors ThinkerSteering)."""
+        result: dict = {"encoder_hidden_states": self.enc_emb}
+        if enc_mask is not None:
+            result["encoder_attention_mask"] = enc_mask
+        return result
+
 
 @dataclass
 class TRMOutput:

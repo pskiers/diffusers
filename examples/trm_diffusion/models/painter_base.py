@@ -206,7 +206,8 @@ class UNetPainter(PainterBase, BaseModel):
     ) -> DiffusionPrediction:
         kwargs: dict = {}
         if self.condition_encoder is not None:
-            kwargs.update(self.condition_encoder(sample))
+            args = [getattr(sample, k) for k in self.condition_encoder.condition_keys]
+            kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
         if steering is not None:
             kwargs.update(steering.to_painter_kwargs())
         noise_pred = self.unet(sample.x_noisy, sample.timesteps, **kwargs).sample
@@ -487,7 +488,8 @@ class DiTPainter(PainterBase, BaseModel):
     ) -> DiffusionPrediction:
         kwargs: dict = {}
         if self.condition_encoder is not None:
-            kwargs.update(self.condition_encoder(sample))
+            args = [getattr(sample, k) for k in self.condition_encoder.condition_keys]
+            kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
         if steering is not None:
             kwargs.update(steering.to_painter_kwargs())
         noise_pred = self.dit(sample.x_noisy, timestep=sample.timesteps, **kwargs).sample
