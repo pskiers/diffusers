@@ -30,7 +30,7 @@ except ImportError:
     _wandb = None
 
 from models.eval_callbacks import EvalCallbackBase
-from datasets.data_sample import DataSample
+from datasets.data_sample import DataSample, collate_data_samples
 from datasets.clevr_dataset import CLEVRHybridDataset, make_tensor_from_scene, ORIG_W, ORIG_H
 
 
@@ -49,10 +49,16 @@ def _scene_to_data_sample(scene: dict, mode: str) -> DataSample:
 
 
 def _generate_images(model, samples: list[DataSample], device: torch.device) -> torch.Tensor:
-    """Generate and decode images for a list of conditioning DataSamples."""
-    with torch.no_grad():
-        latents = model.sampling_pipeline.generate(model, samples, device)
-    return model.decode_for_eval(latents)  # (B, C, H, W) in [0, 1]
+    """Generate and decode images for a list of conditioning DataSamples, batched."""
+    pipeline = model.sampling_pipeline
+    imgs = []
+    for start in range(0, len(samples), pipeline.batch_size):
+        chunk = samples[start : start + pipeline.batch_size]
+        with torch.no_grad():
+            batch = collate_data_samples(chunk).to(device)
+            latents = pipeline.sample_one_batch(model, batch, device)
+        imgs.append(model.decode_for_eval(latents))
+    return torch.cat(imgs, dim=0)
 
 
 # ── Image log callback ────────────────────────────────────────────────────────
