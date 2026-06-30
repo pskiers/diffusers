@@ -232,18 +232,13 @@ class ClevrMetricsCallback(EvalCallbackBase):
                     m[k] += v
 
         v = max(1, m["v_matches"])
-        result = {
-            "val/clevr_precision": m["v_matches"] / max(1, m["t_pred"]),
-            "val/clevr_recall": m["v_matches"] / max(1, m["t_req"]),
-            "val/clevr_color_acc": m["c_col"] / v,
-            "val/clevr_shape_acc": m["c_sh"] / v,
-            "val/clevr_material_acc": m["c_mat"] / v,
-            "val/clevr_size_acc": m["c_sz"] / v,
-            "val/clevr_perfect_gen": m["perf"] / v,
-            "val/clevr_spatial_acc": m["c_rel"] / max(1, m["t_rel"]),
+        return {
+            "clevr_precision": m["v_matches"] / max(1, m["t_pred"]),
+            "clevr_recall": m["v_matches"] / max(1, m["t_req"]),
+            "clevr_color_acc": m["c_col"] / v,
+            "clevr_shape_acc": m["c_sh"] / v,
+            "clevr_material_acc": m["c_mat"] / v,
+            "clevr_size_acc": m["c_sz"] / v,
+            "clevr_perfect_gen": m["perf"] / v,
+            "clevr_spatial_acc": m["c_rel"] / max(1, m["t_rel"]),
         }
-
-        if _wandb is not None and step is not None:
-            _wandb.log(result, step=step)
-
-        return result
