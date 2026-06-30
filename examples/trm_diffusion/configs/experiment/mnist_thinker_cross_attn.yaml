@@ -26,5 +26,9 @@ defaults:
 
 mode: "thinker_base"
 
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
 run:
   output_dir: "runs/mnist_thinker_cross_attn"

@@ -23,5 +23,12 @@ defaults:
 
 mode: "thinker_base"
 
+# puzzle_emb is for token-input thinkers; float enc_emb skips the puzzle-emb
+# prepend in _input_embeddings, so z_H would be seq_len+puzzle_emb_len (97)
+# but input_embeddings would be seq_len (81) — mismatch.
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
 run:
   output_dir: "runs/mnist_thinker_controlnet"
