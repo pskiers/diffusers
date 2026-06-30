@@ -42,6 +42,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+from diffusers import UNet2DModel
+from diffusers.models.unets.unet_2d import UNet2DOutput
 from hydra.utils import instantiate
 
 from configs.schemas import PainterOptimConfig, TrainConfig, EvalConfig
@@ -346,6 +348,97 @@ class UNetPainter(PainterBase, BaseModel):
             self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
 
 
+# ── UNet2DModel with ControlNet residual injection ────────────────────────────
+
+
+class ControlPainterUNet(UNet2DModel):
+    """UNet2DModel extended with ControlNet-style residual injection.
+
+    Identical to UNet2DModel except forward() accepts
+    down_block_additional_residuals and mid_block_additional_residual, added to
+    the skip connections before the up-blocks (standard ControlNet math).
+
+    When all UNet parameters are frozen and the noisy input has no grad, the
+    down/mid blocks produce no-grad tensors — PyTorch skips activation storage
+    for those passes automatically.
+    """
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        class_labels=None,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        return_dict: bool = True,
+    ):
+        if self.config.center_input_sample:
+            sample = 2 * sample - 1.0
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        timestep = timestep * torch.ones(sample.shape[0], dtype=timestep.dtype, device=timestep.device)
+        emb = self.time_embedding(self.time_proj(timestep).to(dtype=self.dtype))
+
+        if self.class_embedding is not None:
+            if class_labels is None:
+                raise ValueError("class_labels required for class conditioning")
+            if self.config.class_embed_type == "timestep":
+                class_labels = self.time_proj(class_labels)
+            emb = emb + self.class_embedding(class_labels).to(dtype=self.dtype)
+
+        skip_sample = sample
+        sample = self.conv_in(sample)
+
+        down_block_res_samples = (sample,)
+        for downsample_block in self.down_blocks:
+            if hasattr(downsample_block, "skip_conv"):
+                sample, res_samples, skip_sample = downsample_block(
+                    hidden_states=sample, temb=emb, skip_sample=skip_sample
+                )
+            else:
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
+            down_block_res_samples += res_samples
+
+        if down_block_additional_residuals is not None:
+            new_down = ()
+            for orig, add in zip(down_block_res_samples, down_block_additional_residuals):
+                new_down += (orig + add,)
+            down_block_res_samples = new_down
+
+        if self.mid_block is not None:
+            sample = self.mid_block(sample, emb)
+
+        if mid_block_additional_residual is not None:
+            sample = sample + mid_block_additional_residual
+
+        skip_sample = None
+        for upsample_block in self.up_blocks:
+            res_samples = down_block_res_samples[-len(upsample_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(upsample_block.resnets)]
+            if hasattr(upsample_block, "skip_conv"):
+                sample, skip_sample = upsample_block(sample, res_samples, emb, skip_sample)
+            else:
+                sample = upsample_block(sample, res_samples, emb)
+
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+
+        if skip_sample is not None:
+            sample += skip_sample
+
+        if self.config.time_embedding_type == "fourier":
+            timestep = timestep.reshape((sample.shape[0], *([1] * len(sample.shape[1:]))))
+            sample = sample / timestep
+
+        if not return_dict:
+            return (sample,)
+        return UNet2DOutput(sample=sample)
+
+
 # ── Frozen UNet wrapper for TRM steering ─────────────────────────────────────
 
 
@@ -354,11 +447,8 @@ class ControlNetSteeredUNetPainter(UNetPainter):
 
     Builds the same architecture as the training run (same Hydra config), loads
     weights from a checkpoint produced by train_trm.py, and freezes the UNet and
-    condition_encoder.  The VAE remains frozen via the parent class.
-
-    Can be instantiated directly from Hydra config — no factory wrapper needed.
-    UNet2DModel doesn't accept ControlNet kwargs natively, so forward() manually
-    walks the UNet blocks and injects residuals between the down and up passes.
+    condition_encoder.  The unet is converted to ControlPainterUNet so that
+    steering residuals can be passed directly as kwargs.
 
     Args:
         checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
@@ -370,87 +460,14 @@ class ControlNetSteeredUNetPainter(UNetPainter):
         super().__init__(**kwargs)
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        # Swap the UNet class so forward() accepts ControlNet residual kwargs.
+        # ControlPainterUNet adds only a new forward() — no new instance attributes.
+        self.unet.__class__ = ControlPainterUNet
         for p in self.unet.parameters():
             p.requires_grad_(False)
         if self.condition_encoder is not None:
             for p in self.condition_encoder.parameters():
                 p.requires_grad_(False)
-
-    def forward(
-        self,
-        sample: DataSample,
-        steering: Optional[ThinkerSteering] = None,
-    ) -> DiffusionPrediction:
-        # Extract ControlNet residuals from steering (if any).
-        down_res = mid_res = None
-        if steering is not None:
-            pk = steering.to_painter_kwargs()
-            down_res = pk.get("down_block_additional_residuals")
-            mid_res = pk.get("mid_block_additional_residual")
-
-        if down_res is None and mid_res is None:
-            return super().forward(sample, steering=None)
-
-        # UNet2DModel doesn't natively support ControlNet kwargs, so we manually
-        # walk the blocks and inject residuals between the down and up passes.
-        # The frozen down/mid pass runs under no_grad to avoid storing activations
-        # that aren't needed for gradients — UNet weights are frozen so their
-        # intermediate tensors don't need to be buffered.  Gradients still reach
-        # the trainable translator via the up blocks (which are outside no_grad).
-        unet = self.unet
-        x, t = sample.x_noisy, sample.timesteps
-
-        with torch.no_grad():
-            # Time embedding (mirrors UNet2DModel.forward).
-            if not torch.is_tensor(t):
-                t = torch.tensor([t], dtype=torch.long, device=x.device)
-            elif t.ndim == 0:
-                t = t[None].to(x.device)
-            t = t * torch.ones(x.shape[0], dtype=t.dtype, device=t.device)
-            emb = unet.time_embedding(unet.time_proj(t).to(dtype=unet.dtype))
-
-            # conv_in
-            x = unet.conv_in(x)
-
-            # Down pass — collect skip connections.
-            skip_sample = sample.x_noisy
-            down_block_res = (x,)
-            for blk in unet.down_blocks:
-                if hasattr(blk, "skip_conv"):
-                    x, res, skip_sample = blk(hidden_states=x, temb=emb, skip_sample=skip_sample)
-                else:
-                    x, res = blk(hidden_states=x, temb=emb)
-                down_block_res += res
-
-            # Mid block.
-            if unet.mid_block is not None:
-                x = unet.mid_block(x, emb)
-
-        # Inject ControlNet residuals outside no_grad so grad flows from translator.
-        if down_res is not None:
-            down_block_res = tuple(d + r for d, r in zip(down_block_res, down_res))
-        if mid_res is not None:
-            x = x + mid_res
-
-        # Up pass.
-        skip_sample_up = None
-        for blk in unet.up_blocks:
-            n = len(blk.resnets)
-            res = down_block_res[-n:]
-            down_block_res = down_block_res[:-n]
-            if hasattr(blk, "skip_conv"):
-                x, skip_sample_up = blk(x, res, emb, skip_sample_up)
-            else:
-                x = blk(x, res, emb)
-
-        # Post-process.
-        x = unet.conv_norm_out(x)
-        x = unet.conv_act(x)
-        x = unet.conv_out(x)
-        if skip_sample_up is not None:
-            x = x + skip_sample_up
-
-        return DiffusionPrediction(pred=x, pred_type=self.scheduler.config.prediction_type)
 
 
 # ── Generic trainable DiT painter ────────────────────────────────────────────
