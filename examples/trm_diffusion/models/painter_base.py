@@ -393,37 +393,42 @@ class ControlNetSteeredUNetPainter(UNetPainter):
 
         # UNet2DModel doesn't natively support ControlNet kwargs, so we manually
         # walk the blocks and inject residuals between the down and up passes.
+        # The frozen down/mid pass runs under no_grad to avoid storing activations
+        # that aren't needed for gradients — UNet weights are frozen so their
+        # intermediate tensors don't need to be buffered.  Gradients still reach
+        # the trainable translator via the up blocks (which are outside no_grad).
         unet = self.unet
         x, t = sample.x_noisy, sample.timesteps
 
-        # Time embedding (mirrors UNet2DModel.forward).
-        if not torch.is_tensor(t):
-            t = torch.tensor([t], dtype=torch.long, device=x.device)
-        elif t.ndim == 0:
-            t = t[None].to(x.device)
-        t = t * torch.ones(x.shape[0], dtype=t.dtype, device=t.device)
-        emb = unet.time_embedding(unet.time_proj(t).to(dtype=unet.dtype))
+        with torch.no_grad():
+            # Time embedding (mirrors UNet2DModel.forward).
+            if not torch.is_tensor(t):
+                t = torch.tensor([t], dtype=torch.long, device=x.device)
+            elif t.ndim == 0:
+                t = t[None].to(x.device)
+            t = t * torch.ones(x.shape[0], dtype=t.dtype, device=t.device)
+            emb = unet.time_embedding(unet.time_proj(t).to(dtype=unet.dtype))
 
-        # conv_in
-        x = unet.conv_in(x)
+            # conv_in
+            x = unet.conv_in(x)
 
-        # Down pass — collect skip connections.
-        skip_sample = sample.x_noisy
-        down_block_res = (x,)
-        for blk in unet.down_blocks:
-            if hasattr(blk, "skip_conv"):
-                x, res, skip_sample = blk(hidden_states=x, temb=emb, skip_sample=skip_sample)
-            else:
-                x, res = blk(hidden_states=x, temb=emb)
-            down_block_res += res
+            # Down pass — collect skip connections.
+            skip_sample = sample.x_noisy
+            down_block_res = (x,)
+            for blk in unet.down_blocks:
+                if hasattr(blk, "skip_conv"):
+                    x, res, skip_sample = blk(hidden_states=x, temb=emb, skip_sample=skip_sample)
+                else:
+                    x, res = blk(hidden_states=x, temb=emb)
+                down_block_res += res
 
-        # Inject ControlNet down-block residuals.
+            # Mid block.
+            if unet.mid_block is not None:
+                x = unet.mid_block(x, emb)
+
+        # Inject ControlNet residuals outside no_grad so grad flows from translator.
         if down_res is not None:
             down_block_res = tuple(d + r for d, r in zip(down_block_res, down_res))
-
-        # Mid block + ControlNet mid residual.
-        if unet.mid_block is not None:
-            x = unet.mid_block(x, emb)
         if mid_res is not None:
             x = x + mid_res
 
