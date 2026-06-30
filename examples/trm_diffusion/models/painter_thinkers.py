@@ -10,7 +10,7 @@ from configs.schemas import (
     EvalConfig,
 )
 from models.base import BaseModel
-from models.losses import LossBase
+from models.losses import LossBase, build_loss
 from models.translators import ThinkerPainterTranslatorBase
 from models.condition_encoders import ConditionEncoderBase
 from models.interfaces import TRMOutput, DiffusionPrediction
@@ -83,7 +83,7 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         # ── Condition encoder, loss, translator, eval callbacks ───────────────
         self.condition_encoder: ConditionEncoderBase = instantiate(condition_encoder)
-        self.loss_fn: LossBase = instantiate(loss)
+        self.loss_fn: LossBase = build_loss(train_cfg, self.painter.scheduler)
         self.thinker_painter_translator: ThinkerPainterTranslatorBase = instantiate(thinker_painter_translator)
         self.eval_callbacks: list[EvalCallbackBase] = (
             [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
