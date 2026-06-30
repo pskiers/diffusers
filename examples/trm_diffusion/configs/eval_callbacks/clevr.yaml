@@ -8,4 +8,4 @@
 - _target_: eval.clevr_eval_callbacks.ClevrMetricsCallback
   root_dir: ${data.clevr_root}
   mode: ${data.mode}
-  n_samples: 7680
+  n_samples: 1500
