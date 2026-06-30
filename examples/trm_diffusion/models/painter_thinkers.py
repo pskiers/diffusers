@@ -125,6 +125,18 @@ class ThinkerFrozenPainterBase(BaseModel):
 
     # ── Core model methods ────────────────────────────────────────────────────
 
+    def _batch_to_sample(self, batch, device: torch.device) -> DataSample:
+        """Build a static-condition DataSample from a raw batch for sampling."""
+        _RUNTIME = {"x_noisy", "timesteps", "target", "enc_x_noisy"}
+        kwargs: dict = {}
+        for f in dataclasses.fields(DataSample):
+            if f.name in _RUNTIME:
+                continue
+            val = batch.get(f.name) if hasattr(batch, "get") else None
+            if val is not None:
+                kwargs[f.name] = val.to(device) if isinstance(val, torch.Tensor) else val
+        return DataSample(**kwargs)
+
     def get_initial_states(self, bsz: int):
         return self.thinker.get_initial_states(bsz)
 
