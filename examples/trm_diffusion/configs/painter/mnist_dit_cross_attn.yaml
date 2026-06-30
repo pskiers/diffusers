@@ -1,0 +1,18 @@
+# Standalone DiTPainter for MNIST with cross-attention conditioning.
+# The DiT is trained to denoise conditioned on puzzle grid tokens (via cross-attn).
+# Train this first, then use the checkpoint with mnist_dit_cross_attn_frozen for
+# the thinker stage.
+_target_: models.painter_base.DiTPainter
+_recursive_: false
+dit: ${backbone}
+vae: ${vae}
+painter_dtype: null
+vae_pixel_range: "[0,1]"
+condition_encoder: ${condition_encoder}
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

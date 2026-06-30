@@ -1,0 +1,18 @@
+# Frozen cross-attn DiTPainter for thinker steering.
+# Loads a trained mnist_dit_cross_attn checkpoint; freezes the DiT and its
+# condition encoder. The thinker's CrossAttn translator replaces the
+# condition encoder's cross-attention tokens with thinker-derived tokens.
+_target_: models.painter_base.CrossAttnSteeredDiTPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to mnist_dit_cross_attn_painter checkpoint
+dit: ${backbone}
+vae: ${vae}
+painter_dtype: null
+vae_pixel_range: "[0,1]"
+condition_encoder: ${condition_encoder}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

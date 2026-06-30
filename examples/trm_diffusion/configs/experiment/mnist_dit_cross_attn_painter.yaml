@@ -1,0 +1,27 @@
+# @package _global_
+# Stage 1 (cross-attn path): Train a MNIST DiT with cross-attention conditioning.
+# The DiT learns to denoise conditioned on puzzle-grid tokens (via cross-attention).
+# Train this before mnist_thinker_cross_attn — the checkpoint feeds into the thinker stage.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_dit_cross_attn_painter
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_dit_cross_attn
+  - override /vae: mnist_kl
+  - override /painter: mnist_dit_cross_attn
+  - override /condition_encoder: mnist_spatial_v0
+  - override /train: mnist
+  - override /eval: default
+  - override /eval_callbacks: mnist
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+train:
+  cfg_prob: 0.1  # train with conditional dropout so the DiT handles null cross-attn
+
+run:
+  output_dir: "runs/mnist_dit_cross_attn_painter"

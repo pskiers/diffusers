@@ -1,0 +1,11 @@
+# Condition encoder for standalone mnist_dit_cross_attn_painter training.
+# Encodes the puzzle grid (spatial_conditions) into cross-attention tokens.
+# output_dim references backbone.cross_attention_dim so it stays consistent
+# when used in experiments without a thinker config.
+_target_: models.condition_encoders.SpatialConditionEncoder
+in_channels: 1
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${backbone.cross_attention_dim}
+factor: ${data.cell_size}
+with_timestep_emb: true

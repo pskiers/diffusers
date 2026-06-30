@@ -1,0 +1,30 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen MNIST DiT (cross-attention steering).
+# Requires a trained mnist_dit_cross_attn_painter checkpoint (not mnist_dit_painter —
+# the DiT must have cross_attention_dim=512, trained with mnist_dit_cross_attn backbone).
+# The thinker translator replaces the frozen condition encoder's cross-attn tokens.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_cross_attn \
+#     painter.checkpoint=runs/mnist_dit_cross_attn_painter/checkpoint_final.pt \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_dit_cross_attn
+  - override /vae: mnist_kl
+  - override /painter: mnist_dit_cross_attn_frozen
+  - override /thinker: mnist
+  - override /translator: cross_attn_mnist
+  - override /condition_encoder: spatial_image_v0
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/mnist_thinker_cross_attn"

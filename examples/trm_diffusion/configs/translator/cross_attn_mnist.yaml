@@ -1,0 +1,5 @@
+# CrossAttn translator for MNIST DiT (cross_attention_dim = 512).
+_target_: models.translators.CrossAttnTranslator
+in_dim: ${thinker.hidden_size}
+out_dim: 512
+with_timestep_emb: true

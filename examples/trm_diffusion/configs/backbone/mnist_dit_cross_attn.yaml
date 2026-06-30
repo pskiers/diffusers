@@ -1,0 +1,16 @@
+# MNIST DiT backbone with cross-attention support (for cross-attn thinker steering).
+# Same architecture as mnist_dit but with cross_attention_dim and caption_channels
+# so transformer blocks have cross-attention layers that can accept encoder tokens.
+_target_: diffusers.Transformer2DModel
+num_attention_heads: 8
+attention_head_dim: 64
+in_channels: 4
+out_channels: 4
+num_layers: 3
+sample_size: 36
+patch_size: 4
+norm_type: "ada_norm_single"
+attention_bias: true
+activation_fn: "gelu-approximate"
+cross_attention_dim: 512
+caption_channels: 512

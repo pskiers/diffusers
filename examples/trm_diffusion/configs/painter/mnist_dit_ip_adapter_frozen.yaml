@@ -1,0 +1,16 @@
+# Frozen DiTPainter with trainable IP-Adapter blocks for thinker steering.
+# Loads a trained mnist_dit_painter checkpoint, freezes the DiT backbone,
+# and adds per-block trainable IP cross-attention layers.
+_target_: models.painter_base.IPAdapterSteeredDiTPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to mnist_dit_painter checkpoint
+dit: ${backbone}
+vae: ${vae}
+painter_dtype: null
+vae_pixel_range: "[0,1]"
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1
