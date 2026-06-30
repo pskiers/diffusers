@@ -1,5 +1,5 @@
 # IP-Adapter translator for MNIST DiT (inner_dim = 8*64 = 512).
 _target_: models.translators.IPAdapterTranslator
-in_dim: ${thinker.hidden_size}
+in_dim: ${thinker.vocab_size}
 out_dim: 512
 with_timestep_emb: true
