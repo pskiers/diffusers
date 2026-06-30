@@ -24,13 +24,13 @@ COMMON=(
   conditioning=unconditional
   num_classes=0
   wandb_project="$WANDB_PROJECT"
-  dataset.bot_removal_prob="$BOT_REMOVAL"
-  eval_every_n_epochs="$EVAL_EVERY"
-  num_eval_samples="$NUM_EVAL_SAMPLES"
-  inference_steps="$INFERENCE_STEPS"
-  num_epochs="$EPOCHS"
-  batch_size="$BATCH_SIZE"
-  dataset.total_train_size="$TRAIN_SIZE"
+  # dataset.bot_removal_prob="$BOT_REMOVAL"
+  # eval_every_n_epochs="$EVAL_EVERY"
+  # num_eval_samples="$NUM_EVAL_SAMPLES"
+  # inference_steps="$INFERENCE_STEPS"
+  # num_epochs="$EPOCHS"
+  # batch_size="$BATCH_SIZE"
+  # dataset.total_train_size="$TRAIN_SIZE"
 )
 
 STD="sokoban/bit_diffusion/train_std.py"
@@ -53,7 +53,7 @@ echo
 
 
 # 2) DIFFUSION-TRM
-submit "$TRM" trm trm_no_stopping    use_carry_recycling=true use_carry_persistence=true trm.n_sup_max=3 trm.n_sup_min=1 use_q_loss=false
+# submit "$TRM" trm trm_no_stopping    use_carry_recycling=true use_carry_persistence=true trm.n_sup_max=3 trm.n_sup_min=1 use_q_loss=false
 # submit "$TRM" trm trm_cr_75        use_carry_recycling=true carry_recycle_prob=0.75
 # submit "$TRM" trm trm_cr_50        use_carry_recycling=true carry_recycle_prob=0.5
 # submit "$TRM" trm trm_cr_25        use_carry_recycling=true carry_recycle_prob=0.25
@@ -67,12 +67,14 @@ submit "$TRM" trm trm_no_stopping    use_carry_recycling=true use_carry_persiste
 #   trm.shared_stack=true self_cond=true model.num_layers=4 aux_loss_weight=0.5 \
 #   gradient_accumulation_steps=4 trm.isolate_transform=true
 
-submit "$EMB" embedded emb_big \
-  trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=true \
-  resume_from_checkpoint="'/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond/emb_big/checkpoints/best-epoch=58-step=60416.ckpt'"
+submit "$EMB" embedded emb_gate_shared_trm
 
-submit "$EMB" embedded emb_big_no_self_cond \
-  trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=false weight_tied=true use_gate=true
+# submit "$EMB" embedded emb_big \
+#   trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=true \
+#   resume_from_checkpoint="'/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond/emb_big/checkpoints/best-epoch=58-step=60416.ckpt'"
+
+# submit "$EMB" embedded emb_big_no_self_cond \
+#   trm.num_inner_layers=2 model.num_layers=6 trm.shared_stack=true self_cond=false weight_tied=true use_gate=true
 
 echo
 echo "submitted. monitor: squeue --me   |   logs: trm_sokoban/stdout & stderr"

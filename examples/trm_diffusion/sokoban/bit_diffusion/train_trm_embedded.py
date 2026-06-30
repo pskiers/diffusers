@@ -1,21 +1,17 @@
 """
 Embedded-TRM Bit-Diffusion for Sokoban board generation.
 
-A standard DiT in which EACH transformer layer is augmented with a TRM recursion block
-that refines (changes) that layer's output.
+A standard DiT in which each transformer layer is augmented with a TRM recursion block
+that updates that layer's output.
 
   1. DEEP SUPERVISION: decode an x0 prediction after every layer and apply the diffusion
      loss to each (final weight 1.0, earlier weight aux_loss_weight). The DiT layers act as
      TRM supervision steps: every step is trained to produce a better answer.
   2. INPUT GROUNDING: the patchified noisy image is re-injected at every z-update
-     (z = norm_z(f_z(x + inj + y + z))), exactly like TRM's constant input injection.
-  3. PARAMETER SHARING: each block is reused n_inner*T times per step (huge effective depth
-     at tiny param count). Two OPTIONAL sharing axes:
-     - shared_stack - z and y reuse one block stack, like original TRM's single L_level.
-     - weight_tied - one whole DiT+TRM layer reused for every step, best only at higher depth
-       on tiny data where layer specialization would overfit.
-  4. fp32 CARRY + bf16 COMPUTE: the (y, z) recurrent state is kept in fp32 between iterations
-     while the heavy block matmuls run in the autocast dtype. Use bf16-mixed (NOT fp16).
+     (z = norm_z(f_z(x + inj + y + z))).
+  3. PARAMETER SHARING: each block is reused n_inner*T times per step. Two OPTIONAL sharing axes:
+     - shared_stack - z and y reuse one block stack,
+     - weight_tied - one whole DiT+TRM layer reused for every step.
 
 Architecture:
     board 12x12x3 -> patchify -> inj (144 x D), grounding; y = inj, z = z_init
@@ -26,8 +22,6 @@ Architecture:
             y-step : y_trm = norm_y(f_y(y + z))
             T-loop : T-1 no-grad iterations + 1 with-grad iteration (1-step gradient)
         y = x + y_trm                                # residual refine (refine_residual=True):
-                                                     # keeps a DiT highway across layers instead
-                                                     # of overwriting the stream every step
         x0_step = head(y)                            # deep supervision target
     prediction = x0_step of the last layer
 
@@ -60,11 +54,9 @@ class TRMRefiner(nn.Module):
     """TRM recursion over plain transformer blocks, threading a (y, z) carry.
 
     States (B, L, D):
-      - y : high-level "answer" (also the DiT residual stream)
+      - y : high-level "answer"
       - z : low-level "scratch"
-    Blocks are diffusers ``BasicTransformerBlock(norm_type="layer_norm")`` -> plain self-attn
-    + FFN, NO AdaLN/timestep conditioning (exactly like the original TRM reasoning blocks; the
-    diffusion timestep/class is injected only by the surrounding DiT layer via ``x``).
+    Blocks are diffusers ``BasicTransformerBlock(norm_type="layer_norm")``
     """
     def __init__(
         self,
@@ -117,7 +109,7 @@ class TRMRefiner(nn.Module):
         """One latent recursion: n_inner z-updates (N-loop) then one y-update.
 
         The patchified noisy image is re-added at every z-update for constant input
-        grounding (prevents drift).
+        grounding.
 
         isolate_transform toggles how each block output updates the carry:
           - False (default): the carry is REPLACED by the (normed) block output. The block has
@@ -149,7 +141,7 @@ class TRMRefiner(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Deep recursion: T-1 no-grad iterations + 1 with-grad (1-step gradient).
 
-        T-1 warm-up iterations build NO autograd graph at all. Only the final recur is differentiated, so each layer's backward graph stays shallow (~n_inner+1 block applications) regardless of T.
+        T-1 warm-up iterations build NO autograd graph at all. Only the final recur is differentiated, so each layer's backward graph stays shallow regardless of T.
 
         The carry is deliberately NOT detached between layers (full cross-
         layer BPTT) - fine at the small num_layers used here.
@@ -171,40 +163,53 @@ class TRMDiTLayer(nn.Module):
     """
     def __init__(
         self,
-        dim: int,
-        num_heads: int,
-        head_dim: int,
+        # DiT blocks
+        num_attention_heads_dit: int,
+        attention_head_dim_dit: int,
+        # TRM blocks
+        num_attention_heads_trm: int,
+        attention_head_dim_trm: int,
+        num_layers_trm: int,
+        n_inner: int,
+        T: int,
+        # General
         ffn_mult: int,
         activation_fn: str,
         dropout: float,
         num_embeds_ada_norm: int,
-        n_inner: int,
-        T: int,
-        num_inner_layers: int = 1,
+        trm_model: TRMRefiner | None = None,
+        # Options
         shared_stack: bool = False,
         refine_residual: bool = True,
         isolate_transform: bool = False,
         use_gate: bool = False
     ) -> None:
         super().__init__()
+
         self.refine_residual = refine_residual
         self.use_gate = use_gate
-        if self.use_gate:
-            self.gate = nn.Parameter(torch.zeros(dim))
+
+        dit_dim = num_attention_heads_dit * attention_head_dim_dit
         self.dit = BasicTransformerBlock(
-            dim=dim,
-            num_attention_heads=num_heads,
-            attention_head_dim=head_dim,
+            dim=dit_dim,
+            num_attention_heads=num_attention_heads_dit,
+            attention_head_dim=attention_head_dim_dit,
             dropout=dropout,
             activation_fn=activation_fn,
             num_embeds_ada_norm=num_embeds_ada_norm,
             attention_bias=True,
             norm_type="ada_norm_zero",
-            ff_inner_dim=dim * ffn_mult,
+            ff_inner_dim=dit_dim*ffn_mult,
         )
-        self.trm = TRMRefiner(
-            dim, num_heads, head_dim, ffn_mult, activation_fn, dropout,
-            n_inner, T, num_inner_layers, shared_stack, isolate_transform,
+
+        trm_dim = num_attention_heads_trm * attention_head_dim_trm
+        # Different gate per Layer
+        if self.use_gate:
+            self.gate = nn.Parameter(torch.zeros(trm_dim))
+        # For gating: the same TRM for multiple layers
+        self.trm = trm_model or TRMRefiner(
+            trm_dim, num_attention_heads_trm, attention_head_dim_trm, ffn_mult, activation_fn, dropout,
+            n_inner, T, num_layers_trm, shared_stack, isolate_transform,
         )
 
     def forward(
@@ -231,29 +236,34 @@ class EmbeddedTRMDiffusion(nn.Module):
 
     def __init__(
         self,
+        # DiT blocks
+        num_attention_heads_dit: int,
+        attention_head_dim_dit: int,
+        num_embeds_ada_norm: int,
+        # TRM blocks
+        num_attention_heads_trm: int,
+        attention_head_dim_trm: int,
+        num_layers_trm: int,
+        n_inner: int,
+        T: int,
+        # General
+        num_layers: int,
         resolution: int,
         in_channels: int,
         out_channels: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        num_embeds_ada_norm: int,
-        num_layers: int = 2,
-        n_inner: int = 6,
-        T: int = 3,
-        num_inner_layers: int = 1,
-        shared_stack: bool = False,
-        weight_tied: bool = False,
-        refine_residual: bool = True,
-        isolate_transform: bool = False,
         ffn_mult: int = 4,
         activation_fn: str = "gelu-approximate",
         dropout: float = 0.0,
         patch_size: int = 1,
+        # Experiment options
         use_grid_pos_embed: bool = True,
-        use_gate: bool = False
+        refine_residual: bool = True,
+        shared_stack: bool = False,
+        weight_tied: bool = False,
+        isolate_transform: bool = False,
+        use_gate: bool = False,
     ) -> None:
         super().__init__()
-        dim = num_attention_heads * attention_head_dim
         self.out_channels = out_channels
         self.patch_size = patch_size
         self.h_p = resolution // patch_size
@@ -262,37 +272,56 @@ class EmbeddedTRMDiffusion(nn.Module):
         self.weight_tied = weight_tied
         seq_len = self.h_p * self.w_p
 
-        # Patchify (Conv2d + fixed 2D sincos positional embedding).
+        # Embeddings
+        dim = num_attention_heads_dit * attention_head_dim_dit
         self.patch = PatchEmbed(
             height=resolution, width=resolution, patch_size=patch_size,
             in_channels=in_channels, embed_dim=dim, pos_embed_type="sincos",
         )
-        # Optional learnable grid positional embedding (helps structured-grid tasks).
-        self.grid_pos = nn.Parameter(torch.zeros(1, seq_len, dim)) if use_grid_pos_embed else None
+        self.grid_pos = nn.Parameter(torch.zeros(1, seq_len, dim)) if use_grid_pos_embed else None  # helps structured-grid tasks
         if self.grid_pos is not None:
             nn.init.trunc_normal_(self.grid_pos, std=0.02)
 
-        # DiT layers, each augmented with a TRM refinement block. weight_tied=True builds ONE
-        # layer reused for all steps (full TRM parameter tying); else num_layers distinct layers.
-        n_distinct = 1 if weight_tied else num_layers
-        self.layers = nn.ModuleList([
-            TRMDiTLayer(
-                dim, num_attention_heads, attention_head_dim, ffn_mult, activation_fn, dropout,
-                num_embeds_ada_norm, n_inner, T, num_inner_layers, shared_stack, refine_residual,
-                isolate_transform, use_gate
-            )
-            for _ in range(n_distinct)
-        ])
+        # TRM in different space than DiT
+        trm_dim = num_attention_heads_trm * attention_head_dim_trm
+        if trm_dim != dim:
+            # TODO: VAE / Linear layer?
+            raise NotImplementedError("Different space for TRM not supported yet")
+
+        # DiT layers, each augmented with a TRM refinement block
+        if weight_tied:
+            self.layers = nn.ModuleList([
+                TRMDiTLayer(
+                    num_attention_heads_dit, attention_head_dim_dit, num_attention_heads_trm,
+                    attention_head_dim_trm, num_layers_trm, n_inner, T, ffn_mult,
+                    activation_fn, dropout, num_embeds_ada_norm, None, shared_stack, refine_residual,
+                    isolate_transform, use_gate
+                )
+            ])
+        else:
+            trm_model = TRMRefiner(
+                trm_dim, num_attention_heads_trm, attention_head_dim_trm, ffn_mult, activation_fn,
+                dropout, n_inner, T, num_layers_trm, shared_stack, isolate_transform
+            ) if use_gate else None
+            self.layers = nn.ModuleList([
+                TRMDiTLayer(
+                    num_attention_heads_dit, attention_head_dim_dit, num_attention_heads_trm,
+                    attention_head_dim_trm, num_layers_trm, n_inner, T, ffn_mult,
+                    activation_fn, dropout, num_embeds_ada_norm, trm_model, shared_stack, refine_residual,
+                    isolate_transform, use_gate
+                )
+                for _ in range(num_layers)
+            ])
+
         # AdaLN-"Zero": zero-init each DiT block's modulation Linear -> identity start.
         for layer in self.layers:
             nn.init.zeros_(layer.dit.norm1.linear.weight)
             nn.init.zeros_(layer.dit.norm1.linear.bias)
 
-        # Fixed (non-trained) initial scratch state z; the answer y starts from the grounded input.
+        # Not trained, fixed initial scratch state z; the answer y starts from the grounded input.
         self.register_buffer("z_init", torch.randn(1, seq_len, dim))
 
-        # Output head: AdaLN-Zero modulation (timestep+class) -> unpatchify. Shared across the
-        # per-layer deep-supervision decodes (like TRM's single lm_head).
+        # Output head: AdaLN-Zero modulation, shared across the per-layer deep-supervision decodes.
         self.cond_embed = CombinedTimestepLabelEmbeddings(num_embeds_ada_norm, dim, class_dropout_prob=0.0)
         self.proj_out_1 = nn.Linear(dim, 2 * dim)
         self.norm_out = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -329,7 +358,7 @@ class EmbeddedTRMDiffusion(nn.Module):
             inj = inj + self.grid_pos
         inj = inj.float()
         y = inj                                      # answer starts at the grounded input
-        z = self.z_init.expand(inj.shape[0], -1, -1).contiguous().float()  # scratch carry
+        z = self.z_init.expand(inj.shape[0], -1, -1).contiguous().float()
 
         all_samples: list = []
         for layer in self._iter_layers():
@@ -343,7 +372,6 @@ class EmbeddedTRMDiffusion(nn.Module):
 
 
 class _Output:
-    """Minimal output container matching the Transformer2DModel interface"""
     __slots__ = ("sample", "all_samples")
 
     def __init__(self, sample: torch.Tensor, all_samples=None) -> None:
@@ -381,13 +409,7 @@ class SokobanEmbeddedTRMDiffusion(SokobanBitDiffusion):
         raise ValueError(f"Unsupported prediction_type: {prediction_type}")
 
     def _compute_loss(self, x_bits, class_labels=None, cond_board=None):
-        """Deep-supervision diffusion loss: every layer's x0 prediction is supervised.
-
-        Reuses the base diffusion setup (timestep/noise sampling, CFG dropout, self-conditioning)
-        but runs the model with return_all_steps=True and sums per-layer losses with weights
-        [aux_loss_weight, ..., aux_loss_weight, 1.0], normalized by the weight sum so the loss
-        scale is independent of num_layers.
-        """
+        """Deep-supervision diffusion loss: every layer's x0 prediction is supervised."""
         device = x_bits.device
         B = x_bits.shape[0]
 
@@ -436,25 +458,27 @@ def main(cfg: DictConfig) -> None:
         in_channels = num_bits * self_cond_mult
 
     model = EmbeddedTRMDiffusion(
+        num_attention_heads_dit=cfg.model.num_attention_heads,
+        attention_head_dim_dit=cfg.model.attention_head_dim,
+        num_embeds_ada_norm=num_classes + 1,
+        num_attention_heads_trm=cfg.trm.get("num_attention_heads", cfg.model.num_attention_heads),
+        attention_head_dim_trm=cfg.trm.get("attention_head_dim", cfg.model.attention_head_dim),
+        num_layers_trm=cfg.trm.get("num_inner_layers", 1),
+        n_inner=cfg.trm.n_inner,
+        T=cfg.trm.T,
+        num_layers=cfg.model.num_layers,
         resolution=cfg.resolution,
         in_channels=in_channels,
         out_channels=num_bits,
-        num_attention_heads=cfg.model.num_attention_heads,
-        attention_head_dim=cfg.model.attention_head_dim,
-        num_embeds_ada_norm=num_classes + 1,
-        num_layers=cfg.model.num_layers,
-        n_inner=cfg.trm.n_inner,
-        T=cfg.trm.T,
-        num_inner_layers=cfg.trm.get("num_inner_layers", 1),
-        shared_stack=cfg.trm.get("shared_stack", False),
-        weight_tied=cfg.trm.get("weight_tied", False),
-        refine_residual=cfg.trm.get("refine_residual", True),
-        isolate_transform=cfg.trm.get("isolate_transform", False),
         ffn_mult=cfg.model.get("ffn_mult", 4),
         activation_fn=cfg.model.get("activation_fn", "gelu-approximate"),
         dropout=cfg.model.get("dropout", 0.0),
         patch_size=cfg.model.get("patch_size", 1),
         use_grid_pos_embed=cfg.trm.get("use_grid_pos_embed", True),
+        refine_residual=cfg.trm.get("refine_residual", True),
+        shared_stack=cfg.trm.get("shared_stack", False),
+        weight_tied=cfg.trm.get("weight_tied", False),
+        isolate_transform=cfg.trm.get("isolate_transform", False),
         use_gate=cfg.trm.get("use_gate", False),
     )
 

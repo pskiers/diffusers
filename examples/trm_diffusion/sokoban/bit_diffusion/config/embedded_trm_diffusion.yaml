@@ -11,8 +11,8 @@ resolution: 12
 ddpm_num_train_timesteps: 1000
 beta_schedule: "squaredcos_cap_v2"
 prediction_type: "sample" # "sample" (predict x0) or "epsilon"
-rescale_betas_zero_snr: true
 inference_steps: 400
+rescale_betas_zero_snr: true
 self_cond: true
 
 # --- CFG ---
@@ -22,59 +22,29 @@ guidance_scale: 4.0
 # --- Asymmetric time intervals (sampling only) ---
 time_shift_xi: 0.0
 
+# --- EMA (one update per batch) ---
+ema_decay: 0.9999
+
 #  --- Embedded-TRM recursion ---
 trm:
   n_inner: 6
   T: 3
-  num_inner_layers: 1 # transformer layers per z-/y-stack
-  shared_stack: true # true = one shared block stack for z and y
-  weight_tied: false # true = share ONE DiT+TRM layer across all steps
-  refine_residual: true # true = y = x + TRM(...), false = overwrite y each layer
-  isolate_transform: false # true = add only the block's transform (out - in) to the carry (canonical TRM residual)
-  use_gate: false
+  num_inner_layers: 2 # transformer layers per z-/y-stack
+  num_attention_heads: 4
+  attention_head_dim: 64
   use_grid_pos_embed: true
+  refine_residual: true # true = y = x + TRM(...), false = overwrite y each layer
+  shared_stack: true # true = one shared block stack for z and y
+  use_gate: true # gate before TRM and one TRM per block (DiTs are seperate)
+  weight_tied: false # true = share ONE DiT+TRM layer across all steps
+  isolate_transform: false # true = add only the block's transform (out - in) to the carry (canonical TRM residual)
 
 # --- Deep supervision ---
-# Earlier layers get this weight, the final layer always gets 1.0.
 aux_loss_weight: 0.3
-
-# --- EMA (one update per batch) ---
-ema_decay: 0.9999
-
-# --- Training ---
-num_epochs: 300
-batch_size: 32
-num_workers: 4
-lr: 1e-4
-adam_betas: [0.9, 0.999]
-weight_decay: 1e-4
-warmup_steps: 500
-precision: "bf16-mixed"
-gradient_accumulation_steps: 1 # >1 = accumulate this many batches per optimizer update
-
-# --- Evaluation ---
-eval_every_n_epochs: 50
-num_eval_samples: 128
-save_every_n_epochs: 50
-
-# --- W&B ---
-output_dir: "outputs/embedded_trm_bit_diffusion_sokoban"
-run_name: null
-wandb_project: "Sokoban-EmbeddedTRM-BitDiffusion"
-wandb_group: null
-resume_from_checkpoint: null
-
-# --- Sampling (sample.py) ---
-checkpoint_path: "best"
-num_samples: 256
-sample_batch_size: 64
-log_to_wandb: true # log test metrics back onto the training run
-wandb_run_id: null # explicit run id to resume (else read from the checkpoint dir)
-wandb_entity: null # set only if the run lives under a team entity
 
 # --- DiT backbone ---
 model:
-  num_layers: 2 # number of (DiT layer + TRM block) stages
+  num_layers: 6 # number of (DiT layer + TRM block) stages
   patch_size: 1
   attention_head_dim: 64
   num_attention_heads: 4
@@ -87,8 +57,39 @@ dataset:
   data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4"
   val_data_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-val"
   test_path: "/net/tscratch/people/plgmgrzanka/trm_sokoban/data/12-12-4-test"
-  total_train_size: 1000
-  total_eval_size: 200
+  total_train_size: 65536
+  total_eval_size: 256
   k_values: [3, 8, 10]
   bot_removal_prob: 0.75
   use_dihedral_aug: true # random D4 transform per __getitem__ (on-the-fly)
+
+# --- Training ---
+num_epochs: 600
+batch_size: 64
+num_workers: 4
+lr: 1e-4
+adam_betas: [0.9, 0.999]
+weight_decay: 1e-4
+warmup_steps: 500
+precision: "bf16-mixed"
+gradient_accumulation_steps: 1
+
+# --- Sampling (sample.py) ---
+checkpoint_path: "best"
+num_samples: 256
+sample_batch_size: 64
+log_to_wandb: true # log test metrics back onto the training run
+wandb_run_id: null # explicit run id to resume (else read from the checkpoint dir)
+wandb_entity: null # set only if the run lives under a team entity
+
+# --- Evaluation ---
+eval_every_n_epochs: 50
+num_eval_samples: 256
+save_every_n_epochs: 50
+
+# --- W&B ---
+output_dir: "outputs/embedded_trm_bit_diffusion_sokoban"
+run_name: null
+wandb_project: "Sokoban-Ablation-Uncond"
+wandb_group: null
+resume_from_checkpoint: null
