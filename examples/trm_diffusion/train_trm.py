@@ -22,6 +22,7 @@ Design notes:
 """
 
 import os
+import signal
 import logging
 from pathlib import Path
 
@@ -41,6 +42,30 @@ from models.trm.ema import EMAHelper
 from models.utility_models import strip_compiled_prefix
 
 logger = get_logger(__name__, log_level="INFO")
+
+
+# ── Step timeout (catches torch.compile / triton hangs) ───────────────────────
+
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError("Training/eval step exceeded the configured timeout.")
+
+
+class _StepTimeout:
+    """Context manager: raises TimeoutError if the block takes > `seconds`."""
+
+    def __init__(self, seconds: int):
+        self._seconds = seconds
+
+    def __enter__(self):
+        if self._seconds > 0:
+            signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(self._seconds)
+        return self
+
+    def __exit__(self, *_):
+        if self._seconds > 0:
+            signal.alarm(0)
 
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
@@ -112,6 +137,7 @@ def main(cfg: DictConfig):
         shuffle=False,
         num_workers=0,  # eval iterates the dataloader twice; forking after CUDA init causes worker segfaults
         pin_memory=False,
+        drop_last=True,  # keeps batch size constant so torch.compile never sees a new shape
         collate_fn=eval_collate_fn,
     )
 
@@ -180,6 +206,8 @@ def main(cfg: DictConfig):
     save_every = cfg.eval.save_every
     log_every = cfg.eval.log_every
     grad_accum_steps = cfg.train.get("gradient_accumulation_steps", 1)
+    train_timeout: int = cfg.train.get("step_timeout", 600)
+    eval_timeout: int = cfg.eval.get("step_timeout", 3600)
 
     next_log = log_every
     next_eval = eval_every
@@ -206,14 +234,15 @@ def main(cfg: DictConfig):
         unwrapped.train()
         micro_batches = [_next_batch() for _ in range(grad_accum_steps)]
 
-        metrics, lr, global_step = unwrapped.train_step(
-            micro_batches,
-            accelerator,
-            optimizers,
-            ema_helper,
-            global_batch_size,
-            global_step,
-        )
+        with _StepTimeout(train_timeout):
+            metrics, lr, global_step = unwrapped.train_step(
+                micro_batches,
+                accelerator,
+                optimizers,
+                ema_helper,
+                global_batch_size,
+                global_step,
+            )
 
         log_dict = {f"train/{k}": v for k, v in metrics.items()}
         log_dict["train/lr"] = lr
@@ -232,7 +261,8 @@ def main(cfg: DictConfig):
                 live_params = [p.data.clone() for p in unwrapped.parameters() if p.requires_grad]
                 ema_helper.ema(unwrapped)
 
-            val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step)
+            with _StepTimeout(eval_timeout):
+                val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step)
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
 
             if ema_helper is not None:
