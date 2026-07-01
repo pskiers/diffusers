@@ -42,7 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from diffusers import UNet2DModel
+from diffusers import UNet2DConditionModel, UNet2DModel
 from diffusers.models.unets.unet_2d import UNet2DOutput
 from hydra.utils import instantiate
 
@@ -460,9 +460,10 @@ class ControlNetSteeredUNetPainter(UNetPainter):
         super().__init__(**kwargs)
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
-        # Swap the UNet class so forward() accepts ControlNet residual kwargs.
-        # ControlPainterUNet adds only a new forward() — no new instance attributes.
-        self.unet.__class__ = ControlPainterUNet
+        # UNet2DConditionModel already accepts ControlNet residual kwargs natively.
+        # Only swap to ControlPainterUNet for plain UNet2DModel (pixel-space UNets).
+        if not isinstance(self.unet, UNet2DConditionModel):
+            self.unet.__class__ = ControlPainterUNet
         for p in self.unet.parameters():
             p.requires_grad_(False)
         if self.condition_encoder is not None:
