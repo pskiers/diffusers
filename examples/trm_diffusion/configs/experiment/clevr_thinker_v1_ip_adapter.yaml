@@ -17,7 +17,7 @@ defaults:
   - override /condition_encoder: object_feature_v1
   - override /painter: clevr_dit_ip_adapter_frozen
   - override /loss: combined_mse
-  - override /eval_callbacks: clevr_image_log
+  - override /eval_callbacks: clevr
   - override /sampling: cfg
   - _self_
 

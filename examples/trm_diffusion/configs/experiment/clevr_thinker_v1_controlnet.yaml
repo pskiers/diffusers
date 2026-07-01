@@ -18,7 +18,7 @@ defaults:
   - override /painter: clevr_unet_controlnet_frozen
   - override /translator: controlnet_clevr_v1
   - override /loss: combined_mse
-  - override /eval_callbacks: clevr_image_log
+  - override /eval_callbacks: clevr
   - override /sampling: cfg
   - _self_
 

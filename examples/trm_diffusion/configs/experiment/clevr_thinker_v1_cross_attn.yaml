@@ -18,7 +18,7 @@ defaults:
   - override /painter: clevr_dit_cross_attn_frozen
   - override /translator: cross_attn_clevr
   - override /loss: combined_mse
-  - override /eval_callbacks: clevr_image_log
+  - override /eval_callbacks: clevr
   - override /sampling: cfg
   - _self_
 
