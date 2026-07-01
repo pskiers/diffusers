@@ -51,7 +51,7 @@ from models.utility_models import strip_compiled_prefix
 from datasets.data_sample import DataSample
 from models.base import BaseModel
 from models.diffusion_utils import apply_noisy_swap
-from models.interfaces import DiffusionPrediction, ThinkerSteering
+from models.interfaces import DiffusionPrediction, IPAdapterSteering, ThinkerSteering
 from models.losses import LossBase, build_loss
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 
@@ -820,3 +820,19 @@ class IPAdapterSteeredDiTPainter(CrossAttnSteeredDiTPainter):
         self.dit.transformer_blocks = nn.ModuleList(
             [_IPAdapterDiTBlock(blk, D, H) for blk in self.dit.transformer_blocks]
         )
+        # Snapshot the DiT's patch positional embeddings (1, N_patches, D).
+        # Added to IP tokens in forward() so cross-attention has the same spatial
+        # coordinates as the DiT queries — cells near patch (i,j) naturally attend
+        # to the token for cell (i,j) without needing CE supervision to learn it.
+        self.register_buffer(
+            "_ip_pos_embed",
+            self.dit.pos_embed.pos_embed.detach().clone(),
+        )
+
+    def forward(self, sample: DataSample, steering=None) -> DiffusionPrediction:
+        if steering is not None and isinstance(steering, IPAdapterSteering):
+            pos = self._ip_pos_embed.to(steering.ip_hidden_states.dtype)
+            steering = IPAdapterSteering(
+                ip_hidden_states=steering.ip_hidden_states + pos
+            )
+        return super().forward(sample, steering)
