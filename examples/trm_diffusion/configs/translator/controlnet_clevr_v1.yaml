@@ -1,0 +1,12 @@
+# ControlNet translator for CLEVR V1 thinker (seq_len=74: 10 objects + 64 spatial).
+# seq_len=74 is projected to grid²=64 via a learned linear before spatial reshape.
+# painter_size=32: SDXL VAE compresses 256px → 32×32 latent.
+_target_: models.translators.ControlNetTranslator
+in_channels: ${thinker.vocab_size}
+painter_channels: [128, 256, 256]
+layers_per_block: 2
+painter_size: 32
+grid: 8
+seq_len: ${thinker.seq_len}
+bridge_mode: "softmax"
+with_timestep_emb: true

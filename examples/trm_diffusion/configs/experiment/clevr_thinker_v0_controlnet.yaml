@@ -1,0 +1,31 @@
+# @package _global_
+# Stage 2: TRM thinker (V0, ControlNet) with frozen CLEVR UNet.
+# V0 = TRM sees object embeddings only (seq_len=10).
+#
+# Usage:
+#   python train_trm.py experiment=clevr_thinker_v0_controlnet \
+#     painter.checkpoint=runs/clevr_unet_painter/checkpoint_final.pt \
+#     data.clevr_root=/path/to/clevr
+
+defaults:
+  - override /data: clevr
+  - override /train: clevr_thinker
+  - override /eval: clevr_thinker
+  - override /thinker: clevr_v0
+  - override /backbone: clevr_unet
+  - override /vae: sdxl
+  - override /condition_encoder: object_feature
+  - override /painter: clevr_unet_controlnet_frozen
+  - override /translator: controlnet_clevr_v0
+  - override /loss: combined_mse
+  - override /eval_callbacks: clevr_image_log
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/clevr_thinker_v0_controlnet"
+
+data:
+  mode: "reduced"

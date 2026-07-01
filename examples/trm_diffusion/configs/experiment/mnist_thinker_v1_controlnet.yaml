@@ -1,0 +1,32 @@
+# @package _global_
+# Stage 2: TRM thinker (V1, ControlNet) with frozen MNIST UNet.
+# V1 = TRM sees condition image + noisy input (NoisySpatialConditionEncoder).
+# The encoder handles noisy dropout internally (noisy_dropout_p_max=0.7).
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_v1_controlnet \
+#     painter.checkpoint=runs/mnist_unet_painter/checkpoint_final.pt \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_unet
+  - override /painter: mnist_unet_controlnet_frozen
+  - override /thinker: mnist
+  - override /translator: controlnet
+  - override /condition_encoder: spatial_image_v1
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
+run:
+  output_dir: "runs/mnist_thinker_v1_controlnet"

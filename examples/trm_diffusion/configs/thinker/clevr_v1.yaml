@@ -1,8 +1,8 @@
 # CLEVR V1: TRM sees object embeddings + noisy-latent tokens.
-# seq_len = max_objects(10) + grid_size²(16) = 26
+# seq_len = max_objects(10) + grid_size²(64) = 74
 _target_: models.trm_wrappers.SpatialTRM
 vocab_size: 10        # placeholder; thinker output tokens
-seq_len: 26
+seq_len: 74
 hidden_size: 512
 n_heads: 8
 L_layers: 2

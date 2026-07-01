@@ -144,10 +144,19 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         grid: int,
         bridge_mode: str = "logits",
         thinker_out_channels: Optional[int] = None,
+        seq_len: Optional[int] = None,
         with_timestep_emb: bool = False,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode)
         self.painter_size = painter_size
+
+        # Project sequence length to grid² when they don't match (e.g. CLEVR
+        # max_objects=10 → 4×4, or V1 seq_len=74 → 8×8). None = identity (MNIST).
+        self.seq_proj = (
+            nn.Linear(seq_len, grid * grid, bias=False)
+            if seq_len is not None and seq_len != grid * grid
+            else None
+        )
 
         if thinker_out_channels is not None and thinker_out_channels != in_channels:
             self.logit_expand = nn.Linear(in_channels, thinker_out_channels, bias=False)
@@ -173,6 +182,9 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         logits = trm_output.logits
         if self.logit_expand is not None:
             logits = self.logit_expand(logits.float())
+        if self.seq_proj is not None:
+            # (B, N, C) → (B, C, N) → Linear(N→grid²) → (B, C, grid²) → (B, grid², C)
+            logits = self.seq_proj(logits.float().transpose(1, 2)).transpose(1, 2)
         spatial = self._logits_to_spatial(logits)
         spatial = F.interpolate(spatial, size=self.painter_size, mode="bilinear", align_corners=False)
         down_res, mid_res = self.control_pyramid(spatial)
