@@ -156,7 +156,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             condition_encoder=cfg.condition_encoder,
             loss=cfg.loss,
             thinker_painter_translator=cfg.translator,
-            eval_callbacks=list(cfg.eval_callbacks) if cfg.get("eval_callbacks") else None,
+            eval_callbacks=cfg.get("eval_callbacks") or None,
             scheduler=scheduler,
             sampling_pipeline=sampling,
         )
