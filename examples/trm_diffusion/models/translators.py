@@ -34,7 +34,11 @@ class ThinkerPainterTranslatorBase(nn.Module):
     Args:
         grid:        thinker output grid size (seq_len = grid*grid)
         bridge_mode: how to convert logits to spatial map —
-                     "logits" (raw floats), "softmax", or "onehot"
+                     "logits" (raw floats), "softmax", "onehot", or "normalized"
+                     (per-channel BatchNorm1d; for continuous/latent thinker
+                     outputs that aren't actually class logits)
+        bridge_channels: number of channels the spatial map will have; required
+                     when bridge_mode="normalized" (to size the BatchNorm1d).
     """
 
     condition_keys: list[str] = []
@@ -42,10 +46,14 @@ class ThinkerPainterTranslatorBase(nn.Module):
     The model passes ``{k: getattr(sample, k) for k in condition_keys}``
     as keyword arguments to forward."""
 
-    def __init__(self, grid: int, bridge_mode: str = "logits"):
+    def __init__(self, grid: int, bridge_mode: str = "logits", bridge_channels: Optional[int] = None):
         super().__init__()
         self._grid = grid
         self._bridge_mode = bridge_mode
+        if bridge_mode == "normalized":
+            if bridge_channels is None:
+                raise ValueError("bridge_mode='normalized' requires bridge_channels")
+            self._norm = nn.BatchNorm1d(bridge_channels)
 
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         """(B, N, C) → (B, C, grid, grid) using self._bridge_mode."""
@@ -57,6 +65,9 @@ class ThinkerPainterTranslatorBase(nn.Module):
             return onehot.transpose(1, 2).reshape(B, C, self._grid, self._grid)
         elif self._bridge_mode == "softmax":
             return logits.float().softmax(dim=-1).transpose(1, 2).reshape(B, C, self._grid, self._grid)
+        elif self._bridge_mode == "normalized":
+            normed = self._norm(logits.float().transpose(1, 2))  # (B, C, N)
+            return normed.reshape(B, C, self._grid, self._grid)
         else:
             return logits.float().transpose(1, 2).reshape(B, C, self._grid, self._grid)
 
@@ -147,7 +158,16 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         seq_len: Optional[int] = None,
         with_timestep_emb: bool = False,
     ):
-        super().__init__(grid=grid, bridge_mode=bridge_mode)
+        if thinker_out_channels is not None and thinker_out_channels != in_channels:
+            ctrl_in = thinker_out_channels
+        else:
+            ctrl_in = in_channels
+
+        super().__init__(
+            grid=grid,
+            bridge_mode=bridge_mode,
+            bridge_channels=ctrl_in if bridge_mode == "normalized" else None,
+        )
         self.painter_size = painter_size
 
         # Project sequence length to grid² when they don't match (e.g. CLEVR
@@ -158,12 +178,11 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
             else None
         )
 
-        if thinker_out_channels is not None and thinker_out_channels != in_channels:
-            self.logit_expand = nn.Linear(in_channels, thinker_out_channels, bias=False)
-            ctrl_in = thinker_out_channels
-        else:
-            self.logit_expand = None
-            ctrl_in = in_channels
+        self.logit_expand = (
+            nn.Linear(in_channels, thinker_out_channels, bias=False)
+            if thinker_out_channels is not None and thinker_out_channels != in_channels
+            else None
+        )
 
         self.control_pyramid = ConditioningPyramid(
             in_channels=ctrl_in,

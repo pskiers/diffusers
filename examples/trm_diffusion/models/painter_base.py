@@ -141,6 +141,7 @@ class UNetPainter(PainterBase, BaseModel):
         eval_callbacks=None,
         painter_dtype: Optional[str] = None,
         sampling_pipeline=None,
+        vae_pixel_range: str = "[-1,1]",
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -151,6 +152,9 @@ class UNetPainter(PainterBase, BaseModel):
         self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
         self.vae: Optional[nn.Module] = instantiate(vae) if vae is not None else None
         self.scaling_factor = self.vae.config.scaling_factor if self.vae is not None else 1.0
+        # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
+        # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
+        self._vae_tanh = vae_pixel_range == "[-1,1]"
         self.condition_encoder: Optional[nn.Module] = (
             instantiate(condition_encoder) if condition_encoder is not None else None
         )
@@ -179,17 +183,21 @@ class UNetPainter(PainterBase, BaseModel):
         """Decode latents → [0, 1] pixel images for logging."""
         if self.vae is not None:
             imgs = self.vae.decode(latents / self.scaling_factor).sample
-            return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
+            if self._vae_tanh:
+                return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
+            return imgs.clamp(0.0, 1.0)
         return latents.clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
         """Convert dataset batch images → [0, 1] for display.
 
-        Latent-space models receive [-1, 1] images from the dataset (VAE convention).
-        Pixel-space models receive [0, 1] images directly.
+        Latent-space models receive dataset images in whatever range their VAE
+        was trained on (vae_pixel_range). Pixel-space models receive [0, 1] directly.
         """
         if self.vae is not None:
-            return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+            if self._vae_tanh:
+                return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+            return images.clamp(0.0, 1.0)
         return images.clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
