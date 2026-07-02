@@ -837,3 +837,70 @@ class IPAdapterSteeredDiTPainter(CrossAttnSteeredDiTPainter):
                 ip_hidden_states=steering.ip_hidden_states + pos
             )
         return super().forward(sample, steering)
+
+
+# ── Direct (index-matched) IP-Adapter frozen DiT wrapper ─────────────────────
+
+
+class _DirectIPAdapterDiTBlock(nn.Module):
+    """Wraps a single frozen DiT block with index-matched IP injection.
+
+    Unlike _IPAdapterDiTBlock, this skips Q/K attention entirely: it requires
+    ip_hidden_states to already be aligned 1:1 with the block's patch sequence
+    (same length N == S, same raster order) and adds token i's projected value
+    directly to patch i. The correspondence between "thinker token" and "output
+    patch" is therefore fixed by tensor position, not learned via a softmax
+    lookup — the same guarantee ControlNet residuals get from being added at
+    matching feature-map positions.
+
+    Zero-init on to_out_ip means no effect at the start of training — the model
+    begins identical to the frozen painter.
+    """
+
+    def __init__(self, block: nn.Module, hidden_dim: int) -> None:
+        super().__init__()
+        self.block = block
+        self.to_v_ip = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.to_out_ip = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.to_out_ip.weight)
+
+    def forward(self, hidden_states: torch.Tensor, cross_attention_kwargs=None, **kwargs) -> torch.Tensor:
+        ip_hs = None
+        inner_cak = cross_attention_kwargs
+        if cross_attention_kwargs is not None and "ip_hidden_states" in cross_attention_kwargs:
+            ip_hs = cross_attention_kwargs["ip_hidden_states"]
+            inner_cak = {k: v for k, v in cross_attention_kwargs.items() if k != "ip_hidden_states"} or None
+
+        out = self.block(hidden_states, cross_attention_kwargs=inner_cak, **kwargs)
+        if ip_hs is not None:
+            if ip_hs.shape[1] != out.shape[1]:
+                raise ValueError(
+                    "DirectIPAdapterSteeredDiTPainter requires ip_hidden_states to be "
+                    f"aligned 1:1 with the DiT's patch sequence (got {ip_hs.shape[1]} "
+                    f"tokens vs {out.shape[1]} patches)."
+                )
+            out = out + self.to_out_ip(self.to_v_ip(ip_hs))
+        return out
+
+
+class DirectIPAdapterSteeredDiTPainter(DiTPainter):
+    """Frozen DiTPainter with trainable, index-matched IP conditioning.
+    Args:
+        checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
+                    (must contain a "model_state" key).
+        **kwargs:   forwarded verbatim to DiTPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        for p in self.dit.parameters():
+            p.requires_grad_(False)
+        if self.condition_encoder is not None:
+            for p in self.condition_encoder.parameters():
+                p.requires_grad_(False)
+        D = self.dit.config.num_attention_heads * self.dit.config.attention_head_dim
+        self.dit.transformer_blocks = nn.ModuleList(
+            [_DirectIPAdapterDiTBlock(blk, D) for blk in self.dit.transformer_blocks]
+        )
