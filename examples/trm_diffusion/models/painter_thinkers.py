@@ -215,15 +215,25 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         Zeros both thinker condition_encoder keys and painter condition_keys so both
         the thinker encoding and the painter cross-attention receive null input.
-        enc_x_noisy is also zeroed when set.
+
+        "x_noisy" is special-cased: it's the painter's actual denoising target
+        (x_t), not a droppable conditioning field. If a condition encoder reads
+        it (e.g. ObjectFeatureEncoderV1's self-conditioning on the noisy latent),
+        the null view is given via enc_x_noisy instead — mirroring
+        _encode_condition's fallback — so the painter still denoises the real
+        x_t while the encoder sees zeros.
         """
         all_keys = set(self.condition_encoder.condition_keys) | set(self.painter.condition_keys)
+        needs_null_noisy_view = "x_noisy" in all_keys
+        droppable_keys = all_keys - {"x_noisy"}
         updates = {
             k: torch.zeros_like(getattr(sample, k))
-            for k in all_keys
+            for k in droppable_keys
             if getattr(sample, k, None) is not None
         }
-        if sample.enc_x_noisy is not None:
+        if needs_null_noisy_view and sample.x_noisy is not None:
+            updates["enc_x_noisy"] = torch.zeros_like(sample.x_noisy)
+        elif sample.enc_x_noisy is not None:
             updates["enc_x_noisy"] = torch.zeros_like(sample.enc_x_noisy)
         return dataclasses.replace(sample, **updates)
 
