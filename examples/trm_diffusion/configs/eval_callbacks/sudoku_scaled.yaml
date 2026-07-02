@@ -1,0 +1,8 @@
+# Use with data=mnist_sudoku_scaled: crops each generated image to its
+# non-background content bounding box and resizes back to painter_size
+# before running the standard cell classifier (see ScaledSudokuEvalCallback).
+- _target_: models.eval_callbacks.ScaledSudokuEvalCallback
+  classifier_path: runs/mnist_classifier_cell16.pt
+  cell_size: 16
+  num_samples: 7680
+  num_log_images: 8

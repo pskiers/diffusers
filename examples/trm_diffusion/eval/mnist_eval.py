@@ -194,6 +194,43 @@ def evaluate_grids(
     return {"cell_acc": cell_acc, "puzzle_acc": puzzle_acc, "preds": preds.cpu()}
 
 
+@torch.no_grad()
+def extract_and_resize_sudoku(
+    images: torch.Tensor,        # (B, 1, H, W) float32 [0, 1]
+    size: int,
+    threshold: float = 0.05,
+) -> torch.Tensor:
+    """Crop each image to its non-background content bounding box, then resize
+    back to (size, size).
+
+    For models trained on MNISTSudokuScaledDataset, the solved grid is pasted
+    onto a black canvas at a random scale/offset, so the generated image can't
+    be unfold-into-9x9-cells directly like evaluate_grids expects — the true
+    scale/position isn't known at generation time and has to be recovered from
+    the image itself. Falls back to the full image if nothing clears the
+    threshold (e.g. a failed/blank generation).
+
+    Returns: (B, 1, size, size) float32 [0, 1]
+    """
+    B, C, H, W = images.shape
+    out = torch.empty(B, C, size, size, dtype=images.dtype, device=images.device)
+    for i in range(B):
+        img = images[i]
+        mask = img.amax(dim=0) > threshold  # (H, W)
+        rows = mask.any(dim=1).nonzero(as_tuple=True)[0]
+        cols = mask.any(dim=0).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0 or cols.numel() == 0:
+            crop = img
+        else:
+            r0, r1 = rows[0].item(), rows[-1].item() + 1
+            c0, c1 = cols[0].item(), cols[-1].item() + 1
+            crop = img[:, r0:r1, c0:c1]
+        out[i] = F.interpolate(
+            crop.unsqueeze(0), size=(size, size), mode="bilinear", align_corners=False
+        )[0]
+    return out
+
+
 # ── DDIM sampling ─────────────────────────────────────────────────────────────
 
 def _build_denoising_schedule(

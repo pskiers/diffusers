@@ -22,6 +22,7 @@ If `downscale=True` (default False), MNIST images are downsampled from 28×28 to
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Optional
 
@@ -198,6 +199,45 @@ class MNISTSudokuDataset(Dataset):
         )
 
     collate_fn = staticmethod(collate_data_samples)
+
+
+class MNISTSudokuScaledDataset(MNISTSudokuDataset):
+    """
+    Same puzzle/conditioning as MNISTSudokuDataset, but the diffusion target
+    (``images``) is the solved grid randomly scaled down and pasted onto a
+    black canvas at a random offset. ``spatial_conditions`` and every other
+    field are unchanged, so the model is given the same puzzle hints but must
+    paint the solution at an unknown scale and position.
+
+    Args:
+        scale_min, scale_max: the solved grid is resized to a random fraction
+            of the full resolution drawn uniformly from [scale_min, scale_max]
+            before being pasted at a random offset.
+    """
+
+    def __init__(self, *args, scale_min: float = 0.8, scale_max: float = 0.9, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    def __getitem__(self, idx: int) -> DataSample:
+        sample = super().__getitem__(idx)
+        images = sample.images  # (1, H, W)
+        full_size = images.shape[-1]
+
+        scale = self._rng.uniform(self.scale_min, self.scale_max)
+        new_size = max(1, round(full_size * scale))
+        resized = F.interpolate(
+            images.unsqueeze(0), size=(new_size, new_size), mode="bilinear", align_corners=False
+        ).squeeze(0)
+
+        canvas = torch.zeros_like(images)
+        max_off = full_size - new_size
+        off_y = int(self._rng.integers(0, max_off + 1))
+        off_x = int(self._rng.integers(0, max_off + 1))
+        canvas[:, off_y : off_y + new_size, off_x : off_x + new_size] = resized
+
+        return dataclasses.replace(sample, images=canvas)
 
 
 def get_solution_tokens(solution: torch.Tensor) -> torch.Tensor:

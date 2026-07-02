@@ -1,0 +1,36 @@
+# Same puzzle/conditioning as mnist_sudoku, but the diffusion target is the
+# solved grid randomly scaled down and pasted onto a black canvas — see
+# datasets.mnist_sudoku_dataset.MNISTSudokuScaledDataset. Pair with
+# eval_callbacks=sudoku_scaled, which crops+resizes generated images back to
+# painter_size before running the standard cell classifier.
+sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
+mnist_root: "data/mnist"
+cell_size: 16
+painter_size: 144  # cell_size(16) * 9 = 144
+num_workers: 4
+vocab_size: 11   # 0=PAD, 1=blank, 2-10=digits 1-9
+num_givens: null  # if set, randomly keep only this many given cells per puzzle
+scale_min: 0.8
+scale_max: 0.9
+
+train_dataset:
+  _target_: datasets.mnist_sudoku_dataset.MNISTSudokuScaledDataset
+  sudoku_dir: "${data.sudoku_dir}/train"
+  mnist_root: "${data.mnist_root}"
+  cell_size: "${data.cell_size}"
+  mnist_split: "train"
+  mask_given: true
+  num_givens: "${data.num_givens}"
+  scale_min: "${data.scale_min}"
+  scale_max: "${data.scale_max}"
+
+val_dataset:
+  _target_: datasets.mnist_sudoku_dataset.MNISTSudokuScaledDataset
+  sudoku_dir: "${data.sudoku_dir}/test"
+  mnist_root: "${data.mnist_root}"
+  cell_size: "${data.cell_size}"
+  mnist_split: "test"
+  mask_given: true
+  num_givens: "${data.num_givens}"
+  scale_min: "${data.scale_min}"
+  scale_max: "${data.scale_max}"

@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 import wandb as _wandb
 from eval.mnist_eval import (
     evaluate_grids,
+    extract_and_resize_sudoku,
     load_or_train_classifier,
     make_panel_image,
     plot_thinker_ts_curve,
@@ -403,6 +404,14 @@ class SudokuEvalCallback(EvalCallbackBase):
             for p in self.eval_clf.parameters():
                 p.requires_grad_(False)
 
+    def _prepare_for_eval(self, generated: torch.Tensor) -> torch.Tensor:
+        """Hook for subclasses to preprocess generated images before classification.
+
+        Only affects the accuracy computation — logged panel images always show
+        the raw model output.
+        """
+        return generated
+
     def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
         if self.eval_clf is None or not accelerator.is_main_process:
             return {}
@@ -434,8 +443,9 @@ class SudokuEvalCallback(EvalCallbackBase):
             conditions = model._batch_to_sample(batch, device)
             generated = pipeline.sample_one_batch(model, conditions, device)
             generated = model.decode_for_eval(generated)  # (B, 1, H, W) in [0, 1]
+            eval_images = self._prepare_for_eval(generated)
 
-            acc = evaluate_grids(generated, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
+            acc = evaluate_grids(eval_images, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_cell_acc.append(acc["cell_acc"])
             all_puzzle_acc.append(acc["puzzle_acc"])
 
@@ -462,3 +472,26 @@ class SudokuEvalCallback(EvalCallbackBase):
             result["samples"] = panels
 
         return result
+
+
+class ScaledSudokuEvalCallback(SudokuEvalCallback):
+    """SudokuEvalCallback variant for MNISTSudokuScaledDataset targets.
+
+    There, the solved grid is pasted onto a black canvas at a random
+    scale/offset, so the generated image can't be evaluated by unfolding it
+    into 9×9 cells directly — the true scale/position isn't known at
+    generation time. Crops each generated image to its non-background content
+    bounding box and resizes back to painter_size before running the standard
+    cell classifier.
+
+    Args (in addition to SudokuEvalCallback's):
+        bbox_threshold: pixel intensity above which a pixel counts as content
+                        when finding the crop bounding box.
+    """
+
+    def __init__(self, *args, bbox_threshold: float = 0.05, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bbox_threshold = bbox_threshold
+
+    def _prepare_for_eval(self, generated: torch.Tensor) -> torch.Tensor:
+        return extract_and_resize_sudoku(generated, self.painter_size, self.bbox_threshold)
