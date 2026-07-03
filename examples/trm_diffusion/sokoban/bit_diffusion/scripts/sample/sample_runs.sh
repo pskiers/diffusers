@@ -1,21 +1,17 @@
 #!/bin/bash -l
 # Sample one or more trained runs by name.
 #
-# For each run name it pulls the run's full config from W&B (on the login node,
-# fail-fast on typos), materializes it as a Hydra config via fetch_run_config.py,
-# then submits a SLURM job (run_sampling.sh) that sweeps time_shift_xi and logs
-# the test metrics back onto that run's existing W&B charts.
+# For each run name it pulls the run's full config from W&B (on the login node, fail-fast on typos), then submits a SLURM job (run_sampling.sh) that sweeps time_shift_xi and logs the test metrics back onto that run's existing W&B charts.
 #
 # Usage:
 #   PROJECT=<wandb_project> [ENTITY=<entity>] ./sample_runs.sh <run_name> [run_name ...]
 #
-# Examples:
-#   ./sample_runs.sh std_6L_baseline std_6L_selfcond
+# Example:
 #   PROJECT=Sokoban-Ablation-Uncond ENTITY=my-team ./sample_runs.sh trm_base emb_base
 #
 # Env:
 #   PROJECT   W&B project the runs live in   (default: Sokoban-Ablation-Uncond)
-#   ENTITY    W&B entity/team                (default: your default entity)
+#   ENTITY    W&B entity/team
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOB="$SCRIPT_DIR/run_sampling.sh"
@@ -49,11 +45,11 @@ for RUN_NAME in "$@"; do
 
     CONFIG_NAME="$(python "$FETCH" --run-name "$RUN_NAME" "${FETCH_ARGS[@]}" | tail -n 1)"
     if [ -z "$CONFIG_NAME" ]; then
-        echo "  ! Could not resolve config for '$RUN_NAME'; skipping."
+        echo "Could not resolve config for '$RUN_NAME', skipping."
         continue
     fi
 
-    echo "  -> config: $CONFIG_NAME"
+    echo "config: $CONFIG_NAME"
     sbatch --job-name="eval-$RUN_NAME" "$JOB" "$RUN_NAME" "$CONFIG_NAME"
 done
 

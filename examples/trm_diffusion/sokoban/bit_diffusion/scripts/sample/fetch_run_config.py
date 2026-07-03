@@ -58,6 +58,57 @@ def detect_type(cfg: dict) -> str:
     return "std"
 
 
+def normalize_wandb_config(raw: dict) -> dict:
+    """Return a plain {key: value} config from a W&B run config.
+
+    W&B stores config in a wrapped form ({"key": {"value": ..., "desc": ...}})
+    and injects an internal "_wandb" key. wandb.Api().run.config normally unwraps
+    this, but the behaviour is version-dependent, so we unwrap defensively here so
+    downstream (detect_type, sample.py) always sees real values -- not {"value": ...}
+    nodes, which is what silently misclassified embedded runs and hid output_dir.
+    """
+    cfg = {}
+    for key, val in raw.items():
+        if key.startswith("_"):  # drop _wandb and other internal bookkeeping keys
+            continue
+        if isinstance(val, dict) and set(val.keys()) <= {"value", "desc"} and "value" in val:
+            cfg[key] = val["value"]
+        else:
+            cfg[key] = val
+    return cfg
+
+
+BASE_CONFIG_BY_TYPE = {
+    "std": "standard_diffusion.yaml",
+    "trm": "trm_diffusion.yaml",
+    "embedded": "embedded_trm_diffusion.yaml",
+}
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override onto base; override wins on leaf conflicts."""
+    merged = dict(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
+def backfill_from_base(cfg: dict, config_dir: Path) -> dict:
+    """Fill keys missing from an old run's W&B config (e.g. output_dir) from the
+    matching base config, so sample.py can rebuild the run. W&B values always win."""
+    base_name = BASE_CONFIG_BY_TYPE[detect_type(cfg)]
+    base_path = config_dir / base_name
+    if not base_path.exists():
+        eprint(f"WARNING: base config {base_path} not found; not backfilling defaults.")
+        return cfg
+    with open(base_path) as f:
+        base = yaml.safe_load(f) or {}
+    return deep_merge(base, cfg)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Materialize a W&B run config for sample.py.")
     ap.add_argument("--run-name", required=True, help="W&B run display name (also the checkpoint dir name).")
@@ -75,6 +126,22 @@ def main():
     cfg = dict(run.config)
     if not cfg:
         raise SystemExit(f"Run '{run.name}' (id={run.id}) has an empty config; cannot reconstruct it.")
+
+    # W&B may hand back the wrapped {"key": {"value": ...}} form (version-dependent);
+    # unwrap to plain values and strip the internal "_wandb" key before anything reads it.
+    cfg = normalize_wandb_config(cfg)
+
+    # Runs trained before some keys (e.g. output_dir) were logged to W&B would be
+    # missing them and crash sample.py's struct access. Backfill from the base config.
+    had_output_dir = "output_dir" in cfg
+    config_dir = Path(__file__).resolve().parents[2] / "config"
+    cfg = backfill_from_base(cfg, config_dir)
+    if not had_output_dir:
+        eprint(
+            f"WARNING: run '{run.name}' had no 'output_dir' in its W&B config; "
+            f"backfilled default '{cfg.get('output_dir')}'. If checkpoints live "
+            "elsewhere, pass an explicit checkpoint_path to sample.py."
+        )
 
     # Make checkpoint lookup and W&B resume-logging deterministic for sample.py.
     cfg["run_name"] = run.name
