@@ -155,6 +155,7 @@ def main():
 
     out_path = out_dir / f"{run.name}.yaml"
     with open(out_path, "w") as f:
+        f.write("# @package _global_\n")
         yaml.safe_dump(cfg, f, sort_keys=False)
 
     eprint(f"Wrote {out_path}")

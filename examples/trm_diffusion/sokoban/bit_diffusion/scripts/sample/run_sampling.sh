@@ -30,6 +30,13 @@ fi
 RUN_NAME="$1"
 CONFIG_NAME="${2:-standard_diffusion}"
 
+CONFIG_ROOT="sokoban/bit_diffusion/config"
+CONFIG_DIR_ARG=()
+if [[ "$CONFIG_NAME" == */* ]]; then
+    CONFIG_DIR_ARG=(--config-dir "$CONFIG_ROOT/$(dirname "$CONFIG_NAME")")
+    CONFIG_NAME="$(basename "$CONFIG_NAME")"
+fi
+
 module load ML-bundle/24.06a
 source /net/tscratch/people/plgmgrzanka/trm_sokoban/venv/bin/activate
 
@@ -47,6 +54,7 @@ for SHIFT in "${SHIFTS[@]}"; do
     echo "---------------------------------------------------"
 
     srun python sokoban/bit_diffusion/sample.py \
+        "${CONFIG_DIR_ARG[@]}" \
         --config-name="$CONFIG_NAME" \
         run_name="$RUN_NAME" \
         time_shift_xi=$SHIFT
