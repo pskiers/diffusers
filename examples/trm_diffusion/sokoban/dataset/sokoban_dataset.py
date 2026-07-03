@@ -294,7 +294,7 @@ class SokobanDatasetTokens(Dataset):
         """Converts matrix 12x12 with 0-6 fields to RGB image."""
         w, h = board_tokens.shape
         render_surface = self._load_surface(board_tokens.shape)
-        res = np.empty((w**2, h**2, 3))
+        res = np.empty((w**2, h**2, 3), dtype=np.uint8)
         for i in range(w):
             for j in range(h):
                 res[i * w : (i + 1) * w, j * h : (j + 1) * h] = render_surface[board_tokens[i, j] % len(render_surface)]
