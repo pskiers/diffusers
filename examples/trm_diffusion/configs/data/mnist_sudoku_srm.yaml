@@ -7,6 +7,8 @@
 # Training range (0, 80) = all difficulties, matching the paper config.
 # For evaluation the model sees the test split (last 10 000 puzzles).
 
+cell_size: 16          # 16×16 cells → 144×144 grid (consistent with this repo)
+
 train_dataset:
   _target_: datasets.mnist_sudoku_srm_dataset.MNISTSudokuSRMDataset
   root_dir: data/mnist_sudoku_srm
@@ -14,6 +16,7 @@ train_dataset:
   top_n: 1000
   test_samples_num: 10000
   given_cells_range: [0, 80]
+  cell_size: ${data.cell_size}
   seed: 0
   download: true
 
@@ -24,10 +27,10 @@ val_dataset:
   top_n: 1000
   test_samples_num: 10000
   given_cells_range: [17, 65]   # evaluation: at least 17 given cells (meaningful puzzles)
+  cell_size: ${data.cell_size}
   seed: 0
   download: true
 
 painter_size: 144
-cell_size: 16          # 16×16 cells → 144×144 grid (consistent with this repo)
 num_workers: 4
 vocab_size: 11         # 0=PAD, 1=blank, 2-10=digits 1-9

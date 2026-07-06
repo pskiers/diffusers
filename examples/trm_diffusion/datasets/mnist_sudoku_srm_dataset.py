@@ -104,7 +104,6 @@ class MNISTSudokuSRMDataset(Dataset):
         download:          If True (default), download missing files automatically.
     """
 
-    CELL_SIZE        = 28
     GRID_CELLS       = 81
     DIGIT_OFFSET     = DIGIT_OFFSET
     BLANK_TOKEN      = BLANK_TOKEN
@@ -116,6 +115,7 @@ class MNISTSudokuSRMDataset(Dataset):
         top_n: int = 1000,
         test_samples_num: int = 10_000,
         given_cells_range: Sequence[int] = (0, 80),
+        cell_size: int = 28,
         seed: int = 0,
         download: bool = True,
     ) -> None:
@@ -126,6 +126,7 @@ class MNISTSudokuSRMDataset(Dataset):
         self.top_n             = top_n
         self.test_samples_num  = test_samples_num
         self.given_lo, self.given_hi = int(given_cells_range[0]), int(given_cells_range[1])
+        self.cell_size         = cell_size
         self.seed              = seed
         self.is_train          = split == "train"
 
@@ -182,6 +183,15 @@ class MNISTSudokuSRMDataset(Dataset):
             )
             digit_arrays[label] = selected
 
+        # Resize from 28×28 if a different cell_size is requested
+        if self.cell_size != 28:
+            resized: dict[int, np.ndarray] = {}
+            for label, arr in digit_arrays.items():
+                t = torch.from_numpy(arr).unsqueeze(1)  # (N, 1, 28, 28)
+                t = F.interpolate(t, size=(self.cell_size, self.cell_size), mode="bilinear", align_corners=False)
+                resized[label] = t.squeeze(1).numpy()
+            digit_arrays = resized
+
         return digit_arrays
 
     def _render_grid(
@@ -196,7 +206,7 @@ class MNISTSudokuSRMDataset(Dataset):
             full_img  — (252, 252) float32 [0,1], every cell filled
             cond_img  — (252, 252) float32 [0,1], blank cells are black
         """
-        cs = self.CELL_SIZE
+        cs = self.cell_size
         full_img = np.empty((9 * cs, 9 * cs), dtype=np.float32)
         cond_img = np.zeros((9 * cs, 9 * cs), dtype=np.float32)
 
