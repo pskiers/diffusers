@@ -16,13 +16,13 @@ Key design decisions matching the paper:
   * Auto-download: if sudokus.npy / top_5000_values.csv are missing, the
     dataset downloads them from the SRM GitHub v1.0.0 release.
 
-Return format (identical to MNISTSudokuDataset):
-  "images"        — (1, 252, 252) float32 [0, 1]   full solved grid
-  "conditions"    — (1, 252, 252) float32           given cells only; blanks = 0
-  "solution"      — (81,) int64, values 0-8         digit - 1
-  "puzzle_id"     — scalar int64
-  "puzzle_tokens" — (81,) long, 1=blank, 2-10=digit 1-9
-  "given_mask"    — (81,) bool, True where cell is given
+Return format (DataSample, identical to MNISTSudokuDataset):
+  images             — (1, H, W) float32 [0, 1]   full solved grid
+  spatial_conditions — (1, H, W) float32           given cells only; blanks = 0
+  solution           — (81,) int64, values 0-8     digit - 1
+  puzzle_id          — scalar int64
+  token_conditions   — (81,) long, 1=blank, 2-10=digit 1-9
+  solution_mask      — (81,) bool, True where cell is given
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+
+from datasets.data_sample import DataSample, collate_data_samples
 
 BLANK_TOKEN  = 1
 DIGIT_OFFSET = 2  # token 2 → digit 1 → class 0
@@ -225,7 +227,7 @@ class MNISTSudokuSRMDataset(Dataset):
     def __len__(self) -> int:
         return len(self._grids)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> DataSample:
         grid_2d = self._grids[idx]  # (9, 9), values 1-9
 
         # Deterministic for test; random for train.
@@ -248,11 +250,13 @@ class MNISTSudokuSRMDataset(Dataset):
         # Solution class indices: digit 1-9 → class 0-8
         solution = (solution_flat - 1).astype(np.int64)  # (81,) in [0, 8]
 
-        return {
-            "images":        torch.from_numpy(full_img).unsqueeze(0),    # (1, 252, 252)
-            "conditions":    torch.from_numpy(cond_img).unsqueeze(0),    # (1, 252, 252)
-            "solution":      torch.from_numpy(solution),                  # (81,) int64
-            "puzzle_id":     torch.tensor(idx, dtype=torch.int64),
-            "puzzle_tokens": torch.from_numpy(puzzle_tokens),             # (81,) long
-            "given_mask":    torch.from_numpy(given_mask),                # (81,) bool
-        }
+        return DataSample(
+            images=torch.from_numpy(full_img).unsqueeze(0),           # (1, H, W)
+            spatial_conditions=torch.from_numpy(cond_img).unsqueeze(0),# (1, H, W)
+            solution=torch.from_numpy(solution),                        # (81,) int64
+            puzzle_id=torch.tensor(idx, dtype=torch.int64),
+            token_conditions=torch.from_numpy(puzzle_tokens),          # (81,) long
+            solution_mask=torch.from_numpy(given_mask),                # (81,) bool
+        )
+
+    collate_fn = staticmethod(collate_data_samples)

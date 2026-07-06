@@ -27,6 +27,7 @@ val_dataset:
   seed: 0
   download: true
 
+painter_size: 144
 cell_size: 16          # 16×16 cells → 144×144 grid (consistent with this repo)
 num_workers: 4
 vocab_size: 11         # 0=PAD, 1=blank, 2-10=digits 1-9
