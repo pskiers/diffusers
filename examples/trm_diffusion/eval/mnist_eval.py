@@ -150,6 +150,29 @@ def load_or_train_classifier(
 
 # ── Grid evaluation ───────────────────────────────────────────────────────────
 
+def _check_sudoku_constraints(preds: torch.Tensor) -> torch.Tensor:
+    """Return a (B,) bool tensor: True if the 9×9 grid is a valid sudoku.
+
+    preds: (B, 81) int64 with values 0-8 (digit d represented as d-1).
+    A valid sudoku has each of 0-8 exactly once in every row, column, and 3×3 box.
+    """
+    B = preds.shape[0]
+    grid = preds.reshape(B, 9, 9)  # (B, 9, 9)
+    valid = torch.ones(B, dtype=torch.bool, device=preds.device)
+
+    expected = torch.arange(9, device=preds.device)
+
+    for i in range(9):
+        row_ok = grid[:, i, :].sort(dim=1).values.eq(expected).all(dim=1)
+        col_ok = grid[:, :, i].sort(dim=1).values.eq(expected).all(dim=1)
+        br, bc = (i // 3) * 3, (i % 3) * 3
+        box = grid[:, br:br+3, bc:bc+3].reshape(B, 9)
+        box_ok = box.sort(dim=1).values.eq(expected).all(dim=1)
+        valid &= row_ok & col_ok & box_ok
+
+    return valid
+
+
 @torch.no_grad()
 def evaluate_grids(
     images:      torch.Tensor,               # (B, 1, H, W) float32 [0, 1]
@@ -160,10 +183,13 @@ def evaluate_grids(
 ) -> dict:
     """Classify every cell in *images* and compare to *solutions*.
 
-    cell_acc   — accuracy on blank (inferred) cells only when given_masks supplied.
-    puzzle_acc — accuracy requiring all 81 cells correct (given + blank).
+    cell_acc            — accuracy on blank cells only (when given_masks supplied).
+    puzzle_acc          — fraction of puzzles where all 81 cells match ground truth.
+    constraint_puzzle_acc — fraction of puzzles satisfying all sudoku constraints
+                            (rows/cols/boxes each contain digits 1-9), regardless
+                            of whether the solution matches the ground truth.
 
-    Returns {"cell_acc": float, "puzzle_acc": float, "preds": (B,81) cpu int64}.
+    Returns dict with keys: cell_acc, puzzle_acc, constraint_puzzle_acc, preds.
     """
     device    = next(classifier.parameters()).device
     images    = images.to(device)
@@ -179,8 +205,11 @@ def evaluate_grids(
     sol   = solutions.reshape(B, 81)
     correct = preds == sol                           # (B, 81)
 
-    # Puzzle accuracy: every cell must be correct.
+    # Ground-truth puzzle accuracy: every cell must match the reference solution.
     puzzle_acc = correct.all(dim=1).float().mean().item()
+
+    # Constraint puzzle accuracy: does the predicted grid satisfy sudoku rules?
+    constraint_puzzle_acc = _check_sudoku_constraints(preds).float().mean().item()
 
     # Cell accuracy: blank cells only.
     if given_masks is not None:
@@ -191,7 +220,12 @@ def evaluate_grids(
     else:
         cell_acc = correct.float().mean().item()
 
-    return {"cell_acc": cell_acc, "puzzle_acc": puzzle_acc, "preds": preds.cpu()}
+    return {
+        "cell_acc": cell_acc,
+        "puzzle_acc": puzzle_acc,
+        "constraint_puzzle_acc": constraint_puzzle_acc,
+        "preds": preds.cpu(),
+    }
 
 
 @torch.no_grad()

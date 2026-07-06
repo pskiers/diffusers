@@ -170,7 +170,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         n_log = self.num_log_images
         token_offset = getattr(model, "token_offset", 0)
 
-        all_cell_acc, all_puzzle_acc = [], []
+        all_cell_acc, all_puzzle_acc, all_constraint_acc = [], [], []
         all_thinker_cell_best, all_thinker_cell_mean = [], []
         all_thinker_puzzle_best, all_thinker_puzzle_mean = [], []
         all_thinker_deviation = []
@@ -204,6 +204,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
             acc = evaluate_grids(sr["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_cell_acc.append(acc["cell_acc"])
             all_puzzle_acc.append(acc["puzzle_acc"])
+            all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
 
             if self.include_thinker_metrics:
                 for key, lst in [
@@ -263,6 +264,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         result: dict = {
             "cell_acc": float(np.mean(all_cell_acc)),
             "puzzle_acc": float(np.mean(all_puzzle_acc)),
+            "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
         }
         if self.include_thinker_metrics:
             if all_thinker_cell_best:
@@ -428,7 +430,7 @@ class SudokuEvalCallback(EvalCallbackBase):
         n_log = self.num_log_images
         token_offset = getattr(model, "token_offset", 0)
 
-        all_cell_acc, all_puzzle_acc = [], []
+        all_cell_acc, all_puzzle_acc, all_constraint_acc = [], [], []
         panels: list = []
         n_done = 0
 
@@ -448,6 +450,7 @@ class SudokuEvalCallback(EvalCallbackBase):
             acc = evaluate_grids(eval_images, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_cell_acc.append(acc["cell_acc"])
             all_puzzle_acc.append(acc["puzzle_acc"])
+            all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
 
             if _wandb is not None and len(panels) < n_log:
                 n_new = min(n_log - len(panels), B_cur)
@@ -467,6 +470,7 @@ class SudokuEvalCallback(EvalCallbackBase):
         result: dict = {
             "cell_acc": float(np.mean(all_cell_acc)),
             "puzzle_acc": float(np.mean(all_puzzle_acc)),
+            "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
         }
         if panels:
             result["samples"] = panels
