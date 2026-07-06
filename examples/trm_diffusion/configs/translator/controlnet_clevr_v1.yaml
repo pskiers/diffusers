@@ -8,5 +8,5 @@ layers_per_block: 2
 painter_size: 32
 grid: 8
 seq_len: ${thinker.seq_len}
-bridge_mode: "softmax"
+bridge_mode: "normalized"
 with_timestep_emb: true
