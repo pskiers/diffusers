@@ -26,7 +26,7 @@ val_dataset:
   split: test
   top_n: 1000
   test_samples_num: 10000
-  given_cells_range: [17, 65]   # evaluation: at least 17 given cells (meaningful puzzles)
+  given_cells_range: [0, 26]   # hard sudoku dataset
   cell_size: ${data.cell_size}
   seed: 0
   download: true
