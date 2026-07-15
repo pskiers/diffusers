@@ -493,9 +493,15 @@ class PushTHybridDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def download_pusht(data_dir='data'):
-    """Download PushT zarr dataset."""
+    """Download PushT zarr dataset.
+
+    pusht.zip already contains a top-level pusht/ folder (verified against
+    its actual contents), so it's extracted into data_dir directly —
+    extracting into data_dir/pusht/ would double-nest it as
+    data_dir/pusht/pusht/pusht_cchi_v7_replay.zarr.
+    """
     import urllib.request, zipfile, pathlib
-    out_dir = pathlib.Path(data_dir) / 'pusht'
+    out_dir = pathlib.Path(data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     url = 'https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip'
     zip_path = out_dir / 'pusht.zip'

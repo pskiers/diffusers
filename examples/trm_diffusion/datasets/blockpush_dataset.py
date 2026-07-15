@@ -6,7 +6,7 @@ DataSample field mapping:
   embedding_conditions — (T, 16) normalized state observations (conditioning)
 
 Download:
-  wget https://diffusion-policy.cs.columbia.edu/data/training/multimodal_push_seed.zip
+  wget https://diffusion-policy.cs.columbia.edu/data/training/block_pushing.zip
 """
 
 import os
@@ -46,7 +46,6 @@ class BlockPushDataset(Dataset):
       embedding_conditions — (T, 16) normalized state observations
 
     Download: wget https://diffusion-policy.cs.columbia.edu/data/training/block_pushing.zip
-    or from https://diffusion-policy.cs.columbia.edu/data/training/multimodal_push_seed.zip
     """
 
     collate_fn = staticmethod(collate_data_samples)
@@ -165,12 +164,21 @@ class BlockPushDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def download_block_push(data_dir='data'):
-    """Download BlockPush zarr dataset from diffusion_policy servers."""
+    """Download BlockPush zarr dataset from diffusion_policy servers.
+
+    The correct filename is block_pushing.zip, not multimodal_push_seed.zip
+    (which 404s — verified against the actual server directory listing at
+    https://diffusion-policy.cs.columbia.edu/data/training/). It already
+    contains a top-level block_pushing/ folder (with both
+    multimodal_push_seed.zarr and multimodal_push_seed_abs.zarr inside), so
+    it's extracted into data_dir directly — extracting into
+    data_dir/block_pushing/ would double-nest it.
+    """
     import urllib.request, zipfile, pathlib
-    out_dir = pathlib.Path(data_dir) / 'block_pushing'
+    out_dir = pathlib.Path(data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    url = 'https://diffusion-policy.cs.columbia.edu/data/training/multimodal_push_seed.zip'
-    zip_path = out_dir / 'block_push.zip'
+    url = 'https://diffusion-policy.cs.columbia.edu/data/training/block_pushing.zip'
+    zip_path = out_dir / 'block_pushing.zip'
     print(f'Downloading BlockPush from {url} ...')
     urllib.request.urlretrieve(url, zip_path)
     with zipfile.ZipFile(zip_path) as zf:
