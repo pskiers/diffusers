@@ -2,6 +2,7 @@
 # low-dim obs, matching upstream's MultiImageObsEncoder(share_rgb_model=True).
 # Used by pusht_hybrid and toolhang_image.
 _target_: models.condition_encoders.ImageObsConditionEncoder
+n_obs_steps: ${data.n_obs_steps}
 use_group_norm: true
 pretrained: false
 crop_shape: [76, 76]  # matches upstream's random-crop train / center-crop eval augmentation

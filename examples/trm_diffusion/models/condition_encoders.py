@@ -316,20 +316,31 @@ class GlobalCondEncoderBase(nn.Module):
 
 
 class LowdimObsConditionEncoder(GlobalCondEncoderBase):
-    """Passes the observation-history tensor through unchanged.
+    """Slices the observation history down to the first n_obs_steps entries.
 
     Matches upstream diffusion_policy's lowdim policies: no learned encoder,
     the raw (normalized) observation history is used directly as conditioning
     (ConditionalUnet1D flattens it into one FiLM vector itself;
     TransformerForDiffusion consumes it as n_obs_steps separate cond tokens).
 
-    Input/Output: embedding_conditions (B, n_obs_steps, obs_dim)
+    embedding_conditions comes from the dataset sampled over the full action
+    horizon (matching the `images` target length), not just the observable
+    history — e.g. upstream's own dataset classes do the same, and it's the
+    policy/model that slices `nobs[:, :n_obs_steps]` before conditioning, not
+    the dataset. This encoder does that slicing.
+
+    Input:  embedding_conditions (B, horizon, obs_dim)
+    Output: (B, n_obs_steps, obs_dim)
     """
 
     condition_keys: list[str] = ["embedding_conditions"]
 
+    def __init__(self, n_obs_steps: int):
+        super().__init__()
+        self.n_obs_steps = n_obs_steps
+
     def forward(self, embedding_conditions: torch.Tensor, timesteps=None, **_) -> torch.Tensor:
-        return embedding_conditions
+        return embedding_conditions[:, :self.n_obs_steps]
 
 
 def _replace_batchnorm_with_groupnorm(module: nn.Module) -> nn.Module:
@@ -357,21 +368,29 @@ class ImageObsConditionEncoder(GlobalCondEncoderBase):
     fixed camera crop for the whole rollout) but drawn independently per
     sample in the batch.
 
+    spatial_conditions/embedding_conditions come from the dataset sampled over
+    the full action horizon (matching the `images` target length), not just
+    the observable history — it's the policy/model that slices
+    `nobs[:, :n_obs_steps]` before conditioning, not the dataset. This encoder
+    does that slicing (before running the vision encoder, so frames beyond
+    n_obs_steps are never even encoded).
+
     Input:
-      spatial_conditions   (B, T, C, H, W)     — single camera view, or
-                            (B, T, V, C, H, W)  — V camera views (kept
+      spatial_conditions   (B, horizon, C, H, W)     — single camera view, or
+                            (B, horizon, V, C, H, W)  — V camera views (kept
                             separate, e.g. ToolHangImageDataset)
-      embedding_conditions (B, T, obs_dim)     — optional raw low-dim obs
+      embedding_conditions (B, horizon, obs_dim)     — optional raw low-dim obs
                             (e.g. agent_pos / robot proprioception)
-    Output: (B, T, V * resnet_feature_dim + obs_dim)
+    Output: (B, n_obs_steps, V * resnet_feature_dim + obs_dim)
     """
 
     condition_keys: list[str] = ["spatial_conditions", "embedding_conditions"]
 
-    def __init__(self, use_group_norm: bool = True, pretrained: bool = False, crop_shape=None):
+    def __init__(self, n_obs_steps: int, use_group_norm: bool = True, pretrained: bool = False, crop_shape=None):
         super().__init__()
         import torchvision
 
+        self.n_obs_steps = n_obs_steps
         weights = "IMAGENET1K_V1" if pretrained else None
         resnet = torchvision.models.resnet18(weights=weights)
         resnet.fc = nn.Identity()
@@ -399,7 +418,9 @@ class ImageObsConditionEncoder(GlobalCondEncoderBase):
         return out
 
     def forward(self, spatial_conditions: torch.Tensor, embedding_conditions=None, timesteps=None, **_) -> torch.Tensor:
-        x = spatial_conditions
+        x = spatial_conditions[:, :self.n_obs_steps]
+        if embedding_conditions is not None:
+            embedding_conditions = embedding_conditions[:, :self.n_obs_steps]
         multiview = x.ndim == 6
         if multiview:
             B, T, V, C, H, W = x.shape
