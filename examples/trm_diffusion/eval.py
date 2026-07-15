@@ -58,18 +58,20 @@ def _load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") 
         step = ckpt.get("step", None)
 
         if use_ema and ckpt.get("ema_state") is not None:
-            shadow = ckpt["ema_state"].get("shadow", {})
-            if shadow:
-                sd = strip_compiled_prefix(shadow)
+            # EMAHelper.state_dict() returns self.shadow directly:
+            # {param_name: tensor} — no extra nesting.
+            ema_state = ckpt["ema_state"]
+            if isinstance(ema_state, dict) and ema_state:
+                sd = strip_compiled_prefix(ema_state)
                 missing, unexpected = model.load_state_dict(sd, strict=False)
                 logger.info(
-                    f"Loaded EMA weights (shadow has {len(sd)} params, "
+                    f"Loaded EMA weights ({len(sd)} params, "
                     f"missing={len(missing)}, unexpected={len(unexpected)})"
                 )
                 if missing:
                     logger.info(f"  Missing (first 5): {missing[:5]}")
                 return step
-            logger.warning("EMA state has no 'shadow' key — falling back to model_state")
+            logger.warning("EMA state is empty — falling back to model_state")
 
         sd = strip_compiled_prefix(ckpt["model_state"])
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -160,6 +162,14 @@ def main(cfg: DictConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     scheduler = instantiate(cfg.diffusion)
     model = build_model(cfg, scheduler)
+
+    # See train_trm.py: closed-loop eval callbacks need the dataset's fitted
+    # normalizer, which can't be expressed as a static Hydra config value.
+    eval_normalizer = getattr(eval_ds, "normalizer", None)
+    if eval_normalizer is not None:
+        for cb in getattr(model, "eval_callbacks", []) or []:
+            if getattr(cb, "normalizer", None) is None:
+                cb.normalizer = eval_normalizer
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model parameters: {n_params:,}")
