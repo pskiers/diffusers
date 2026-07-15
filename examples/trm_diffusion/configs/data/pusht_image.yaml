@@ -1,0 +1,37 @@
+# PushT visual dataset — 96x96 RGB observations, 2D continuous actions
+# Following Diffusion Policy paper (Chi et al. 2023): horizon=16, n_obs_steps=2, n_action_steps=8
+# Download: python -c "from datasets.pusht_dataset import download_pusht; download_pusht()"
+
+train_dataset:
+  _target_: datasets.pusht_dataset.PushTImageDataset
+  zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
+  split: train
+  horizon: 16
+  pad_before: 1
+  pad_after: 7
+  val_ratio: 0.02
+  max_train_episodes: 90
+  seed: 42
+  download: true
+
+val_dataset:
+  _target_: datasets.pusht_dataset.PushTImageDataset
+  zarr_path: data/pusht/pusht_cchi_v7_replay.zarr
+  split: val
+  horizon: 16
+  pad_before: 1
+  pad_after: 7
+  val_ratio: 0.02
+  max_train_episodes: 90
+  seed: 42
+  download: true
+
+# Policy temporal structure (from paper)
+n_obs_steps: 2
+n_action_steps: 8
+action_dim: 2
+obs_image_shape: [3, 96, 96]
+
+# Trainer compatibility fields
+painter_size: 96
+num_workers: 4

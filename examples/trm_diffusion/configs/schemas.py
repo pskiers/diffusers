@@ -108,6 +108,7 @@ class PainterOptimConfig:
     weight_decay: float
     warmup_steps: int
     lr_min_ratio: float = 0.0
+    betas: tuple[float, float] = (0.9, 0.999)
 
 
 # ── Latent DiT configs ────────────────────────────────────────────────────────

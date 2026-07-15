@@ -1,0 +1,8 @@
+# Direct (unconditional-guidance) DDPM sampling for action-sequence painters
+# — single model call per step, no CFG (obs conditioning is always available
+# at rollout time, so classifier-free guidance isn't needed here).
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 100  # matches num_train_timesteps in configs/diffusion/ddpm_epsilon.yaml
+batch_size: ${eval.batch_size}
+predictor:
+  _target_: models.sampling.DirectPredictor

@@ -1,0 +1,7 @@
+# Matches real-stanford/diffusion_policy's default noise scheduler for the
+# base diffusion model: epsilon prediction (not sample/x0 like configs/diffusion/ddpm.yaml).
+_target_: diffusers.DDPMScheduler
+num_train_timesteps: 100
+beta_schedule: "squaredcos_cap_v2"
+prediction_type: "epsilon"
+clip_sample: true

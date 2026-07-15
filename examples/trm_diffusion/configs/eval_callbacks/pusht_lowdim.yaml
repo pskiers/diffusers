@@ -1,0 +1,9 @@
+# Closed-loop PushT eval using gym_pusht's low-dim state obs (obs_type='state'),
+# for PushTLowdimDataset-trained painters.
+- _target_: models.dp_eval_callbacks.PushTImageEvalCallback
+  normalizer: null
+  n_eval_episodes: 50
+  max_steps: 300
+  n_obs_steps: ${data.n_obs_steps}
+  n_action_steps: ${data.n_action_steps}
+  obs_type: state

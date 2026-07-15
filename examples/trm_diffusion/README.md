@@ -12,7 +12,7 @@ cd diffusers
 git checkout pskiers/trm-diffusion
 pip install .
 pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 ```
 
 Then cd in the example folder  and run
@@ -30,6 +30,30 @@ accelerate config
 And login to [Wandb](https://wandb.ai/) with:
 ```bash
 wandb login
+```
+
+### Optional: closed-loop eval simulators (PushT / BlockPush / ToolHang)
+
+Not required for training — `models/dp_eval_callbacks.py` gracefully skips
+(logs a warning, returns `{}`) any callback whose simulator isn't installed.
+Only needed for the periodic/standalone closed-loop coverage/success-rate
+metrics on those three tasks.
+
+```bash
+# PushT
+pip install gym-pusht pymunk shapely
+
+# ToolHang — pinned to match upstream real-stanford/diffusion_policy's own
+# conda_environment.yaml as closely as possible (current robosuite releases
+# have drifted API-wise from the version they benchmarked against):
+pip install "robosuite @ https://github.com/cheng-chi/robosuite/archive/277ab9588ad7a4f4b55cf75508b44aa67ec171f0.tar.gz"
+pip install robomimic==0.2.0
+# Simpler but unverified-compatible alternative: pip install robosuite robomimic
+
+# BlockPush — `block_pushing` is not on PyPI; it lives inside
+# google-research/ibc and must be put on PYTHONPATH:
+git clone https://github.com/google-research/ibc.git third_party/ibc
+export PYTHONPATH="$PYTHONPATH:$(pwd)/third_party/ibc/environments"
 ```
 
 ## Training

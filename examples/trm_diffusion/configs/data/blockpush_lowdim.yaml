@@ -1,0 +1,32 @@
+# BlockPush multi-modal dataset (16D state, 2D action)
+# Following Diffusion Policy paper: horizon=16
+# Download: python -c "from datasets.blockpush_dataset import download_block_push; download_block_push()"
+
+train_dataset:
+  _target_: datasets.blockpush_dataset.BlockPushDataset
+  zarr_path: data/block_pushing/multimodal_push_seed.zarr
+  split: train
+  horizon: ${data.horizon}
+  pad_before: 1
+  pad_after: 7
+  val_ratio: 0.02
+  seed: 42
+  download: true
+
+val_dataset:
+  _target_: datasets.blockpush_dataset.BlockPushDataset
+  zarr_path: data/block_pushing/multimodal_push_seed.zarr
+  split: val
+  horizon: ${data.horizon}
+  pad_before: 1
+  pad_after: 7
+  val_ratio: 0.02
+  seed: 42
+  download: true
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+action_dim: 2
+obs_dim: 16
+num_workers: 4

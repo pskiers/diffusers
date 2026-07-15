@@ -1,0 +1,19 @@
+# cond_dim = resnet_feature_dim + obs_state_dim = 512 + 2 = 514 (per-obs-step
+# token width; n_obs_steps tokens total).
+# NOTE: upstream diffusion_policy does not publish a transformer+image config
+# for any of our 3 tasks (train_diffusion_transformer_hybrid_workspace.yaml's
+# only default task is lift_image_abs, unrelated) — p_drop_attn=0.3 is taken
+# from that generic hybrid-transformer workspace default, not a task-specific
+# published value. This experiment combination has no direct upstream
+# reference to validate against.
+_target_: models.action_backbones.TransformerForDiffusion
+input_dim: ${data.action_dim}
+horizon: ${data.horizon}
+cond_dim: 514
+n_obs_steps: ${data.n_obs_steps}
+n_layer: 8
+n_head: 4
+n_emb: 256
+p_drop_emb: 0.0
+p_drop_attn: 0.3
+causal_attn: true

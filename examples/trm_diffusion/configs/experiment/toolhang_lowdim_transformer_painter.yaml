@@ -1,0 +1,19 @@
+# @package _global_
+# Base diffusion model for ToolHang (lowdim obs), transformer backbone.
+# Usage: python train_trm.py experiment=toolhang_lowdim_transformer_painter
+defaults:
+  - override /data: toolhang_lowdim
+  - override /diffusion: ddpm_epsilon
+  - override /backbone: toolhang_lowdim_transformer
+  - override /painter: action_transformer
+  - override /condition_encoder: lowdim_obs
+  - override /train: action_lowdim
+  - override /eval: action_lowdim
+  - override /eval_callbacks: toolhang_lowdim
+  - override /sampling: action_direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/toolhang_lowdim_transformer_painter"

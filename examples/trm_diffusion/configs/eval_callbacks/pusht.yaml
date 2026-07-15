@@ -1,0 +1,12 @@
+# Closed-loop PushT eval, image variant (obs_type defaults to
+# 'pixels_agent_pos') — for PushTHybridDataset-trained painters. See
+# pusht_lowdim.yaml for the lowdim-obs variant. normalizer is left null here
+# and attached at runtime from the fitted train_dataset normalizer (see
+# train_trm.py) since a fitted normalizer can't be expressed as a static
+# Hydra config value.
+- _target_: models.dp_eval_callbacks.PushTImageEvalCallback
+  normalizer: null
+  n_eval_episodes: 50
+  max_steps: 300
+  n_obs_steps: ${data.n_obs_steps}
+  n_action_steps: ${data.n_action_steps}

@@ -1,0 +1,9 @@
+# Training hyperparams for larger-image action-sequence tasks (toolhang_image,
+# 240x240 x 2 camera views). Smaller batch again than pusht_hybrid.
+seed: 42
+compile: true
+
+batch_size: 32
+num_steps: 300000
+gradient_accumulation_steps: 2
+cfg_prob: 0.0

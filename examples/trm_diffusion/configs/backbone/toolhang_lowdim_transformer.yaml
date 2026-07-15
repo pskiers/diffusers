@@ -1,0 +1,12 @@
+# cond_dim = obs_dim (per-obs-step token width; n_obs_steps tokens total)
+_target_: models.action_backbones.TransformerForDiffusion
+input_dim: ${data.action_dim}
+horizon: ${data.horizon}
+cond_dim: 53
+n_obs_steps: ${data.n_obs_steps}
+n_layer: 8
+n_head: 4
+n_emb: 256
+p_drop_emb: 0.0
+p_drop_attn: 0.01
+causal_attn: true

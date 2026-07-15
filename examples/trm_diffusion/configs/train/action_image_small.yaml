@@ -1,0 +1,10 @@
+# Training hyperparams for smaller-image action-sequence tasks (pusht_hybrid,
+# 96x96 single view). Smaller batch than the lowdim tasks — the ResNet18
+# vision encoder is the memory bottleneck, not the action backbone.
+seed: 42
+compile: true
+
+batch_size: 64
+num_steps: 200000
+gradient_accumulation_steps: 1
+cfg_prob: 0.0

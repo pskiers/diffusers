@@ -1,0 +1,5 @@
+# Flattens the raw (normalized) observation history into global_cond.
+# Shared by all lowdim action-sequence tasks (pusht_lowdim, blockpush,
+# toolhang_lowdim) — matches upstream diffusion_policy (no learned encoder
+# for lowdim obs).
+_target_: models.condition_encoders.LowdimObsConditionEncoder

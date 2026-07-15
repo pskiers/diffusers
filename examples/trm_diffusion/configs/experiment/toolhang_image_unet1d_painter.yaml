@@ -1,0 +1,21 @@
+# @package _global_
+# Base diffusion model for ToolHang (image obs, two camera views + robot
+# proprioception), conv1d U-Net backbone only (image obs is expensive enough
+# that we don't also stand up the heavier transformer backbone for it here).
+# Usage: python train_trm.py experiment=toolhang_image_unet1d_painter
+defaults:
+  - override /data: toolhang_image
+  - override /diffusion: ddpm_epsilon
+  - override /backbone: toolhang_image_unet1d
+  - override /painter: action_unet1d
+  - override /condition_encoder: image_obs
+  - override /train: action_image_large
+  - override /eval: action_image_large
+  - override /eval_callbacks: toolhang
+  - override /sampling: action_direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/toolhang_image_unet1d_painter"

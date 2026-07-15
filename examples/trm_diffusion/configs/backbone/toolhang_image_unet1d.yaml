@@ -1,0 +1,10 @@
+# global_cond_dim = n_obs_steps * (n_views * resnet_feature_dim + obs_dim)
+#                 = 2 * (2 * 512 + 9) = 2066
+_target_: models.action_backbones.ConditionalUnet1D
+input_dim: ${data.action_dim}
+global_cond_dim: 2066
+down_dims: [512, 1024, 2048]
+diffusion_step_embed_dim: 128
+kernel_size: 5
+n_groups: 8
+cond_predict_scale: true

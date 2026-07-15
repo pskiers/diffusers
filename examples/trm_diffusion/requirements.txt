@@ -32,4 +32,28 @@ flash_attn
 einops
 timm
 sentencepiece
-adam-atan2-pytorch
+adam-atan2
+argdantic
+zarr<3
+h5py
+
+# ---------------------------------------------------------------------------
+# Optional: closed-loop eval simulators for dp_eval_callbacks.py
+# (PushT / BlockPush / ToolHang). NOT required for training — these callbacks
+# gracefully skip (log a warning, return {}) if their simulator isn't
+# installed. Only needed if you want the periodic/standalone closed-loop
+# coverage/success-rate metrics.
+# ---------------------------------------------------------------------------
+# PushT:
+gym-pusht
+pymunk
+shapely
+# ToolHang (robomimic==0.2.0 matches upstream diffusion_policy's pin; newer
+# robosuite releases have drifted API-wise from the version they used —
+# see examples/trm_diffusion/README.md for the exact pinned robosuite fork/commit
+# if you need closest fidelity to their reported numbers):
+robomimic==0.2.0
+robosuite
+# BlockPush's `block_pushing` package is NOT on PyPI — it lives inside
+# google-research/ibc and must be put on PYTHONPATH manually; see
+# examples/trm_diffusion/README.md.

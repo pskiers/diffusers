@@ -144,6 +144,16 @@ def main(cfg: DictConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(cfg, scheduler)
 
+    # Closed-loop eval callbacks (e.g. dp_eval_callbacks.py) need the dataset's
+    # fitted action/obs normalizer, which only exists once the dataset object
+    # is built and can't be expressed as a static Hydra config value. Attach it
+    # here for any callback that declared `normalizer=None` in its config.
+    train_normalizer = getattr(train_ds, "normalizer", None)
+    if train_normalizer is not None:
+        for cb in getattr(model, "eval_callbacks", []) or []:
+            if getattr(cb, "normalizer", None) is None:
+                cb.normalizer = train_normalizer
+
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Model parameters: {n_params:,}")

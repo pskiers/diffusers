@@ -1,0 +1,9 @@
+# Shared training hyperparams for lowdim action-sequence tasks
+# (pusht_lowdim, blockpush, toolhang_lowdim).
+seed: 42
+compile: true
+
+batch_size: 256
+num_steps: 200000
+gradient_accumulation_steps: 1
+cfg_prob: 0.0

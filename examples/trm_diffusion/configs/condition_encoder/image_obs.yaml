@@ -1,0 +1,7 @@
+# Shared ResNet18 vision encoder (BatchNorm->GroupNorm, fc->Identity) + raw
+# low-dim obs, matching upstream's MultiImageObsEncoder(share_rgb_model=True).
+# Used by pusht_hybrid and toolhang_image.
+_target_: models.condition_encoders.ImageObsConditionEncoder
+use_group_norm: true
+pretrained: false
+crop_shape: [76, 76]  # matches upstream's random-crop train / center-crop eval augmentation

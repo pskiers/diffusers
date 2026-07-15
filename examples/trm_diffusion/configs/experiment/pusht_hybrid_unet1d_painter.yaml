@@ -1,0 +1,20 @@
+# @package _global_
+# Base diffusion model for PushT (image + agent_pos obs — upstream's actual
+# "image" task variant), conv1d U-Net backbone.
+# Usage: python train_trm.py experiment=pusht_hybrid_unet1d_painter
+defaults:
+  - override /data: pusht_hybrid
+  - override /diffusion: ddpm_epsilon
+  - override /backbone: pusht_hybrid_unet1d
+  - override /painter: action_unet1d
+  - override /condition_encoder: image_obs
+  - override /train: action_image_small
+  - override /eval: action_image_small
+  - override /eval_callbacks: pusht
+  - override /sampling: action_direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/pusht_hybrid_unet1d_painter"

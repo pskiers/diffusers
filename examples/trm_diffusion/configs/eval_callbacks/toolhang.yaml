@@ -1,0 +1,10 @@
+# Closed-loop ToolHang eval, image variant (use_camera_obs defaults to true) —
+# for ToolHangImageDataset-trained painters. See toolhang_lowdim.yaml for the
+# lowdim-obs variant. normalizer is left null here and attached at runtime
+# from the fitted train_dataset normalizer (see train_trm.py).
+- _target_: models.dp_eval_callbacks.ToolHangEvalCallback
+  normalizer: null
+  n_eval_episodes: 50
+  max_steps: 700
+  n_obs_steps: ${data.n_obs_steps}
+  n_action_steps: ${data.n_action_steps}

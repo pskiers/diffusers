@@ -288,3 +288,131 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
 
 ClevrObjectFeatureEncoder = ObjectFeatureEncoder
 ClevrNoisyObjectFeatureEncoder = ObjectFeatureEncoderV1
+
+
+# ── Action-sequence (global_cond) encoders ────────────────────────────────────
+#
+# The encoders above all produce a TRMInput (a token sequence consumed via
+# cross-attention, per interfaces.py's TRMInput.to_painter_kwargs()). The
+# action_backbones.py painters (ConditionalUnet1D / TransformerForDiffusion)
+# instead take conditioning per observation step — FiLM (flattened into one
+# vector by ConditionalUnet1D itself) or per-step prefix tokens (consumed
+# as-is by TransformerForDiffusion) — matching real-stanford/diffusion_policy.
+# These encoders implement that different (simpler) contract: condition_keys
+# still declares which DataSample fields to read, but forward() returns a
+# plain (B, n_obs_steps, D) tensor instead of a TRMInput.
+
+
+class GlobalCondEncoderBase(nn.Module):
+    """Base for condition encoders that produce a (B, n_obs_steps, D) tensor.
+
+    Used by models/action_painters.py, not by the thinker/TRM pipeline.
+    """
+
+    condition_keys: list[str] = []
+
+    def forward(self, *args, timesteps: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class LowdimObsConditionEncoder(GlobalCondEncoderBase):
+    """Passes the observation-history tensor through unchanged.
+
+    Matches upstream diffusion_policy's lowdim policies: no learned encoder,
+    the raw (normalized) observation history is used directly as conditioning
+    (ConditionalUnet1D flattens it into one FiLM vector itself;
+    TransformerForDiffusion consumes it as n_obs_steps separate cond tokens).
+
+    Input/Output: embedding_conditions (B, n_obs_steps, obs_dim)
+    """
+
+    condition_keys: list[str] = ["embedding_conditions"]
+
+    def forward(self, embedding_conditions: torch.Tensor, timesteps=None, **_) -> torch.Tensor:
+        return embedding_conditions
+
+
+def _replace_batchnorm_with_groupnorm(module: nn.Module) -> nn.Module:
+    """Recursively replace every BatchNorm2d with GroupNorm(num_features // 16),
+    matching upstream's MultiImageObsEncoder(use_group_norm=True)."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            setattr(module, name, nn.GroupNorm(num_groups=max(1, child.num_features // 16), num_channels=child.num_features))
+        else:
+            _replace_batchnorm_with_groupnorm(child)
+    return module
+
+
+class ImageObsConditionEncoder(GlobalCondEncoderBase):
+    """ResNet18 vision encoder + raw low-dim obs, matching upstream's
+    MultiImageObsEncoder (share_rgb_model=True path): a single shared ResNet18
+    backbone (fc replaced with Identity, BatchNorm optionally replaced with
+    GroupNorm) encodes every camera view via its own global average pool (no
+    spatial softmax — upstream doesn't use one either); per-view features are
+    concatenated, then concatenated with the raw low-dim observation.
+
+    crop_shape (e.g. [76, 76]) matches upstream's train-time random-crop /
+    eval-time center-crop augmentation ("eval_fixed_crop: True"). The random
+    crop offset is shared across all obs-steps/views of a given sample (a
+    fixed camera crop for the whole rollout) but drawn independently per
+    sample in the batch.
+
+    Input:
+      spatial_conditions   (B, T, C, H, W)     — single camera view, or
+                            (B, T, V, C, H, W)  — V camera views (kept
+                            separate, e.g. ToolHangImageDataset)
+      embedding_conditions (B, T, obs_dim)     — optional raw low-dim obs
+                            (e.g. agent_pos / robot proprioception)
+    Output: (B, T, V * resnet_feature_dim + obs_dim)
+    """
+
+    condition_keys: list[str] = ["spatial_conditions", "embedding_conditions"]
+
+    def __init__(self, use_group_norm: bool = True, pretrained: bool = False, crop_shape=None):
+        super().__init__()
+        import torchvision
+
+        weights = "IMAGENET1K_V1" if pretrained else None
+        resnet = torchvision.models.resnet18(weights=weights)
+        resnet.fc = nn.Identity()
+        if use_group_norm:
+            resnet = _replace_batchnorm_with_groupnorm(resnet)
+        self.resnet = resnet
+        self.feature_dim = 512  # resnet18's pre-fc feature width
+        self.crop_shape = tuple(crop_shape) if crop_shape is not None else None
+
+    def _crop(self, imgs: torch.Tensor, per_sample: int) -> torch.Tensor:
+        """imgs: (B*per_sample, C, H, W), grouped in contiguous per-sample blocks."""
+        if self.crop_shape is None:
+            return imgs
+        n, c, h, w = imgs.shape
+        ch, cw = self.crop_shape
+        out = imgs.new_empty(n, c, ch, cw)
+        for b in range(n // per_sample):
+            sl = slice(b * per_sample, (b + 1) * per_sample)
+            if self.training:
+                top = int(torch.randint(0, h - ch + 1, (1,)))
+                left = int(torch.randint(0, w - cw + 1, (1,)))
+            else:
+                top, left = (h - ch) // 2, (w - cw) // 2
+            out[sl] = imgs[sl][:, :, top:top + ch, left:left + cw]
+        return out
+
+    def forward(self, spatial_conditions: torch.Tensor, embedding_conditions=None, timesteps=None, **_) -> torch.Tensor:
+        x = spatial_conditions
+        multiview = x.ndim == 6
+        if multiview:
+            B, T, V, C, H, W = x.shape
+            x = self._crop(x.reshape(B * T * V, C, H, W), per_sample=T * V)
+            feat = self.resnet(x)
+            feat = feat.reshape(B, T, V * self.feature_dim)
+        else:
+            B, T, C, H, W = x.shape
+            x = self._crop(x.reshape(B * T, C, H, W), per_sample=T)
+            feat = self.resnet(x)
+            feat = feat.reshape(B, T, self.feature_dim)
+
+        if embedding_conditions is not None:
+            feat = torch.cat([feat, embedding_conditions], dim=-1)
+
+        return feat

@@ -1,0 +1,17 @@
+# Base (painter_base mode) painter for action-sequence data, conv1d backbone.
+# Task-agnostic: composes with whichever backbone/data/condition_encoder/
+# eval_callbacks config group the experiment selects.
+_target_: models.action_painters.ActionUNet1DPainter
+_recursive_: false
+backbone: ${backbone}
+action_dim: ${data.action_dim}
+horizon: ${data.horizon}
+condition_encoder: ${condition_encoder}
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 1e-6
+  warmup_steps: 500
+  lr_min_ratio: 1.0
+  betas: [0.95, 0.999]
