@@ -356,7 +356,12 @@ class ToolHangImageDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def download_tool_hang(data_dir='data', variant='lowdim'):
-    """Download ToolHang HDF5 dataset from diffusion_policy servers.
+    """Download the ToolHang HDF5 dataset from diffusion_policy servers.
+
+    Note this zip bundles robomimic's *entire* task suite (lift/can/square/
+    transport/tool_hang, each ph/mh) under a top-level robomimic/ folder, not
+    just ToolHang — that's why it's ~1.9GB (lowdim) / ~78GB (image) even
+    though we only use the tool_hang/ph subset.
 
     Parameters
     ----------
@@ -366,13 +371,16 @@ def download_tool_hang(data_dir='data', variant='lowdim'):
         'lowdim' or 'image'.
     """
     import urllib.request, zipfile, pathlib
-    out_dir = pathlib.Path(data_dir) / 'robomimic' / 'datasets' / 'tool_hang' / 'ph'
+    out_dir = pathlib.Path(data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     url = f'https://diffusion-policy.cs.columbia.edu/data/training/robomimic_{variant}.zip'
-    zip_path = out_dir / f'tool_hang_{variant}.zip'
+    zip_path = out_dir / f'robomimic_{variant}.zip'
     print(f'Downloading ToolHang {variant} from {url} ...')
     urllib.request.urlretrieve(url, zip_path)
+    # The zip already contains a top-level robomimic/ folder (verified against
+    # its actual contents), so it's extracted into data_dir directly —
+    # extracting into data_dir/robomimic/ would double-nest it.
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(pathlib.Path(data_dir) / 'robomimic')
+        zf.extractall(out_dir)
     zip_path.unlink(missing_ok=True)
     print('Done.')
