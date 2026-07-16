@@ -509,6 +509,16 @@ class ToolHangEvalCallback:
 
     def _make_env(self):
         try:
+            # The pinned robosuite 1.2.0 fork (cheng-chi/robosuite) still does
+            # `from collections import Iterable` / `collections.Iterable` in
+            # a couple of places (multi_table_arena.py, placement_samplers.py)
+            # — that alias moved to collections.abc in Python 3.3 and was
+            # hard-removed from collections itself in Python 3.10. Restore it
+            # before robosuite (or anything it imports) runs.
+            import collections
+            import collections.abc
+            if not hasattr(collections, "Iterable"):
+                collections.Iterable = collections.abc.Iterable
             import robosuite as suite
             kwargs = dict(
                 robots='Panda',
