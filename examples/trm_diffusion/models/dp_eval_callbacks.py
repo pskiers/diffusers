@@ -545,11 +545,20 @@ class ToolHangEvalCallback:
             return None
 
     def _obs_to_dict(self, raw_obs):
-        """Extract and stack relevant observation keys from a robosuite obs dict."""
+        """Extract and stack relevant observation keys from a robosuite obs dict.
+
+        Raw robosuite observables group every modality="object" sensor into
+        a single concatenated 'object-state' key — 'object' is robomimic's
+        own renamed convention for that same vector when it builds its
+        offline datasets (which is what obs_keys/the trained painter expect),
+        so alias it here rather than assuming robosuite exposes 'object'
+        directly.
+        """
         result = {}
         for key in self.obs_keys:
-            if key in raw_obs:
-                val = np.array(raw_obs[key], dtype=np.float32)
+            raw_key = 'object-state' if key == 'object' and key not in raw_obs else key
+            if raw_key in raw_obs:
+                val = np.array(raw_obs[raw_key], dtype=np.float32)
                 result[key] = val
         return result
 
