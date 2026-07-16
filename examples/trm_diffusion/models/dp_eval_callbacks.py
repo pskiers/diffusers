@@ -520,8 +520,15 @@ class ToolHangEvalCallback:
             if not hasattr(collections, "Iterable"):
                 collections.Iterable = collections.abc.Iterable
             import robosuite as suite
+            from robosuite.controllers import load_controller_config
             kwargs = dict(
                 robots='Panda',
+                # robomimic's public ToolHang dataset (which the painter is
+                # trained on) was collected with OSC_POSE (6D pose delta + 1
+                # gripper = 7-dim actions) — Panda's default when
+                # unspecified is JOINT_VELOCITY (7 joint vels + 1 gripper =
+                # 8-dim), which doesn't match the trained action space.
+                controller_configs=load_controller_config(default_controller="OSC_POSE"),
                 has_renderer=False,
                 has_offscreen_renderer=self.use_camera_obs,
                 use_camera_obs=self.use_camera_obs,
