@@ -63,13 +63,19 @@ class PushTImageEvalCallback:
 
     Paper result: 0.73 mean coverage (DDPM-CNN baseline).
 
-    Supports both obs modalities gym_pusht exposes:
-      obs_type='pixels_agent_pos' (default) — image + agent_pos, for
-        PushTHybridDataset-trained painters (spatial_conditions + embedding_conditions).
-      obs_type='state' — low-dim state vector only, for
+    Supports two obs modalities:
+      obs_type='pixels_agent_pos' (default) — image + agent_pos via the
+        gym-pusht package, for PushTHybridDataset-trained painters
+        (spatial_conditions + embedding_conditions).
+      obs_type='keypoints' — the vendored third_party/pusht_keypoints env
+        (real-stanford/diffusion_policy's own PushTKeypointsEnv), for
         PushTLowdimDataset-trained painters (embedding_conditions only).
+        gym-pusht's own built-in keypoints option uses a different,
+        incompatible 8-keypoint scheme and can't be used here — our dataset
+        was built with upstream's 9-keypoint PushTKeypointsEnv.
 
-    Requires: pip install gym-pusht pymunk shapely
+    Requires: pip install gym-pusht "pymunk<7" shapely gym pygame scikit-image
+    (gym/pygame/scikit-image are only needed for obs_type='keypoints').
     """
 
     def __init__(
@@ -95,24 +101,12 @@ class PushTImageEvalCallback:
         self.device = device
 
     def _raw_obs_to_dict(self, obs):
-        if self.obs_type == 'state':
-            # gym_pusht returns a plain low-dim array in this mode.
-            return {'state': np.asarray(obs, dtype=np.float32)}
         # obs_type='pixels_agent_pos': dict with 'pixels' (96,96,3) uint8 and
         # 'agent_pos' (2,) float32.
         return {'image': obs['pixels'], 'agent_pos': obs['agent_pos']}
 
     def _stacked_to_obs_tensor(self, stacked_obs, device):
         normalizer = self.normalizer
-        if self.obs_type == 'state':
-            state = stacked_obs['state'].astype(np.float32)
-            try:
-                state_t = torch.from_numpy(state).unsqueeze(0).to(device)
-                state = normalizer['obs'].normalize(state_t).squeeze(0).cpu().numpy()
-            except (KeyError, Exception):
-                pass
-            return {'embedding_conditions': torch.from_numpy(state).unsqueeze(0).to(device)}
-
         image_norm = stacked_obs['image'].astype(np.float32) / 255.0 * 2.0 - 1.0
         image_norm = image_norm.transpose(0, 3, 1, 2)  # (T, 3, H, W)
 
@@ -130,7 +124,15 @@ class PushTImageEvalCallback:
             'embedding_conditions': torch.from_numpy(agent_pos).unsqueeze(0).to(device),
         }
 
-    def __call__(self, model, dataloader, accelerator, **kwargs):
+    def _unnormalize_action(self, actions, device):
+        try:
+            actions_t = torch.from_numpy(actions).unsqueeze(0).to(device)
+            action_exec = self.normalizer['action'].unnormalize(actions_t)
+            return action_exec.squeeze(0).cpu().numpy()
+        except (KeyError, Exception):
+            return actions
+
+    def _run_pixels_agent_pos(self, model):
         try:
             # gym-pusht registers its env under the gymnasium registry, not
             # the legacy `gym` package (confirmed against its PyPI metadata:
@@ -140,15 +142,14 @@ class PushTImageEvalCallback:
         except ImportError:
             logger.warning(
                 "gym-pusht not installed. Skipping PushT eval. "
-                "pip install gym-pusht pymunk shapely"
+                "pip install gym-pusht \"pymunk<7\" shapely"
             )
-            return {}
+            return None
 
         device = self.device
-        normalizer = self.normalizer
         obs_buffer = ObsBuffer(self.n_obs_steps)
 
-        env = gym.make('gym_pusht/PushT-v0', obs_type=self.obs_type)
+        env = gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos')
         all_max_coverage = []
 
         for seed in range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes):
@@ -167,14 +168,7 @@ class PushTImageEvalCallback:
                     action_dict = model.predict_action(obs_tensor)
 
                 actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
-
-                # Unnormalize actions
-                try:
-                    actions_t = torch.from_numpy(actions).unsqueeze(0).to(device)
-                    action_exec = normalizer['action'].unnormalize(actions_t)
-                    action_exec = action_exec.squeeze(0).cpu().numpy()
-                except (KeyError, Exception):
-                    action_exec = actions
+                action_exec = self._unnormalize_action(actions, device)
 
                 T_a = action_exec.shape[0]
                 for t in range(min(self.n_action_steps, T_a)):
@@ -190,6 +184,80 @@ class PushTImageEvalCallback:
             all_max_coverage.append(max_coverage)
 
         env.close()
+        return all_max_coverage
+
+    def _run_keypoints(self, model):
+        try:
+            from third_party.pusht_keypoints.pusht_keypoints_env import PushTKeypointsEnv
+            from third_party.pusht_keypoints.pusht_env import pymunk_to_shapely
+        except ImportError as exc:
+            logger.warning(
+                "PushT keypoints env dependencies not installed. Skipping PushT eval. "
+                "pip install \"pymunk<7\" shapely gym pygame scikit-image matplotlib opencv-python "
+                f"(missing: {exc})"
+            )
+            return None
+
+        device = self.device
+        obs_buffer = ObsBuffer(self.n_obs_steps)
+
+        kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
+        env = PushTKeypointsEnv(legacy=False, keypoint_visible_rate=1.0, agent_keypoints=False, **kp_kwargs)
+        all_max_coverage = []
+
+        def coverage_of(env):
+            goal_body = env._get_goal_pose_body(env.goal_pose)
+            goal_geom = pymunk_to_shapely(goal_body, env.block.shapes)
+            block_geom = pymunk_to_shapely(env.block, env.block.shapes)
+            return goal_geom.intersection(block_geom).area / goal_geom.area
+
+        for seed in range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes):
+            env.seed(seed)
+            raw_obs = env.reset()
+            Do = raw_obs.shape[-1] // 2
+            obs_buffer.reset({'state': raw_obs[:Do].astype(np.float32)})
+
+            max_coverage = 0.0
+            done = False
+            step = 0
+
+            while not done and step < self.max_steps:
+                state = obs_buffer.get()['state'].astype(np.float32)
+                try:
+                    state_t = torch.from_numpy(state).unsqueeze(0).to(device)
+                    state = self.normalizer['obs'].normalize(state_t).squeeze(0).cpu().numpy()
+                except (KeyError, Exception):
+                    pass
+                obs_tensor = {'embedding_conditions': torch.from_numpy(state).unsqueeze(0).to(device)}
+
+                with torch.no_grad():
+                    action_dict = model.predict_action(obs_tensor)
+
+                actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
+                action_exec = self._unnormalize_action(actions, device)
+
+                T_a = action_exec.shape[0]
+                for t in range(min(self.n_action_steps, T_a)):
+                    raw_obs, reward, done, info = env.step(action_exec[t])
+                    max_coverage = max(max_coverage, coverage_of(env))
+                    obs_buffer.push({'state': raw_obs[:Do].astype(np.float32)})
+                    step += 1
+                    if done:
+                        break
+
+            all_max_coverage.append(max_coverage)
+
+        env.close()
+        return all_max_coverage
+
+    def __call__(self, model, dataloader, accelerator, **kwargs):
+        if self.obs_type == 'keypoints':
+            all_max_coverage = self._run_keypoints(model)
+        else:
+            all_max_coverage = self._run_pixels_agent_pos(model)
+
+        if all_max_coverage is None:
+            return {}
 
         return {
             'pusht/mean_coverage': float(np.mean(all_max_coverage)),
