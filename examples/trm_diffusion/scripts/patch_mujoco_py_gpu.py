@@ -49,6 +49,25 @@ real GPU (H100) that free-mujoco-py==2.1.6 still couldn't use out of the box:
    license) into mujoco_py's own vendor/egl/GL/ include directory (already
    on its build's include path) rather than requiring a system GLEW install.
 
+5. Fix (2) (appending instead of overwriting LD_LIBRARY_PATH) exposes a
+   second, independent bug: builder.py's fix_shared_library() calls
+   (LinuxGPUExtensionBuilder._build_impl / LinuxCPUExtensionBuilder._build_impl)
+   hardcode the patchelf --add-needed target as
+   f'{os.environ["LD_LIBRARY_PATH"]}/{name}' — i.e. they assume
+   LD_LIBRARY_PATH is a single directory containing every one of
+   libmujoco210.so/libglewegl.so/libglewosmesa.so/libOpenGL.so.0/libEGL.so.1.
+   That's only true in the original (unpatched) single-directory-overwrite
+   behavior fix (2) had to remove — so once LD_LIBRARY_PATH is a real
+   colon-separated PATH (as it must be for the OS's own dynamic linker),
+   these calls embed the literal, nonexistent string
+   "<entire LD_LIBRARY_PATH>/<name>" into the .so via patchelf, and it fails
+   to dlopen at import time ("... cannot open shared object file"). This
+   script replaces fix_shared_library() with a version that searches each
+   directory in LD_LIBRARY_PATH for the real file and uses its actual
+   resolved path (falling back to the bare library name — a normal system
+   library lookup — for libraries like libOpenGL.so.0/libEGL.so.1 that live
+   in standard system paths rather than anywhere on LD_LIBRARY_PATH).
+
 You need to re-run this any time free-mujoco-py/mujoco_py gets reinstalled
 (directly, or transitively via reinstalling robosuite/robomimic) — a fresh
 install always overwrites these files with their original, unpatched source.
@@ -66,7 +85,7 @@ import shutil
 import sys
 
 NEW_FUNC = '''def get_nvidia_lib_dir():
-    # Patched by scripts/patch_mujoco_py_gpu.py — see its module docstring.
+    # Patched by scripts/patch_mujoco_py_gpu.py (get_nvidia_lib_dir) — see its module docstring.
     docker_path = '/usr/local/nvidia/lib64'
     if exists(docker_path):
         return docker_path
@@ -81,7 +100,7 @@ NEW_FUNC = '''def get_nvidia_lib_dir():
 
     return None
 '''
-BUILDER_MARKER = "# Patched by scripts/patch_mujoco_py_gpu.py"
+BUILDER_MARKER = "# Patched by scripts/patch_mujoco_py_gpu.py (get_nvidia_lib_dir)"
 
 # Matches the three (linux/darwin/win32) `os.environ["LD_LIBRARY_PATH"] = ...`
 # overwrite lines in mujoco_py/__init__.py.
@@ -110,6 +129,24 @@ typedef khronos_uintptr_t EGLNativePixmapType;
 typedef khronos_uintptr_t EGLNativeWindowType;
 '''
 EGL_MARKER = "Patched by scripts/patch_mujoco_py_gpu.py"  # C file: no leading `#`
+
+NEW_FIX_SHARED_LIBRARY = '''def fix_shared_library(so_file, name, library_path):
+    # Patched by scripts/patch_mujoco_py_gpu.py (fix_shared_library) — see its module docstring.
+    """ Used to fixup shared libraries on Linux """
+    library_path = name
+    for lib_dir in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        candidate = os.path.join(lib_dir, name)
+        if lib_dir and os.path.exists(candidate):
+            library_path = candidate
+            break
+    subprocess.check_call(['patchelf', '--remove-rpath', so_file])
+    ldd_output = subprocess.check_output(['ldd', so_file]).decode('utf-8')
+
+    if name in ldd_output:
+        subprocess.check_call(['patchelf', '--remove-needed', name, so_file])
+    subprocess.check_call(['patchelf', '--add-needed', library_path, so_file])
+'''
+FIX_SHARED_LIBRARY_MARKER = "# Patched by scripts/patch_mujoco_py_gpu.py (fix_shared_library)"
 
 
 def find_package_dir():
@@ -188,6 +225,26 @@ def patch_eglplatform(pkg_dir):
     print(f"Patched {path}")
 
 
+def patch_fix_shared_library(pkg_dir):
+    path = os.path.join(pkg_dir, "builder.py")
+    src = open(path).read()
+
+    if FIX_SHARED_LIBRARY_MARKER in src:
+        print(f"{path} already patched (fix_shared_library), nothing to do.")
+        return
+
+    tree = ast.parse(src)
+    target = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "fix_shared_library"), None)
+    if target is None:
+        sys.exit(f"Could not find fix_shared_library() in {path} — inspect it manually.")
+
+    lines = src.splitlines(keepends=True)
+    start, end = target.lineno - 1, target.end_lineno
+    new_lines = lines[:start] + [NEW_FIX_SHARED_LIBRARY] + lines[end:]
+    open(path, "w").write("".join(new_lines))
+    print(f"Patched {path} (fix_shared_library)")
+
+
 def install_glew_header(pkg_dir):
     dest_dir = os.path.join(pkg_dir, "vendor", "egl", "GL")
     dest = os.path.join(dest_dir, "glew.h")
@@ -207,6 +264,7 @@ def install_glew_header(pkg_dir):
 def main():
     pkg_dir = find_package_dir()
     patch_builder(pkg_dir)
+    patch_fix_shared_library(pkg_dir)
     patch_init(pkg_dir)
     patch_eglplatform(pkg_dir)
     install_glew_header(pkg_dir)
