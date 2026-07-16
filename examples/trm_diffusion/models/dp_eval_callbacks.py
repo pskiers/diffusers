@@ -21,6 +21,7 @@ import collections
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,9 @@ class PushTImageEvalCallback:
         env = gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos')
         all_max_coverage = []
 
-        for seed in range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes):
+        seeds = range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes)
+        pbar = tqdm(seeds, desc="PushT eval (pixels_agent_pos)", total=self.n_eval_episodes, leave=False)
+        for seed in pbar:
             obs, info = env.reset(seed=seed)
             obs_buffer.reset(self._raw_obs_to_dict(obs))
 
@@ -180,8 +183,10 @@ class PushTImageEvalCallback:
                     done = terminated or truncated
                     if done:
                         break
+                pbar.set_postfix(step=f"{step}/{self.max_steps}", coverage=f"{max_coverage:.3f}")
 
             all_max_coverage.append(max_coverage)
+            pbar.set_postfix(mean_coverage=f"{np.mean(all_max_coverage):.3f}")
 
         env.close()
         return all_max_coverage
@@ -211,7 +216,9 @@ class PushTImageEvalCallback:
             block_geom = pymunk_to_shapely(env.block, env.block.shapes)
             return goal_geom.intersection(block_geom).area / goal_geom.area
 
-        for seed in range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes):
+        seeds = range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes)
+        pbar = tqdm(seeds, desc="PushT eval (keypoints)", total=self.n_eval_episodes, leave=False)
+        for seed in pbar:
             env.seed(seed)
             raw_obs = env.reset()
             Do = raw_obs.shape[-1] // 2
@@ -244,8 +251,10 @@ class PushTImageEvalCallback:
                     step += 1
                     if done:
                         break
+                pbar.set_postfix(step=f"{step}/{self.max_steps}", coverage=f"{max_coverage:.3f}")
 
             all_max_coverage.append(max_coverage)
+            pbar.set_postfix(mean_coverage=f"{np.mean(all_max_coverage):.3f}")
 
         env.close()
         return all_max_coverage
@@ -334,7 +343,8 @@ class BlockPushEvalCallback:
         n_p1 = 0
         n_p2 = 0
 
-        for episode_idx in range(self.n_eval_episodes):
+        pbar = tqdm(range(self.n_eval_episodes), desc="BlockPush eval", leave=False)
+        for episode_idx in pbar:
             seed = self.test_start_seed + episode_idx
             try:
                 obs = env.reset(seed=seed)
@@ -423,6 +433,7 @@ class BlockPushEvalCallback:
                     step += 1
                     if done:
                         break
+                pbar.set_postfix(step=f"{step}/{self.max_steps}", score=f"{episode_score:.3f}")
 
             all_scores.append(episode_score)
             # Thresholds match upstream blockpush_lowdim_runner.py.
@@ -430,6 +441,7 @@ class BlockPushEvalCallback:
                 n_p1 += 1
             if episode_score > 0.9:
                 n_p2 += 1
+            pbar.set_postfix(mean_score=f"{np.mean(all_scores):.3f}", p1=n_p1, p2=n_p2)
 
         env.close()
 
@@ -603,7 +615,8 @@ class ToolHangEvalCallback:
         obs_buffer = ObsBuffer(self.n_obs_steps)
         n_success = 0
 
-        for episode_idx in range(self.n_eval_episodes):
+        pbar = tqdm(range(self.n_eval_episodes), desc="ToolHang eval", leave=False)
+        for episode_idx in pbar:
             seed = self.test_start_seed + episode_idx
             try:
                 env.seed(seed)  # robosuite/legacy-gym seeding API
@@ -645,9 +658,11 @@ class ToolHangEvalCallback:
                     step += 1
                     if done:
                         break
+                pbar.set_postfix(step=f"{step}/{self.max_steps}", success=success)
 
             if success:
                 n_success += 1
+            pbar.set_postfix(success_rate=f"{n_success / (episode_idx + 1):.3f}")
 
         env.close()
 
