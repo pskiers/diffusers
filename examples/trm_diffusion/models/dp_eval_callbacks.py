@@ -321,8 +321,8 @@ class BlockPushEvalCallback:
                 control_frequency=10,
                 shared_memory=False,
             )
-        except ImportError:
-            pass
+        except ImportError as exc:
+            logger.warning("Failed to create BlockPush env (ImportError): %s", exc)
 
         return None
 
@@ -527,7 +527,8 @@ class ToolHangEvalCallback:
                 )
             env = suite.make('ToolHang', **kwargs)
             return env
-        except ImportError:
+        except ImportError as exc:
+            logger.warning("Failed to create ToolHang env (ImportError): %s", exc)
             return None
         except Exception as exc:
             logger.warning("Failed to create ToolHang env: %s", exc)
