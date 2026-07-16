@@ -133,9 +133,13 @@ EGL_MARKER = "Patched by scripts/patch_mujoco_py_gpu.py"  # C file: no leading `
 NEW_FIX_SHARED_LIBRARY = '''def fix_shared_library(so_file, name, library_path):
     # Patched by scripts/patch_mujoco_py_gpu.py (fix_shared_library) — see its module docstring.
     """ Used to fixup shared libraries on Linux """
-    library_path = name
+    # library_path's basename (e.g. libEGL.so.1) is the real, often-versioned
+    # filename to look for — it can differ from `name` (e.g. libEGL.so, the
+    # unversioned reference ldd/patchelf --remove-needed match against).
+    target = os.path.basename(library_path)
+    library_path = target
     for lib_dir in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
-        candidate = os.path.join(lib_dir, name)
+        candidate = os.path.join(lib_dir, target)
         if lib_dir and os.path.exists(candidate):
             library_path = candidate
             break
