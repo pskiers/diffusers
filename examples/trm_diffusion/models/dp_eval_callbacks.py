@@ -301,18 +301,18 @@ class BlockPushEvalCallback:
 
     def _make_env(self):
         try:
-            from block_pushing import block_pushing_multimodal
+            # Vendored (third_party/block_pushing/) — google-research/ibc's
+            # own `block_pushing` isn't pip-installable and its internal
+            # imports are rooted at `ibc.environments...`, not a bare
+            # top-level `block_pushing` package. Requires pybullet-svl (not
+            # plain pybullet) for the xarm6_robot.urdf asset — see
+            # third_party/block_pushing/__init__.py.
+            from third_party.block_pushing import block_pushing_multimodal
             return block_pushing_multimodal.BlockPushMultimodal(
                 control_frequency=10,
                 shared_memory=False,
             )
         except ImportError:
-            pass
-
-        try:
-            import gym
-            return gym.make('BlockPushMultimodal-v0')
-        except Exception:
             pass
 
         return None
@@ -351,7 +351,7 @@ class BlockPushEvalCallback:
 
             # obs is a 16D state vector or a dict; normalise to ndarray
             if isinstance(obs, dict):
-                obs_arr = np.concatenate([v.flatten() for v in obs.values()]).astype(np.float32)
+                obs_arr = np.concatenate([np.asarray(v).flatten() for v in obs.values()]).astype(np.float32)
             else:
                 obs_arr = np.array(obs, dtype=np.float32)
 
@@ -415,7 +415,7 @@ class BlockPushEvalCallback:
                         episode_score += float(reward)
 
                     if isinstance(obs, dict):
-                        obs_arr = np.concatenate([v.flatten() for v in obs.values()]).astype(np.float32)
+                        obs_arr = np.concatenate([np.asarray(v).flatten() for v in obs.values()]).astype(np.float32)
                     else:
                         obs_arr = np.array(obs, dtype=np.float32)
                     obs_buffer.push({'state': obs_arr})
