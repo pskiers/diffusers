@@ -114,13 +114,24 @@ class ActionPainterBase(PainterBase, BaseModel):
         )
 
     @torch.no_grad()
-    def predict_action(self, obs_dict: dict) -> dict:
+    def predict_action(self, obs_dict: dict, n_action_steps: Optional[int] = None) -> dict:
         """Closed-loop rollout entry point used by dp_eval_callbacks.py.
 
         obs_dict keys mirror DataSample fields ('spatial_conditions',
         'embedding_conditions'); values already carry a batch dimension.
-        Returns {'action': (B, horizon, action_dim)} still in the model's
+        Returns {'action': (B, T, action_dim)} still in the model's
         normalized action space — the caller unnormalizes.
+
+        The backbone predicts a full (horizon, action_dim) chunk, but the
+        first (n_obs_steps - 1) steps of that chunk correspond to already-
+        observed history, not future actions — matching upstream diffusion_policy
+        (e.g. diffusion_unet_lowdim_policy.predict_action), we slice
+        action_pred[:, n_obs_steps-1 : n_obs_steps-1+n_action_steps] rather
+        than returning the raw chunk from index 0. Executing from index 0
+        instead silently offsets every closed-loop action by (n_obs_steps-1)
+        steps — invisible to training loss (teacher-forced regression over
+        the whole horizon doesn't care about this slicing), but enough to
+        tank success rate on contact-rich/precision tasks.
         """
         device = next(self.parameters()).device
         conditions = DataSample(
@@ -132,8 +143,13 @@ class ActionPainterBase(PainterBase, BaseModel):
         if pipeline is None:
             pipeline = SamplingPipeline(num_inference_steps=self.eval_cfg.num_ddim_steps, batch_size=1)
 
-        action = pipeline.sample_one_batch(self, conditions, device)
-        return {'action': action}
+        action_pred = pipeline.sample_one_batch(self, conditions, device)
+
+        n_obs_steps = getattr(self.condition_encoder, 'n_obs_steps', 1) if self.condition_encoder is not None else 1
+        start = n_obs_steps - 1
+        end = start + n_action_steps if n_action_steps is not None else action_pred.shape[1]
+        action = action_pred[:, start:end]
+        return {'action': action, 'action_pred': action_pred}
 
     # ── Training helpers (identical structure to UNetPainter) ────────────────
 

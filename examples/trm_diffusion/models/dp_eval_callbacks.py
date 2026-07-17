@@ -8,7 +8,9 @@ Callback interface:
     callback(model, dataloader, accelerator, **kwargs) -> dict[str, float]
 
 Model contract:
-    model.predict_action(obs_dict) -> {'action': tensor (B, T_a, Da)}
+    model.predict_action(obs_dict, n_action_steps=N) -> {'action': tensor (B, N, Da)}
+    (already sliced to the executable [n_obs_steps-1 : n_obs_steps-1+N] window
+    of the predicted horizon — see ActionPainterBase.predict_action)
 
 Supported environments:
     PushT      — gym-pusht (pip install gym-pusht pymunk shapely)
@@ -168,7 +170,7 @@ class PushTImageEvalCallback:
                 obs_tensor = self._stacked_to_obs_tensor(stacked_obs, device)
 
                 with torch.no_grad():
-                    action_dict = model.predict_action(obs_tensor)
+                    action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
                 actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
                 action_exec = self._unnormalize_action(actions, device)
@@ -238,7 +240,7 @@ class PushTImageEvalCallback:
                 obs_tensor = {'embedding_conditions': torch.from_numpy(state).unsqueeze(0).to(device)}
 
                 with torch.no_grad():
-                    action_dict = model.predict_action(obs_tensor)
+                    action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
                 actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
                 action_exec = self._unnormalize_action(actions, device)
@@ -396,7 +398,7 @@ class BlockPushEvalCallback:
                 }
 
                 with torch.no_grad():
-                    action_dict = model.predict_action(obs_tensor)
+                    action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
                 actions = action_dict['action'][0].cpu().numpy()  # (T_a, Da) normalized
 
@@ -662,7 +664,7 @@ class ToolHangEvalCallback:
                 obs_tensor = self._build_obs_tensor(stacked_obs)
 
                 with torch.no_grad():
-                    action_dict = model.predict_action(obs_tensor)
+                    action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
                 actions = action_dict['action'][0].cpu().numpy()  # (T_a, Da) normalized
 
