@@ -83,6 +83,7 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         # ── Condition encoder, loss, translator, eval callbacks ───────────────
         self.condition_encoder: ConditionEncoderBase = instantiate(condition_encoder)
+        self.condition_encoder.bind_painter(self.painter)
         self.loss_fn: LossBase = build_loss(train_cfg, self.painter.scheduler)
         self.thinker_painter_translator: ThinkerPainterTranslatorBase = instantiate(thinker_painter_translator)
         self.eval_callbacks: list[EvalCallbackBase] = (

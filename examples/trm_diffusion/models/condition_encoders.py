@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from datasets.data_sample import DataSample
+from models.diffusion_utils import x0_from_noise_pred
 from models.interfaces import TRMInput
 from models.utility_models import SpatialEncoder, TimestepMLP
 
@@ -39,6 +41,13 @@ class ConditionEncoderBase(nn.Module):
     """
 
     condition_keys: list[str] = ["spatial_conditions"]
+
+    def bind_painter(self, painter) -> None:
+        """Optional hook: encoders that need access to the frozen painter
+        (e.g. to run an extra denoising pass for an x0-prediction hint)
+        override this. No-op by default. Called once by the owning model
+        (ThinkerFrozenPainterBase) right after both painter and
+        condition_encoder are instantiated."""
 
     def forward(
         self,
@@ -215,6 +224,79 @@ class NoisySpatialConditionEncoderV2(ConditionEncoderBase):
         if self.with_timestep_emb and timesteps is not None:
             emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
         return TRMInput(enc_emb=emb)
+
+
+class X0PredHintConditionEncoder(ConditionEncoderBase):
+    """
+    Wraps another (noisy-aware) condition encoder and replaces its raw
+    ``x_noisy`` input with a blurred x0 estimate before delegating — a
+    coarse-to-fine anti-exposure-bias hint instead of the raw diffusion
+    state.
+
+    Motivation: feeding the TRM raw x_t lets it exploit whatever ground-truth
+    signal survives at low noise levels ("exposure bias") instead of
+    reasoning over the puzzle. This computes x0_pred via one frozen,
+    unsteered forward pass of the bound painter (see ``bind_painter``) at
+    ``t_hint = max(timesteps, threshold)`` — i.e. never at a noise level
+    below ``threshold`` — first re-noising x_noisy up to ``threshold`` when
+    the real timestep is already cleaner than that. The result carries the
+    low-frequency spatial layout (scale/offset) the TRM needs while hiding
+    exact digit identity behind noise that never drops below the floor.
+
+    Requires ``bind_painter()`` to have been called with a frozen painter
+    exposing ``.scheduler`` and callable as ``painter(sample, steering=None)``
+    — the owning model (ThinkerFrozenPainterBase) does this automatically.
+    Assumes that call only needs ``sample.x_noisy``/``sample.timesteps``
+    (true for a plain frozen UNet painter with no painter-side
+    condition_encoder of its own).
+
+    Args:
+        inner:     Hydra config for the wrapped ConditionEncoderBase (e.g.
+                    NoisySpatialConditionEncoder or ...V2) — instantiated
+                    recursively by Hydra before reaching this constructor.
+        threshold: minimum diffusion timestep the hint is ever computed at.
+    """
+
+    def __init__(self, inner: ConditionEncoderBase, threshold: int):
+        super().__init__()
+        self.inner = inner
+        self.threshold = threshold
+        self._painter = None
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return self.inner.condition_keys
+
+    def bind_painter(self, painter) -> None:
+        self._painter = painter
+
+    @torch.no_grad()
+    def _x0_pred_hint(self, x_noisy: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        if self._painter is None:
+            raise RuntimeError("X0PredHintConditionEncoder requires bind_painter() before use.")
+        scheduler = self._painter.scheduler
+        threshold = torch.full_like(timesteps, self.threshold)
+        t_hint = torch.maximum(timesteps, threshold)
+
+        x_for_hint = x_noisy
+        needs_renoise = timesteps < threshold
+        if needs_renoise.any():
+            renoised = scheduler.add_noise(x_noisy, torch.randn_like(x_noisy), t_hint)
+            mask = needs_renoise.view(-1, *([1] * (x_noisy.ndim - 1)))
+            x_for_hint = torch.where(mask, renoised, x_noisy)
+
+        hint_sample = DataSample(x_noisy=x_for_hint, timesteps=t_hint)
+        eps_pred = self._painter(hint_sample, steering=None).pred
+        return x0_from_noise_pred(eps_pred, x_for_hint, t_hint, scheduler)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        hint = self._x0_pred_hint(x_noisy, timesteps) if timesteps is not None else x_noisy
+        return self.inner(condition, x_noisy=hint, timesteps=timesteps)
 
 
 # Backward-compatible alias — existing Hydra configs reference SpatialImageEncoder.

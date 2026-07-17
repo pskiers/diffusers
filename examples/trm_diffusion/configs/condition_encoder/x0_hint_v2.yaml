@@ -1,0 +1,16 @@
+# Same as x0_hint_v1.yaml but wrapping spatial_image_v2 (token-length-concat
+# encoder) instead — combine with translator=controlnet_sliced and
+# thinker.seq_len=162.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90
+inner:
+  _target_: models.condition_encoders.NoisySpatialConditionEncoderV2
+  cond_in_channels: 1
+  noisy_in_channels: 1
+  enc_channels: 128
+  hidden_channels: [128, 256, 256]
+  output_dim: ${thinker.hidden_size}
+  factor: ${data.cell_size}
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true

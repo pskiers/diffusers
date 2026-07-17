@@ -1,0 +1,26 @@
+# Wraps spatial_image_v1 (channel-concat noisy encoder) with an x0-prediction
+# hint: x_noisy is replaced by a blurred x0 estimate from one frozen,
+# unsteered painter forward pass at t_hint = max(timesteps, threshold),
+# before being handed to the inner encoder. See
+# models.condition_encoders.X0PredHintConditionEncoder.
+#
+# threshold is in units of the actual scheduler timesteps — this pipeline
+# uses num_train_timesteps=100 (configs/diffusion/ddpm.yaml), not 1000.
+# Set close to the noisy end: the coarse sudoku-grid structure emerges very
+# early in denoising, so the hint can stay noisy (safe from leaking exact
+# digit identity) while still carrying the spatial layout the TRM needs.
+# noisy_dropout_p_max=0 on the inner encoder: that was a separate, weaker
+# anti-exposure-bias mechanism (randomly zeroing x_noisy) — redundant now
+# that the x0-pred hint handles it directly.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90
+inner:
+  _target_: models.condition_encoders.NoisySpatialConditionEncoder
+  in_channels: 2
+  enc_channels: 128
+  hidden_channels: [128, 256, 256]
+  output_dim: ${thinker.hidden_size}
+  factor: ${data.cell_size}
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true
