@@ -1,0 +1,10 @@
+# Eval batch size kept well below the training microbatch — eval_step runs
+# the same thinker reasoning (forward-only, no backward, so it could in
+# principle go higher, but this leaves headroom since eval interleaves with
+# training in the same process). Lower this further if you hit OOM during
+# eval specifically.
+eval_every: 5000
+save_every: 20000
+log_every: 500
+batch_size: 64
+num_ddim_steps: 100

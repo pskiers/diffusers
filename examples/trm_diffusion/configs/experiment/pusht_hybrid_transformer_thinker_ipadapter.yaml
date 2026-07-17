@@ -13,9 +13,9 @@ defaults:
   - override /painter: action_transformer_ipadapter_frozen_image
   - override /thinker: action
   - override /translator: ipadapter_action
-  - override /condition_encoder: image_obs_trm
-  - override /train: action_image_small
-  - override /eval: action_image_small
+  - override /condition_encoder: pusht_hybrid_obs_trm
+  - override /train: action_thinker_pusht_hybrid
+  - override /eval: action_thinker_pusht_hybrid
   - override /loss: mse
   - override /eval_callbacks: pusht
   - override /sampling: action_direct

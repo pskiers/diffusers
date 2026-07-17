@@ -1,0 +1,19 @@
+# Training hyperparams for TRM thinker + frozen lowdim action-sequence painter
+# (pusht_lowdim, blockpush, toolhang_lowdim). batch_size here is a per-step
+# microbatch, reaching an effective/global batch of 768 via
+# gradient_accumulation_steps (matches the effective batch size used for
+# other TRM thinker trainings) rather than a single huge batch.
+# batch_size=256/accum=3 mirrors clevr_thinker.yaml's own ratio (256/3) —
+# our action backbones (ConditionalUnet1D/TransformerForDiffusion on
+# 16-length 1D sequences) and lowdim thinker condition encoder (a plain
+# Linear, no vision backbone) are both far smaller/cheaper per-sample than
+# CLEVR's 101M-param UNet on 32x32x4 SDXL latents, so this should have
+# comparable or better headroom on an H100 — not a reason to need more
+# accumulation. Adjust (keeping the product at 768) based on observed memory.
+seed: 42
+compile: true
+
+batch_size: 256
+num_steps: 200000
+gradient_accumulation_steps: 3
+cfg_prob: 0.0

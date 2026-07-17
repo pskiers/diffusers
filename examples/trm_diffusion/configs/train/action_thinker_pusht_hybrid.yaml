@@ -1,0 +1,17 @@
+# Training hyperparams for TRM thinker + frozen PushT-hybrid (image) action-
+# sequence painter. batch_size here is a per-step microbatch, reaching an
+# effective/global batch of 768 via gradient_accumulation_steps.
+# Every step runs the vision encoder twice (thinker's own separate
+# ImageObsTRMConditionEncoder + the frozen painter's own baked-in
+# ImageObsConditionEncoder), each a single-view ResNet18 (11M params) on a
+# small 76x76 crop — cheap relative to clevr_thinker.yaml's single 101M-param
+# UNet pass on 32x32x4 SDXL latents (which only needed accum=3 at
+# microbatch=85), so a much smaller microbatch than that shouldn't be
+# necessary. Adjust (keeping the product at 768) based on observed memory.
+seed: 42
+compile: true
+
+batch_size: 128
+num_steps: 200000
+gradient_accumulation_steps: 6
+cfg_prob: 0.0

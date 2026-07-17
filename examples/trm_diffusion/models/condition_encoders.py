@@ -454,27 +454,45 @@ class ImageObsConditionEncoder(GlobalCondEncoderBase):
 class LowdimObsTRMConditionEncoder(ConditionEncoderBase):
     """Thinker-facing wrapper around LowdimObsConditionEncoder.
 
-    Output: TRMInput with enc_emb (B, n_obs_steps, obs_dim).
+    SpatialTRMInner._input_embeddings treats a floating-point input as an
+    already-computed embedding at (B, seq_len, hidden_size) — it does no
+    projection of its own (that's only needed for discrete token inputs).
+    So unlike LowdimObsConditionEncoder (raw obs passed straight through as
+    global_cond for FiLM/prefix-token conditioning), this wrapper must
+    project obs_dim -> hidden_size itself before wrapping into TRMInput.
+
+    Output: TRMInput with enc_emb (B, n_obs_steps, hidden_size).
     """
 
     condition_keys: list[str] = ["embedding_conditions"]
 
-    def __init__(self, n_obs_steps: int):
+    def __init__(self, n_obs_steps: int, in_dim: int, hidden_size: int):
         super().__init__()
         self._inner = LowdimObsConditionEncoder(n_obs_steps)
+        self.proj = nn.Linear(in_dim, hidden_size)
 
     @property
     def n_obs_steps(self) -> int:
         return self._inner.n_obs_steps
 
     def forward(self, embedding_conditions: torch.Tensor, timesteps=None, **_) -> TRMInput:
-        return TRMInput(enc_emb=self._inner(embedding_conditions, timesteps=timesteps))
+        raw = self._inner(embedding_conditions, timesteps=timesteps)
+        return TRMInput(enc_emb=self.proj(raw))
 
 
 class ImageObsTRMConditionEncoder(ConditionEncoderBase):
     """Thinker-facing wrapper around ImageObsConditionEncoder.
 
-    Output: TRMInput with enc_emb (B, n_obs_steps, V * resnet_feature_dim + obs_dim).
+    SpatialTRMInner._input_embeddings treats a floating-point input as an
+    already-computed embedding at (B, seq_len, hidden_size) — it does no
+    projection of its own. So unlike ImageObsConditionEncoder (raw
+    ResNet-feature + obs concat passed straight through as global_cond for
+    FiLM/prefix-token conditioning), this wrapper must project
+    V*resnet_feature_dim+obs_dim -> hidden_size itself before wrapping into
+    TRMInput. in_dim must be set to that exact width (task-specific, since
+    it depends on the number of camera views).
+
+    Output: TRMInput with enc_emb (B, n_obs_steps, hidden_size).
     """
 
     condition_keys: list[str] = ["spatial_conditions", "embedding_conditions"]
@@ -482,6 +500,8 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
     def __init__(
         self,
         n_obs_steps: int,
+        in_dim: int,
+        hidden_size: int,
         use_group_norm: bool = True,
         pretrained: bool = False,
         crop_shape=None,
@@ -493,6 +513,7 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
             pretrained=pretrained,
             crop_shape=crop_shape,
         )
+        self.proj = nn.Linear(in_dim, hidden_size)
 
     @property
     def n_obs_steps(self) -> int:
@@ -505,9 +526,9 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
         timesteps=None,
         **_,
     ) -> TRMInput:
-        enc_emb = self._inner(
+        raw = self._inner(
             spatial_conditions,
             embedding_conditions=embedding_conditions,
             timesteps=timesteps,
         )
-        return TRMInput(enc_emb=enc_emb)
+        return TRMInput(enc_emb=self.proj(raw))

@@ -1,0 +1,15 @@
+# Training hyperparams for TRM thinker + frozen ToolHang-image action-sequence
+# painter. batch_size here is a per-step microbatch, reaching an
+# effective/global batch of 768 via gradient_accumulation_steps.
+# Same reasoning as action_thinker_pusht_hybrid.yaml, but with two camera
+# views (double the ResNet18 vision cost per pass) and a larger conv1d
+# backbone (down_dims up to 2048) — half the microbatch of the single-view
+# variant as a starting point. Adjust (keeping the product at 768) based on
+# observed memory.
+seed: 42
+compile: true
+
+batch_size: 64
+num_steps: 300000
+gradient_accumulation_steps: 12
+cfg_prob: 0.0

@@ -13,9 +13,9 @@ defaults:
   - override /painter: action_unet1d_controlnet1d_frozen_image
   - override /thinker: action
   - override /translator: controlnet1d_large
-  - override /condition_encoder: image_obs_trm
-  - override /train: action_image_small
-  - override /eval: action_image_small
+  - override /condition_encoder: pusht_hybrid_obs_trm
+  - override /train: action_thinker_pusht_hybrid
+  - override /eval: action_thinker_pusht_hybrid
   - override /loss: mse
   - override /eval_callbacks: pusht
   - override /sampling: action_direct

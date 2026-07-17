@@ -1,0 +1,5 @@
+eval_every: 5000
+save_every: 20000
+log_every: 500
+batch_size: 32
+num_ddim_steps: 100

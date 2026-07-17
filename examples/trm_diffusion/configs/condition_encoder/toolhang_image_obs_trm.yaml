@@ -1,0 +1,11 @@
+# Thinker-facing condition encoder for ToolHang-image — separate from the frozen
+# painter's own baked-in image_obs encoder. Wraps ImageObsConditionEncoder's
+# output as a TRMInput for the thinker to reason over.
+# in_dim = n_views * resnet_feature_dim + obs_dim = 2 * 512 + 9 = 1033 (two camera views).
+_target_: models.condition_encoders.ImageObsTRMConditionEncoder
+n_obs_steps: ${data.n_obs_steps}
+in_dim: 1033
+hidden_size: ${thinker.hidden_size}
+use_group_norm: true
+pretrained: false
+crop_shape: [76, 76]

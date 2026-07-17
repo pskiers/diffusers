@@ -1,0 +1,11 @@
+# Thinker-facing condition encoder for PushT-hybrid — separate from the frozen
+# painter's own baked-in image_obs encoder. Wraps ImageObsConditionEncoder's
+# output as a TRMInput for the thinker to reason over.
+# in_dim = resnet_feature_dim + obs_dim = 512 + 2 = 514 (single camera view).
+_target_: models.condition_encoders.ImageObsTRMConditionEncoder
+n_obs_steps: ${data.n_obs_steps}
+in_dim: 514
+hidden_size: ${thinker.hidden_size}
+use_group_norm: true
+pretrained: false
+crop_shape: [76, 76]

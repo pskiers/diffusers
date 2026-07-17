@@ -14,8 +14,8 @@ defaults:
   - override /thinker: action
   - override /translator: ipadapter_action
   - override /condition_encoder: lowdim_obs_trm
-  - override /train: action_lowdim
-  - override /eval: action_lowdim
+  - override /train: action_thinker_lowdim
+  - override /eval: action_thinker_lowdim
   - override /loss: mse
   - override /eval_callbacks: toolhang_lowdim
   - override /sampling: action_direct
