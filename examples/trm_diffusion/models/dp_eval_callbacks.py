@@ -55,6 +55,44 @@ class ObsBuffer:
         return {k: np.stack(list(v)) for k, v in self._buf.items()}
 
 
+class VectorizedObsBuffer:
+    """A list of n_envs independent ObsBuffer instances, stacked into batched
+    arrays for one model.predict_action(...) call per chunk-replan instead of
+    n_envs separate batch-1 calls.
+
+    Reuses ObsBuffer's existing per-env reset/push logic unchanged — this
+    only adds the stacking-across-envs step, which is where the actual
+    speedup comes from (model.predict_action is already batch-agnostic, see
+    models/sampling.py::_batch_size_of).
+    """
+
+    def __init__(self, n_envs, n_obs_steps):
+        self.n_envs = n_envs
+        self._buffers = [ObsBuffer(n_obs_steps) for _ in range(n_envs)]
+
+    def reset(self, i, first_obs):
+        self._buffers[i].reset(first_obs)
+
+    def push(self, i, obs):
+        self._buffers[i].push(obs)
+
+    def get_batched(self):
+        """dict of str -> np.ndarray (n_envs, n_obs_steps, *obs_shape)."""
+        per_env = [b.get() for b in self._buffers]
+        keys = per_env[0].keys()
+        return {k: np.stack([e[k] for e in per_env], axis=0) for k in keys}
+
+
+def _chunk_sizes(n_eval_episodes, n_envs):
+    """[n_envs, n_envs, ..., remainder] summing to n_eval_episodes, no padding."""
+    sizes = []
+    remaining = n_eval_episodes
+    while remaining > 0:
+        sizes.append(min(n_envs, remaining))
+        remaining -= sizes[-1]
+    return sizes
+
+
 # ── PushT ─────────────────────────────────────────────────────────────────────
 
 
@@ -84,12 +122,13 @@ class PushTImageEvalCallback:
     def __init__(
         self,
         normalizer=None,
-        n_eval_episodes=50,
+        n_eval_episodes=128,
         max_steps=300,
         n_obs_steps=2,
         n_action_steps=8,
         obs_type='pixels_agent_pos',
         test_start_seed=100000,
+        n_envs=32,
         render=False,
         device='cpu',
     ):
@@ -100,6 +139,7 @@ class PushTImageEvalCallback:
         self.n_action_steps = n_action_steps
         self.obs_type = obs_type
         self.test_start_seed = test_start_seed
+        self.n_envs = n_envs
         self.render = render
         self.device = device
 
@@ -109,29 +149,32 @@ class PushTImageEvalCallback:
         return {'image': obs['pixels'], 'agent_pos': obs['agent_pos']}
 
     def _stacked_to_obs_tensor(self, stacked_obs, device):
+        """stacked_obs: dict of (N, n_obs_steps, *shape) arrays from
+        VectorizedObsBuffer.get_batched() — N is the chunk's active env count."""
         normalizer = self.normalizer
         image_norm = stacked_obs['image'].astype(np.float32) / 255.0 * 2.0 - 1.0
-        image_norm = image_norm.transpose(0, 3, 1, 2)  # (T, 3, H, W)
+        image_norm = image_norm.transpose(0, 1, 4, 2, 3)  # (N, T, 3, H, W)
 
-        agent_pos = stacked_obs['agent_pos'].astype(np.float32)
+        agent_pos = stacked_obs['agent_pos'].astype(np.float32)  # (N, T, 2)
         try:
-            agent_pos_t = torch.from_numpy(agent_pos).unsqueeze(0).to(device)
-            agent_pos = normalizer['agent_pos'].normalize(agent_pos_t).squeeze(0).cpu().numpy()
+            agent_pos_t = torch.from_numpy(agent_pos).to(device)
+            agent_pos = normalizer['agent_pos'].normalize(agent_pos_t).cpu().numpy()
         except (KeyError, Exception):
             pass
 
         # Keys match the DataSample fields the painter's condition
         # encoder reads (see models/condition_encoders.py).
         return {
-            'spatial_conditions': torch.from_numpy(image_norm).unsqueeze(0).to(device),
-            'embedding_conditions': torch.from_numpy(agent_pos).unsqueeze(0).to(device),
+            'spatial_conditions': torch.from_numpy(image_norm).to(device),
+            'embedding_conditions': torch.from_numpy(agent_pos).to(device),
         }
 
     def _unnormalize_action(self, actions, device):
+        """actions: (N, T_a, action_dim)."""
         try:
-            actions_t = torch.from_numpy(actions).unsqueeze(0).to(device)
+            actions_t = torch.from_numpy(actions).to(device)
             action_exec = self.normalizer['action'].unnormalize(actions_t)
-            return action_exec.squeeze(0).cpu().numpy()
+            return action_exec.cpu().numpy()
         except (KeyError, Exception):
             return actions
 
@@ -150,47 +193,59 @@ class PushTImageEvalCallback:
             return None
 
         device = self.device
-        obs_buffer = ObsBuffer(self.n_obs_steps)
-
-        env = gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos')
         all_max_coverage = []
+        episode_offset = 0
 
-        seeds = range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes)
-        pbar = tqdm(seeds, desc="PushT eval (pixels_agent_pos)", total=self.n_eval_episodes, leave=False)
-        for seed in pbar:
-            obs, info = env.reset(seed=seed)
-            obs_buffer.reset(self._raw_obs_to_dict(obs))
+        pbar = tqdm(total=self.n_eval_episodes, desc="PushT eval (pixels_agent_pos)", leave=False)
+        for chunk_size in _chunk_sizes(self.n_eval_episodes, self.n_envs):
+            envs = [gym.make('gym_pusht/PushT-v0', obs_type='pixels_agent_pos') for _ in range(chunk_size)]
+            obs_buffer = VectorizedObsBuffer(chunk_size, self.n_obs_steps)
+            max_coverage = np.zeros(chunk_size, dtype=np.float64)
+            done_flags = np.zeros(chunk_size, dtype=bool)
+            steps = np.zeros(chunk_size, dtype=np.int64)
 
-            max_coverage = 0.0
-            done = False
-            step = 0
+            for i, env in enumerate(envs):
+                obs, info = env.reset(seed=self.test_start_seed + episode_offset + i)
+                obs_buffer.reset(i, self._raw_obs_to_dict(obs))
 
-            while not done and step < self.max_steps:
-                stacked_obs = obs_buffer.get()
+            while not np.all(done_flags | (steps >= self.max_steps)):
+                stacked_obs = obs_buffer.get_batched()
                 obs_tensor = self._stacked_to_obs_tensor(stacked_obs, device)
 
                 with torch.no_grad():
                     action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
-                actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
+                actions = action_dict['action'].cpu().numpy()  # (N, T_a, 2) normalized
                 action_exec = self._unnormalize_action(actions, device)
 
-                T_a = action_exec.shape[0]
+                T_a = action_exec.shape[1]
                 for t in range(min(self.n_action_steps, T_a)):
-                    obs, reward, terminated, truncated, info = env.step(action_exec[t])
-                    coverage = info.get('coverage', reward if reward is not None else 0.0)
-                    max_coverage = max(max_coverage, coverage)
-                    obs_buffer.push(self._raw_obs_to_dict(obs))
-                    step += 1
-                    done = terminated or truncated
-                    if done:
+                    for i, env in enumerate(envs):
+                        if done_flags[i] or steps[i] >= self.max_steps:
+                            continue
+                        obs, reward, terminated, truncated, info = env.step(action_exec[i, t])
+                        coverage = info.get('coverage', reward if reward is not None else 0.0)
+                        max_coverage[i] = max(max_coverage[i], coverage)
+                        obs_buffer.push(i, self._raw_obs_to_dict(obs))
+                        steps[i] += 1
+                        if terminated or truncated:
+                            done_flags[i] = True
+                    if np.all(done_flags | (steps >= self.max_steps)):
                         break
-                pbar.set_postfix(step=f"{step}/{self.max_steps}", coverage=f"{max_coverage:.3f}")
+                pbar.set_postfix(
+                    active=int((~done_flags).sum()),
+                    max_step=int(steps.max()),
+                    coverage=f"{max_coverage.mean():.3f}",
+                )
 
-            all_max_coverage.append(max_coverage)
+            for env in envs:
+                env.close()
+            all_max_coverage.extend(max_coverage.tolist())
+            episode_offset += chunk_size
+            pbar.update(chunk_size)
             pbar.set_postfix(mean_coverage=f"{np.mean(all_max_coverage):.3f}")
+        pbar.close()
 
-        env.close()
         return all_max_coverage
 
     def _run_keypoints(self, model):
@@ -206,11 +261,12 @@ class PushTImageEvalCallback:
             return None
 
         device = self.device
-        obs_buffer = ObsBuffer(self.n_obs_steps)
-
-        kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
-        env = PushTKeypointsEnv(legacy=False, keypoint_visible_rate=1.0, agent_keypoints=False, **kp_kwargs)
         all_max_coverage = []
+        episode_offset = 0
+
+        def make_env():
+            kp_kwargs = PushTKeypointsEnv.genenerate_keypoint_manager_params()
+            return PushTKeypointsEnv(legacy=False, keypoint_visible_rate=1.0, agent_keypoints=False, **kp_kwargs)
 
         def coverage_of(env):
             goal_body = env._get_goal_pose_body(env.goal_pose)
@@ -218,47 +274,62 @@ class PushTImageEvalCallback:
             block_geom = pymunk_to_shapely(env.block, env.block.shapes)
             return goal_geom.intersection(block_geom).area / goal_geom.area
 
-        seeds = range(self.test_start_seed, self.test_start_seed + self.n_eval_episodes)
-        pbar = tqdm(seeds, desc="PushT eval (keypoints)", total=self.n_eval_episodes, leave=False)
-        for seed in pbar:
-            env.seed(seed)
-            raw_obs = env.reset()
-            Do = raw_obs.shape[-1] // 2
-            obs_buffer.reset({'state': raw_obs[:Do].astype(np.float32)})
+        pbar = tqdm(total=self.n_eval_episodes, desc="PushT eval (keypoints)", leave=False)
+        for chunk_size in _chunk_sizes(self.n_eval_episodes, self.n_envs):
+            envs = [make_env() for _ in range(chunk_size)]
+            obs_buffer = VectorizedObsBuffer(chunk_size, self.n_obs_steps)
+            max_coverage = np.zeros(chunk_size, dtype=np.float64)
+            done_flags = np.zeros(chunk_size, dtype=bool)
+            steps = np.zeros(chunk_size, dtype=np.int64)
+            Do = None
 
-            max_coverage = 0.0
-            done = False
-            step = 0
+            for i, env in enumerate(envs):
+                env.seed(self.test_start_seed + episode_offset + i)
+                raw_obs = env.reset()
+                if Do is None:
+                    Do = raw_obs.shape[-1] // 2
+                obs_buffer.reset(i, {'state': raw_obs[:Do].astype(np.float32)})
 
-            while not done and step < self.max_steps:
-                state = obs_buffer.get()['state'].astype(np.float32)
+            while not np.all(done_flags | (steps >= self.max_steps)):
+                state = obs_buffer.get_batched()['state'].astype(np.float32)  # (N, T, Do)
                 try:
-                    state_t = torch.from_numpy(state).unsqueeze(0).to(device)
-                    state = self.normalizer['obs'].normalize(state_t).squeeze(0).cpu().numpy()
+                    state_t = torch.from_numpy(state).to(device)
+                    state = self.normalizer['obs'].normalize(state_t).cpu().numpy()
                 except (KeyError, Exception):
                     pass
-                obs_tensor = {'embedding_conditions': torch.from_numpy(state).unsqueeze(0).to(device)}
+                obs_tensor = {'embedding_conditions': torch.from_numpy(state).to(device)}
 
                 with torch.no_grad():
                     action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
-                actions = action_dict['action'][0].cpu().numpy()  # (T_a, 2) normalized
+                actions = action_dict['action'].cpu().numpy()  # (N, T_a, 2) normalized
                 action_exec = self._unnormalize_action(actions, device)
 
-                T_a = action_exec.shape[0]
+                T_a = action_exec.shape[1]
                 for t in range(min(self.n_action_steps, T_a)):
-                    raw_obs, reward, done, info = env.step(action_exec[t])
-                    max_coverage = max(max_coverage, coverage_of(env))
-                    obs_buffer.push({'state': raw_obs[:Do].astype(np.float32)})
-                    step += 1
-                    if done:
+                    for i, env in enumerate(envs):
+                        if done_flags[i] or steps[i] >= self.max_steps:
+                            continue
+                        raw_obs, reward, done, info = env.step(action_exec[i, t])
+                        max_coverage[i] = max(max_coverage[i], coverage_of(env))
+                        obs_buffer.push(i, {'state': raw_obs[:Do].astype(np.float32)})
+                        steps[i] += 1
+                        if done:
+                            done_flags[i] = True
+                    if np.all(done_flags | (steps >= self.max_steps)):
                         break
-                pbar.set_postfix(step=f"{step}/{self.max_steps}", coverage=f"{max_coverage:.3f}")
+                pbar.set_postfix(
+                    active=int((~done_flags).sum()),
+                    max_step=int(steps.max()),
+                    coverage=f"{max_coverage.mean():.3f}",
+                )
 
-            all_max_coverage.append(max_coverage)
+            all_max_coverage.extend(max_coverage.tolist())
+            episode_offset += chunk_size
+            pbar.update(chunk_size)
             pbar.set_postfix(mean_coverage=f"{np.mean(all_max_coverage):.3f}")
+        pbar.close()
 
-        env.close()
         return all_max_coverage
 
     def __call__(self, model, dataloader, accelerator, **kwargs):
@@ -295,11 +366,12 @@ class BlockPushEvalCallback:
     def __init__(
         self,
         normalizer=None,
-        n_eval_episodes=50,
+        n_eval_episodes=128,
         max_steps=350,
         n_obs_steps=2,
         n_action_steps=8,
         test_start_seed=100000,
+        n_envs=32,
         device='cpu',
     ):
         self.normalizer = normalizer
@@ -308,6 +380,7 @@ class BlockPushEvalCallback:
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.test_start_seed = test_start_seed
+        self.n_envs = n_envs
         self.device = device
 
     def _make_env(self):
@@ -328,131 +401,138 @@ class BlockPushEvalCallback:
 
         return None
 
+    @staticmethod
+    def _obs_to_arr(obs):
+        if isinstance(obs, dict):
+            return np.concatenate([np.asarray(v).flatten() for v in obs.values()]).astype(np.float32)
+        return np.array(obs, dtype=np.float32)
+
+    def _reset_env(self, env, seed):
+        # BlockPushMultimodal (gym<0.26-era API) has no `seed` kwarg on
+        # reset() — it's a separate .seed() method that reseeds the internal
+        # RandomState, called once before reset(). Without this, every
+        # "episode" was silently continuing one shared unseeded RNG stream
+        # instead of using deterministic per-episode seeds.
+        try:
+            env.seed(seed)
+        except AttributeError:
+            pass
+        try:
+            obs = env.reset(seed=seed)
+        except TypeError:
+            try:
+                obs, _info = env.reset(seed=seed)
+            except TypeError:
+                try:
+                    obs = env.reset()
+                except TypeError:
+                    obs, _info = env.reset()
+        return obs
+
     def __call__(self, model, dataloader, accelerator, **kwargs):
-        env = self._make_env()
-        if env is None:
+        probe_env = self._make_env()
+        if probe_env is None:
             logger.warning(
                 "BlockPush env not available. Skipping. "
                 "See diffusion_policy repo for setup."
             )
             return {}
+        probe_env.close()
 
         device = self.device
         normalizer = self.normalizer
-        obs_buffer = ObsBuffer(self.n_obs_steps)
 
         all_scores = []
         n_p1 = 0
         n_p2 = 0
+        episode_offset = 0
 
-        pbar = tqdm(range(self.n_eval_episodes), desc="BlockPush eval", leave=False)
-        for episode_idx in pbar:
-            seed = self.test_start_seed + episode_idx
-            # BlockPushMultimodal (gym<0.26-era API) has no `seed` kwarg on
-            # reset() — it's a separate .seed() method that reseeds the
-            # internal RandomState, called once before reset(). Without this,
-            # every "episode" was silently continuing one shared unseeded RNG
-            # stream instead of using deterministic per-episode seeds.
-            try:
-                env.seed(seed)
-            except AttributeError:
-                pass
-            try:
-                obs = env.reset(seed=seed)
-            except TypeError:
-                try:
-                    obs, _info = env.reset(seed=seed)
-                except TypeError:
-                    try:
-                        obs = env.reset()
-                    except TypeError:
-                        obs, _info = env.reset()
-
-            # obs is a 16D state vector or a dict; normalise to ndarray
-            if isinstance(obs, dict):
-                obs_arr = np.concatenate([np.asarray(v).flatten() for v in obs.values()]).astype(np.float32)
-            else:
-                obs_arr = np.array(obs, dtype=np.float32)
-
-            obs_buffer.reset({'state': obs_arr})
-
+        pbar = tqdm(total=self.n_eval_episodes, desc="BlockPush eval", leave=False)
+        for chunk_size in _chunk_sizes(self.n_eval_episodes, self.n_envs):
+            envs = [self._make_env() for _ in range(chunk_size)]
+            obs_buffer = VectorizedObsBuffer(chunk_size, self.n_obs_steps)
             # Upstream (blockpush_lowdim_runner.py) scores an episode as the
             # sum of *unique* reward values observed over the rollout — the
             # env's reward is a per-block completion indicator that jumps to
             # a new fixed value the first time each block reaches its target,
             # not a running max of a single 'score' info key.
-            seen_rewards = set()
-            episode_score = 0.0
-            done = False
-            step = 0
+            seen_rewards = [set() for _ in range(chunk_size)]
+            episode_score = np.zeros(chunk_size, dtype=np.float64)
+            done_flags = np.zeros(chunk_size, dtype=bool)
+            steps = np.zeros(chunk_size, dtype=np.int64)
 
-            while not done and step < self.max_steps:
-                stacked_obs = obs_buffer.get()  # {'state': (n_obs_steps, D)}
+            for i, env in enumerate(envs):
+                obs = self._reset_env(env, self.test_start_seed + episode_offset + i)
+                obs_buffer.reset(i, {'state': self._obs_to_arr(obs)})
+
+            while not np.all(done_flags | (steps >= self.max_steps)):
+                stacked_obs = obs_buffer.get_batched()  # {'state': (N, n_obs_steps, D)}
                 state = stacked_obs['state'].astype(np.float32)
 
-                # Normalize state if possible
                 try:
-                    state_t = torch.from_numpy(state).unsqueeze(0).to(device)
-                    state_norm = normalizer['obs'].normalize(state_t)
-                    state = state_norm.squeeze(0).cpu().numpy()
+                    state_t = torch.from_numpy(state).to(device)
+                    state = normalizer['obs'].normalize(state_t).cpu().numpy()
                 except (KeyError, Exception):
                     pass
 
                 # Key matches the DataSample field the painter's condition
                 # encoder reads (see models/condition_encoders.py).
-                obs_tensor = {
-                    'embedding_conditions': torch.from_numpy(state).unsqueeze(0).to(device),
-                }
+                obs_tensor = {'embedding_conditions': torch.from_numpy(state).to(device)}
 
                 with torch.no_grad():
                     action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
-                actions = action_dict['action'][0].cpu().numpy()  # (T_a, Da) normalized
+                actions = action_dict['action'].cpu().numpy()  # (N, T_a, Da) normalized
 
-                # Unnormalize actions
                 try:
-                    actions_t = torch.from_numpy(actions).unsqueeze(0).to(device)
+                    actions_t = torch.from_numpy(actions).to(device)
                     action_exec = normalizer['action'].unnormalize(actions_t)
-                    action_exec = action_exec.squeeze(0).cpu().numpy()
+                    action_exec = action_exec.cpu().numpy()
                 except (KeyError, Exception):
                     action_exec = actions
 
-                T_a = action_exec.shape[0]
+                T_a = action_exec.shape[1]
                 for t in range(min(self.n_action_steps, T_a)):
-                    step_result = env.step(action_exec[t])
-                    # Support both (obs, reward, done, info) and (obs, reward, terminated, truncated, info)
-                    if len(step_result) == 5:
-                        obs, reward, terminated, truncated, info = step_result
-                        done = terminated or truncated
-                    else:
-                        obs, reward, done_flag, info = step_result
-                        done = done_flag
+                    for i, env in enumerate(envs):
+                        if done_flags[i] or steps[i] >= self.max_steps:
+                            continue
+                        step_result = env.step(action_exec[i, t])
+                        # Support both (obs, reward, done, info) and (obs, reward, terminated, truncated, info)
+                        if len(step_result) == 5:
+                            obs, reward, terminated, truncated, info = step_result
+                            done = terminated or truncated
+                        else:
+                            obs, reward, done_flag, info = step_result
+                            done = done_flag
 
-                    reward_key = round(float(reward), 6)
-                    if reward_key not in seen_rewards:
-                        seen_rewards.add(reward_key)
-                        episode_score += float(reward)
+                        reward_key = round(float(reward), 6)
+                        if reward_key not in seen_rewards[i]:
+                            seen_rewards[i].add(reward_key)
+                            episode_score[i] += float(reward)
 
-                    if isinstance(obs, dict):
-                        obs_arr = np.concatenate([np.asarray(v).flatten() for v in obs.values()]).astype(np.float32)
-                    else:
-                        obs_arr = np.array(obs, dtype=np.float32)
-                    obs_buffer.push({'state': obs_arr})
-
-                    step += 1
-                    if done:
+                        obs_buffer.push(i, {'state': self._obs_to_arr(obs)})
+                        steps[i] += 1
+                        if done:
+                            done_flags[i] = True
+                    if np.all(done_flags | (steps >= self.max_steps)):
                         break
-                pbar.set_postfix(step=f"{step}/{self.max_steps}", score=f"{episode_score:.3f}")
+                pbar.set_postfix(
+                    active=int((~done_flags).sum()),
+                    max_step=int(steps.max()),
+                    score=f"{episode_score.mean():.3f}",
+                )
 
-            all_scores.append(episode_score)
+            for env in envs:
+                env.close()
+
+            all_scores.extend(episode_score.tolist())
             # Thresholds match upstream blockpush_lowdim_runner.py.
-            if episode_score > 0.4:
-                n_p1 += 1
-            if episode_score > 0.9:
-                n_p2 += 1
+            n_p1 += int((episode_score > 0.4).sum())
+            n_p2 += int((episode_score > 0.9).sum())
+            episode_offset += chunk_size
+            pbar.update(chunk_size)
             pbar.set_postfix(mean_score=f"{np.mean(all_scores):.3f}", p1=n_p1, p2=n_p2)
-
-        env.close()
+        pbar.close()
 
         n = self.n_eval_episodes
         return {
@@ -477,13 +557,14 @@ class ToolHangEvalCallback:
     def __init__(
         self,
         normalizer=None,
-        n_eval_episodes=50,
+        n_eval_episodes=128,
         max_steps=700,
         n_obs_steps=2,
         n_action_steps=8,
         use_camera_obs=True,
         obs_keys=None,
         test_start_seed=100000,
+        n_envs=32,
         device='cpu',
     ):
         self.normalizer = normalizer
@@ -493,6 +574,7 @@ class ToolHangEvalCallback:
         self.n_action_steps = n_action_steps
         self.use_camera_obs = use_camera_obs
         self.test_start_seed = test_start_seed
+        self.n_envs = n_envs
         if obs_keys is not None:
             self.obs_keys = obs_keys
         elif use_camera_obs:
@@ -582,6 +664,9 @@ class ToolHangEvalCallback:
         """Assemble the raw per-key robosuite obs into the DataSample fields
         the painter's condition encoder reads.
 
+        stacked_obs values are (N, n_obs_steps, *shape) arrays from
+        VectorizedObsBuffer.get_batched() — N is the chunk's active env count.
+
         Image variant (use_camera_obs=True): spatial_conditions (two camera
         views stacked, matching ToolHangImageDataset's view order [sideview,
         hand]) + embedding_conditions (robot proprioception, normalized with
@@ -600,8 +685,8 @@ class ToolHangEvalCallback:
                 stacked_obs['robot0_eef_pos'],
                 stacked_obs['robot0_eef_quat'],
                 stacked_obs['robot0_gripper_qpos'],
-            ], axis=-1).astype(np.float32)  # (T, 53)
-            obs_t = torch.from_numpy(obs_lowdim).unsqueeze(0).to(self.device)
+            ], axis=-1).astype(np.float32)  # (N, T, 53)
+            obs_t = torch.from_numpy(obs_lowdim).to(self.device)
             try:
                 obs_t = normalizer['obs'].normalize(obs_t)
             except (KeyError, Exception):
@@ -610,12 +695,12 @@ class ToolHangEvalCallback:
 
         def _img(key):
             arr = stacked_obs[key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            return torch.from_numpy(arr.transpose(0, 3, 1, 2))  # (T, 3, H, W)
+            return torch.from_numpy(arr.transpose(0, 1, 4, 2, 3))  # (N, T, 3, H, W)
 
         views = [
             _img(key) for key in ('sideview_image', 'robot0_eye_in_hand_image') if key in stacked_obs
         ]
-        spatial_conditions = torch.stack(views, dim=1).unsqueeze(0).to(self.device) if views else None
+        spatial_conditions = torch.stack(views, dim=2).to(self.device) if views else None  # (N, T, 2, 3, H, W)
 
         embedding_conditions = None
         if all(k in stacked_obs for k in ('robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos')):
@@ -623,12 +708,12 @@ class ToolHangEvalCallback:
                 stacked_obs['robot0_eef_pos'],
                 stacked_obs['robot0_eef_quat'],
                 stacked_obs['robot0_gripper_qpos'],
-            ], axis=-1).astype(np.float32)  # (T, 9)
+            ], axis=-1).astype(np.float32)  # (N, T, 9)
             try:
-                obs_t = torch.from_numpy(obs_robot).unsqueeze(0).to(self.device)
+                obs_t = torch.from_numpy(obs_robot).to(self.device)
                 obs_t = normalizer['obs_robot'].normalize(obs_t)
             except (KeyError, Exception):
-                obs_t = torch.from_numpy(obs_robot).unsqueeze(0).to(self.device)
+                obs_t = torch.from_numpy(obs_robot).to(self.device)
             embedding_conditions = obs_t
 
         obs_tensor = {}
@@ -639,73 +724,86 @@ class ToolHangEvalCallback:
         return obs_tensor
 
     def __call__(self, model, dataloader, accelerator, **kwargs):
-        env = self._make_env()
-        if env is None:
+        probe_env = self._make_env()
+        if probe_env is None:
             logger.warning(
                 "robosuite not installed or ToolHang env unavailable. "
                 "Skipping ToolHang eval. pip install robosuite robomimic"
             )
             return {}
+        probe_env.close()
 
         normalizer = self.normalizer
-        obs_buffer = ObsBuffer(self.n_obs_steps)
         n_success = 0
+        episode_offset = 0
 
-        pbar = tqdm(range(self.n_eval_episodes), desc="ToolHang eval", leave=False)
-        for episode_idx in pbar:
-            seed = self.test_start_seed + episode_idx
-            try:
-                env.seed(seed)  # robosuite/legacy-gym seeding API
-            except (AttributeError, Exception):
-                pass
-            raw_obs = env.reset()
-            first_obs = self._obs_to_dict(raw_obs)
-            obs_buffer.reset(first_obs)
+        pbar = tqdm(total=self.n_eval_episodes, desc="ToolHang eval", leave=False)
+        for chunk_size in _chunk_sizes(self.n_eval_episodes, self.n_envs):
+            envs = [self._make_env() for _ in range(chunk_size)]
+            obs_buffer = VectorizedObsBuffer(chunk_size, self.n_obs_steps)
+            success_flags = np.zeros(chunk_size, dtype=bool)
+            done_flags = np.zeros(chunk_size, dtype=bool)
+            steps = np.zeros(chunk_size, dtype=np.int64)
 
-            done = False
-            step = 0
-            success = False
+            for i, env in enumerate(envs):
+                try:
+                    env.seed(self.test_start_seed + episode_offset + i)  # robosuite/legacy-gym seeding API
+                except (AttributeError, Exception):
+                    pass
+                raw_obs = env.reset()
+                obs_buffer.reset(i, self._obs_to_dict(raw_obs))
 
-            while not done and step < self.max_steps:
-                stacked_obs = obs_buffer.get()
+            while not np.all(done_flags | (steps >= self.max_steps)):
+                stacked_obs = obs_buffer.get_batched()
                 obs_tensor = self._build_obs_tensor(stacked_obs)
 
                 with torch.no_grad():
                     action_dict = model.predict_action(obs_tensor, n_action_steps=self.n_action_steps)
 
-                actions = action_dict['action'][0].cpu().numpy()  # (T_a, Da) normalized
+                actions = action_dict['action'].cpu().numpy()  # (N, T_a, Da) normalized
 
-                # Unnormalize actions
                 try:
-                    actions_t = torch.from_numpy(actions).unsqueeze(0).to(self.device)
+                    actions_t = torch.from_numpy(actions).to(self.device)
                     action_exec = normalizer['action'].unnormalize(actions_t)
-                    action_exec = action_exec.squeeze(0).cpu().numpy()
+                    action_exec = action_exec.cpu().numpy()
                 except (KeyError, Exception):
                     action_exec = actions
 
-                T_a = action_exec.shape[0]
+                T_a = action_exec.shape[1]
                 for t in range(min(self.n_action_steps, T_a)):
-                    raw_obs, reward, done_flag, info = env.step(action_exec[t])
-                    # robosuite returns done when horizon is reached
-                    done = bool(done_flag)
-                    # robosuite's base env._post_action() always returns an
-                    # EMPTY info dict ({}) — info.get('success', False) can
-                    # never be True. Success must be queried directly via the
-                    # task env's own _check_success(), exactly like
-                    # robomimic's EnvRobosuite.is_success() does.
-                    if env._check_success():
-                        success = True
-                    obs_buffer.push(self._obs_to_dict(raw_obs))
-                    step += 1
-                    if done:
+                    for i, env in enumerate(envs):
+                        if done_flags[i] or steps[i] >= self.max_steps:
+                            continue
+                        raw_obs, reward, done_flag, info = env.step(action_exec[i, t])
+                        # robosuite returns done when horizon is reached
+                        done = bool(done_flag)
+                        # robosuite's base env._post_action() always returns an
+                        # EMPTY info dict ({}) — info.get('success', False) can
+                        # never be True. Success must be queried directly via the
+                        # task env's own _check_success(), exactly like
+                        # robomimic's EnvRobosuite.is_success() does.
+                        if env._check_success():
+                            success_flags[i] = True
+                        obs_buffer.push(i, self._obs_to_dict(raw_obs))
+                        steps[i] += 1
+                        if done:
+                            done_flags[i] = True
+                    if np.all(done_flags | (steps >= self.max_steps)):
                         break
-                pbar.set_postfix(step=f"{step}/{self.max_steps}", success=success)
+                pbar.set_postfix(
+                    active=int((~done_flags).sum()),
+                    max_step=int(steps.max()),
+                    success=int(success_flags.sum()),
+                )
 
-            if success:
-                n_success += 1
-            pbar.set_postfix(success_rate=f"{n_success / (episode_idx + 1):.3f}")
+            for env in envs:
+                env.close()
 
-        env.close()
+            n_success += int(success_flags.sum())
+            episode_offset += chunk_size
+            pbar.update(chunk_size)
+            pbar.set_postfix(success_rate=f"{n_success / episode_offset:.3f}")
+        pbar.close()
 
         return {
             'toolhang/success_rate': float(n_success / self.n_eval_episodes),

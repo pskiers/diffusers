@@ -4,7 +4,8 @@
 # from the fitted train_dataset normalizer (see train_trm.py).
 - _target_: models.dp_eval_callbacks.ToolHangEvalCallback
   normalizer: null
-  n_eval_episodes: 50
+  n_eval_episodes: 128
   max_steps: 700
   n_obs_steps: ${data.n_obs_steps}
   n_action_steps: ${data.n_action_steps}
+  n_envs: 32
