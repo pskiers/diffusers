@@ -348,14 +348,21 @@ class BlockPushEvalCallback:
         pbar = tqdm(range(self.n_eval_episodes), desc="BlockPush eval", leave=False)
         for episode_idx in pbar:
             seed = self.test_start_seed + episode_idx
+            # BlockPushMultimodal (gym<0.26-era API) has no `seed` kwarg on
+            # reset() — it's a separate .seed() method that reseeds the
+            # internal RandomState, called once before reset(). Without this,
+            # every "episode" was silently continuing one shared unseeded RNG
+            # stream instead of using deterministic per-episode seeds.
+            try:
+                env.seed(seed)
+            except AttributeError:
+                pass
             try:
                 obs = env.reset(seed=seed)
             except TypeError:
                 try:
                     obs, _info = env.reset(seed=seed)
                 except TypeError:
-                    # Env doesn't support a seed kwarg at all — fall back to
-                    # unseeded reset rather than failing eval entirely.
                     try:
                         obs = env.reset()
                     except TypeError:
