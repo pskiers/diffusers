@@ -289,6 +289,75 @@ class ConditioningPyramid(nn.Module):
         return residuals, self.mid_zero_conv(mid_res)
 
 
+class ConditioningPyramid1D(nn.Module):
+    """1D ControlNet-style conditioning pyramid for ConditionalUnet1D
+    (models/action_backbones.py), used via ControlPainterUNet1D.
+
+    Unlike ConditioningPyramid (which mirrors UNet2DModel's one-residual-
+    per-resnet-layer structure), ConditionalUnet1D only produces ONE skip
+    connection per U-Net *level* (after both of that level's resnets, before
+    downsampling) — so this produces exactly one residual per entry in
+    block_out_channels plus one mid-block residual, using the identical
+    stride-2 Conv1d downsampling (kernel=3, stride=2, padding=1, matching
+    Downsample1d exactly) so every residual's temporal length lines up
+    exactly with the frozen backbone's skip connections, regardless of the
+    input sequence length.
+
+    Zero convolutions (1×1, weight+bias zero-init) on every output — at
+    init this injects exactly zero, same ControlNet trick as ConditioningPyramid.
+    """
+
+    def __init__(self, in_channels, block_out_channels=(256, 512, 1024), n_groups=8):
+        super().__init__()
+        self.conv_in = nn.Conv1d(in_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList()
+        current_channels = block_out_channels[0]
+        for i, out_channels in enumerate(block_out_channels):
+            is_last = i == len(block_out_channels) - 1
+            self.down_blocks.append(nn.ModuleDict({
+                "proj": (
+                    nn.Conv1d(current_channels, out_channels, kernel_size=1)
+                    if current_channels != out_channels else nn.Identity()
+                ),
+                "res": nn.Sequential(
+                    nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1),
+                    nn.GroupNorm(min(n_groups, out_channels), out_channels),
+                    nn.SiLU(),
+                ),
+                # Matches ConditionalUnet1D.Downsample1d exactly.
+                "downsample": (
+                    nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+                    if not is_last else nn.Identity()
+                ),
+            }))
+            current_channels = out_channels
+
+        self.mid_block = nn.Sequential(
+            nn.Conv1d(current_channels, current_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(n_groups, current_channels), current_channels),
+            nn.SiLU(),
+        )
+
+        self.zero_convs = nn.ModuleList([nn.Conv1d(c, c, kernel_size=1) for c in block_out_channels])
+        self.mid_zero_conv = nn.Conv1d(current_channels, current_channels, kernel_size=1)
+        for m in list(self.zero_convs) + [self.mid_zero_conv]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, blueprint):
+        x = self.conv_in(blueprint)
+        residuals = []
+        for i, layer in enumerate(self.down_blocks):
+            x = layer["proj"](x)
+            x = x + layer["res"](x)
+            residuals.append(self.zero_convs[i](x))
+            x = layer["downsample"](x)
+
+        mid_res = x + self.mid_block(x)
+        return residuals, self.mid_zero_conv(mid_res)
+
+
 class SpatialBridge(nn.Module):
     """
     Bilinear upsample + 2 conv layers.

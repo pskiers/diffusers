@@ -1,0 +1,37 @@
+# Shared TRM thinker for all action-sequence diffusion policy tasks (PushT,
+# BlockPush, ToolHang; lowdim + image variants). seq_len = action horizon
+# (16, matching every configs/data/*.yaml) — the thinker reasons once per
+# timestep of the predicted action chunk, not over a spatial grid.
+#
+# puzzle_emb disabled (ndim=0, len=0): there's no puzzle_id concept for
+# continuous control tasks, matching the same override already used for
+# CLEVR's non-sudoku thinker configs.
+_target_: models.trm_wrappers.SpatialTRM
+vocab_size: 32        # placeholder; continuous thinker output width (bridge_mode="normalized")
+seq_len: 16           # = action horizon
+hidden_size: 256
+n_heads: 4
+L_layers: 2
+L_cycles: 4
+H_cycles: 3
+n_sup: 8
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+num_puzzle_identifiers: 1
+halt_exploration_prob: 0.0
+freeze_weights: false
+batch_size: 256
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 0.1
+with_timestep_emb: false

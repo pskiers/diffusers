@@ -1,0 +1,27 @@
+# @package _global_
+# TRM thinker + frozen PushT-hybrid (image) transformer painter (IP-Adapter steering).
+# Requires a trained pusht_hybrid_transformer_painter checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=pusht_hybrid_transformer_thinker_ipadapter \
+#     painter.checkpoint=runs/pusht_hybrid_transformer_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: pusht_hybrid
+  - override /diffusion: ddpm_epsilon
+  - override /backbone: pusht_hybrid_transformer
+  - override /painter: action_transformer_ipadapter_frozen_image
+  - override /thinker: action
+  - override /translator: ipadapter_action
+  - override /condition_encoder: image_obs_trm
+  - override /train: action_image_small
+  - override /eval: action_image_small
+  - override /loss: mse
+  - override /eval_callbacks: pusht
+  - override /sampling: action_direct
+  - _self_
+
+mode: "action_thinker_base"
+
+run:
+  output_dir: "runs/pusht_hybrid_transformer_thinker_ipadapter"

@@ -1,0 +1,9 @@
+# ControlNet1D steering for lowdim action-sequence conv1d backbones
+# (pusht_lowdim, blockpush, toolhang_lowdim — all down_dims=[256,512,1024]).
+_target_: models.translators.ControlNetTranslator1D
+in_channels: ${thinker.vocab_size}
+painter_channels: [256, 512, 1024]
+painter_length: ${data.horizon}
+bridge_mode: "normalized"
+seq_len: ${thinker.seq_len}
+with_timestep_emb: true

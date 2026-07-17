@@ -1,0 +1,24 @@
+# Frozen ActionUNet1DPainter for ControlNet1D thinker steering — image obs
+# variant (pusht_hybrid, toolhang_image).
+# Loads a trained {task}_unet1d_painter checkpoint and freezes the backbone.
+# No trainable painter params — only the thinker and translator train.
+# The condition_encoder here is inlined (not a swappable group): it must
+# exactly match whatever the checkpoint being loaded was trained with.
+_target_: models.action_painters.ControlNetSteeredActionUNet1DPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to the base {task}_unet1d_painter checkpoint
+backbone: ${backbone}
+action_dim: ${data.action_dim}
+horizon: ${data.horizon}
+condition_encoder:
+  _target_: models.condition_encoders.ImageObsConditionEncoder
+  n_obs_steps: ${data.n_obs_steps}
+  use_group_norm: true
+  pretrained: false
+  crop_shape: [76, 76]
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

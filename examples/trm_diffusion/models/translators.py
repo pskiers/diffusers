@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.interfaces import ControlNetSteering, CrossAttnSteering, IPAdapterSteering, ThinkerSteering, TRMOutput
-from models.utility_models import ConditioningPyramid, TimestepMLP
+from models.utility_models import ConditioningPyramid, ConditioningPyramid1D, TimestepMLP
 
 
 class ThinkerPainterTranslatorBase(nn.Module):
@@ -209,6 +209,100 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         down_res, mid_res = self.control_pyramid(spatial)
         if self.with_timestep_emb and timesteps is not None:
             mid_res = mid_res + self.timestep_mlp(timesteps).unsqueeze(-1).unsqueeze(-1)
+        return ControlNetSteering(
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        )
+
+
+class ControlNetTranslator1D(ThinkerPainterTranslatorBase):
+    """
+    Translates thinker logits into 1D ControlNet residuals for
+    ControlPainterUNet1D (models/action_backbones.py) via
+    ConditioningPyramid1D — the 1D analog of ControlNetTranslator, for any
+    sequence-diffusion backbone conditioned via ConditionalUnet1D's skip
+    connections.
+
+    Steps:
+      1. Optional logit_expand (Linear) if thinker_out_channels != vocab_size
+      2. Optional seq_proj if thinker seq_len != painter_length
+      3. (B, N, C) -> (B, C, N): no spatial grid reshape needed, already 1D
+      4. ConditioningPyramid1D -> ControlNetSteering
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        painter_channels: tuple[int, ...],
+        painter_length: int,
+        bridge_mode: str = "logits",
+        thinker_out_channels: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        with_timestep_emb: bool = False,
+    ):
+        if thinker_out_channels is not None and thinker_out_channels != in_channels:
+            ctrl_in = thinker_out_channels
+        else:
+            ctrl_in = in_channels
+
+        super().__init__(
+            grid=1,  # unused: this class reshapes to (B, C, painter_length), not a spatial grid
+            bridge_mode=bridge_mode,
+            bridge_channels=ctrl_in if bridge_mode == "normalized" else None,
+        )
+        self.painter_length = painter_length
+
+        # Project sequence length to painter_length when they don't match. None = identity.
+        self.seq_proj = (
+            nn.Linear(seq_len, painter_length, bias=False)
+            if seq_len is not None and seq_len != painter_length
+            else None
+        )
+
+        self.logit_expand = (
+            nn.Linear(in_channels, thinker_out_channels, bias=False)
+            if thinker_out_channels is not None and thinker_out_channels != in_channels
+            else None
+        )
+
+        self.control_pyramid = ConditioningPyramid1D(
+            in_channels=ctrl_in,
+            block_out_channels=painter_channels,
+        )
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=painter_channels[-1])
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def _logits_to_1d(self, logits: torch.Tensor) -> torch.Tensor:
+        """(B, N, C) -> (B, C, N) using self._bridge_mode (no spatial grid)."""
+        if self._bridge_mode == "onehot":
+            B, N, C = logits.shape
+            soft = logits.float().softmax(dim=-1)
+            hard = F.one_hot(logits.argmax(dim=-1), num_classes=C).float()
+            onehot = hard - soft.detach() + soft  # straight-through
+            return onehot.transpose(1, 2)
+        elif self._bridge_mode == "softmax":
+            return logits.float().softmax(dim=-1).transpose(1, 2)
+        elif self._bridge_mode == "normalized":
+            return self._norm(logits.float().transpose(1, 2))  # (B, C, N)
+        else:
+            return logits.float().transpose(1, 2)
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> ControlNetSteering:
+        logits = trm_output.logits
+        if self.logit_expand is not None:
+            logits = self.logit_expand(logits.float())
+        if self.seq_proj is not None:
+            # (B, N, C) → (B, C, N) → Linear(N→painter_length) → (B, C, painter_length) → (B, painter_length, C)
+            logits = self.seq_proj(logits.float().transpose(1, 2)).transpose(1, 2)
+        spatial = self._logits_to_1d(logits)  # (B, C, painter_length)
+        down_res, mid_res = self.control_pyramid(spatial)
+        if self.with_timestep_emb and timesteps is not None:
+            mid_res = mid_res + self.timestep_mlp(timesteps).unsqueeze(-1)
         return ControlNetSteering(
             down_block_additional_residuals=down_res,
             mid_block_additional_residual=mid_res,

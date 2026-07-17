@@ -437,3 +437,77 @@ class ImageObsConditionEncoder(GlobalCondEncoderBase):
             feat = torch.cat([feat, embedding_conditions], dim=-1)
 
         return feat
+
+
+# ── Thinker-facing wrappers around the action-sequence encoders ──────────────
+#
+# The two encoders above return a plain (B, n_obs_steps, D) tensor for direct
+# use as a painter's global_cond (models/action_painters.py). The TRM thinker
+# instead expects a TRMInput (per ConditionEncoderBase's contract above) — this
+# is a SEPARATE condition encoder from the frozen painter's own baked-in one
+# (exactly like spatial_image_v0 is separate from the frozen MNIST DiT/UNet's
+# own encoder in the existing thinker experiments), used only to give the
+# thinker something to reason over. These wrappers compose the existing
+# encoders rather than duplicating their tensor math.
+
+
+class LowdimObsTRMConditionEncoder(ConditionEncoderBase):
+    """Thinker-facing wrapper around LowdimObsConditionEncoder.
+
+    Output: TRMInput with enc_emb (B, n_obs_steps, obs_dim).
+    """
+
+    condition_keys: list[str] = ["embedding_conditions"]
+
+    def __init__(self, n_obs_steps: int):
+        super().__init__()
+        self._inner = LowdimObsConditionEncoder(n_obs_steps)
+
+    @property
+    def n_obs_steps(self) -> int:
+        return self._inner.n_obs_steps
+
+    def forward(self, embedding_conditions: torch.Tensor, timesteps=None, **_) -> TRMInput:
+        return TRMInput(enc_emb=self._inner(embedding_conditions, timesteps=timesteps))
+
+
+class ImageObsTRMConditionEncoder(ConditionEncoderBase):
+    """Thinker-facing wrapper around ImageObsConditionEncoder.
+
+    Output: TRMInput with enc_emb (B, n_obs_steps, V * resnet_feature_dim + obs_dim).
+    """
+
+    condition_keys: list[str] = ["spatial_conditions", "embedding_conditions"]
+
+    def __init__(
+        self,
+        n_obs_steps: int,
+        use_group_norm: bool = True,
+        pretrained: bool = False,
+        crop_shape=None,
+    ):
+        super().__init__()
+        self._inner = ImageObsConditionEncoder(
+            n_obs_steps,
+            use_group_norm=use_group_norm,
+            pretrained=pretrained,
+            crop_shape=crop_shape,
+        )
+
+    @property
+    def n_obs_steps(self) -> int:
+        return self._inner.n_obs_steps
+
+    def forward(
+        self,
+        spatial_conditions: torch.Tensor,
+        embedding_conditions=None,
+        timesteps=None,
+        **_,
+    ) -> TRMInput:
+        enc_emb = self._inner(
+            spatial_conditions,
+            embedding_conditions=embedding_conditions,
+            timesteps=timesteps,
+        )
+        return TRMInput(enc_emb=enc_emb)

@@ -1,0 +1,6 @@
+# IP-Adapter steering for action-sequence transformer backbones (all 4:
+# pusht_lowdim, pusht_hybrid, blockpush, toolhang_lowdim — all n_emb=256).
+_target_: models.translators.IPAdapterTranslator
+in_dim: ${thinker.vocab_size}
+out_dim: 256
+with_timestep_emb: true

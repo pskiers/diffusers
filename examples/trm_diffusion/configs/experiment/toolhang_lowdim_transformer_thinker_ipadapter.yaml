@@ -1,0 +1,27 @@
+# @package _global_
+# TRM thinker + frozen ToolHang-lowdim transformer painter (IP-Adapter steering).
+# Requires a trained toolhang_lowdim_transformer_painter checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=toolhang_lowdim_transformer_thinker_ipadapter \
+#     painter.checkpoint=runs/toolhang_lowdim_transformer_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: toolhang_lowdim
+  - override /diffusion: ddpm_epsilon
+  - override /backbone: toolhang_lowdim_transformer
+  - override /painter: action_transformer_ipadapter_frozen_lowdim
+  - override /thinker: action
+  - override /translator: ipadapter_action
+  - override /condition_encoder: lowdim_obs_trm
+  - override /train: action_lowdim
+  - override /eval: action_lowdim
+  - override /loss: mse
+  - override /eval_callbacks: toolhang_lowdim
+  - override /sampling: action_direct
+  - _self_
+
+mode: "action_thinker_base"
+
+run:
+  output_dir: "runs/toolhang_lowdim_transformer_thinker_ipadapter"

@@ -1,7 +1,7 @@
 """
 factory.py — Build models, datasets, and schedulers from a Hydra DictConfig.
 
-Supports two training modes (set via cfg.mode in the experiment config):
+Supports three training modes (set via cfg.mode in the experiment config):
 
   painter_base  — Standalone painter (UNetPainter / DiTPainter).
                   The full model is declared under cfg.painter with a Hydra
@@ -10,7 +10,13 @@ Supports two training modes (set via cfg.mode in the experiment config):
   thinker_base  — ThinkerFrozenPainterBase: TRM thinker + frozen pre-trained
                   painter.  Sub-configs (thinker, painter, condition_encoder,
                   translator, loss, eval_callbacks) are separate Hydra config
-                  groups wired together by build_model.
+                  groups wired together by build_model. Used by the sudoku/
+                  CLEVR thinker experiments.
+
+  action_thinker_base — Same wiring as thinker_base, but builds an
+                  ActionThinkerFrozenPainterBase (adds predict_action() for
+                  models/dp_eval_callbacks.py's closed-loop rollouts). Used by
+                  the PushT/BlockPush/ToolHang thinker experiments.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from configs.schemas import (
     TwoStageConfig,
 )
 from models.base import BaseModel
+from models.action_painters import ActionThinkerFrozenPainterBase
 from models.painter_thinkers import ThinkerFrozenPainterBase
 
 
@@ -161,7 +168,27 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             sampling_pipeline=sampling,
         )
 
+    if mode == "action_thinker_base":
+        # Same wiring as thinker_base, but ActionThinkerFrozenPainterBase adds
+        # predict_action() — the closed-loop rollout entry point
+        # models/dp_eval_callbacks.py needs for the action-diffusion tasks
+        # (PushT/BlockPush/ToolHang). Kept as a separate mode (rather than
+        # swapping thinker_base's class outright) so the existing sudoku/CLEVR
+        # thinker experiments are entirely untouched.
+        return ActionThinkerFrozenPainterBase(
+            thinker=cfg.thinker,
+            painter=cfg.painter,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            condition_encoder=cfg.condition_encoder,
+            loss=cfg.loss,
+            thinker_painter_translator=cfg.translator,
+            eval_callbacks=cfg.get("eval_callbacks") or None,
+            scheduler=scheduler,
+            sampling_pipeline=sampling,
+        )
+
     raise ValueError(
         f"Unknown mode: {mode!r}. "
-        "Set cfg.mode to 'painter_base' or 'thinker_base' in your experiment config."
+        "Set cfg.mode to 'painter_base', 'thinker_base', or 'action_thinker_base' in your experiment config."
     )

@@ -240,6 +240,72 @@ class ConditionalUnet1D(nn.Module):
         return x.transpose(1, 2)  # (B, T, input_dim)
 
 
+class ControlPainterUNet1D(ConditionalUnet1D):
+    """ConditionalUnet1D extended with ControlNet-style residual injection —
+    the 1D analog of models/painter_base.py::ControlPainterUNet.
+
+    Identical forward() to the parent except it accepts
+    down_block_additional_residuals (one per down_modules level, matching
+    models/utility_models.py::ConditioningPyramid1D's output) and
+    mid_block_additional_residual, added to the skip connections / mid-block
+    output before the up-pass — standard ControlNet math, just applied at
+    ConditionalUnet1D's one-skip-per-level granularity instead of
+    UNet2DModel's one-skip-per-resnet-layer granularity.
+
+    When all backbone parameters are frozen and the noisy input has no grad,
+    the down/mid blocks produce no-grad tensors — PyTorch skips activation
+    storage for those passes automatically.
+    """
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        global_cond: Optional[torch.Tensor] = None,
+        down_block_additional_residuals: Optional[list] = None,
+        mid_block_additional_residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = sample.transpose(1, 2)
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=x.device)
+        elif timestep.ndim == 0:
+            timestep = timestep[None].to(x.device)
+        timestep = timestep.expand(x.shape[0])
+
+        t_emb = self.time_mlp(self.time_proj(timestep).to(dtype=x.dtype))
+        if global_cond is not None and global_cond.ndim == 3:
+            global_cond = global_cond.reshape(global_cond.shape[0], -1)
+        cond = t_emb if global_cond is None else torch.cat([t_emb, global_cond], dim=-1)
+
+        skip_connections = []
+        for resnet1, resnet2, downsample in self.down_modules:
+            x = resnet1(x, cond)
+            x = resnet2(x, cond)
+            skip_connections.append(x)
+            x = downsample(x)
+
+        if down_block_additional_residuals is not None:
+            skip_connections = [
+                skip + res for skip, res in zip(skip_connections, down_block_additional_residuals)
+            ]
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, cond)
+
+        if mid_block_additional_residual is not None:
+            x = x + mid_block_additional_residual
+
+        for resnet1, resnet2, upsample in self.up_modules:
+            x = torch.cat([x, skip_connections.pop()], dim=1)
+            x = resnet1(x, cond)
+            x = resnet2(x, cond)
+            x = upsample(x)
+
+        x = self.final_conv(x)
+        return x.transpose(1, 2)  # (B, T, input_dim)
+
+
 # ---------------------------------------------------------------------------
 # TransformerForDiffusion
 # ---------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+# ControlNet1D steering for image-obs action-sequence conv1d backbones
+# (pusht_hybrid, toolhang_image — both down_dims=[512,1024,2048]).
+_target_: models.translators.ControlNetTranslator1D
+in_channels: ${thinker.vocab_size}
+painter_channels: [512, 1024, 2048]
+painter_length: ${data.horizon}
+bridge_mode: "normalized"
+seq_len: ${thinker.seq_len}
+with_timestep_emb: true

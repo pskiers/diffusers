@@ -27,21 +27,77 @@ from tqdm.auto import tqdm
 
 from configs.schemas import EvalConfig, PainterOptimConfig, TrainConfig
 from datasets.data_sample import DataSample
+from models.action_backbones import ControlPainterUNet1D
 from models.base import BaseModel
 from models.diffusion_utils import apply_noisy_swap
-from models.interfaces import DiffusionPrediction, ThinkerSteering
+from models.interfaces import DiffusionPrediction, IPAdapterSteering, ThinkerSteering
 from models.losses import LossBase, build_loss
 from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 from models.painter_base import PainterBase
+from models.painter_thinkers import ThinkerFrozenPainterBase
 from models.sampling import SamplingPipeline
+from models.utility_models import strip_compiled_prefix
 
 
-class ActionPainterBase(PainterBase, BaseModel):
+class ClosedLoopActionMixin:
+    """Adds predict_action() — the closed-loop rollout entry point
+    models/dp_eval_callbacks.py needs — to any model exposing
+    self.condition_encoder (with an optional .n_obs_steps attribute),
+    self.sampling_pipeline, self.eval_cfg, and callable as self(sample) via
+    SamplingPipeline.sample_one_batch.
+
+    Mixed into both ActionPainterBase (plain action-sequence painters) and
+    ActionThinkerFrozenPainterBase (TRM thinker + frozen action painter) —
+    the rollout logic itself doesn't care which one "self" actually is, so
+    it lives here once instead of being duplicated or living in either
+    class specifically.
+    """
+
+    @torch.no_grad()
+    def predict_action(self, obs_dict: dict, n_action_steps: Optional[int] = None) -> dict:
+        """Closed-loop rollout entry point used by dp_eval_callbacks.py.
+
+        obs_dict keys mirror DataSample fields ('spatial_conditions',
+        'embedding_conditions'); values already carry a batch dimension.
+        Returns {'action': (B, T, action_dim)} still in the model's
+        normalized action space — the caller unnormalizes.
+
+        The backbone predicts a full (horizon, action_dim) chunk, but the
+        first (n_obs_steps - 1) steps of that chunk correspond to already-
+        observed history, not future actions — matching upstream diffusion_policy
+        (e.g. diffusion_unet_lowdim_policy.predict_action), we slice
+        action_pred[:, n_obs_steps-1 : n_obs_steps-1+n_action_steps] rather
+        than returning the raw chunk from index 0. Executing from index 0
+        instead silently offsets every closed-loop action by (n_obs_steps-1)
+        steps — invisible to training loss (teacher-forced regression over
+        the whole horizon doesn't care about this slicing), but enough to
+        tank success rate on contact-rich/precision tasks.
+        """
+        device = next(self.parameters()).device
+        conditions = DataSample(
+            spatial_conditions=obs_dict.get('spatial_conditions'),
+            embedding_conditions=obs_dict.get('embedding_conditions'),
+        ).to(device)
+
+        pipeline = self.sampling_pipeline
+        if pipeline is None:
+            pipeline = SamplingPipeline(num_inference_steps=self.eval_cfg.num_ddim_steps, batch_size=1)
+
+        action_pred = pipeline.sample_one_batch(self, conditions, device)
+
+        n_obs_steps = getattr(self.condition_encoder, 'n_obs_steps', 1) if self.condition_encoder is not None else 1
+        start = n_obs_steps - 1
+        end = start + n_action_steps if n_action_steps is not None else action_pred.shape[1]
+        action = action_pred[:, start:end]
+        return {'action': action, 'action_pred': action_pred}
+
+
+class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
     """Shared implementation for ActionUNet1DPainter / ActionTransformerPainter.
 
     Subclasses only need to set ``self.backbone`` in ``__init__``; everything
-    else (training loop, CFG dropout, optimizer, closed-loop predict_action)
-    is shared here.
+    else (training loop, CFG dropout, optimizer, closed-loop predict_action
+    via ClosedLoopActionMixin) is shared here.
 
     Args:
         backbone:          Hydra config for a models.action_backbones module
@@ -107,49 +163,14 @@ class ActionPainterBase(PainterBase, BaseModel):
         steering: Optional[ThinkerSteering] = None,
     ) -> DiffusionPrediction:
         global_cond = self._global_cond(sample)
-        noise_pred = self.backbone(sample.x_noisy, sample.timesteps, global_cond=global_cond)
+        kwargs: dict = {}
+        if steering is not None:
+            kwargs.update(steering.to_painter_kwargs())
+        noise_pred = self.backbone(sample.x_noisy, sample.timesteps, global_cond=global_cond, **kwargs)
         return DiffusionPrediction(
             pred=noise_pred,
             pred_type=self.scheduler.config.prediction_type,
         )
-
-    @torch.no_grad()
-    def predict_action(self, obs_dict: dict, n_action_steps: Optional[int] = None) -> dict:
-        """Closed-loop rollout entry point used by dp_eval_callbacks.py.
-
-        obs_dict keys mirror DataSample fields ('spatial_conditions',
-        'embedding_conditions'); values already carry a batch dimension.
-        Returns {'action': (B, T, action_dim)} still in the model's
-        normalized action space — the caller unnormalizes.
-
-        The backbone predicts a full (horizon, action_dim) chunk, but the
-        first (n_obs_steps - 1) steps of that chunk correspond to already-
-        observed history, not future actions — matching upstream diffusion_policy
-        (e.g. diffusion_unet_lowdim_policy.predict_action), we slice
-        action_pred[:, n_obs_steps-1 : n_obs_steps-1+n_action_steps] rather
-        than returning the raw chunk from index 0. Executing from index 0
-        instead silently offsets every closed-loop action by (n_obs_steps-1)
-        steps — invisible to training loss (teacher-forced regression over
-        the whole horizon doesn't care about this slicing), but enough to
-        tank success rate on contact-rich/precision tasks.
-        """
-        device = next(self.parameters()).device
-        conditions = DataSample(
-            spatial_conditions=obs_dict.get('spatial_conditions'),
-            embedding_conditions=obs_dict.get('embedding_conditions'),
-        ).to(device)
-
-        pipeline = self.sampling_pipeline
-        if pipeline is None:
-            pipeline = SamplingPipeline(num_inference_steps=self.eval_cfg.num_ddim_steps, batch_size=1)
-
-        action_pred = pipeline.sample_one_batch(self, conditions, device)
-
-        n_obs_steps = getattr(self.condition_encoder, 'n_obs_steps', 1) if self.condition_encoder is not None else 1
-        start = n_obs_steps - 1
-        end = start + n_action_steps if n_action_steps is not None else action_pred.shape[1]
-        action = action_pred[:, start:end]
-        return {'action': action, 'action_pred': action_pred}
 
     # ── Training helpers (identical structure to UNetPainter) ────────────────
 
@@ -288,3 +309,175 @@ class ActionTransformerPainter(ActionPainterBase):
     def __init__(self, backbone, **kwargs):
         super().__init__(**kwargs)
         self.backbone: nn.Module = instantiate(backbone)
+
+
+# ── Frozen action-sequence painters for TRM thinker steering ─────────────────
+
+
+class ControlNetSteeredActionUNet1DPainter(ActionUNet1DPainter):
+    """Frozen ActionUNet1DPainter loaded from a checkpoint for ControlNet-style
+    thinker steering — the action-sequence analog of
+    models.painter_base.ControlNetSteeredUNetPainter.
+
+    Builds the same architecture as the training run (same Hydra config), loads
+    weights from a checkpoint produced by train_trm.py, and freezes the backbone
+    and condition_encoder. The backbone is converted to ControlPainterUNet1D so
+    that steering residuals (from models.translators.ControlNetTranslator1D)
+    can be passed directly as kwargs — no forward() override needed here since
+    ActionPainterBase.forward already unpacks steering.to_painter_kwargs()
+    generically.
+
+    Args:
+        checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
+                    (must contain a "model_state" key).
+        **kwargs:   forwarded verbatim to ActionUNet1DPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, **kwargs):
+        super().__init__(**kwargs)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        self.backbone.__class__ = ControlPainterUNet1D
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
+        if self.condition_encoder is not None:
+            for p in self.condition_encoder.parameters():
+                p.requires_grad_(False)
+
+
+# ── IP-Adapter frozen action-transformer wrapper ─────────────────────────────
+
+
+class _IPAdapterEncoderLayer(nn.Module):
+    """Wraps a single frozen nn.TransformerEncoderLayer with trainable,
+    index-matched IP conditioning — the action-sequence analog of
+    models.painter_base._DirectIPAdapterDiTBlock.
+
+    ip_hidden_states must already be aligned 1:1 with the action-token
+    positions (same length, same order as the action horizon) — token i's
+    projected value is added directly to action-token i's output, not
+    attended to via a separate Q/K softmax lookup (the same guarantee
+    ControlNet residuals get from being added at matching positions).
+
+    Zero-init on to_out_ip means no effect at the start of training — the
+    model begins identical to the frozen painter.
+    """
+
+    def __init__(self, layer: nn.TransformerEncoderLayer, hidden_dim: int) -> None:
+        super().__init__()
+        self.layer = layer
+        self.to_v_ip = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.to_out_ip = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.to_out_ip.weight)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        ip_hidden_states: Optional[torch.Tensor] = None,
+        n_cond: int = 0,
+    ) -> torch.Tensor:
+        out = self.layer(src, src_mask=src_mask)
+        if ip_hidden_states is not None:
+            act = out[:, n_cond:]
+            if ip_hidden_states.shape[1] != act.shape[1]:
+                raise ValueError(
+                    "IPAdapterSteeredActionTransformerPainter requires ip_hidden_states "
+                    f"to be aligned 1:1 with the action token sequence (got "
+                    f"{ip_hidden_states.shape[1]} tokens vs {act.shape[1]} action steps)."
+                )
+            delta = self.to_out_ip(self.to_v_ip(ip_hidden_states))
+            out = torch.cat([out[:, :n_cond], act + delta], dim=1)
+        return out
+
+
+class IPAdapterSteeredActionTransformerPainter(ActionTransformerPainter):
+    """Frozen ActionTransformerPainter with trainable, index-matched IP
+    conditioning — the action-sequence analog of
+    models.painter_base.DirectIPAdapterSteeredDiTPainter.
+
+    nn.TransformerEncoder.forward() has no hook for threading extra per-layer
+    kwargs, so this class's forward() reimplements TransformerForDiffusion's
+    small token-assembly + causal-mask logic inline (rather than delegating
+    to self.backbone(...) as a black box) and loops over the wrapped layers
+    directly, passing ip_hidden_states explicitly each call. This keeps
+    models/action_backbones.py untouched and avoids any hidden/stateful
+    kwarg passing.
+
+    Args:
+        checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
+                    (must contain a "model_state" key).
+        **kwargs:   forwarded verbatim to ActionTransformerPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
+        if self.condition_encoder is not None:
+            for p in self.condition_encoder.parameters():
+                p.requires_grad_(False)
+        self.backbone.decoder.layers = nn.ModuleList([
+            _IPAdapterEncoderLayer(layer, self.backbone.n_emb) for layer in self.backbone.decoder.layers
+        ])
+
+    def forward(self, sample: DataSample, steering: Optional[ThinkerSteering] = None) -> DiffusionPrediction:
+        global_cond = self._global_cond(sample)
+        bb = self.backbone
+        x_noisy, timestep = sample.x_noisy, sample.timesteps
+        B, T, _ = x_noisy.shape
+        device = x_noisy.device
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=device)
+        elif timestep.ndim == 0:
+            timestep = timestep[None].to(device)
+        timestep = timestep.expand(B)
+        time_token = bb.time_emb(bb.time_proj(timestep).to(dtype=x_noisy.dtype)).unsqueeze(1)  # (B, 1, n_emb)
+
+        cond_tokens = [time_token]
+        if bb.has_cond:
+            if global_cond is None:
+                raise ValueError("This backbone was built with cond_dim > 0.")
+            cond_tokens.append(bb.cond_obs_emb(global_cond))  # (B, n_obs_steps, n_emb)
+        cond = torch.cat(cond_tokens, dim=1) + bb.cond_pos_emb
+        n_cond = cond.shape[1]
+
+        act = bb.input_emb(x_noisy) + bb.pos_emb[:, :T]
+        x = bb.drop(torch.cat([cond, act], dim=1))
+
+        mask = bb._causal_mask(n_cond, T, device) if bb.causal_attn else None
+
+        ip_hidden_states = None
+        if steering is not None and isinstance(steering, IPAdapterSteering):
+            ip_hidden_states = steering.ip_hidden_states
+
+        for layer in bb.decoder.layers:
+            x = layer(x, src_mask=mask, ip_hidden_states=ip_hidden_states, n_cond=n_cond)
+
+        x = bb.ln_f(x)
+        noise_pred = bb.head(x[:, n_cond:])  # drop cond/time positions, keep action tokens
+
+        return DiffusionPrediction(
+            pred=noise_pred,
+            pred_type=self.scheduler.config.prediction_type,
+        )
+
+
+# ── Thinker base with closed-loop predict_action ──────────────────────────────
+
+
+class ActionThinkerFrozenPainterBase(ClosedLoopActionMixin, ThinkerFrozenPainterBase):
+    """TRM thinker + frozen action-diffusion painter.
+
+    Combines ThinkerFrozenPainterBase (thinker/translator/painter wiring,
+    training, eval_step — unchanged, shared with the sudoku/CLEVR thinkers)
+    with ClosedLoopActionMixin (predict_action, the closed-loop rollout entry
+    point models/dp_eval_callbacks.py needs). n_obs_steps is read from the
+    thinker's own condition_encoder (LowdimObsTRMConditionEncoder /
+    ImageObsTRMConditionEncoder from condition_encoders.py), not the frozen
+    painter's — the thinker and the frozen painter each have their own,
+    separate condition encoders.
+    """

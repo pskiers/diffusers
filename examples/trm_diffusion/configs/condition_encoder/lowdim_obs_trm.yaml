@@ -1,0 +1,7 @@
+# Thinker-facing condition encoder for lowdim action-sequence tasks — separate
+# from the frozen painter's own baked-in lowdim_obs encoder (models/action_painters.py's
+# frozen wrappers instantiate their own condition_encoder from the base
+# painter's checkpoint config). Wraps LowdimObsConditionEncoder's output as a
+# TRMInput for the thinker to reason over.
+_target_: models.condition_encoders.LowdimObsTRMConditionEncoder
+n_obs_steps: ${data.n_obs_steps}
