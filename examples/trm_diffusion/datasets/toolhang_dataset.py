@@ -30,35 +30,40 @@ from datasets.pusht_dataset import _split_episodes, _build_split_data
 # HDF5 loading
 # ---------------------------------------------------------------------------
 
-def _load_hdf5_data(hdf5_path, load_images=False, download=False):
-    """Load robomimic-format HDF5 into memory.
+def _load_hdf5_data(hdf5_path, download=False, variant='lowdim'):
+    """Load robomimic-format HDF5 low-dim fields + episode metadata into memory.
+
+    Camera images are never eagerly loaded here (even for the image variant)
+    — the image HDF5 can be ~78GB, larger than RAM on most machines.
+    ToolHangImageDataset reads image frames lazily per-sample instead, via
+    _LazyHDF5ImageSeq below.
 
     Parameters
     ----------
     hdf5_path : str or Path
         Path to the .hdf5 file.
-    load_images : bool
-        When True also load agentview and hand camera images.
     download : bool
         When True and hdf5_path is missing, download it automatically via
-        download_tool_hang() (variant inferred from load_images).
+        download_tool_hang().
+    variant : str
+        'lowdim' or 'image' — only affects which zip download_tool_hang() fetches
+        if the file is missing; doesn't change what this function reads.
 
     Returns
     -------
     data_dict : dict
-        'action'        : (N_total, 7)        float32
-        'obs_robot'     : (N_total, 9)        float32  (eef_pos 3 + eef_quat 4 + gripper 2)
-        'obs_object'    : (N_total, 44)       float32  or None if key absent
-        'sideview_image': (N_total, H, W, 3) uint8    only when load_images=True
-        'hand_image'    : (N_total, H, W, 3)  uint8    only when load_images=True
+        'action'     : (N_total, 7)  float32
+        'obs_robot'  : (N_total, 9)  float32  (eef_pos 3 + eef_quat 4 + gripper 2)
+        'obs_object' : (N_total, 44) float32  or None if key absent
     episode_ends : np.ndarray
         Shape (E,) exclusive cumulative lengths.
+    demo_keys : list[str]
+        HDF5 demo group names, in the same order as episode_ends.
     """
     import h5py
 
     hdf5_path = str(hdf5_path)
     if not os.path.exists(hdf5_path) and download:
-        variant = 'image' if load_images else 'lowdim'
         data_dir = hdf5_path.split('/robomimic/')[0] or 'data'
         download_tool_hang(data_dir, variant=variant)
 
@@ -67,7 +72,7 @@ def _load_hdf5_data(hdf5_path, load_images=False, download=False):
             f"ToolHang HDF5 not found at: {hdf5_path}\n"
             "Pass download=True, or download manually with:\n"
             "  python -c \"from datasets.toolhang_dataset import download_tool_hang; "
-            f"download_tool_hang('data', '{'image' if load_images else 'lowdim'}')\"\n"
+            f"download_tool_hang('data', '{variant}')\"\n"
             "Or directly from:\n"
             "  https://diffusion-policy.cs.columbia.edu/data/training/robomimic_lowdim.zip\n"
             "  https://diffusion-policy.cs.columbia.edu/data/training/robomimic_image.zip"
@@ -83,10 +88,6 @@ def _load_hdf5_data(hdf5_path, load_images=False, download=False):
         obs_robot_list = []
         obs_object_list = []
         has_object = None
-
-        if load_images:
-            sideview_list = []
-            hand_list = []
 
         for demo_key in demo_keys:
             demo = f['data'][demo_key]
@@ -108,37 +109,6 @@ def _load_hdf5_data(hdf5_path, load_images=False, download=False):
             if has_object:
                 obs_object_list.append(obs['object'][:].astype(np.float32))  # (L, 44)
 
-            # --- images ---
-            if load_images:
-                # sideview camera: try different key names (ToolHang uses sideview,
-                # not agentview, per upstream tool_hang_image.yaml shape_meta)
-                sideview_img = None
-                for cam_key in ('sideview_image', 'agentview_image', 'robot0_sideview_image'):
-                    if cam_key in obs:
-                        sideview_img = obs[cam_key][:]
-                        break
-                if sideview_img is None:
-                    raise KeyError(
-                        f"Could not find sideview camera in demo '{demo_key}'. "
-                        "Tried: sideview_image, agentview_image, robot0_sideview_image. "
-                        f"Available keys: {list(obs.keys())}"
-                    )
-                sideview_list.append(sideview_img.astype(np.uint8))
-
-                # hand camera
-                hand_img = None
-                for cam_key in ('robot0_eye_in_hand_image', 'hand_camera_image'):
-                    if cam_key in obs:
-                        hand_img = obs[cam_key][:]
-                        break
-                if hand_img is None:
-                    raise KeyError(
-                        f"Could not find hand camera in demo '{demo_key}'. "
-                        "Tried: robot0_eye_in_hand_image, hand_camera_image. "
-                        f"Available keys: {list(obs.keys())}"
-                    )
-                hand_list.append(hand_img.astype(np.uint8))
-
     # --- concatenate across demos ---
     data_dict = {}
     data_dict['action'] = np.concatenate(actions_list, axis=0)       # (N, 7)
@@ -149,15 +119,69 @@ def _load_hdf5_data(hdf5_path, load_images=False, download=False):
     else:
         data_dict['obs_object'] = None
 
-    if load_images:
-        data_dict['sideview_image'] = np.concatenate(sideview_list, axis=0)  # (N, H, W, 3)
-        data_dict['hand_image'] = np.concatenate(hand_list, axis=0)          # (N, H, W, 3)
-
     # --- episode_ends: exclusive cumulative lengths ---
     lengths = [len(a) for a in actions_list]
     episode_ends = np.cumsum(lengths).astype(np.int64)
 
-    return data_dict, episode_ends
+    return data_dict, episode_ends, demo_keys
+
+
+class _LazyHDF5ImageSeq:
+    """Array-like proxy over one camera's frames across a set of selected
+    HDF5 demos — reads only the requested window from disk on __getitem__,
+    instead of loading the whole (up to ~78GB) image dataset into RAM.
+
+    Relies on SequenceSampler's guarantee that any single sample's window
+    never crosses an episode boundary: a slice passed to __getitem__ always
+    falls entirely within one selected episode, so it can be resolved to
+    exactly one HDF5 demo group.
+    """
+
+    def __init__(self, hdf5_path, cam_key_candidates, demo_keys, split_episode_ends):
+        self.hdf5_path = str(hdf5_path)
+        self.cam_key_candidates = cam_key_candidates
+        self.demo_keys = demo_keys
+        ends = np.asarray(split_episode_ends, dtype=np.int64)
+        self._ep_starts = np.concatenate([[0], ends[:-1]])
+        self._ep_ends = ends
+        self._file = None  # opened lazily — see _get_file()
+        self._resolved_cam_key = {}
+
+    def _get_file(self):
+        # An open h5py.File can't safely cross a DataLoader worker-process
+        # fork, so each worker process opens its own copy on first access
+        # rather than one being opened eagerly in __init__/the main process.
+        if self._file is None:
+            import h5py
+            self._file = h5py.File(self.hdf5_path, 'r')
+        return self._file
+
+    def _resolve_cam_key(self, demo_key, obs_group):
+        if demo_key not in self._resolved_cam_key:
+            for k in self.cam_key_candidates:
+                if k in obs_group:
+                    self._resolved_cam_key[demo_key] = k
+                    break
+            else:
+                raise KeyError(
+                    f"None of {self.cam_key_candidates} found in demo '{demo_key}'. "
+                    f"Available keys: {list(obs_group.keys())}"
+                )
+        return self._resolved_cam_key[demo_key]
+
+    def __getitem__(self, key):
+        assert isinstance(key, slice) and key.step in (None, 1), \
+            "_LazyHDF5ImageSeq only supports contiguous slices"
+        start, stop = key.start, key.stop
+        ep_idx = int(np.searchsorted(self._ep_ends, start, side='right'))
+        local_start = start - int(self._ep_starts[ep_idx])
+        local_stop = stop - int(self._ep_starts[ep_idx])
+
+        f = self._get_file()
+        demo_key = self.demo_keys[ep_idx]
+        obs = f['data'][demo_key]['obs']
+        cam_key = self._resolve_cam_key(demo_key, obs)
+        return obs[cam_key][local_start:local_stop].astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +223,7 @@ class ToolHangLowdimDataset(Dataset):
         self.pad_after = pad_after
 
         # Load HDF5 (lowdim keys only — no images)
-        data_dict, episode_ends = _load_hdf5_data(hdf5_path, load_images=False, download=download)
+        data_dict, episode_ends, _ = _load_hdf5_data(hdf5_path, download=download, variant='lowdim')
 
         # Build observation array — object-first, matching upstream's
         # obs_keys order ['object', 'robot0_eef_pos', 'robot0_eef_quat',
@@ -267,8 +291,9 @@ class ToolHangImageDataset(Dataset):
       embedding_conditions — (T, 9) float32 normalized robot proprioception
                               (eef_pos 3 + eef_quat 4 + gripper 2)
 
-    Requires h5py and potentially significant RAM for the full image dataset.
-    The ~78GB image HDF5 will be loaded entirely into memory — ensure sufficient RAM.
+    Requires h5py. Camera frames are read lazily per-sample directly from the
+    HDF5 file (see _LazyHDF5ImageSeq) rather than loaded into RAM up front —
+    the image HDF5 can be ~78GB, larger than RAM on most machines.
     """
 
     collate_fn = staticmethod(collate_data_samples)
@@ -290,14 +315,12 @@ class ToolHangImageDataset(Dataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
 
-        # Load HDF5 including images — store uint8 to save memory
-        data_dict, episode_ends = _load_hdf5_data(hdf5_path, load_images=True, download=download)
+        # Load low-dim fields only — images are read lazily per-sample below.
+        data_dict, episode_ends, demo_keys = _load_hdf5_data(hdf5_path, download=download, variant='image')
 
         full_data = {
-            'action': data_dict['action'],               # (N, 7)  float32
-            'obs_robot': data_dict['obs_robot'],          # (N, 9)  float32
-            'sideview_image': data_dict['sideview_image'],  # (N, H, W, 3) uint8
-            'hand_image': data_dict['hand_image'],        # (N, H, W, 3) uint8
+            'action': data_dict['action'],       # (N, 7)  float32
+            'obs_robot': data_dict['obs_robot'],  # (N, 9)  float32
         }
 
         # Fit normalizers over the full dataset (before splitting): identity
@@ -311,6 +334,22 @@ class ToolHangImageDataset(Dataset):
         # Real held-out train/val split.
         selected = _split_episodes(episode_ends, split=split, val_ratio=val_ratio, seed=seed)
         self._data, split_episode_ends = _build_split_data(full_data, episode_ends, selected)
+
+        # Lazy per-sample image proxies over just the selected demos — these
+        # slot into self._data alongside the eager arrays above; SequenceSampler
+        # only ever calls arr[start:stop] on each value, which both a real
+        # ndarray and _LazyHDF5ImageSeq support identically.
+        selected_demo_keys = [demo_keys[i] for i in selected]
+        self._data['sideview_image'] = _LazyHDF5ImageSeq(
+            hdf5_path,
+            ('sideview_image', 'agentview_image', 'robot0_sideview_image'),
+            selected_demo_keys, split_episode_ends,
+        )
+        self._data['hand_image'] = _LazyHDF5ImageSeq(
+            hdf5_path,
+            ('robot0_eye_in_hand_image', 'hand_camera_image'),
+            selected_demo_keys, split_episode_ends,
+        )
 
         # Build sampler
         self.sampler = SequenceSampler(split_episode_ends, horizon, pad_before, pad_after)
