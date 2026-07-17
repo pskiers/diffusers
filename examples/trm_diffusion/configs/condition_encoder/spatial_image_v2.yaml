@@ -1,0 +1,15 @@
+# Thinker-side condition encoder: spatial image CNN concatenated with noisy
+# input token-wise (length axis) rather than channel-wise (V2). Use when
+# condition and noisy image aren't pixel-aligned — e.g. mnist_sudoku_scaled,
+# where the target is randomly scaled/offset relative to the fixed puzzle
+# grid. Pair with translator=controlnet_sliced and thinker.seq_len=162.
+_target_: models.condition_encoders.NoisySpatialConditionEncoderV2
+cond_in_channels: 1
+noisy_in_channels: 1
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.cell_size}
+noisy_dropout_p_max: 0.7
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

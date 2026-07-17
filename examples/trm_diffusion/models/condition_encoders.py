@@ -150,6 +150,73 @@ class NoisySpatialConditionEncoder(ConditionEncoderBase):
         return TRMInput(enc_emb=emb)
 
 
+class NoisySpatialConditionEncoderV2(ConditionEncoderBase):
+    """
+    CNN encoder for a spatial condition and the noisy image, encoded through
+    separate CNN branches and concatenated token-wise (sequence-length axis)
+    rather than channel-wise like ``NoisySpatialConditionEncoder`` (V1).
+
+    V1's channel-wise concat assumes condition and noisy image are pixel-
+    aligned (same cell grid, same position/scale) — true for plain MNIST
+    Sudoku, false once the target is randomly scaled/offset (mnist_sudoku_scaled)
+    or when the "condition" isn't even spatial to begin with (CLEVR relations).
+    Concatenating as two separate token blocks instead lets the thinker's
+    self-attention learn whatever relation actually holds between them.
+
+    Reads ``spatial_conditions`` and ``x_noisy`` from the DataSample.
+
+    Output: TRMInput with enc_emb (B, 2*grid², output_dim) — condition
+    tokens first, followed by noisy tokens. The noisy-token block is
+    positionally registered with the real output image (it's encoded
+    straight from x_noisy pixels), which is what SlicedControlNetTranslator
+    reads back out for steering — see models/translators.py.
+    """
+
+    condition_keys: list[str] = ["spatial_conditions", "x_noisy"]
+
+    def __init__(
+        self,
+        cond_in_channels: int,
+        noisy_in_channels: int,
+        enc_channels: int,
+        hidden_channels: list[int],
+        output_dim: int,
+        factor: int,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.cond_enc, self.cond_proj = _build_spatial_enc(cond_in_channels, enc_channels, hidden_channels, output_dim, factor)
+        self.noisy_enc, self.noisy_proj = _build_spatial_enc(noisy_in_channels, enc_channels, hidden_channels, output_dim, factor)
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=output_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        noisy_in = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_in = x_noisy * keep[:, None, None, None]
+
+        cond_tokens = self.cond_proj(self.cond_enc(condition)).flatten(2).transpose(1, 2)  # (B, grid², output_dim)
+        noisy_tokens = self.noisy_proj(self.noisy_enc(noisy_in)).flatten(2).transpose(1, 2)  # (B, grid², output_dim)
+
+        emb = torch.cat([cond_tokens, noisy_tokens], dim=1)  # (B, 2*grid², output_dim)
+        if self.with_timestep_emb and timesteps is not None:
+            emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=emb)
+
+
 # Backward-compatible alias — existing Hydra configs reference SpatialImageEncoder.
 SpatialImageEncoder = SpatialConditionEncoder
 

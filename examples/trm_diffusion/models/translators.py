@@ -215,6 +215,31 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
         )
 
 
+class SlicedControlNetTranslator(ControlNetTranslator):
+    """
+    ControlNetTranslator variant that reads only a contiguous slice of the
+    TRM's output sequence — e.g. the token range produced by
+    NoisySpatialConditionEncoderV2 (models/condition_encoders.py) that
+    corresponds to the x_noisy-derived tokens, positionally registered with
+    the real output image, rather than the whole sequence (which also
+    includes the puzzle/reasoning tokens the TRM used to think but that
+    carry no output-space registration of their own).
+
+    slice_start/slice_len select the token range; everything else
+    (bridge_mode, seq_proj, ConditioningPyramid) is inherited unchanged from
+    ControlNetTranslator and operates on the sliced logits only.
+    """
+
+    def __init__(self, *args, slice_start: int, slice_len: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slice_start = slice_start
+        self.slice_len = slice_len
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> ControlNetSteering:
+        sliced = trm_output.logits[:, self.slice_start : self.slice_start + self.slice_len]
+        return super().forward(TRMOutput(logits=sliced), timesteps=timesteps)
+
+
 class ControlNetTranslator1D(ThinkerPainterTranslatorBase):
     """
     Translates thinker logits into 1D ControlNet residuals for

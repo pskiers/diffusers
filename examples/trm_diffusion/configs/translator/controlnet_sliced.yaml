@@ -1,0 +1,14 @@
+# ControlNet translator that reads only the noisy-token slice of the TRM
+# output (tokens [81:162] when paired with condition_encoder=spatial_image_v2,
+# which puts condition tokens first and noisy tokens second). Pair with
+# thinker.seq_len=162.
+_target_: models.translators.SlicedControlNetTranslator
+in_channels: ${thinker.vocab_size}
+painter_channels: [32, 64, 64]
+layers_per_block: 2
+painter_size: ${data.painter_size}
+grid: 9             # painter_size // cell_size = 144 // 16
+bridge_mode: "normalized"
+with_timestep_emb: true
+slice_start: 81     # grid² — condition tokens come first
+slice_len: 81       # grid²
