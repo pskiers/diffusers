@@ -688,7 +688,12 @@ class ToolHangEvalCallback:
                     raw_obs, reward, done_flag, info = env.step(action_exec[t])
                     # robosuite returns done when horizon is reached
                     done = bool(done_flag)
-                    if isinstance(info, dict) and info.get('success', False):
+                    # robosuite's base env._post_action() always returns an
+                    # EMPTY info dict ({}) — info.get('success', False) can
+                    # never be True. Success must be queried directly via the
+                    # task env's own _check_success(), exactly like
+                    # robomimic's EnvRobosuite.is_success() does.
+                    if env._check_success():
                         success = True
                     obs_buffer.push(self._obs_to_dict(raw_obs))
                     step += 1
