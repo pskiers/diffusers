@@ -455,44 +455,62 @@ class LowdimObsTRMConditionEncoder(ConditionEncoderBase):
     """Thinker-facing wrapper around LowdimObsConditionEncoder.
 
     SpatialTRMInner._input_embeddings treats a floating-point input as an
-    already-computed embedding at (B, seq_len, hidden_size) — it does no
-    projection of its own (that's only needed for discrete token inputs).
-    So unlike LowdimObsConditionEncoder (raw obs passed straight through as
-    global_cond for FiLM/prefix-token conditioning), this wrapper must
-    project obs_dim -> hidden_size itself before wrapping into TRMInput.
+    already-computed embedding at (B, seq_len, hidden_size), added directly
+    to z_H (also (B, seq_len, hidden_size)) — it does no projection or
+    broadcasting of its own. seq_len here is the thinker's reasoning grid
+    (= the action horizon, e.g. 16), which has no natural 1:1
+    correspondence with the n_obs_steps (e.g. 2) observed history steps —
+    there's no reason obs step i should align with output horizon position
+    i. So instead of keeping per-obs-step tokens (which is what
+    LowdimObsConditionEncoder itself does for FiLM/prefix-token painter
+    conditioning), this flattens the whole obs history into a single
+    conditioning vector — mirroring how ConditionalUnet1D's own FiLM
+    conditioning already flattens obs history into one vector — and
+    broadcasts that same vector to every reasoning position.
 
-    Output: TRMInput with enc_emb (B, n_obs_steps, hidden_size).
+    Output: TRMInput with enc_emb (B, seq_len, hidden_size).
     """
 
     condition_keys: list[str] = ["embedding_conditions"]
 
-    def __init__(self, n_obs_steps: int, in_dim: int, hidden_size: int):
+    def __init__(self, n_obs_steps: int, in_dim: int, hidden_size: int, seq_len: int):
         super().__init__()
         self._inner = LowdimObsConditionEncoder(n_obs_steps)
-        self.proj = nn.Linear(in_dim, hidden_size)
+        self.proj = nn.Linear(n_obs_steps * in_dim, hidden_size)
+        self.seq_len = seq_len
 
     @property
     def n_obs_steps(self) -> int:
         return self._inner.n_obs_steps
 
     def forward(self, embedding_conditions: torch.Tensor, timesteps=None, **_) -> TRMInput:
-        raw = self._inner(embedding_conditions, timesteps=timesteps)
-        return TRMInput(enc_emb=self.proj(raw))
+        raw = self._inner(embedding_conditions, timesteps=timesteps)  # (B, n_obs_steps, in_dim)
+        flat = raw.reshape(raw.shape[0], -1)  # (B, n_obs_steps * in_dim)
+        token = self.proj(flat)  # (B, hidden_size)
+        enc_emb = token.unsqueeze(1).expand(-1, self.seq_len, -1)  # (B, seq_len, hidden_size)
+        return TRMInput(enc_emb=enc_emb)
 
 
 class ImageObsTRMConditionEncoder(ConditionEncoderBase):
     """Thinker-facing wrapper around ImageObsConditionEncoder.
 
     SpatialTRMInner._input_embeddings treats a floating-point input as an
-    already-computed embedding at (B, seq_len, hidden_size) — it does no
-    projection of its own. So unlike ImageObsConditionEncoder (raw
-    ResNet-feature + obs concat passed straight through as global_cond for
-    FiLM/prefix-token conditioning), this wrapper must project
-    V*resnet_feature_dim+obs_dim -> hidden_size itself before wrapping into
-    TRMInput. in_dim must be set to that exact width (task-specific, since
-    it depends on the number of camera views).
+    already-computed embedding at (B, seq_len, hidden_size), added directly
+    to z_H (also (B, seq_len, hidden_size)). seq_len here is the thinker's
+    reasoning grid (= the action horizon, e.g. 16), which has no natural
+    1:1 correspondence with the n_obs_steps (e.g. 2) observed history steps.
+    So instead of keeping per-obs-step tokens (what ImageObsConditionEncoder
+    itself produces for FiLM/prefix-token painter conditioning), this
+    flattens the whole obs history into a single conditioning vector and
+    broadcasts it to every reasoning position — same reasoning as
+    LowdimObsTRMConditionEncoder.
 
-    Output: TRMInput with enc_emb (B, n_obs_steps, hidden_size).
+    in_dim must be set to the per-obs-step feature width
+    (V*resnet_feature_dim+obs_dim, task-specific since it depends on the
+    number of camera views) — the Linear projection's actual input width is
+    n_obs_steps*in_dim after flattening across obs steps.
+
+    Output: TRMInput with enc_emb (B, seq_len, hidden_size).
     """
 
     condition_keys: list[str] = ["spatial_conditions", "embedding_conditions"]
@@ -502,6 +520,7 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
         n_obs_steps: int,
         in_dim: int,
         hidden_size: int,
+        seq_len: int,
         use_group_norm: bool = True,
         pretrained: bool = False,
         crop_shape=None,
@@ -513,7 +532,8 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
             pretrained=pretrained,
             crop_shape=crop_shape,
         )
-        self.proj = nn.Linear(in_dim, hidden_size)
+        self.proj = nn.Linear(n_obs_steps * in_dim, hidden_size)
+        self.seq_len = seq_len
 
     @property
     def n_obs_steps(self) -> int:
@@ -530,5 +550,8 @@ class ImageObsTRMConditionEncoder(ConditionEncoderBase):
             spatial_conditions,
             embedding_conditions=embedding_conditions,
             timesteps=timesteps,
-        )
-        return TRMInput(enc_emb=self.proj(raw))
+        )  # (B, n_obs_steps, in_dim)
+        flat = raw.reshape(raw.shape[0], -1)  # (B, n_obs_steps * in_dim)
+        token = self.proj(flat)  # (B, hidden_size)
+        enc_emb = token.unsqueeze(1).expand(-1, self.seq_len, -1)  # (B, seq_len, hidden_size)
+        return TRMInput(enc_emb=enc_emb)

@@ -7,3 +7,4 @@ _target_: models.condition_encoders.LowdimObsTRMConditionEncoder
 n_obs_steps: ${data.n_obs_steps}
 in_dim: ${data.obs_dim}
 hidden_size: ${thinker.hidden_size}
+seq_len: ${thinker.seq_len}

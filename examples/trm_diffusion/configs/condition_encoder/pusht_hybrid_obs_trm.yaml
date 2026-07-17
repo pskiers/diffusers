@@ -6,6 +6,7 @@ _target_: models.condition_encoders.ImageObsTRMConditionEncoder
 n_obs_steps: ${data.n_obs_steps}
 in_dim: 514
 hidden_size: ${thinker.hidden_size}
+seq_len: ${thinker.seq_len}
 use_group_norm: true
 pretrained: false
 crop_shape: [76, 76]
