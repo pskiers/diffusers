@@ -9,12 +9,12 @@
 _target_: models.trm_wrappers.SpatialTRM
 vocab_size: 32        # placeholder; continuous thinker output width (bridge_mode="normalized")
 seq_len: 16           # = action horizon
-hidden_size: 256
-n_heads: 4
+hidden_size: 512
+n_heads: 8
 L_layers: 2
-L_cycles: 4
+L_cycles: 6
 H_cycles: 3
-n_sup: 8
+n_sup: 16
 expansion: 4.0
 forward_dtype: "bfloat16"
 pos_encodings: "rope"
