@@ -240,6 +240,56 @@ class MNISTSudokuScaledDataset(MNISTSudokuDataset):
         return dataclasses.replace(sample, images=canvas)
 
 
+class MNISTSudokuAlignedScaledDataset(MNISTSudokuDataset):
+    """
+    Diagnostic variant of MNISTSudokuScaledDataset: applies the SAME random
+    scale+offset transform to BOTH the diffusion target (``images``) and the
+    puzzle condition (``spatial_conditions``), instead of only the target.
+
+    Isolates one variable from mnist_sudoku_scaled: whether random scale/
+    offset variety by itself breaks the pipeline, independent of the puzzle-
+    vs-target coordinate mismatch (mnist_sudoku_scaled keeps the condition at
+    a fixed canonical layout while only the target moves). Here both move
+    together, so the task reduces to "solve sudoku, then paint the whole
+    thing at some scale/offset" — structurally close to plain mnist_sudoku,
+    just rigidly transformed as a whole, with no puzzle/target mismatch to
+    resolve.
+
+    Args:
+        scale_min, scale_max: the solved grid *and* the puzzle condition are
+            both resized to the same random fraction, drawn uniformly from
+            [scale_min, scale_max], and pasted at the same random offset.
+    """
+
+    def __init__(self, *args, scale_min: float = 0.8, scale_max: float = 0.9, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    @staticmethod
+    def _scale_and_offset(x: torch.Tensor, new_size: int, off_y: int, off_x: int) -> torch.Tensor:
+        resized = F.interpolate(
+            x.unsqueeze(0), size=(new_size, new_size), mode="bilinear", align_corners=False
+        ).squeeze(0)
+        canvas = torch.zeros_like(x)
+        canvas[:, off_y : off_y + new_size, off_x : off_x + new_size] = resized
+        return canvas
+
+    def __getitem__(self, idx: int) -> DataSample:
+        sample = super().__getitem__(idx)
+        full_size = sample.images.shape[-1]
+
+        scale = self._rng.uniform(self.scale_min, self.scale_max)
+        new_size = max(1, round(full_size * scale))
+        max_off = full_size - new_size
+        off_y = int(self._rng.integers(0, max_off + 1))
+        off_x = int(self._rng.integers(0, max_off + 1))
+
+        images = self._scale_and_offset(sample.images, new_size, off_y, off_x)
+        spatial_conditions = self._scale_and_offset(sample.spatial_conditions, new_size, off_y, off_x)
+        return dataclasses.replace(sample, images=images, spatial_conditions=spatial_conditions)
+
+
 def get_solution_tokens(solution: torch.Tensor) -> torch.Tensor:
     """Raw solution (0-8) → full token grid (2-10, no blanks) for painter stage."""
     return solution.clamp(min=0) + 2

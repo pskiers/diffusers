@@ -1,0 +1,39 @@
+# Diagnostic variant of mnist_sudoku_scaled: the SAME random scale+offset
+# transform is applied to both the diffusion target (images) and the puzzle
+# condition (spatial_conditions), instead of only the target — see
+# datasets.mnist_sudoku_dataset.MNISTSudokuAlignedScaledDataset. Isolates
+# whether scale/offset variety itself breaks the pipeline, independent of
+# the puzzle-vs-target coordinate mismatch mnist_sudoku_scaled has.
+# Pair with eval_callbacks=sudoku_scaled (same crop-back-and-classify logic
+# works unchanged since only the target's transform matters there).
+sudoku_dir: "data/sudoku-extreme-1k-aug-1000"
+mnist_root: "data/mnist"
+cell_size: 16
+painter_size: 144  # cell_size(16) * 9 = 144
+num_workers: 4
+vocab_size: 11   # 0=PAD, 1=blank, 2-10=digits 1-9
+num_givens: null  # if set, randomly keep only this many given cells per puzzle
+scale_min: 0.8
+scale_max: 0.9
+
+train_dataset:
+  _target_: datasets.mnist_sudoku_dataset.MNISTSudokuAlignedScaledDataset
+  sudoku_dir: "${data.sudoku_dir}/train"
+  mnist_root: "${data.mnist_root}"
+  cell_size: "${data.cell_size}"
+  mnist_split: "train"
+  mask_given: true
+  num_givens: "${data.num_givens}"
+  scale_min: "${data.scale_min}"
+  scale_max: "${data.scale_max}"
+
+val_dataset:
+  _target_: datasets.mnist_sudoku_dataset.MNISTSudokuAlignedScaledDataset
+  sudoku_dir: "${data.sudoku_dir}/test"
+  mnist_root: "${data.mnist_root}"
+  cell_size: "${data.cell_size}"
+  mnist_split: "test"
+  mask_given: true
+  num_givens: "${data.num_givens}"
+  scale_min: "${data.scale_min}"
+  scale_max: "${data.scale_max}"
