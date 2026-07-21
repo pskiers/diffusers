@@ -170,7 +170,7 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
         n_log = self.num_log_images
         token_offset = getattr(model, "token_offset", 0)
 
-        all_cell_acc, all_puzzle_acc, all_constraint_acc = [], [], []
+        all_cell_acc, all_puzzle_acc, all_constraint_acc, all_given_consistent_acc = [], [], [], []
         all_thinker_cell_best, all_thinker_cell_mean = [], []
         all_thinker_puzzle_best, all_thinker_puzzle_mean = [], []
         all_thinker_deviation = []
@@ -205,6 +205,8 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
             all_cell_acc.append(acc["cell_acc"])
             all_puzzle_acc.append(acc["puzzle_acc"])
             all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
+            if acc.get("given_consistent_puzzle_acc") is not None:
+                all_given_consistent_acc.append(acc["given_consistent_puzzle_acc"])
 
             if self.include_thinker_metrics:
                 for key, lst in [
@@ -266,6 +268,8 @@ class SudokuDDIMEvalCallback(EvalCallbackBase):
             "puzzle_acc": float(np.mean(all_puzzle_acc)),
             "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
         }
+        if all_given_consistent_acc:
+            result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent_acc))
         if self.include_thinker_metrics:
             if all_thinker_cell_best:
                 result["thinker_cell_acc_best"] = float(np.mean(all_thinker_cell_best))
@@ -336,6 +340,7 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
         n_total = self.num_samples
 
         all_real_cell, all_real_puzzle = [], []
+        all_real_constraint, all_real_given_consistent = [], []
         n_real = 0
         n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
 
@@ -361,12 +366,19 @@ class SudokuRealSolutionCallback(EvalCallbackBase):
             acc_r = evaluate_grids(sr_r["generated"], solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
             all_real_cell.append(acc_r["cell_acc"])
             all_real_puzzle.append(acc_r["puzzle_acc"])
+            all_real_constraint.append(acc_r.get("constraint_puzzle_acc", 0.0))
+            if acc_r.get("given_consistent_puzzle_acc") is not None:
+                all_real_given_consistent.append(acc_r["given_consistent_puzzle_acc"])
             n_real += solutions.shape[0]
 
-        return {
+        result = {
             "real_cell_acc": float(np.mean(all_real_cell)),
             "real_puzzle_acc": float(np.mean(all_real_puzzle)),
+            "real_constraint_puzzle_acc": float(np.mean(all_real_constraint)),
         }
+        if all_real_given_consistent:
+            result["real_given_consistent_puzzle_acc"] = float(np.mean(all_real_given_consistent))
+        return result
 
 
 class SudokuEvalCallback(EvalCallbackBase):
@@ -430,7 +442,7 @@ class SudokuEvalCallback(EvalCallbackBase):
         n_log = self.num_log_images
         token_offset = getattr(model, "token_offset", 0)
 
-        all_cell_acc, all_puzzle_acc, all_constraint_acc = [], [], []
+        all_cell_acc, all_puzzle_acc, all_constraint_acc, all_given_consistent_acc = [], [], [], []
         panels: list = []
         n_done = 0
 
@@ -451,6 +463,8 @@ class SudokuEvalCallback(EvalCallbackBase):
             all_cell_acc.append(acc["cell_acc"])
             all_puzzle_acc.append(acc["puzzle_acc"])
             all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
+            if acc.get("given_consistent_puzzle_acc") is not None:
+                all_given_consistent_acc.append(acc["given_consistent_puzzle_acc"])
 
             if _wandb is not None and len(panels) < n_log:
                 n_new = min(n_log - len(panels), B_cur)
@@ -472,6 +486,8 @@ class SudokuEvalCallback(EvalCallbackBase):
             "puzzle_acc": float(np.mean(all_puzzle_acc)),
             "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
         }
+        if all_given_consistent_acc:
+            result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent_acc))
         if panels:
             result["samples"] = panels
 

@@ -275,6 +275,7 @@ def sample_with_verif(
 def run_eval(model, loader, classifier, args, device, cfg):
     painter_size = 9 * args.cell_size
     all_cell, all_puzzle = [], []
+    all_constraint, all_given_consistent = [], []
     n_done = 0
     model.eval()
 
@@ -307,14 +308,21 @@ def run_eval(model, loader, classifier, args, device, cfg):
                              args.cell_size, given_masks=given_masks)
         all_cell.append(acc["cell_acc"])
         all_puzzle.append(acc["puzzle_acc"])
+        all_constraint.append(acc.get("constraint_puzzle_acc", 0.0))
+        if acc.get("given_consistent_puzzle_acc") is not None:
+            all_given_consistent.append(acc["given_consistent_puzzle_acc"])
         n_done += solutions.shape[0]
 
-    return {
+    result = {
         **{k: v for k, v in cfg.items()},
         "cell_acc":   float(np.mean(all_cell)),
         "puzzle_acc": float(np.mean(all_puzzle)),
+        "constraint_puzzle_acc": float(np.mean(all_constraint)),
         "n_samples":  n_done,
     }
+    if all_given_consistent:
+        result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent))
+    return result
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

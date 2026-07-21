@@ -381,6 +381,8 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
 
     all_cell_acc: list[float] = []
     all_puzzle_acc: list[float] = []
+    all_constraint_acc: list[float] = []
+    all_given_consistent_acc: list[float] = []
     all_thinker_cell_best: list[float] = []
     all_thinker_cell_mean: list[float] = []
     all_thinker_puzzle_best: list[float] = []
@@ -391,6 +393,8 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
 
     all_real_cell_acc: list[float] = []
     all_real_puzzle_acc: list[float] = []
+    all_real_constraint_acc: list[float] = []
+    all_real_given_consistent_acc: list[float] = []
     do_real_eval = getattr(model, "has_realsolution_eval", False)
 
     n_done = 0
@@ -424,6 +428,9 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
         acc = evaluate_grids(sr["generated"], sols, classifier, args.cell_size, given_masks=given_masks)
         all_cell_acc.append(acc["cell_acc"])
         all_puzzle_acc.append(acc["puzzle_acc"])
+        all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
+        if acc.get("given_consistent_puzzle_acc") is not None:
+            all_given_consistent_acc.append(acc["given_consistent_puzzle_acc"])
 
         for key, lst in [
             ("thinker_cell_acc_best", all_thinker_cell_best),
@@ -474,6 +481,9 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
             acc_r = evaluate_grids(sr_r["generated"], sols, classifier, args.cell_size, given_masks=given_masks)
             all_real_cell_acc.append(acc_r["cell_acc"])
             all_real_puzzle_acc.append(acc_r["puzzle_acc"])
+            all_real_constraint_acc.append(acc_r.get("constraint_puzzle_acc", 0.0))
+            if acc_r.get("given_consistent_puzzle_acc") is not None:
+                all_real_given_consistent_acc.append(acc_r["given_consistent_puzzle_acc"])
 
         n_done += B_cur
 
@@ -484,10 +494,16 @@ def run_eval(model, eval_ds, args, device, cfg_scale: float):
         "n_samples": n_done,
         "cell_acc": float(np.mean(all_cell_acc)),
         "puzzle_acc": float(np.mean(all_puzzle_acc)),
+        "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
     }
+    if all_given_consistent_acc:
+        metrics["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent_acc))
     if all_real_cell_acc:
         metrics["realsolution_cell_acc"] = float(np.mean(all_real_cell_acc))
         metrics["realsolution_puzzle_acc"] = float(np.mean(all_real_puzzle_acc))
+        metrics["realsolution_constraint_puzzle_acc"] = float(np.mean(all_real_constraint_acc))
+        if all_real_given_consistent_acc:
+            metrics["realsolution_given_consistent_puzzle_acc"] = float(np.mean(all_real_given_consistent_acc))
     if all_thinker_cell_best:
         metrics["thinker_cell_acc_best"] = float(np.mean(all_thinker_cell_best))
         metrics["thinker_cell_acc_mean"] = float(np.mean(all_thinker_cell_mean))

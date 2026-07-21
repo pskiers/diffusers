@@ -81,6 +81,8 @@ def run_schedule(model, loader, classifier, args, guidance_fn, device):
 
     all_cell_acc = []
     all_puzzle_acc = []
+    all_constraint_acc = []
+    all_given_consistent_acc = []
     n_done = 0
 
     for batch in tqdm(
@@ -112,12 +114,19 @@ def run_schedule(model, loader, classifier, args, guidance_fn, device):
         acc = evaluate_grids(sr["generated"], sols, classifier, args.cell_size, given_masks=given_masks)
         all_cell_acc.append(acc["cell_acc"])
         all_puzzle_acc.append(acc["puzzle_acc"])
+        all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
+        if acc.get("given_consistent_puzzle_acc") is not None:
+            all_given_consistent_acc.append(acc["given_consistent_puzzle_acc"])
         n_done += sols.shape[0]
 
-    return {
+    result = {
         "cell_acc": float(np.mean(all_cell_acc)),
         "puzzle_acc": float(np.mean(all_puzzle_acc)),
+        "constraint_puzzle_acc": float(np.mean(all_constraint_acc)),
     }
+    if all_given_consistent_acc:
+        result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent_acc))
+    return result
 
 
 def main():

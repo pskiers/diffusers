@@ -626,6 +626,7 @@ class LatentSpatialDiT(nn.Module):
 
             # ── Spatial (confidence-driven) sampling ──────────────────────────
             all_cell_acc, all_puzzle_acc, panel_images = [], [], []
+            all_constraint_acc, all_given_consistent_acc = [], []
             n_done = 0
             for batch in tqdm(dataloader, desc="Sampling (spatial)", leave=False):
                 if n_done >= num_samples:
@@ -664,6 +665,9 @@ class LatentSpatialDiT(nn.Module):
                 acc = evaluate_grids(generated, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
                 all_cell_acc.append(acc["cell_acc"])
                 all_puzzle_acc.append(acc["puzzle_acc"])
+                all_constraint_acc.append(acc.get("constraint_puzzle_acc", 0.0))
+                if acc.get("given_consistent_puzzle_acc") is not None:
+                    all_given_consistent_acc.append(acc["given_consistent_puzzle_acc"])
                 n_done += B
                 if len(panel_images) < num_log_images and conditions_pixel is not None:
                     for j in range(min(num_log_images - len(panel_images), B)):
@@ -677,9 +681,13 @@ class LatentSpatialDiT(nn.Module):
 
             result["cell_acc"] = float(np.mean(all_cell_acc))
             result["puzzle_acc"] = float(np.mean(all_puzzle_acc))
+            result["constraint_puzzle_acc"] = float(np.mean(all_constraint_acc))
+            if all_given_consistent_acc:
+                result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent_acc))
 
             # ── Uniform DDIM sampling (baseline comparison) ───────────────────
             all_cell_acc_u, all_puzzle_acc_u, panel_images_u = [], [], []
+            all_constraint_acc_u, all_given_consistent_acc_u = [], []
             n_done_u = 0
             uniform_ts = torch.linspace(T_max - 1, 0, num_ddim_steps + 1).long()
             for batch in tqdm(dataloader, desc="Sampling (uniform)", leave=False):
@@ -707,6 +715,9 @@ class LatentSpatialDiT(nn.Module):
                 acc_u = evaluate_grids(generated_u, solutions, self.eval_clf, self.cell_size, given_masks=given_masks)
                 all_cell_acc_u.append(acc_u["cell_acc"])
                 all_puzzle_acc_u.append(acc_u["puzzle_acc"])
+                all_constraint_acc_u.append(acc_u.get("constraint_puzzle_acc", 0.0))
+                if acc_u.get("given_consistent_puzzle_acc") is not None:
+                    all_given_consistent_acc_u.append(acc_u["given_consistent_puzzle_acc"])
                 n_done_u += B
                 if len(panel_images_u) < num_log_images and conditions_pixel is not None:
                     for j in range(min(num_log_images - len(panel_images_u), B)):
@@ -720,6 +731,9 @@ class LatentSpatialDiT(nn.Module):
 
             result["cell_acc_uniform"] = float(np.mean(all_cell_acc_u))
             result["puzzle_acc_uniform"] = float(np.mean(all_puzzle_acc_u))
+            result["constraint_puzzle_acc_uniform"] = float(np.mean(all_constraint_acc_u))
+            if all_given_consistent_acc_u:
+                result["given_consistent_puzzle_acc_uniform"] = float(np.mean(all_given_consistent_acc_u))
 
             # ── Log images ────────────────────────────────────────────────────
             if step is not None:
