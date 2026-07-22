@@ -107,7 +107,21 @@ def _save_metrics(metrics: dict, path: str, extra: dict | None = None) -> None:
     out = {}
     if extra:
         out.update(extra)
-    out["metrics"] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
+
+    # Some eval_callbacks (e.g. sudoku thinker's wandb sample panels) put
+    # non-JSON-serializable objects (wandb.Image, lists of them, ...) into
+    # the same dict used for wandb logging — those aren't meaningful in a
+    # JSON metrics summary anyway, so drop them here rather than crashing.
+    json_metrics = {}
+    dropped = []
+    for k, v in metrics.items():
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            json_metrics[k] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+        else:
+            dropped.append(k)
+    if dropped:
+        logger.info(f"Skipping non-JSON-serializable metric(s) in saved output: {dropped}")
+    out["metrics"] = json_metrics
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
