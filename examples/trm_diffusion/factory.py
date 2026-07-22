@@ -101,6 +101,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         sudoku_loss_weight=float(tr.get("sudoku_loss_weight", 1.0)),
         mse_loss_weight=float(tr.get("mse_loss_weight", 1.0)),
         cfg_prob=float(tr.get("cfg_prob", 0.0)),
+        force_unconditional_painter=bool(tr.get("force_unconditional_painter", False)),
         noisy_swap=_noisy_swap_cfg(cfg),
         classifier_loss=_classifier_loss_cfg(cfg),
         two_stage=_two_stage_cfg(cfg),

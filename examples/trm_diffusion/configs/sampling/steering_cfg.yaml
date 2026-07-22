@@ -1,0 +1,10 @@
+# Steering-only CFG — contrasts "with thinker steering" vs "frozen painter's
+# own conditioning untouched, zero steering" (SteeringCFGPredictor), instead
+# of CFGPredictor's null_condition_sample() which also zeros the painter's
+# own conditioning. Requires a ThinkerFrozenPainterBase (or subclass) model.
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 20
+batch_size: 256
+predictor:
+  _target_: models.sampling.SteeringCFGPredictor
+  scale: 2.0

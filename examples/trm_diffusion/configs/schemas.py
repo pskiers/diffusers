@@ -54,6 +54,11 @@ class TrainConfig:
     sudoku_loss_weight: float = 1.0
     mse_loss_weight: float = 1.0
     cfg_prob: float = 0.0
+    # Thinker-frozen-painter models only: always feed the frozen painter its
+    # own null_condition_sample() instead of the real sample (translator/steering
+    # still sees the real one). Forces the steering pathway to supply all
+    # conditioning itself, rather than nudging an already-conditional painter.
+    force_unconditional_painter: bool = False
     noisy_swap: Optional[NoisySwapConfig] = None
     classifier_loss: Optional[ClassifierLossConfig] = None
     two_stage: Optional[TwoStageConfig] = None

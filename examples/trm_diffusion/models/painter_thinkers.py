@@ -42,6 +42,12 @@ class ThinkerFrozenPainterBase(BaseModel):
     thinker_painter_translator: Hydra config → ThinkerPainterTranslatorBase subclass
     eval_callbacks            : list of Hydra configs → EvalCallbackBase instances
     scheduler                 : DDPMScheduler injected from factory
+
+    train_cfg.force_unconditional_painter: if True, the frozen painter always receives
+        its own null_condition_sample() instead of the real sample (see run_painter) —
+        the translator/steering still sees the real one. Forces the steering pathway
+        to supply all conditioning itself, rather than nudging an already-conditional
+        painter. Default False is a no-op, fully backward compatible.
     """
 
     token_input: bool = False
@@ -142,17 +148,27 @@ class ThinkerFrozenPainterBase(BaseModel):
         return self.thinker.get_initial_states(bsz)
 
     def run_painter(self, sample: DataSample, logits: torch.Tensor) -> torch.Tensor:
-        """Translate thinker logits to conditioning, then run the frozen painter."""
+        """Translate thinker logits to conditioning, then run the frozen painter.
+
+        translator_extra is always built from the real sample — the translator
+        needs real information to produce useful steering. Only the painter's
+        own input is optionally blinded (force_unconditional_painter), via its
+        own null_condition_sample() so the frozen painter's condition_encoder
+        keeps running with the same shapes, just on zeroed data.
+        """
         painter_dtype = getattr(self.painter, "painter_dtype", None)
         ctx = (
             torch.autocast(device_type=sample.x_noisy.device.type, dtype=painter_dtype)
             if painter_dtype is not None
             else torch.autocast(device_type=sample.x_noisy.device.type, enabled=False)
         )
+        painter_sample = (
+            self.painter.null_condition_sample(sample) if self.train_cfg.force_unconditional_painter else sample
+        )
         with ctx:
             translator_extra = {k: getattr(sample, k) for k in self.thinker_painter_translator.condition_keys}
             steering = self.thinker_painter_translator(TRMOutput(logits=logits), **translator_extra)
-            return self.painter(sample, steering).pred
+            return self.painter(painter_sample, steering).pred
 
     def reasoning_step(self, sample: DataSample, z_H: torch.Tensor, z_L: torch.Tensor):
         """One supervision step: encode -> think -> translate -> paint.
@@ -174,41 +190,47 @@ class ThinkerFrozenPainterBase(BaseModel):
         noise_pred = self.run_painter(sample, logits_for_tpt)
         return noise_pred, logits, z_H_next, z_L_next
 
-    def forward(self, sample: DataSample, **kwargs) -> DiffusionPrediction:
+    def forward(self, sample: DataSample, null_steering: bool = False, **kwargs) -> DiffusionPrediction:
         """Single inference pass: encode → think (n_sup steps) → translate → paint.
 
         No guidance is applied here.  Use CFGPredictor / NoisyGuidancePredictor
         from models.sampling to add guidance during SamplingPipeline.sample().
         Logits are included in the return value so eval_step can compute CE loss.
+
+        null_steering=True skips condition encoding and thinker reasoning
+        entirely and feeds the translator all-zero logits instead. The
+        frozen painter still receives the real sample (its own conditioning
+        is untouched) — only the thinker's contribution is ablated. This is
+        the steering-only CFG null used by SteeringCFGPredictor
+        (models/sampling.py), as opposed to null_condition_sample() below,
+        which also zeros the painter's own conditioning.
         """
-        enc_emb = self._encode_condition(sample)
-        puzzle_ids = sample.puzzle_id
-
         bsz = sample.x_noisy.shape[0]
-        z_H, z_L = self.get_initial_states(bsz)
-        z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
 
-        logits = None
-        for _ in range(self.n_sup):
-            logits, z_H, z_L = self.thinker.reasoning_step(
-                enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
+        if null_steering:
+            logits = torch.zeros(
+                bsz, self.thinker.inner.config.seq_len, self.thinker.vocab_size,
+                device=sample.x_noisy.device,
             )
+        else:
+            enc_emb = self._encode_condition(sample)
+            puzzle_ids = sample.puzzle_id
 
-        painter_dtype = getattr(self.painter, "painter_dtype", None)
-        ctx = (
-            torch.autocast(device_type=sample.x_noisy.device.type, dtype=painter_dtype)
-            if painter_dtype is not None
-            else torch.autocast(device_type=sample.x_noisy.device.type, enabled=False)
-        )
-        with ctx:
-            translator_extra = {k: getattr(sample, k) for k in self.thinker_painter_translator.condition_keys}
-            steering = self.thinker_painter_translator(TRMOutput(logits=logits), **translator_extra)
-            noise_pred = self.painter(sample, steering).pred
+            z_H, z_L = self.get_initial_states(bsz)
+            z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
+
+            logits = None
+            for _ in range(self.n_sup):
+                logits, z_H, z_L = self.thinker.reasoning_step(
+                    enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
+                )
+
+        noise_pred = self.run_painter(sample, logits)
 
         return DiffusionPrediction(
             pred=noise_pred,
             pred_type=self.painter.scheduler.config.prediction_type,
-            logits=logits,
+            logits=None if null_steering else logits,
         )
 
     def null_condition_sample(self, sample: DataSample) -> DataSample:

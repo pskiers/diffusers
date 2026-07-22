@@ -94,6 +94,30 @@ class CFGPredictor(NoisePredictor):
         return pred_uncond + self.scale * (pred_cond - pred_uncond)
 
 
+class SteeringCFGPredictor(NoisePredictor):
+    """Classifier-free guidance over the thinker's steering only.
+
+    pred = pred_unsteered + scale * (pred_steered - pred_unsteered)
+
+    Unlike CFGPredictor (which zeros the *painter's own* conditioning too,
+    via null_condition_sample), this contrasts "with thinker steering" vs
+    "frozen painter's own conditioning untouched, zero steering" — calling
+    model(sample, null_steering=True) instead. See
+    ThinkerFrozenPainterBase.forward in models/painter_thinkers.py.
+
+    Requires the model to support forward(sample, null_steering=True) —
+    i.e. a ThinkerFrozenPainterBase (or subclass) model.
+    """
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def predict(self, model, sample: DataSample, t: int, T: int) -> Tensor:
+        pred_steered = model(sample).pred
+        pred_unsteered = model(sample, null_steering=True).pred
+        return pred_unsteered + self.scale * (pred_steered - pred_unsteered)
+
+
 class NoisyGuidancePredictor(NoisePredictor):
     """Noisy-image guidance wrapping any inner predictor.
 
@@ -200,11 +224,11 @@ class SamplingPipeline:
 
     @property
     def cfg_scale(self) -> float:
-        """CFG scale if predictor is (or wraps) a CFGPredictor, else 1.0."""
+        """CFG scale if predictor is (or wraps) a CFGPredictor/SteeringCFGPredictor, else 1.0."""
         p = self.predictor
         if isinstance(p, NoisyGuidancePredictor):
             p = p.inner
-        return p.scale if isinstance(p, CFGPredictor) else 1.0
+        return p.scale if isinstance(p, (CFGPredictor, SteeringCFGPredictor)) else 1.0
 
     @torch.no_grad()
     def sample_one_batch(
