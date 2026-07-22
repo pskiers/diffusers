@@ -23,6 +23,7 @@ Config overrides work exactly like train_trm.py — all Hydra override syntax is
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sys
@@ -178,6 +179,24 @@ def main(cfg: DictConfig):
 
     model = accelerator.prepare(model)
     unwrapped = accelerator.unwrap_model(model)
+
+    # ── Optional steering ablation/amplification (diagnostic) ──────────────────
+    # +steering_scale=0.0 fully ablates the thinker's steering (pure frozen-
+    # painter baseline); +steering_scale=2.0/5.0/10.0 amplifies it. See
+    # ThinkerSteering.scaled() in models/interfaces.py.
+    steering_scale = cfg.get("steering_scale", None)
+    if steering_scale is not None:
+        translator = getattr(unwrapped, "thinker_painter_translator", None)
+        if translator is None:
+            logger.warning("steering_scale set but model has no thinker_painter_translator — ignoring.")
+        else:
+            orig_forward = translator.forward
+
+            def _scaled_forward(*args, _orig=orig_forward, _scale=steering_scale, **kwargs):
+                return _orig(*args, **kwargs).scaled(_scale)
+
+            translator.forward = _scaled_forward
+            logger.info(f"Steering scale override active: {steering_scale}x")
 
     # ── Eval callbacks ────────────────────────────────────────────────────────
     unwrapped.eval()

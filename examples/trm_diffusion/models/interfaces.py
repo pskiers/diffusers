@@ -16,7 +16,7 @@ real use-case demands them, not speculatively.
 from __future__ import annotations
 
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from typing import Literal, Optional
 
 import torch
@@ -76,6 +76,27 @@ class ThinkerSteering:
     def to_painter_kwargs(self) -> dict:
         """Return a dict of keyword arguments to unpack into the painter's
         forward call."""
+
+    def scaled(self, scale: float) -> "ThinkerSteering":
+        """Return a copy with every tensor field scaled by `scale`.
+
+        scale=0.0 fully ablates the steering (pure frozen-painter baseline);
+        scale>1.0 amplifies it. Generic across every subclass (ControlNetSteering,
+        IPAdapterSteering, CrossAttnSteering, ...) — scales whatever
+        tensor/list-of-tensor fields it finds rather than hardcoding
+        per-subclass field names, so new subclasses get this for free.
+        Used for the steering-ablation/amplification diagnostics in eval.py.
+        """
+        if scale == 1.0:
+            return self
+        updates = {}
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, Tensor):
+                updates[f.name] = val * scale
+            elif isinstance(val, list) and val and isinstance(val[0], Tensor):
+                updates[f.name] = [v * scale for v in val]
+        return replace(self, **updates) if updates else self
 
 
 @dataclass
