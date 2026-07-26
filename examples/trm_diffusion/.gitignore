@@ -1,0 +1,13 @@
+# For Amaze datasets (parquet + scratch)
+/data/
+/runs/
+third_party/amaze/mazes-generator/node_modules/
+
+# The repo-root .gitignore has broad rules (`examples/**/*.json` and `lib/`) that
+# would otherwise drop the vendored maze generator's manifest and core library.
+# Re-include the files the generator actually needs to run.
+!third_party/amaze/mazes-generator/package.json
+!third_party/amaze/mazes-generator/package-lock.json
+!third_party/amaze/mazes-generator/maze-config.json
+!third_party/amaze/mazes-generator/js/lib/
+!third_party/amaze/mazes-generator/js/lib/*.js

@@ -1,0 +1,11 @@
+# Thinker-side condition encoder: spatial image CNN concatenated with noisy input (V1).
+# RGB variant of spatial_image_v1: 3 condition channels + 3 noisy channels.
+_target_: models.condition_encoders.NoisySpatialConditionEncoder
+in_channels: 6          # 3 condition (RGB) + 3 noisy (RGB)
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.cell_size}
+noisy_dropout_p_max: 0.7
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

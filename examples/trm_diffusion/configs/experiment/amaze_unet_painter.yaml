@@ -1,0 +1,17 @@
+# @package _global_
+# Stage 1: Train an Amaze UNet painter to reconstruct solved maze images.
+# Usage: python train_trm.py experiment=amaze_unet_painter
+
+defaults:
+  - override /data: amaze
+  - override /backbone: amaze_unet
+  - override /painter: amaze_unet
+  - override /train: mnist
+  - override /eval_callbacks: amaze
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/amaze_unet_painter"

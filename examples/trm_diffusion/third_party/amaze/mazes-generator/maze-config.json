@@ -1,0 +1,41 @@
+{
+  "description": "批量迷宫生成配置示例",
+  "outputDir": "./generated_mazes",
+  "mazes": [
+    {
+      "name": "小型方形迷宫",
+      "shape": "square",
+      "width": 3,
+      "height": 3,
+      "algorithm": "recursiveBacktrack",
+      "exitConfig": "vertical",
+      "filename": "small_square_recursive.png"
+    },
+    {
+      "name": "三角形迷宫 - 递归回溯",
+      "shape": "triangle",
+      "width": 3,
+      "height": 3,
+      "algorithm": "recursiveBacktrack",
+      "exitConfig": "vertical",
+      "filename": "triangle_recursive.png"
+    },
+    {
+      "name": "六边形迷宫 - 真Prims算法",
+      "shape": "hexagon",
+      "width": 3,
+      "height": 3,
+      "algorithm": "truePrims",
+      "exitConfig": "hardest",
+      "filename": "hexagon_true_prims.png"
+    },
+    {
+      "name": "小型圆形迷宫",
+      "shape": "circle",
+      "layers": 3,
+      "algorithm": "recursiveBacktrack",
+      "exitConfig": "vertical",
+      "filename": "small_circle_recursive.png"
+    }
+  ]
+}

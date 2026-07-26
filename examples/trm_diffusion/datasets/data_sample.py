@@ -77,9 +77,18 @@ class DataSample:
     Like ``x_noisy``, populated at training time rather than by the dataset."""
 
     # ── Identity / metadata ─────────────────────────────────────────────────
+    prompt: Optional[str] = None
+    """Optional text prompt associated with this sample.
+    Used by evaluation callbacks and auxiliary logging."""
+
     puzzle_id: Optional[Tensor] = None
     """Integer identifier of the puzzle instance used by the thinker's
     puzzle-embedding layer.  Shape: (), dtype long."""
+
+    metadata: Optional[dict] = None
+    """Optional dataset metadata dictionary for eval callbacks.
+    Contains auxiliary fields such as ``mask_img``, ``cell_map``, and raw
+    Amaze metadata JSON."""
 
     # ── Attention masks ──────────────────────────────────────────────────────
     embedding_mask: Optional[Tensor] = None
@@ -142,6 +151,10 @@ def collate_data_samples(samples: list[DataSample]) -> DataSample:
             first = values[0]
             if isinstance(first, Tensor):
                 kwargs[f.name] = torch.stack(values)
-            else:
+            elif isinstance(first, (dict, list, str, bytes)):
+                kwargs[f.name] = values
+            elif isinstance(first, (int, float, bool)):
                 kwargs[f.name] = torch.tensor(values)
+            else:
+                kwargs[f.name] = values
     return DataSample(**kwargs)

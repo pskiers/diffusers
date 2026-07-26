@@ -1,0 +1,4 @@
+- _target_: models.amaze_eval_callbacks.QueenEvalCallback
+  num_samples: 256
+  num_log_images: 8
+  num_attempts: 1 # for training, just 1 eval pass to spped up training

@@ -21,6 +21,7 @@ mediapy
 umap-learn
 seaborn
 opencv-python
+scikit-image  # required by datasets/amaze/infer/maze_metrics.py (Amaze eval callback)
 wandb
 pytest
 hydra-core
