@@ -1,10 +1,7 @@
 amaze_root: "data/amaze"
 image_size: 144
 painter_size: 144
-# cell_size drives the condition-encoder grid (image_size // cell_size) and must
-# stay consistent with thinker.seq_len (grid**2 = 81) and translator.grid (9):
-# 144 // 16 = 9 → 9x9 = 81 tokens.
-cell_size: 16
+cell_size: 20
 num_workers: 12
 num_channels: 3
 
@@ -21,7 +18,7 @@ train_dataset:
 val_dataset:
   _target_: datasets.amaze_dataset.AmazeDataset
   dataset_path: "${data.amaze_root}"
-  split: "test"
+  split: "val"
   image_size: "${data.image_size}"
   condition_field: "m_original_img"
   target_field: "sol_img"

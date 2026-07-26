@@ -1,10 +1,5 @@
 #!/bin/bash -l
-# Task: maze, 8x8 SQUARE. Both stages (painter → thinker) for 30k steps each.
-#
-# Submit from the trm_diffusion project root:
-#     sbatch slurm_scripts/maze_square_8x8_30k.sh [WANDB_PROJECT] [RUN_NAME]
-#
-#SBATCH --job-name=amaze_maze_sq_30k
+#SBATCH --job-name=amaze_train_maze_sq_30k
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --nodes=1
@@ -18,18 +13,18 @@
 
 set -euo pipefail
 
-# ── User config ──────────────────────────────────────────────────────────────
-PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"   # dir containing train_trm.py
-VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond"
-DATASET="maze_square_8x8"
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/venv"
+TASK="maze"
+GEOMETRY="square"
+N=8
 STEPS=30000
 # maze 8x8 -> 8x8 cells -> GRID=8, SEQ_LEN=64; CELL_SIZE=18 gives 144//18=8.
-# SEQ_LEN == GRID*GRID and GRID == 144 // CELL_SIZE.
 CELL_SIZE=18
 SEQ_LEN=64
 GRID=8
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
-RUN_NAME="${RUN_NAME:-${2:-${DATASET}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
+RUN_NAME="${RUN_NAME:-${2:-train_maze_${GEOMETRY}_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
 module load CUDA/12.4.0
 module load GCCcore/14.3.0 nodejs/22.17.1
@@ -41,10 +36,9 @@ mkdir -p slurm_outputs runs
 
 export PYTHONUNBUFFERED=1
 
-# pre-run bash scripts/generate_amaze_datasets.sh "${DATASET}"
-OUT_ROOT="${PROJECT_ROOT}/data/amaze" PYTHON="${VENV}/bin/python" \
-  bash scripts/generate_amaze_datasets.sh "${DATASET}"
-DATA_DIR="${PROJECT_ROOT}/data/amaze/${DATASET}"
+AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
+  python scripts/gen_amaze.py train "${TASK}" n=${N} type=${GEOMETRY}
+DATA_DIR="${PROJECT_ROOT}/data/amaze/train_maze_${GEOMETRY}_n${N}"
 
 # ── Stage 1: standalone painter ──────────────────────────────────────────────
 srun python train_trm.py experiment=amaze_unet_painter \
@@ -64,4 +58,21 @@ srun python train_trm.py experiment=amaze_thinker_v1_controlnet \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_thinker"
 
-echo "Experiment maze square 8x8, ${STEPS} steps complete."
+echo "Train maze ${GEOMETRY} ${N}x${N}, ${STEPS} steps — painter+thinker complete."
+
+# ── Stage 3: paper metrics → logged into the SAME wandb run as the thinker
+if [[ "${RUN_METRICS:-1}" == "1" ]]; then
+  srun python experiments/sample_amaze_metrics.py \
+    experiment=amaze_thinker_v1_controlnet \
+    painter.checkpoint="runs/${RUN_NAME}_painter/checkpoint_final.pt" \
+    +checkpoint="runs/${RUN_NAME}_thinker/checkpoint_final.pt" \
+    +task="${TASK}" \
+    +data_root="${PROJECT_ROOT}/data/amaze" \
+    +samples_per_puzzle="${SAMPLES:-5}" \
+    run.wandb_project="${WANDB_PROJECT}" \
+    data.cell_size=${CELL_SIZE} \
+    thinker.seq_len=${SEQ_LEN} \
+    translator.grid=${GRID} \
+    || echo "WARN: metrics eval failed — training checkpoints are safe in runs/${RUN_NAME}_thinker."
+  echo "Metrics eval (${TASK}) done — logged into wandb run ${RUN_NAME}_thinker."
+fi

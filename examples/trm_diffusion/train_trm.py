@@ -24,6 +24,7 @@ Design notes:
 import os
 import signal
 import logging
+import sys
 from pathlib import Path
 
 import hydra
@@ -51,6 +52,10 @@ def _alarm_handler(signum, frame):
     raise TimeoutError("Training/eval step exceeded the configured timeout.")
 
 
+# For windows debugging
+_HAS_SIGALRM = hasattr(signal, "SIGALRM")
+
+
 class _StepTimeout:
     """Context manager: raises TimeoutError if the block takes > `seconds`."""
 
@@ -58,13 +63,13 @@ class _StepTimeout:
         self._seconds = seconds
 
     def __enter__(self):
-        if self._seconds > 0:
+        if self._seconds > 0 and _HAS_SIGALRM:
             signal.signal(signal.SIGALRM, _alarm_handler)
             signal.alarm(self._seconds)
         return self
 
     def __exit__(self, *_):
-        if self._seconds > 0:
+        if self._seconds > 0 and _HAS_SIGALRM:
             signal.alarm(0)
 
 
@@ -105,11 +110,21 @@ def main(cfg: DictConfig):
         Path(cfg.run.output_dir).mkdir(parents=True, exist_ok=True)
 
     if wandb_project and accelerator.is_main_process:
+        import wandb
+
+        # Persist a stable wandb run id so a later eval job (sample_amaze_metrics.py) can resume THIS run and log its metrics into the same panel. resume="allow"
         run_name = Path(cfg.run.output_dir).name
+        id_file = Path(cfg.run.output_dir) / "wandb_run_id.txt"
+        if id_file.exists():
+            wandb_id = id_file.read_text().strip()
+        else:
+            wandb_id = wandb.util.generate_id()
+            id_file.write_text(wandb_id)
+
         accelerator.init_trackers(
             project_name=wandb_project,
             config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": {"name": run_name}},
+            init_kwargs={"wandb": {"name": run_name, "id": wandb_id, "resume": "allow"}},
         )
 
     torch.manual_seed(cfg.train.seed + accelerator.process_index)

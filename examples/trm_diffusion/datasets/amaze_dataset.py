@@ -41,22 +41,29 @@ class AmazeDataset(Dataset):
         self.condition_field = condition_field
         self.target_field = target_field
         self.include_eval_metadata = \
-            (split == "test") if include_metadata is None else include_metadata
+            (split in ("test", "val")) if include_metadata is None else include_metadata
 
         if num_channels not in (1, 3):
             raise ValueError("AmazeDataset num_channels must be 1 or 3")
         self.num_channels = num_channels
 
-        if split == "train":
-            file_name = "maze_dataset_train.parquet"
-        elif split == "test":
-            file_name = "maze_dataset_test.parquet"
+        # dataset_path may be a directory (loads maze_dataset_<split>.parquet
+        # from it) OR a direct .parquet FILE (flat layout, e.g.
+        # test_maze/square_3.parquet — the split is then ignored).
+        if str(dataset_path).endswith(".parquet") and os.path.isfile(dataset_path):
+            file_path = str(dataset_path)
         else:
-            raise ValueError("AmazeDataset split must be 'train' or 'test'")
-
-        file_path = os.path.join(dataset_path, file_name)
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Amaze dataset file not found: {file_path}")
+            if split == "train":
+                file_name = "maze_dataset_train.parquet"
+            elif split == "val":
+                file_name = "maze_dataset_val.parquet"
+            elif split == "test":
+                file_name = "maze_dataset_test.parquet"
+            else:
+                raise ValueError("AmazeDataset split must be 'train', 'val', or 'test'")
+            file_path = os.path.join(dataset_path, file_name)
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Amaze dataset file not found: {file_path}")
 
         self.data = pd.read_parquet(file_path)
         if self.data.empty:

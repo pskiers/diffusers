@@ -23,6 +23,10 @@ mode: "thinker_base"
 thinker:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+  seq_len: 49
+
+translator:
+  grid: 7
 
 run:
   output_dir: "runs/amaze_thinker_v1_controlnet"

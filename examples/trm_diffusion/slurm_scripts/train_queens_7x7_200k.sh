@@ -1,11 +1,5 @@
 #!/bin/bash -l
-# Task: queens, 7x7. Both stages: painter (train/mnist default = 100k) then
-# thinker (train/mnist_thinker default = 200k).
-#
-# Submit from the trm_diffusion project root:
-#     sbatch slurm_scripts/queens_7x7_200k.sh [WANDB_PROJECT] [RUN_NAME]
-#
-#SBATCH --job-name=amaze_queens_200k
+#SBATCH --job-name=amaze_train_queens_200k
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --nodes=1
@@ -19,18 +13,16 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"   # dir containing train_trm.py
-VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/outputs/ablation_uncond"
-DATASET="queens_7x7"            # train = n=7; validation split = multi-scale (n=4..10), paper-style
-# No train.num_steps override: painter uses its 100k default, thinker its 200k default.
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/venv"
+TASK="queens"
+N=7
 # queens n=7 -> 7x7 board -> GRID=7, SEQ_LEN=49; CELL_SIZE=20 gives 144//20=7.
-# SEQ_LEN == GRID*GRID and GRID == 144 // CELL_SIZE.
 CELL_SIZE=20
 SEQ_LEN=49
 GRID=7
-
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
-RUN_NAME="${RUN_NAME:-${2:-${DATASET}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
+RUN_NAME="${RUN_NAME:-${2:-train_queens_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
 module load CUDA/12.4.0
 module load GCCcore/14.3.0 nodejs/22.17.1
@@ -42,10 +34,9 @@ mkdir -p slurm_outputs runs
 
 export PYTHONUNBUFFERED=1
 
-# pre-run bash scripts/generate_amaze_datasets.sh "${DATASET}"
-OUT_ROOT="${PROJECT_ROOT}/data/amaze" PYTHON="${VENV}/bin/python" \
-  bash scripts/generate_amaze_datasets.sh "${DATASET}"
-DATA_DIR="${PROJECT_ROOT}/data/amaze/${DATASET}"
+AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
+  python scripts/gen_amaze.py train "${TASK}" n=${N}
+DATA_DIR="${PROJECT_ROOT}/data/amaze/train_queens_n${N}"
 
 # ── Stage 1: standalone painter ──────────────────────────────────────────────
 srun python train_trm.py experiment=amaze_unet_painter \
@@ -65,4 +56,21 @@ srun python train_trm.py experiment=amaze_thinker_v1_controlnet \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_thinker"
 
-echo "Experiment queens 7x7 complete (painter 100k + thinker 200k)."
+echo "Train queens n=${N} — painter + thinker complete."
+
+# ── Stage 3: paper metrics → logged into the SAME wandb run as the thinker
+if [[ "${RUN_METRICS:-1}" == "1" ]]; then
+  srun python experiments/sample_amaze_metrics.py \
+    experiment=amaze_thinker_v1_controlnet \
+    painter.checkpoint="runs/${RUN_NAME}_painter/checkpoint_final.pt" \
+    +checkpoint="runs/${RUN_NAME}_thinker/checkpoint_final.pt" \
+    +task="${TASK}" \
+    +data_root="${PROJECT_ROOT}/data/amaze" \
+    +samples_per_puzzle="${SAMPLES:-5}" \
+    run.wandb_project="${WANDB_PROJECT}" \
+    data.cell_size=${CELL_SIZE} \
+    thinker.seq_len=${SEQ_LEN} \
+    translator.grid=${GRID} \
+    || echo "WARN: metrics eval failed — training checkpoints are safe in runs/${RUN_NAME}_thinker."
+  echo "Metrics eval (${TASK}) done — logged into wandb run ${RUN_NAME}_thinker."
+fi
