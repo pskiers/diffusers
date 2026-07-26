@@ -19,6 +19,15 @@ QUEEN_GEN = TRM_ROOT / "third_party" / "amaze" / "queen-generator"
 # Output root — always data/amaze
 OUT_ROOT = Path(os.environ.get("AMAZE_OUT_ROOT", str(TRM_ROOT / "data" / "amaze")))
 
+
+def _nproc(env_var: str) -> int:
+    """Worker-process count: ``env_var`` override, else the SLURM CPU allocation,
+    else the machine's cpu count (min 1)."""
+    return max(1, int(os.environ.get(env_var)
+                      or os.environ.get("SLURM_CPUS_PER_TASK")
+                      or (os.cpu_count() or 1)))
+
+
 # ── Paper test spec ──────────────────────────────────────────────────────────
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
 MAZE_SCALES = [3, 5, 7, 9, 11, 13, 16]          # 7 scales, 3×3 … 16×16 (circle: layers)
@@ -31,6 +40,9 @@ MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
 QUEEN_TRAIN = int(os.environ.get("QUEEN_TRAIN", "30000"))
 QUEEN_CELL_SIZE = os.environ.get("QUEEN_CELL_SIZE", "64")
 QUEEN_RADIUS = os.environ.get("QUEEN_RADIUS", "16")
+# Parallel worker processes, split the batch across processes
+QUEEN_NPROC = _nproc("QUEEN_NPROC")
+MAZE_NPROC = _nproc("MAZE_NPROC")
 
 _UNIVERSAL = ["recursiveBacktrack", "simplifiedPrims", "truePrims", "wilson", "aldousBroder", "huntAndKill"]
 TRAIN_ALGOS = {
@@ -94,6 +106,41 @@ def _run(cmd, cwd=None) -> subprocess.CompletedProcess:
     return res
 
 
+def _run_parallel(cmds: list) -> None:
+    """Launch every command concurrently, wait for all, raise on any failure.
+    Each item is either an argv list, or an ``(argv, cwd)`` tuple."""
+    procs = []
+    for item in cmds:
+        cmd, cwd = item if isinstance(item, tuple) else (item, None)
+        argv = [str(c) for c in cmd]
+        procs.append((argv, subprocess.Popen(
+            argv, cwd=(str(cwd) if cwd is not None else None),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
+    errors = []
+    for argv, proc in procs:
+        _out, err = proc.communicate()
+        if proc.returncode != 0:
+            errors.append(f"Command failed ({proc.returncode}): {' '.join(argv)}\n--- stderr ---\n{err}")
+    if errors:
+        raise RuntimeError("\n\n".join(errors))
+
+
+def _split_count(count: int, nproc: int) -> list[int]:
+    """Split ``count`` into as-even-as-possible positive chunks (<= nproc of them)."""
+    nproc = max(1, min(nproc, count))
+    base, rem = divmod(count, nproc)
+    return [base + (1 if i < rem else 0) for i in range(nproc)]
+
+
+def _split_list(items: list, nproc: int) -> list[list]:
+    """Split a list into <= nproc as-even-as-possible non-empty sublists."""
+    chunks, start = [], 0
+    for size in _split_count(len(items), nproc):
+        chunks.append(items[start:start + size])
+        start += size
+    return chunks
+
+
 def _ensure_node_deps() -> None:
     """One-time `npm install` for the maze generator (needs internet)."""
     if (MAZE_GEN / "node_modules").is_dir():
@@ -125,27 +172,46 @@ def _maze_entries(geometry: str, scale: int, count: int, algorithms: list[str], 
 def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_ratio: float) -> None:
     """Render ``entries`` with the node generator, convert to parquet, and move
     the requested split file (train_ratio=1.0 → *_train, 0.0 → *_test) to
-    ``out_dir/out_name``. Cleans up the (large) intermediate render dir."""
+    ``out_dir/out_name``. Work is split across MAZE_NPROC parallel node workers
+    (each rendering a chunk in its own dir), then the parquets are merged. Cleans
+    up the (large) intermediate render dirs."""
     _ensure_node_deps()
     out_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="amaze_maze_"))
     try:
-        (work / "cfg.json").write_text(json.dumps({"mazes": entries}))
-        _run(["node", MAZE_GEN / "batch-maze-generator.js", "config", work / "cfg.json"], cwd=work)
-        _run([
-            sys.executable, MAZE_GEN / "process_maze_into_parquet.py",
-            "--maze-dir", work / "generated_mazes",
-            "--no-markers-dir", work / "generated_mazes_no_markers",
-            "--solution-dir", work / "generated_solutions",
-            "--metadata-dir", work / "generated_metadata",
-            "--output", work / "maze_dataset.parquet",
-            "--train-ratio", str(train_ratio),
-            "--seed", "42",
-        ])
-        produced = work / ("maze_dataset_train.parquet" if train_ratio >= 1.0 else "maze_dataset_test.parquet")
-        if not produced.exists():
-            raise RuntimeError(f"Expected {produced.name} not produced by process_maze_into_parquet.py")
-        shutil.move(str(produced), str(out_dir / out_name))
+        chunks = _split_list(entries, MAZE_NPROC)
+        want = "maze_dataset_train.parquet" if train_ratio >= 1.0 else "maze_dataset_test.parquet"
+        print(f">> maze: {len(entries)} mazes across {len(chunks)} worker(s)", flush=True)
+
+        node_cmds, proc_cmds, parts = [], [], []
+        for i, chunk in enumerate(chunks):
+            wk = work / f"w{i}"
+            wk.mkdir()
+            (wk / "cfg.json").write_text(json.dumps({"mazes": chunk}))
+            # node writes generated_* relative to its cwd → give each worker its own.
+            node_cmds.append((["node", MAZE_GEN / "batch-maze-generator.js", "config", wk / "cfg.json"], wk))
+            proc_cmds.append([
+                sys.executable, MAZE_GEN / "process_maze_into_parquet.py",
+                "--maze-dir", wk / "generated_mazes",
+                "--no-markers-dir", wk / "generated_mazes_no_markers",
+                "--solution-dir", wk / "generated_solutions",
+                "--metadata-dir", wk / "generated_metadata",
+                "--output", wk / "maze_dataset.parquet",
+                "--train-ratio", str(train_ratio),
+                "--seed", "42",
+            ])
+            parts.append(wk / want)
+
+        _run_parallel(node_cmds)     # the slow, CPU-bound render step — now on all cores
+        _run_parallel(proc_cmds)
+        for part in parts:
+            if not part.exists():
+                raise RuntimeError(f"Expected {part.name} not produced by process_maze_into_parquet.py")
+
+        if len(parts) == 1:
+            shutil.move(str(parts[0]), str(out_dir / out_name))
+        else:
+            _merge_parquets(parts, out_dir / out_name)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -176,29 +242,47 @@ def gen_maze_train(geometry: str, scale: int) -> None:
 
 
 # ── Queen generation ─────────────────────────────────────────────────────────
-def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path, Path]:
-    """Render ``count`` queen puzzles at n=scale and convert to a single parquet
-    (everything into *_train via --test-ratio 0). Returns the parquet path in a
-    temp dir the caller must clean up."""
-    raw = Path(tempfile.mkdtemp(prefix="amaze_queen_raw_"))
-    pq = Path(tempfile.mkdtemp(prefix="amaze_queen_pq_"))
+def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
+    """Render ``count`` queen puzzles at n=scale and convert to a single parquet.
+    The work is split across QUEEN_NPROC parallel worker processes (each with a
+    distinct seed), then the per-worker parquets are merged. Returns
+    (parquet_path, work_dir); the caller must rmtree work_dir."""
+    work = Path(tempfile.mkdtemp(prefix="amaze_queen_"))
     try:
-        _run([
-            sys.executable, QUEEN_GEN / "generate_queens_puzzle.py",
-            "--n", scale, "--count", count, "--outdir", raw, "--seed", seed,
-            "--cell-size", QUEEN_CELL_SIZE, "--queen-radius", QUEEN_RADIUS, "--image-format", "png",
-        ])
-        _run([
-            sys.executable, QUEEN_GEN / "convert_queen_to_parquet.py",
-            "--queen-outdir", raw, "--dataset-outdir", pq, "--test-ratio", "0", "--seed", "42",
-        ])
-        produced = pq / "maze_dataset_train.parquet"
-        if not produced.exists():
-            raise RuntimeError("convert_queen_to_parquet.py did not produce maze_dataset_train.parquet")
-        return produced, raw, pq
+        chunks = _split_count(count, QUEEN_NPROC)
+        print(f">> queens n={scale}: {count} puzzles across {len(chunks)} worker(s)", flush=True)
+
+        gen_cmds, conv_cmds, parts = [], [], []
+        for i, c in enumerate(chunks):
+            raw_i = work / f"raw_{i}"
+            pq_i = work / f"pq_{i}"
+            raw_i.mkdir()
+            pq_i.mkdir()
+            gen_cmds.append([
+                sys.executable, QUEEN_GEN / "generate_queens_puzzle.py",
+                "--n", scale, "--count", c, "--outdir", raw_i, "--seed", seed + i,
+                "--cell-size", QUEEN_CELL_SIZE, "--queen-radius", QUEEN_RADIUS, "--image-format", "png",
+            ])
+            conv_cmds.append([
+                sys.executable, QUEEN_GEN / "convert_queen_to_parquet.py",
+                "--queen-outdir", raw_i, "--dataset-outdir", pq_i, "--test-ratio", "0", "--seed", "42",
+            ])
+            parts.append(pq_i / "maze_dataset_train.parquet")
+
+        _run_parallel(gen_cmds)     # the slow, CPU-bound step — now on all cores
+        _run_parallel(conv_cmds)
+        for part in parts:
+            if not part.exists():
+                raise RuntimeError("convert_queen_to_parquet.py did not produce maze_dataset_train.parquet")
+
+        produced = work / "maze_dataset_train.parquet"
+        if len(parts) == 1:
+            shutil.move(str(parts[0]), str(produced))
+        else:
+            _merge_parquets(parts, produced)
+        return produced, work
     except Exception:
-        shutil.rmtree(raw, ignore_errors=True)
-        shutil.rmtree(pq, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
         raise
 
 
@@ -209,12 +293,11 @@ def ensure_queens_test_scale(scale: int) -> None:
         print(f"   test_queens/{target.name} already exists — skip")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    produced, raw, pq = _gen_queens_pool(scale, QUEEN_TEST_PER_SCALE, QUEEN_TEST_SEED + scale)
+    produced, work = _gen_queens_pool(scale, QUEEN_TEST_PER_SCALE, QUEEN_TEST_SEED + scale)
     try:
         shutil.move(str(produced), str(target))
     finally:
-        shutil.rmtree(raw, ignore_errors=True)
-        shutil.rmtree(pq, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def gen_queens_train(scale: int) -> None:
@@ -225,12 +308,11 @@ def gen_queens_train(scale: int) -> None:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     print(f">> generating {QUEEN_TRAIN} train queen puzzles: n={scale}")
-    produced, raw, pq = _gen_queens_pool(scale, QUEEN_TRAIN, QUEEN_TRAIN_SEED)
+    produced, work = _gen_queens_pool(scale, QUEEN_TRAIN, QUEEN_TRAIN_SEED)
     try:
         shutil.move(str(produced), str(target))
     finally:
-        shutil.rmtree(raw, ignore_errors=True)
-        shutil.rmtree(pq, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ── Merge + val copy ─────────────────────────────────────────────────────────
