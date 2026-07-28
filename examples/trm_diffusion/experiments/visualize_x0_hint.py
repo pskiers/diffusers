@@ -99,6 +99,11 @@ def main(cfg: DictConfig):
     images = batch.images  # (B, C, H, W) ground-truth target, dataset's own pixel range
     images_disp = painter.images_to_log(images)  # -> [0, 1] regardless of VAE/tanh convention
 
+    # Diffusion happens in VAE latent space for latent-space painters (CLEVR) —
+    # noise must be added to the encoded latent, not the raw pixel image, or the
+    # frozen UNet's conv_in gets the wrong channel count entirely.
+    target = painter.encode(images) if has_vae else images
+
     show_condition = condition is not None and condition.shape[1] in (1, 3)
     ncols = (1 if show_condition else 0) + 1 + len(timesteps)
     fig, axes = plt.subplots(num_samples, ncols, figsize=(2.2 * ncols, 2.2 * num_samples), squeeze=False)
@@ -115,8 +120,8 @@ def main(cfg: DictConfig):
 
         for col, t in enumerate(timesteps, start=col0 + 1):
             t_batch = torch.full((num_samples,), t, device=device, dtype=torch.long)
-            noise = torch.randn_like(images)
-            x_noisy = scheduler.add_noise(images, noise, t_batch)
+            noise = torch.randn_like(target)
+            x_noisy = scheduler.add_noise(target, noise, t_batch)
 
             # Real sample's own conditioning fields carried through (so a
             # conditional frozen painter, e.g. CLEVR's, still has real
