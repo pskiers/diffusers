@@ -1,0 +1,23 @@
+# CLEVR V1 thinker condition encoder, with the noisy-latent branch wrapped in
+# an x0-hint (coarse-to-fine anti-exposure-bias) instead of seeing raw x_t.
+# See models/condition_encoders.py's X0PredHintConditionEncoder — generic
+# over conditioned frozen painters (carries the painter's own conditioning
+# through the internal hint pass) and force_unconditional_painter-aware.
+#
+# threshold is in units of diffusion.num_train_timesteps (100 here, same as
+# sudoku) — pick the value from a
+#   python experiments/visualize_x0_hint.py experiment=clevr_thinker_v1_controlnet ... +force_unconditional=true
+# sweep before trusting the placeholder below.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90  # PLACEHOLDER — replace with your chosen value from the visualize_x0_hint.py sweep
+inner:
+  _target_: models.condition_encoders.ObjectFeatureEncoderV1
+  in_dim: ${data.object_feat_dim}
+  hidden_dim: ${thinker.hidden_size}
+  out_dim: ${thinker.hidden_size}
+  latent_channels: 4
+  hidden_size: ${thinker.hidden_size}
+  grid_size: 16
+  noisy_dropout_p_max: 0.0  # redundant with the x0-hint now (same reasoning as x0_hint_v1.yaml)
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true

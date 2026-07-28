@@ -17,6 +17,7 @@ encoders use noisy to produce additional latent tokens.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Optional
 
@@ -38,9 +39,17 @@ class ConditionEncoderBase(nn.Module):
         condition_keys: list of DataSample field names this encoder reads.
                         The model passes ``getattr(sample, condition_keys[0])``
                         as the primary condition argument.
+        needs_sample:   if True, ThinkerFrozenPainterBase._encode_condition
+                        also passes the full DataSample as `sample=` — for
+                        encoders that need more than just their declared
+                        condition_keys (e.g. X0PredHintConditionEncoder,
+                        which runs an internal frozen-painter forward pass
+                        that may need the painter's own conditioning fields
+                        too, not just what the thinker's encoder reads).
     """
 
     condition_keys: list[str] = ["spatial_conditions"]
+    needs_sample: bool = False
 
     def bind_painter(self, painter) -> None:
         """Optional hook: encoders that need access to the frozen painter
@@ -246,16 +255,30 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
     Requires ``bind_painter()`` to have been called with a frozen painter
     exposing ``.scheduler`` and callable as ``painter(sample, steering=None)``
     — the owning model (ThinkerFrozenPainterBase) does this automatically.
-    Assumes that call only needs ``sample.x_noisy``/``sample.timesteps``
-    (true for a plain frozen UNet painter with no painter-side
-    condition_encoder of its own).
+
+    Generic across conditioned and unconditioned frozen painters: the internal
+    hint pass carries through the real sample's own fields (via
+    ``needs_sample``, see ConditionEncoderBase) rather than assuming an
+    unconditional pixel-space painter with no condition_encoder of its own
+    (true for MNIST, false for e.g. CLEVR's object-feature-conditioned UNet).
+    If the bound painter's ``train_cfg.force_unconditional_painter`` is set,
+    the hint pass also nulls the painter's own conditioning (via
+    ``painter.null_condition_sample``), matching what
+    ThinkerFrozenPainterBase.run_painter does for the real forward pass —
+    so the hint reflects what the painter will actually be run as. Also
+    handles VAE-latent-space painters correctly (skips x0_from_noise_pred's
+    [0,1] pixel clamp, which would otherwise corrupt unbounded latents).
 
     Args:
         inner:     Hydra config for the wrapped ConditionEncoderBase (e.g.
-                    NoisySpatialConditionEncoder or ...V2) — instantiated
-                    recursively by Hydra before reaching this constructor.
+                    NoisySpatialConditionEncoder, ...V2, or
+                    ObjectFeatureEncoderV1) — instantiated recursively by
+                    Hydra before reaching this constructor. Must accept an
+                    ``x_noisy`` kwarg.
         threshold: minimum diffusion timestep the hint is ever computed at.
     """
+
+    needs_sample = True
 
     def __init__(self, inner: ConditionEncoderBase, threshold: int):
         super().__init__()
@@ -271,7 +294,7 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
         self._painter = painter
 
     @torch.no_grad()
-    def _x0_pred_hint(self, x_noisy: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+    def _x0_pred_hint(self, sample: DataSample, x_noisy: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         if self._painter is None:
             raise RuntimeError("X0PredHintConditionEncoder requires bind_painter() before use.")
         scheduler = self._painter.scheduler
@@ -285,17 +308,26 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
             mask = needs_renoise.view(-1, *([1] * (x_noisy.ndim - 1)))
             x_for_hint = torch.where(mask, renoised, x_noisy)
 
-        hint_sample = DataSample(x_noisy=x_for_hint, timesteps=t_hint)
+        # Carry the real sample's own fields through — the painter's own
+        # conditioning (e.g. CLEVR's embedding_conditions) may be required
+        # for it to run at all, not just x_noisy/timesteps.
+        hint_sample = dataclasses.replace(sample, x_noisy=x_for_hint, timesteps=t_hint)
+        train_cfg = getattr(self._painter, "train_cfg", None)
+        if train_cfg is not None and getattr(train_cfg, "force_unconditional_painter", False):
+            hint_sample = self._painter.null_condition_sample(hint_sample)
+
         eps_pred = self._painter(hint_sample, steering=None).pred
-        return x0_from_noise_pred(eps_pred, x_for_hint, t_hint, scheduler)
+        has_vae = getattr(self._painter, "vae", None) is not None
+        return x0_from_noise_pred(eps_pred, x_for_hint, t_hint, scheduler, clamp=not has_vae)
 
     def forward(
         self,
         condition: torch.Tensor,
         x_noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
+        sample: Optional[DataSample] = None,
     ) -> TRMInput:
-        hint = self._x0_pred_hint(x_noisy, timesteps) if timesteps is not None else x_noisy
+        hint = self._x0_pred_hint(sample, x_noisy, timesteps) if timesteps is not None else x_noisy
         return self.inner(condition, x_noisy=hint, timesteps=timesteps)
 
 

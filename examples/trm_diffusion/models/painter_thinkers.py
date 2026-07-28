@@ -128,6 +128,8 @@ class ThinkerFrozenPainterBase(BaseModel):
                 extra["x_noisy"] = sample.enc_x_noisy if sample.enc_x_noisy is not None else sample.x_noisy
             else:
                 extra[k] = getattr(sample, k)
+        if getattr(self.condition_encoder, "needs_sample", False):
+            extra["sample"] = sample
         return self.condition_encoder(primary, **extra).enc_emb
 
     # ── Core model methods ────────────────────────────────────────────────────
