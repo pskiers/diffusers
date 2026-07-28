@@ -61,11 +61,46 @@ from factory import build_datasets, build_model
 GRID = 9  # sudoku grid size
 
 
+def align_feature_map(images: torch.Tensor, feat: torch.Tensor, threshold: float = 0.05) -> torch.Tensor:
+    """Per-sample crop-to-content-bbox + resize, applied to a feature map
+    using the bounding box recovered from the clean ground-truth image —
+    mirrors eval.mnist_eval.extract_and_resize_sudoku (applied to pixels, for
+    evaluation) but applied to activations here, so canonical grid position
+    (and hence the `solution` label at that position) means the same thing
+    for every sample regardless of per-sample scale/offset
+    (mnist_sudoku_scaled) — without changing what the painter actually sees.
+    A no-op in practice for mnist_sudoku, whose content already spans the
+    full canvas.
+    """
+    B, C, Hf, Wf = feat.shape
+    Himg = images.shape[-1]
+    ratio = Hf / Himg
+    out = torch.empty_like(feat)
+    for i in range(B):
+        mask = images[i].amax(dim=0) > threshold
+        rows = mask.any(dim=1).nonzero(as_tuple=True)[0]
+        cols = mask.any(dim=0).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0 or cols.numel() == 0:
+            out[i] = feat[i]
+            continue
+        r0, r1 = rows[0].item(), rows[-1].item() + 1
+        c0, c1 = cols[0].item(), cols[-1].item() + 1
+        fr0, fr1 = max(0, round(r0 * ratio)), min(Hf, round(r1 * ratio))
+        fc0, fc1 = max(0, round(c0 * ratio)), min(Wf, round(c1 * ratio))
+        if fr1 <= fr0 or fc1 <= fc0:
+            out[i] = feat[i]
+            continue
+        crop = feat[i : i + 1, :, fr0:fr1, fc0:fc1]
+        out[i] = F.interpolate(crop, size=(Hf, Wf), mode="bilinear", align_corners=False)[0]
+    return out
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     timesteps = [int(t) for t in cfg.get("timesteps", [0, 10, 30, 50, 70, 90])]
     num_batches = int(cfg.get("num_batches", 8))
     batch_size = int(cfg.get("probe_batch_size", 64))
+    bbox_threshold = float(cfg.get("bbox_threshold", 0.05))
     seed = int(cfg.get("seed", 0))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,6 +139,7 @@ def main(cfg: DictConfig):
 
                 painter(DataSample(x_noisy=x_noisy, timesteps=t_batch), steering=None)
                 feat = activations["mid"]  # (B, C, H, W)
+                feat = align_feature_map(images, feat, threshold=bbox_threshold)
 
                 assert feat.shape[-1] % GRID == 0, (
                     f"mid_block resolution {feat.shape[-1]} not divisible by {GRID}; "
