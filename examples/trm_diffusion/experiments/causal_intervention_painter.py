@@ -159,6 +159,68 @@ def _inject_down0(delta_vec, row, col, pool):
     return _hook
 
 
+def compute_content_bbox(image: torch.Tensor, threshold: float = 0.05):
+    """(r0, r1, c0, c1) content bounding box of a single clean (C, H, W)
+    image, or None if nothing clears the threshold."""
+    mask = image.amax(dim=0) > threshold
+    rows = mask.any(dim=1).nonzero(as_tuple=True)[0]
+    cols = mask.any(dim=0).nonzero(as_tuple=True)[0]
+    if rows.numel() == 0 or cols.numel() == 0:
+        return None
+    return rows[0].item(), rows[-1].item() + 1, cols[0].item(), cols[-1].item() + 1
+
+
+def realign_and_crop_cell(x0_pred: torch.Tensor, bboxes: list, target_row: int, target_col: int, cell_size: int, painter_size: int) -> torch.Tensor:
+    """Per-sample: crop x0_pred to its (ground-truth-derived) content bbox,
+    resize back to painter_size — undoing that sample's scale/offset,
+    mirroring eval.mnist_eval.extract_and_resize_sudoku — THEN extract the
+    canonical target cell. Reading a fixed pixel window directly (without
+    this realignment) grabs whatever fragment of the transformed grid
+    happens to fall there, not a clean digit crop, which biases the
+    classifier in ways unrelated to the intervention being tested.
+    """
+    B, C = x0_pred.shape[:2]
+    r0c, c0c = target_row * cell_size, target_col * cell_size
+    out = torch.empty(B, C, cell_size, cell_size, dtype=x0_pred.dtype, device=x0_pred.device)
+    for i in range(B):
+        bbox = bboxes[i]
+        if bbox is None:
+            aligned = x0_pred[i]
+        else:
+            r0, r1, c0, c1 = bbox
+            crop = x0_pred[i : i + 1, :, r0:r1, c0:c1]
+            aligned = F.interpolate(crop, size=(painter_size, painter_size), mode="bilinear", align_corners=False)[0]
+        out[i] = aligned[:, r0c : r0c + cell_size, c0c : c0c + cell_size]
+    return out
+
+
+def select_target_content_samples(val_ds, target_row, target_col, cell_size, num_needed, threshold, rng, max_candidates=None):
+    """Draw samples from val_ds whose target cell actually has content (in
+    the clean ground-truth image) at (target_row, target_col).
+
+    For mnist_sudoku_scaled, a fixed canonical position is frequently
+    background after the sample's random scale/offset — including those
+    samples would contaminate the intervention readout with "the
+    classifier's default guess for blank input" rather than a real digit to
+    steer, which is a different (and less meaningful) question than the one
+    this script is trying to answer. A no-op in practice for mnist_sudoku,
+    where every canonical cell always has real content.
+    """
+    r0, c0 = target_row * cell_size, target_col * cell_size
+    max_candidates = max_candidates or num_needed * 20
+    selected = []
+    tried = 0
+    while len(selected) < num_needed and tried < max_candidates:
+        idx = int(rng.integers(0, len(val_ds)))
+        tried += 1
+        sample = val_ds[idx]
+        patch = sample.images[:, r0 : r0 + cell_size, c0 : c0 + cell_size]
+        if patch.amax().item() > threshold:
+            selected.append(sample)
+    print(f"selected {len(selected)}/{num_needed} real-content samples for target cell after {tried} draws")
+    return selected
+
+
 def _layer_specs(unet):
     return {
         "mid_block": dict(module=unet.mid_block, capture=_capture_mid, inject=_inject_mid),
@@ -220,8 +282,10 @@ def main(cfg: DictConfig):
     concept_batch_size = int(cfg.get("concept_batch_size", 64))
     num_test_images = int(cfg.get("num_test_images", 32))
     cell_size = int(cfg.data.cell_size)
+    painter_size = int(cfg.data.get("painter_size", cell_size * GRID))
     mnist_root = str(cfg.data.mnist_root)
     classifier_path = str(cfg.get("classifier_path", "runs/mnist_classifier_cell16.pt"))
+    bbox_threshold = float(cfg.get("bbox_threshold", 0.05))
     seed = int(cfg.get("seed", 0))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -239,8 +303,11 @@ def main(cfg: DictConfig):
         p.requires_grad_(False)
 
     rng = np.random.default_rng(seed)
-    test_idx = rng.integers(0, len(val_ds), size=num_test_images)
-    test_batch = collate_data_samples([val_ds[int(i)] for i in test_idx]).to(device)
+    content_samples = select_target_content_samples(
+        val_ds, target_row, target_col, cell_size, num_test_images, bbox_threshold, rng
+    )
+    test_batch = collate_data_samples(content_samples).to(device)
+    test_bboxes = [compute_content_bbox(img, threshold=bbox_threshold) for img in test_batch.images.cpu()]
 
     print(f"target cell = (row={target_row}, col={target_col})   chance = {1/N_CLASSES:.3f}")
 
@@ -265,8 +332,6 @@ def main(cfg: DictConfig):
             noise = torch.randn_like(test_batch.images)
             x_noisy = scheduler.add_noise(test_batch.images, noise, t_batch)
 
-            r0, c0 = target_row * cell_size, target_col * cell_size
-
             print(f"\n=== layer={layer_name}  t={t}  typical_activation_norm={typical_norm:.3f} ===")
             print(f"{'target_digit':>12} {'strength':>9} {'concept_acc':>12} {'random_acc':>11} {'concept_dir_norm/typical':>24}")
             for target_digit in range(N_CLASSES):
@@ -287,7 +352,7 @@ def main(cfg: DictConfig):
                             sample = DataSample(x_noisy=x_noisy, timesteps=t_batch)
                             eps_pred = painter(sample, steering=None).pred
                             x0_pred = x0_from_noise_pred(eps_pred, x_noisy, t_batch, scheduler)
-                            patch = x0_pred[:, :, r0 : r0 + cell_size, c0 : c0 + cell_size]
+                            patch = realign_and_crop_cell(x0_pred, test_bboxes, target_row, target_col, cell_size, painter_size)
                             preds = eval_clf(patch).argmax(dim=1)
                             results[name] = (preds == target_digit).float().mean().item()
                         inj_handle.remove()
