@@ -62,11 +62,15 @@ def apply_noisy_swap(
     return noisy, target
 
 
-def x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler):
+def x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler, clamp: bool = True):
     """Differentiably recover x0_pred from model output.
 
-    Supports epsilon and x0 prediction types.  Result is clamped to [0, 1]
-    (the image range used in this codebase) so it can be fed to the classifier.
+    Supports epsilon and x0 prediction types. When clamp=True (default), the
+    result is clamped to [0, 1] — correct for pixel-space callers (the image
+    range used elsewhere in this codebase, e.g. for the classifier loss), but
+    wrong for VAE-latent-space painters (CLEVR etc.), whose latents are
+    unbounded — pass clamp=False there and clamp/normalize after vae.decode
+    instead.
     """
     pt = scheduler.config.prediction_type
     if pt == "epsilon":
@@ -78,7 +82,7 @@ def x0_from_noise_pred(noise_pred, noisy, timesteps, scheduler):
         x0 = noise_pred.float()
     else:
         raise ValueError(f"Unsupported prediction_type for classifier loss: {pt}")
-    return x0.clamp(0.0, 1.0)
+    return x0.clamp(0.0, 1.0) if clamp else x0
 
 
 def ddim_prev_sample(x0_pred: torch.Tensor, noisy: torch.Tensor, timesteps: torch.Tensor, scheduler) -> torch.Tensor:
