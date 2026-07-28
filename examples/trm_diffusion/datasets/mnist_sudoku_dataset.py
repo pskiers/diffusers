@@ -48,6 +48,9 @@ class MNISTSudokuDataset(Dataset):
         mnist_split: "train" or "test" – which MNIST split to draw digits from.
         mask_given:  Whether to zero out given cells in the condition image.
         seed:        RNG seed for deterministic digit assignment.
+        same_digit_images: if True, a given cell's condition render and its
+                     solution render use the literal same MNIST bitmap
+                     (same drawn instance), not just the same digit class.
     """
 
     # Digit 1..9 → class index 0..8
@@ -62,11 +65,13 @@ class MNISTSudokuDataset(Dataset):
         mask_given: bool = True,
         seed: int = 0,
         num_givens: Optional[int] = None,
+        same_digit_images: bool = False,
     ):
         super().__init__()
         self.cell_size  = cell_size
         self.mask_given = mask_given
         self.num_givens = num_givens
+        self.same_digit_images = same_digit_images
         self._given_seed = seed  # separate seed for given-cell selection
 
         # ── Load Sudoku data ──────────────────────────────────────────────────
@@ -115,11 +120,21 @@ class MNISTSudokuDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sudoku)
 
-    def _render_grid(self, tokens: np.ndarray, given_mask: np.ndarray | None) -> np.ndarray:
+    def _render_grid(
+        self,
+        tokens: np.ndarray,
+        given_mask: np.ndarray | None,
+        chosen_indices: np.ndarray | None = None,
+    ) -> np.ndarray:
         """
         tokens: (81,) int, values in {1,2,...,10}
                 1 = blank, 2-10 = digit 1-9
         given_mask: if not None, cells where given_mask==True are blanked (zeros).
+        chosen_indices: (81,) int, optional. If given, use chosen_indices[idx] as
+            the MNIST instance index for cell idx instead of drawing a fresh
+            random one — lets two _render_grid calls (e.g. condition and
+            solution) render the SAME physical MNIST bitmap for a shared cell.
+            Only meaningful at indices where tokens[idx] > 1.
 
         Returns (cell_size*9, cell_size*9) float32 numpy array.
         """
@@ -139,10 +154,21 @@ class MNISTSudokuDataset(Dataset):
 
             digit = tok - 1  # token 2 → digit 1, … token 10 → digit 9
             arr   = self._digit_arrays[digit]
-            chosen_idx = self._rng.integers(len(arr))
+            chosen_idx = int(chosen_indices[idx]) if chosen_indices is not None else self._rng.integers(len(arr))
             grid[r0:r0+cs, c0:c0+cs] = arr[chosen_idx]
 
         return grid
+
+    def _sample_chosen_indices(self, tokens: np.ndarray) -> np.ndarray:
+        """Pre-draw one MNIST instance index per cell (only meaningful where
+        tokens[idx] > 1) — used by same_digit_images so the condition and
+        solution renders agree on which physical bitmap to use per cell."""
+        chosen = np.zeros(81, dtype=np.int64)
+        for idx in range(81):
+            tok = int(tokens[idx])
+            if tok > 1:
+                chosen[idx] = self._rng.integers(len(self._digit_arrays[tok - 1]))
+        return chosen
 
     def __getitem__(self, idx: int) -> DataSample:
         sudoku_item = self.sudoku[idx]
@@ -165,15 +191,21 @@ class MNISTSudokuDataset(Dataset):
         # ── Full solved image ─────────────────────────────────────────────────
         # Use solution for every cell (so blank cells get their answer digit).
         full_tokens = labels_tok.copy()
-        image_grid  = self._render_grid(full_tokens, given_mask=None)
+        # same_digit_images: pre-draw per-cell MNIST instance indices from the
+        # full solution and reuse them for the condition render too, so a
+        # given cell shows the literal same bitmap in both — removes any
+        # incidental visual mismatch between condition and target digits as
+        # a possible confound, independent of solving/placement correctness.
+        chosen_indices = self._sample_chosen_indices(full_tokens) if self.same_digit_images else None
+        image_grid  = self._render_grid(full_tokens, given_mask=None, chosen_indices=chosen_indices)
 
         # ── Condition image ───────────────────────────────────────────────────
         # Given cells: use given token (from inputs). Blank cells: black.
         if self.mask_given:
             blank = (inputs_tok == PAD_ID) | (inputs_tok == SudokuDataset.BLANK_TOKEN)
-            cond_grid = self._render_grid(inputs_tok, given_mask=blank)
+            cond_grid = self._render_grid(inputs_tok, given_mask=blank, chosen_indices=chosen_indices)
         else:
-            cond_grid = self._render_grid(inputs_tok, given_mask=None)
+            cond_grid = self._render_grid(inputs_tok, given_mask=None, chosen_indices=chosen_indices)
 
         # ── Solution class labels (0-based) ──────────────────────────────────
         # Tokens 2-10 → class 0-8; blank/pad cells → -100 (ignored in loss).
@@ -213,12 +245,29 @@ class MNISTSudokuScaledDataset(MNISTSudokuDataset):
         scale_min, scale_max: the solved grid is resized to a random fraction
             of the full resolution drawn uniformly from [scale_min, scale_max]
             before being pasted at a random offset.
+        center_condition: if True, also scale the puzzle condition image by
+            the SAME random factor drawn for the target this sample, but
+            paste it centered on the canvas — rather than left at full
+            resolution (the default) or moved to the target's actual
+            (matching) offset like MNISTSudokuAlignedScaledDataset. Isolates
+            whether a scale mismatch between condition and target, on its
+            own, is part of what breaks the pipeline — independent of the
+            position mismatch mnist_sudoku_scaled already has, and without
+            removing that position mismatch the way the aligned dataset does.
     """
 
-    def __init__(self, *args, scale_min: float = 0.8, scale_max: float = 0.9, **kwargs):
+    def __init__(
+        self,
+        *args,
+        scale_min: float = 0.8,
+        scale_max: float = 0.9,
+        center_condition: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.scale_min = scale_min
         self.scale_max = scale_max
+        self.center_condition = center_condition
 
     def __getitem__(self, idx: int) -> DataSample:
         sample = super().__getitem__(idx)
@@ -237,7 +286,18 @@ class MNISTSudokuScaledDataset(MNISTSudokuDataset):
         off_x = int(self._rng.integers(0, max_off + 1))
         canvas[:, off_y : off_y + new_size, off_x : off_x + new_size] = resized
 
-        return dataclasses.replace(sample, images=canvas)
+        updates = {"images": canvas}
+        if self.center_condition:
+            cond = sample.spatial_conditions
+            cond_resized = F.interpolate(
+                cond.unsqueeze(0), size=(new_size, new_size), mode="bilinear", align_corners=False
+            ).squeeze(0)
+            cond_canvas = torch.zeros_like(cond)
+            center_off = max_off // 2
+            cond_canvas[:, center_off : center_off + new_size, center_off : center_off + new_size] = cond_resized
+            updates["spatial_conditions"] = cond_canvas
+
+        return dataclasses.replace(sample, **updates)
 
 
 class MNISTSudokuAlignedScaledDataset(MNISTSudokuDataset):
