@@ -62,6 +62,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from datasets.data_sample import DataSample, collate_data_samples
 from factory import build_datasets, build_model
@@ -175,12 +176,23 @@ def main(cfg: DictConfig):
             X, y, test_size=0.3, random_state=seed, stratify=y
         )
 
-        clf = LogisticRegression(max_iter=2000)
-        clf.fit(X_train, y_train)
-        train_acc = clf.score(X_train, y_train)
-        test_acc = clf.score(X_test, y_test)
+        # Gradients can sit at a wildly different scale than activations
+        # (e.g. near a converged loss) — LogisticRegression's default L2
+        # strength assumes roughly unit-scale features, so an unstandardized
+        # tiny-magnitude gradient can make the fit collapse to predicting a
+        # constant class (exactly chance on this class-balanced problem)
+        # regardless of whether the gradient actually carries information.
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
 
-        print(f"t={t:>4d}  n={len(y):>6d}  train_acc={train_acc:.3f}  test_acc={test_acc:.3f}")
+        clf = LogisticRegression(max_iter=2000)
+        clf.fit(X_train_s, y_train)
+        train_acc = clf.score(X_train_s, y_train)
+        test_acc = clf.score(X_test_s, y_test)
+
+        grad_typical_norm = float(np.linalg.norm(X, axis=1).mean())
+        print(f"t={t:>4d}  n={len(y):>6d}  grad_norm={grad_typical_norm:.2e}  train_acc={train_acc:.3f}  test_acc={test_acc:.3f}")
 
     handle.remove()
 
