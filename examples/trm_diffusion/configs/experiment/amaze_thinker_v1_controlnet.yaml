@@ -20,6 +20,13 @@ defaults:
 
 mode: "thinker_base"
 
+# Amaze is 3-channel RGB at 144x144
+# mnist_thinker batch_size=384 OOMs the 40GB A100
+# Here, effective batch (192*4 = 768) and gradient scaling are unchanged, only memory drops.
+train:
+  batch_size: 192
+  gradient_accumulation_steps: 4
+
 thinker:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
