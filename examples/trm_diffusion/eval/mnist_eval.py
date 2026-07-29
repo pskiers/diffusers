@@ -11,6 +11,8 @@ Provides:
   plot_thinker_ts_curve    – plots thinker accuracy vs denoising timestep (mean ± std).
 """
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import os

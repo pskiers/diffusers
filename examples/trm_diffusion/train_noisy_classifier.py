@@ -24,6 +24,8 @@ load it correctly; the returned model has the same forward signature as
 MNISTCellClassifier when called without a timestep argument.
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import os
