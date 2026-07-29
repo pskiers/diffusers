@@ -119,10 +119,18 @@ class ThinkerFrozenPainterBase(BaseModel):
     # ── Condition helpers ─────────────────────────────────────────────────────
 
     def _encode_condition(self, sample: DataSample) -> torch.Tensor:
-        """Encode condition fields from a DataSample into thinker token embeddings."""
+        """Encode condition fields from a DataSample into thinker token embeddings.
+
+        timesteps is always forwarded, not just when some encoder's
+        condition_keys happens to list it: every ConditionEncoderBase
+        subclass's forward() accepts a `timesteps` kwarg (defaulting to
+        None) for with_timestep_emb / noisy_dropout_p_max / the
+        X0PredHintConditionEncoder wrapper's hint mechanism, none of which
+        can do anything useful without it.
+        """
         enc_keys = self.condition_encoder.condition_keys
         primary = getattr(sample, enc_keys[0])
-        extra: dict = {}
+        extra: dict = {"timesteps": sample.timesteps}
         for k in enc_keys[1:]:
             if k == "x_noisy":
                 extra["x_noisy"] = sample.enc_x_noisy if sample.enc_x_noisy is not None else sample.x_noisy

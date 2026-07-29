@@ -8,6 +8,14 @@ n_reduced_samples: 16     # per-scene pre-computed reduced samples (mode=reduced
 object_feat_dim: 55       # 55 for relative/reduced, 21 for absolute
 max_objects: 10
 
+# Diagnostic switches — both default off (original behavior). Mutually
+# exclusive (both populate spatial_conditions). Pair reveal_n_objects>0 with
+# condition_encoder=object_feature_v1_reveal, include_centroid_mask=true
+# with condition_encoder=object_feature_v1_centroidmask.
+reveal_n_objects: 0        # if >0, reveal a real-image crop around this many objects' true positions
+reveal_radius_frac: 0.12
+include_centroid_mask: false
+
 train_dataset:
   _target_: datasets.clevr_dataset.CLEVRHybridDataset
   root_dir: "${data.clevr_root}"
@@ -15,6 +23,9 @@ train_dataset:
   mode: "${data.mode}"
   image_size: "${data.image_size}"
   n_reduced_samples: "${data.n_reduced_samples}"
+  reveal_n_objects: "${data.reveal_n_objects}"
+  reveal_radius_frac: "${data.reveal_radius_frac}"
+  include_centroid_mask: "${data.include_centroid_mask}"
 
 val_dataset:
   _target_: datasets.clevr_dataset.CLEVRHybridDataset
@@ -23,3 +34,6 @@ val_dataset:
   mode: "${data.mode}"
   image_size: "${data.image_size}"
   n_reduced_samples: "${data.n_reduced_samples}"
+  reveal_n_objects: "${data.reveal_n_objects}"
+  reveal_radius_frac: "${data.reveal_radius_frac}"
+  include_centroid_mask: "${data.include_centroid_mask}"

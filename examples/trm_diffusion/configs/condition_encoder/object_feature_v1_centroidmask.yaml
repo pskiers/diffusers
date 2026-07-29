@@ -1,0 +1,20 @@
+# ObjectFeatureEncoderV1 + a spatial map of every object's TRUE position and
+# coarse attributes (Gaussian blobs, see datasets.clevr_dataset.
+# make_mask_from_scene). Diagnostic only. grid_size/mask_factor match the
+# biggrid setup (object_feature_v1_x0hint.yaml's grid_size=16). Pair with
+# data.include_centroid_mask=true (data=clevr override) and
+# thinker.seq_len=522 (10 objects + 256 latent + 256 mask).
+_target_: models.condition_encoders.ObjectFeatureEncoderV1CentroidMask
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
+latent_channels: 4
+hidden_size: ${thinker.hidden_size}
+grid_size: 16           # G=16 → G²=256 latent tokens, matches object_feature_v1_x0hint
+mask_channels: 16
+mask_enc_channels: 64
+mask_hidden_channels: [64, 128]
+mask_factor: 2           # mask_size(32) / 2 = 16 -> 256 mask tokens
+noisy_dropout_p_max: 0.0
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

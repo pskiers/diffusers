@@ -1,0 +1,21 @@
+# ObjectFeatureEncoderV1 + a real-image reveal around a handful of objects'
+# true positions (CLEVR's analogue of MNIST-Sudoku's "given cells").
+# Diagnostic only — needs the real target image, unavailable at real
+# generation time. grid_size/reveal_factor=16 match the biggrid setup
+# (object_feature_v1_x0hint.yaml's grid_size=16). Pair with
+# data.reveal_n_objects>0 (data=clevr override) and thinker.seq_len=522
+# (10 objects + 256 latent + 256 reveal).
+_target_: models.condition_encoders.ObjectFeatureEncoderV1Reveal
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
+latent_channels: 4
+hidden_size: ${thinker.hidden_size}
+grid_size: 16          # G=16 → G²=256 latent tokens, matches object_feature_v1_x0hint
+reveal_channels: 3
+reveal_enc_channels: 64
+reveal_hidden_channels: [64, 128]
+reveal_factor: 16      # image_size(256) / 16 = 16 -> 256 reveal tokens
+noisy_dropout_p_max: 0.0
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

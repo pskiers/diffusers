@@ -326,9 +326,15 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
         x_noisy: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
         sample: Optional[DataSample] = None,
+        **extra,
     ) -> TRMInput:
+        """**extra passes through untouched to self.inner — needed for inner
+        encoders that declare condition_keys beyond embedding_conditions/
+        x_noisy/timesteps (e.g. ObjectFeatureEncoderV1Reveal/CentroidMask's
+        spatial_conditions). Only x_noisy is intercepted and replaced with
+        the hint; everything else is the inner encoder's business."""
         hint = self._x0_pred_hint(sample, x_noisy, timesteps) if timesteps is not None else x_noisy
-        return self.inner(condition, x_noisy=hint, timesteps=timesteps)
+        return self.inner(condition, x_noisy=hint, timesteps=timesteps, **extra)
 
 
 # Backward-compatible alias — existing Hydra configs reference SpatialImageEncoder.
@@ -459,6 +465,391 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
             noisy_for_enc = x_noisy * keep[:, None, None, None]
 
         img_tokens = self.latent_encoder(noisy_for_enc)  # (B, G², hidden)
+        enc_emb = torch.cat([obj_tokens, img_tokens], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
+
+
+# ── CLEVR diagnostics: swatch / reveal / centroid-mask encoders ──────────────
+#
+# Three variants testing what MNIST-Sudoku's same_digit_images and
+# center_condition/aligned-dataset findings translate to for CLEVR (object-
+# relational conditioning, not a rendered puzzle image). Each augments
+# ObjectFeatureEncoderV1 (object tokens + noisy-latent tokens) with one extra
+# signal:
+#   - Swatch:        a real photorealistic anchor per object, built purely
+#                     from its attributes — deployable (available at real
+#                     inference, unlike the other two).
+#   - Reveal:        an exact crop of the REAL target image around a few
+#                     objects' true positions — diagnostic only (needs the
+#                     real image, which doesn't exist yet at generation time).
+#   - Centroid mask: a spatial map of every object's TRUE position/attributes
+#                     — also diagnostic only, for the same reason.
+#
+# All three assume embedding_conditions' first 15 dims are always
+# [rot_sin, rot_cos, size_id, material_id, shape_onehot(3), color_onehot(8)]
+# — true for every mode (absolute/relative/reduced); see
+# datasets.clevr_dataset.make_tensor_from_scene, which always builds this
+# `base` block before appending mode-specific dims.
+
+from datasets.clevr_dataset import COLORS as _CLEVR_COLORS_
+from datasets.clevr_dataset import MATERIALS as _CLEVR_MATERIALS_
+from datasets.clevr_dataset import SHAPES as _CLEVR_SHAPES_
+from datasets.clevr_dataset import SIZES as _CLEVR_SIZES_
+
+
+def _clevr_swatch_indices(condition: torch.Tensor) -> torch.Tensor:
+    """Decode each object's (color, shape, material, size) combo index
+    straight out of embedding_conditions' first 15 dims — no dataset changes
+    needed, since this block is identical across every mode. Must match the
+    (color, shape, material, size) nesting order
+    datasets.clevr_dataset.extract_clevr_swatch_table builds its table in."""
+    size_id = condition[..., 2].round().long().clamp(0, 1)
+    mat_id = condition[..., 3].round().long().clamp(0, 1)
+    shape_id = condition[..., 4:7].argmax(dim=-1)
+    color_id = condition[..., 7:15].argmax(dim=-1)
+    return ((color_id * len(_CLEVR_SHAPES_) + shape_id) * len(_CLEVR_MATERIALS_) + mat_id) * len(
+        _CLEVR_SIZES_
+    ) + size_id
+
+
+class ObjectFeatureEncoderV1Swatch(ConditionEncoderBase):
+    """ObjectFeatureEncoderV1 (object tokens + noisy-latent tokens) plus a
+    per-object visual anchor: a small CNN feature extracted from a real
+    photorealistic crop of that object's (shape, color, material, size)
+    combination, pulled once from real training images (see
+    datasets.clevr_dataset.extract_clevr_swatch_table) — a hand-drawn icon
+    would have essentially no visual correspondence to a Blender render, so
+    the anchor has to be real pixels from the same renderer/lighting engine,
+    not a synthetic stand-in. Deployable — the lookup table is built once
+    from attributes, available at real inference too, unlike the
+    reveal/centroid-mask variants below which need the current scene's
+    ground truth.
+
+    Args:
+        swatch_table_path: path to a (N_combos, 3, S, S) tensor saved by
+            experiments/build_clevr_swatch_table.py.
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "x_noisy"]
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        latent_channels: int,
+        hidden_size: int,
+        grid_size: int,
+        swatch_table_path: str,
+        swatch_channels: int = 32,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
+        self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
+        self.swatch_cnn = nn.Sequential(
+            nn.Conv2d(3, swatch_channels, 3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(swatch_channels, swatch_channels, 3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.swatch_proj = nn.Linear(swatch_channels, out_dim)
+        nn.init.zeros_(self.swatch_proj.weight)
+        nn.init.zeros_(self.swatch_proj.bias)
+        swatch_table = torch.load(swatch_table_path, map_location="cpu", weights_only=True)
+        self.register_buffer("swatch_table", swatch_table, persistent=False)
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        obj_tokens = self.object_encoder(condition).enc_emb  # (B, N, out_dim)
+
+        idx = _clevr_swatch_indices(condition)  # (B, N)
+        B, N = idx.shape
+        swatches = self.swatch_table[idx.reshape(-1)]  # (B*N, 3, S, S)
+        swatch_feat = self.swatch_cnn(swatches).flatten(1)  # (B*N, swatch_channels)
+        swatch_emb = self.swatch_proj(swatch_feat).view(B, N, -1)  # (B, N, out_dim)
+        obj_tokens = obj_tokens + swatch_emb
+
+        noisy_for_enc = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_for_enc = x_noisy * keep[:, None, None, None]
+
+        img_tokens = self.latent_encoder(noisy_for_enc)  # (B, G², hidden)
+        enc_emb = torch.cat([obj_tokens, img_tokens], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
+
+
+class ObjectFeatureEncoderV1Reveal(ConditionEncoderBase):
+    """ObjectFeatureEncoderV1 plus a third token block encoding
+    ``spatial_conditions`` — a real-image reveal around a handful of
+    objects' true positions (see datasets.clevr_dataset.make_reveal_from_scene).
+    Diagnostic only: requires the real target image, unavailable at real
+    generation time.
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "x_noisy", "spatial_conditions"]
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        latent_channels: int,
+        hidden_size: int,
+        grid_size: int,
+        reveal_channels: int = 3,
+        reveal_enc_channels: int = 64,
+        reveal_hidden_channels: Optional[list[int]] = None,
+        reveal_factor: int = 32,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
+        self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
+        self.reveal_enc, self.reveal_proj = _build_spatial_enc(
+            reveal_channels, reveal_enc_channels, reveal_hidden_channels or [64, 128], hidden_size, reveal_factor
+        )
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        spatial_conditions: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        obj_tokens = self.object_encoder(condition).enc_emb  # (B, N, out_dim)
+
+        noisy_for_enc = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_for_enc = x_noisy * keep[:, None, None, None]
+        img_tokens = self.latent_encoder(noisy_for_enc)  # (B, G², hidden)
+
+        reveal_feat = self.reveal_proj(self.reveal_enc(spatial_conditions)).flatten(2).transpose(1, 2)  # (B, g², hidden)
+
+        enc_emb = torch.cat([obj_tokens, img_tokens, reveal_feat], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
+
+
+class ObjectFeatureEncoderV1CentroidMask(ConditionEncoderBase):
+    """ObjectFeatureEncoderV1 plus a third token block encoding
+    ``spatial_conditions`` — a per-attribute Gaussian-blob mask at every
+    object's TRUE position (see datasets.clevr_dataset.make_mask_from_scene).
+    Diagnostic only: the true positions are exactly what the model is
+    supposed to invent from relations, not something available at real
+    generation time — this tests whether a perfect position signal (of the
+    kind mode="absolute" gives as raw coordinates) helps when given instead
+    as a spatial image, matching the noisy latent's own representation.
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "x_noisy", "spatial_conditions"]
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        latent_channels: int,
+        hidden_size: int,
+        grid_size: int,
+        mask_channels: int = 16,
+        mask_enc_channels: int = 64,
+        mask_hidden_channels: Optional[list[int]] = None,
+        mask_factor: int = 4,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
+        self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
+        self.mask_enc, self.mask_proj = _build_spatial_enc(
+            mask_channels, mask_enc_channels, mask_hidden_channels or [64, 128], hidden_size, mask_factor
+        )
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        spatial_conditions: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        obj_tokens = self.object_encoder(condition).enc_emb  # (B, N, out_dim)
+
+        noisy_for_enc = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_for_enc = x_noisy * keep[:, None, None, None]
+        img_tokens = self.latent_encoder(noisy_for_enc)  # (B, G², hidden)
+
+        mask_feat = self.mask_proj(self.mask_enc(spatial_conditions)).flatten(2).transpose(1, 2)  # (B, g², hidden)
+
+        enc_emb = torch.cat([obj_tokens, img_tokens, mask_feat], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
+
+
+class ObjectFeatureEncoderV1RevealFused(ConditionEncoderBase):
+    """Channel-concat variant of ObjectFeatureEncoderV1Reveal: the reveal
+    image is resized to the noisy latent's spatial size and concatenated
+    channel-wise with it, then run through ONE combined CNN — instead of a
+    separate token block. Half the extra tokens (max_objects + grid_size²,
+    not + 2*grid_size²).
+
+    This is safe here in a way MNIST-Sudoku's channel-concat V1 encoder
+    wasn't: that one assumed the condition image and x_noisy were pixel-
+    aligned when they weren't (scaled/offset independently). Here the
+    reveal image and x_noisy are genuinely co-registered — both derived
+    from the exact same real target scene, with no independent transform
+    applied to one but not the other.
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "x_noisy", "spatial_conditions"]
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        latent_channels: int,
+        hidden_size: int,
+        grid_size: int,
+        reveal_channels: int = 3,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
+        self.latent_encoder = ClevrLatentEncoder(latent_channels + reveal_channels, hidden_size, grid_size)
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        spatial_conditions: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        obj_tokens = self.object_encoder(condition).enc_emb  # (B, N, out_dim)
+
+        noisy_for_enc = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_for_enc = x_noisy * keep[:, None, None, None]
+
+        reveal_resized = spatial_conditions
+        if spatial_conditions.shape[-2:] != noisy_for_enc.shape[-2:]:
+            reveal_resized = F.interpolate(spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False)
+        combined = torch.cat([noisy_for_enc, reveal_resized], dim=1)
+        img_tokens = self.latent_encoder(combined)  # (B, G², hidden)
+
+        enc_emb = torch.cat([obj_tokens, img_tokens], dim=1)
+        if self.with_timestep_emb and timesteps is not None:
+            enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
+        return TRMInput(enc_emb=enc_emb)
+
+
+class ObjectFeatureEncoderV1CentroidMaskFused(ConditionEncoderBase):
+    """Channel-concat variant of ObjectFeatureEncoderV1CentroidMask: the
+    centroid/attribute mask is concatenated channel-wise with the noisy
+    latent (already the same spatial size by construction — mask_size =
+    image_size // 8 matches the VAE's own downsampling) and run through ONE
+    combined CNN, instead of a separate token block. Safe for the same
+    reason as ObjectFeatureEncoderV1RevealFused: the mask and x_noisy are
+    genuinely co-registered, both built from the same real scene.
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "x_noisy", "spatial_conditions"]
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        latent_channels: int,
+        hidden_size: int,
+        grid_size: int,
+        mask_channels: int = 16,
+        noisy_dropout_p_max: float = 0.0,
+        num_train_timesteps: int = 1000,
+        with_timestep_emb: bool = False,
+    ):
+        super().__init__()
+        self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
+        self.latent_encoder = ClevrLatentEncoder(latent_channels + mask_channels, hidden_size, grid_size)
+        self.noisy_dropout_p_max = noisy_dropout_p_max
+        self.num_train_timesteps = num_train_timesteps
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=out_dim)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        spatial_conditions: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> TRMInput:
+        obj_tokens = self.object_encoder(condition).enc_emb  # (B, N, out_dim)
+
+        noisy_for_enc = x_noisy
+        if self.training and self.noisy_dropout_p_max > 0.0 and timesteps is not None:
+            t_norm = timesteps.float() / self.num_train_timesteps
+            p = self.noisy_dropout_p_max * (1.0 - t_norm)
+            keep = (torch.rand(p.shape, device=p.device) > p).float()
+            noisy_for_enc = x_noisy * keep[:, None, None, None]
+
+        mask_resized = spatial_conditions
+        if spatial_conditions.shape[-2:] != noisy_for_enc.shape[-2:]:
+            mask_resized = F.interpolate(spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False)
+        combined = torch.cat([noisy_for_enc, mask_resized], dim=1)
+        img_tokens = self.latent_encoder(combined)  # (B, G², hidden)
+
         enc_emb = torch.cat([obj_tokens, img_tokens], dim=1)
         if self.with_timestep_emb and timesteps is not None:
             enc_emb = enc_emb + self.timestep_mlp(timesteps).unsqueeze(1)
