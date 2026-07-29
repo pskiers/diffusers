@@ -27,6 +27,9 @@ train:
   batch_size: 192
   gradient_accumulation_steps: 4
 
+eval:
+  batch_size: 128
+
 thinker:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0

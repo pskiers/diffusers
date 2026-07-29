@@ -20,5 +20,8 @@ train:
   batch_size: 192
   gradient_accumulation_steps: 4
 
+eval:
+  batch_size: 128
+
 run:
   output_dir: "runs/amaze_unet_painter"
