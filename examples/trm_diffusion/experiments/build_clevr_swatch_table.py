@@ -56,7 +56,7 @@ def main():
     H_inv = calibrate_mask_projection(scenes, num_scenes=args.num_calibration_scenes)
 
     print("Extracting swatch table...")
-    table = extract_clevr_swatch_table(
+    table, isolated_mask = extract_clevr_swatch_table(
         scenes, image_dir, H_inv, swatch_size=args.swatch_size, margin=args.margin, seed=args.seed
     )
     print(f"Table shape: {tuple(table.shape)}")
@@ -64,6 +64,10 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save(table, args.out)
     print(f"Saved to {args.out}")
+
+    mask_path = os.path.splitext(args.out)[0] + "_isolated.pt"
+    torch.save(isolated_mask, mask_path)
+    print(f"Saved isolation mask to {mask_path} (for experiments/visualize_swatch_table.py only, not used at train/inference time)")
 
 
 if __name__ == "__main__":

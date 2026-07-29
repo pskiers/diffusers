@@ -7,7 +7,11 @@ The table is ordered color -> shape -> material -> size (96 entries total),
 matching datasets.clevr_dataset.extract_clevr_swatch_table and
 models.condition_encoders._clevr_swatch_indices. An all-black tile means
 that combination was missing from the scanned scenes (see the "filled with
-zeros" warning printed at build time).
+zeros" warning printed at build time). If the sidecar "<table>_isolated.pt"
+file saved by build_clevr_swatch_table.py is found next to --table, tiles
+whose crop had no fully-isolated candidate anywhere in the scanned scenes
+(i.e. a neighboring object may intrude into the crop) are marked
+"[OVERLAP]".
 
 Usage:
     python experiments/visualize_swatch_table.py \\
@@ -63,6 +67,11 @@ def main():
         "wrong file, or COLORS/SHAPES/MATERIALS/SIZES changed since it was built."
     )
 
+    mask_path = os.path.splitext(args.table)[0] + "_isolated.pt"
+    isolated_mask = torch.load(mask_path, map_location="cpu") if os.path.exists(mask_path) else None
+    if isolated_mask is not None:
+        print(f"Loaded isolation mask from {mask_path}: {int((~isolated_mask).sum())}/{len(isolated_mask)} flagged [OVERLAP]")
+
     keep = []
     for idx, (color, shape, material, size) in enumerate(_COMBOS):
         if args.shape and shape != args.shape:
@@ -98,6 +107,8 @@ def main():
         label = f"{size[0]}.{material[0]}.{color}\n{shape}"
         if is_missing[idx]:
             label += "\n[MISSING]"
+        elif isolated_mask is not None and not isolated_mask[idx]:
+            label += "\n[OVERLAP]"
         ax.set_title(label, fontsize=7)
         ax.axis("off")
 

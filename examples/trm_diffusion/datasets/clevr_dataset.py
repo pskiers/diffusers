@@ -189,9 +189,18 @@ def _crop_object_swatch(image: torch.Tensor, obj: dict, H_inv: np.ndarray, swatc
     tensor, resized to (3, swatch_size, swatch_size). ``H_inv`` — see
     calibrate_mask_projection — gives a perspective-correct pixel radius
     from the object's known 3-D size, the same projection make_mask_from_scene
-    uses for its Gaussian blob sigma."""
+    uses for its Gaussian blob sigma.
+
+    The crop WINDOW is sized from the "large" reference radius regardless of
+    this object's own size (``size_override="large"`` below), not from the
+    object's own radius: sizing the window to the object's own radius would
+    make every crop fill the tile after resizing, erasing the small/large
+    size cue entirely. With a fixed window, a "small" object naturally
+    occupies less of the tile than a "large" one, so the resized swatch
+    still visually encodes relative size."""
     C, H, W = image.shape
-    cx, cy, r_pix = _object_pixel_circle(obj, W, H, H_inv)
+    cx, cy, _ = _object_pixel_circle(obj, W, H, H_inv)
+    _, _, r_pix = _object_pixel_circle(obj, W, H, H_inv, size_override="large")
     r_pix = max(r_pix * margin, 4.0)
 
     x0, x1 = int(round(cx - r_pix)), int(round(cx + r_pix))
@@ -205,12 +214,15 @@ def _crop_object_swatch(image: torch.Tensor, obj: dict, H_inv: np.ndarray, swatc
     return F.interpolate(crop, size=(swatch_size, swatch_size), mode="bilinear", align_corners=False)[0]
 
 
-def _object_pixel_circle(obj: dict, image_w: int, image_h: int, H_inv: np.ndarray):
+def _object_pixel_circle(obj: dict, image_w: int, image_h: int, H_inv: np.ndarray, size_override: Optional[str] = None):
     """(cx, cy, r) — object's projected center and perspective-correct
-    radius, in pixel coordinates scaled to (image_w, image_h)."""
+    radius, in pixel coordinates scaled to (image_w, image_h). Pass
+    ``size_override`` (e.g. "large") to compute r for a hypothetical object
+    of that size AT this object's position, instead of its own true size —
+    used by _crop_object_swatch to get a size-invariant crop window."""
     cx = obj["pixel_coords"][0] / ORIG_W * image_w
     cy = obj["pixel_coords"][1] / ORIG_H * image_h
-    r_3d = _CLEVR_RADIUS[obj["size"]]
+    r_3d = _CLEVR_RADIUS[size_override or obj["size"]]
     x3, y3 = obj["3d_coords"][0], obj["3d_coords"][1]
     uv_center = _project_3d_to_pixel(x3, y3, H_inv)
     uv_edge = _project_3d_to_pixel(x3 + r_3d, y3, H_inv)
@@ -218,13 +230,28 @@ def _object_pixel_circle(obj: dict, image_w: int, image_h: int, H_inv: np.ndarra
     return cx, cy, r
 
 
-def _is_isolated(target_obj: dict, scene_objects: list, image_w: int, image_h: int, H_inv: np.ndarray, margin: float = 1.3) -> bool:
-    """True if target_obj's projected silhouette (inflated by ``margin``)
-    doesn't overlap any OTHER object's projected silhouette in the same
-    scene — objects can visually overlap in 2-D even when spaced apart in
-    3-D, so this checks in projected pixel space, not 3-D distance. Avoids
-    picking a swatch crop that's contaminated by a neighboring object."""
-    tcx, tcy, tr = _object_pixel_circle(target_obj, image_w, image_h, H_inv)
+def _is_isolated(
+    target_obj: dict,
+    scene_objects: list,
+    image_w: int,
+    image_h: int,
+    H_inv: np.ndarray,
+    margin: float = 1.6,
+    size_override: Optional[str] = None,
+) -> bool:
+    """True if no other object's real silhouette intrudes into target_obj's
+    CROP WINDOW — radius = size_override's reference radius * margin, i.e.
+    exactly the window _crop_object_swatch will actually use (pass the same
+    margin/size_override to both, as extract_clevr_swatch_table does).
+    Checking against target_obj's own true radius instead — the previous
+    behavior — under-margins whenever the actual crop window is bigger than
+    the object itself, which is always true here since the window is sized
+    to "large" regardless of the object's own size: a neighbor could sit
+    just outside a same-size isolation check yet still land inside the
+    size-invariant window used for the real crop. Objects can visually
+    overlap in 2-D even when spaced apart in 3-D, so this checks in
+    projected pixel space, not 3-D distance."""
+    tcx, tcy, tr = _object_pixel_circle(target_obj, image_w, image_h, H_inv, size_override=size_override)
     tr *= margin
     for other in scene_objects:
         if other is target_obj:
@@ -256,9 +283,16 @@ def extract_clevr_swatch_table(
     pixels, every time — CLEVR's analogue of MNISTSudokuDataset's
     same_digit_images.
 
-    Returns: (len(COLORS)*len(SHAPES)*len(MATERIALS)*len(SIZES), 3, S, S)
-    float32 tensor in [0, 1], ordered color->shape->material->size (must
-    match models.condition_encoders._clevr_swatch_indices).
+    Returns:
+        table: (len(COLORS)*len(SHAPES)*len(MATERIALS)*len(SIZES), 3, S, S)
+            float32 tensor in [0, 1], ordered color->shape->material->size
+            (must match models.condition_encoders._clevr_swatch_indices).
+        isolated_mask: bool tensor, same length as table's first dim. False
+            means that combination had no isolated candidate anywhere in the
+            scanned scenes and fell back to a possibly-overlapping instance
+            (or is all-zero because the combination never appeared at all —
+            check the table for that separately). For inspection only, not
+            needed by ObjectFeatureEncoderV1Swatch.
     """
     rng = random.Random(seed)
     candidates: dict = {}
@@ -267,7 +301,7 @@ def extract_clevr_swatch_table(
         n_objects = len(objects)
         for obj in objects:
             key = (obj["color"], obj["shape"], obj["material"], obj["size"])
-            isolated = _is_isolated(obj, objects, ORIG_W, ORIG_H, H_inv)
+            isolated = _is_isolated(obj, objects, ORIG_W, ORIG_H, H_inv, margin=margin, size_override="large")
             candidates.setdefault(key, []).append((scene["image_filename"], obj, n_objects, isolated))
 
     def _pick(options):
@@ -280,6 +314,7 @@ def extract_clevr_swatch_table(
     to_tensor = T.ToTensor()
     image_cache: dict = {}
     table = []
+    isolated_mask = []
     missing = []
     n_occluded_fallback = 0
     for color in COLORS:
@@ -291,10 +326,12 @@ def extract_clevr_swatch_table(
                     if not options:
                         missing.append(key)
                         table.append(torch.zeros(3, swatch_size, swatch_size))
+                        isolated_mask.append(False)
                         continue
                     filename, obj, _n, isolated = _pick(options)
                     if not isolated:
                         n_occluded_fallback += 1
+                    isolated_mask.append(isolated)
                     if filename not in image_cache:
                         img = Image.open(os.path.join(image_dir, filename)).convert("RGB")
                         image_cache[filename] = to_tensor(img)
@@ -303,7 +340,7 @@ def extract_clevr_swatch_table(
         print(f"extract_clevr_swatch_table: no example found for {len(missing)} combinations, filled with zeros: {missing}")
     if n_occluded_fallback:
         print(f"extract_clevr_swatch_table: {n_occluded_fallback} combinations had no isolated instance, fell back to a possibly-occluded one")
-    return torch.stack(table)
+    return torch.stack(table), torch.tensor(isolated_mask, dtype=torch.bool)
 
 
 def _adj_lists_to_matrix(adj_lists, n):
