@@ -26,46 +26,54 @@ representation editing):
      class", never comparing against ground truth) so it does not need
      the alignment fix.
   2. For a held-out image, add k * typical_activation_norm *
-     unit(concept_vector[target_digit] - overall_mean) directly into a
-     layer's activation at a target cell's spatial patch (via a forward
-     hook — bypasses the ControlNetTranslator/ConditioningPyramid pathway
-     entirely and injects straight into the UNet's own internals), run
-     the rest of the forward pass unchanged, decode x0_pred, crop the
-     target cell, and classify it. Strength k is relative to that layer's
-     own typical activation norm (measured from the same batches used to
-     build concept vectors), not an arbitrary absolute scale — a raw,
-     uncalibrated strength can look like "no causal channel" simply
-     because it was too small to matter, independent of whether one
-     exists.
+     unit(concept_vector[target_digit] - overall_mean) into EVERY tested
+     layer's activation SIMULTANEOUSLY, at the target cell's spatial patch
+     (via forward hooks — bypasses the ControlNetTranslator/
+     ConditioningPyramid pathway entirely and injects straight into the
+     UNet's own internals), run the rest of the forward pass unchanged,
+     decode x0_pred, crop the target cell, and classify it. Injecting at
+     every layer at once (not one at a time) matches how real ControlNet
+     steering actually works — it adds residuals at every down-block AND
+     the mid-block in the same forward pass — and gives whatever channel
+     exists its best, most representative chance to show up, rather than
+     asking one isolated layer to carry the whole effect. Strength k is
+     relative to each layer's own typical activation norm (measured from
+     the same batches used to build concept vectors), not an arbitrary
+     absolute scale.
   3. Compare against a control: the same-magnitude but RANDOM (non-class)
-     direction, at the same strengths — rules out "any big enough
-     perturbation changes the digit" as an explanation for a positive
-     result.
+     direction, drawn independently per layer AND repeated
+     `num_random_reps` times (not once) — a single random draw is one
+     noisy realization of a high-variance quantity, not a stable
+     baseline, and comparing concept against it directly makes "random
+     sometimes beats concept" look like evidence against a real channel
+     when it may just be sampling noise. The random condition's mean and
+     spread across reps gives an actual null distribution to compare
+     against (reported as a z-score), and `num_test_images` is large
+     enough that per-condition accuracy itself isn't dominated by small-n
+     noise.
 
-Tests two layers: mid_block (the coarse bottleneck ConditioningPyramid's
-mid-block residual targets) and down_blocks[0]'s pre-downsample output (full
-144x144 pixel resolution — one of the down_block_additional_residuals
-injection points, and structurally closer to the skip-connection pathway
-that carries most fine spatial detail in a standard UNet2DModel). A null
-result at mid_block alone doesn't tell you much about the mechanism ControlNet
-actually uses, since it also injects at every down-block resolution.
+Injects at mid_block (the coarse bottleneck ConditioningPyramid's mid-block
+residual targets) and down_blocks[0]'s pre-downsample output (full 144x144
+pixel resolution — one of the down_block_additional_residuals injection
+points, structurally closer to the skip-connection pathway that carries most
+fine spatial detail in a standard UNet2DModel) together, every trial.
 
-If accuracy-toward-target-digit rises with strength for the concept
-direction but not the random control, there's a real, class-correlated,
-controllable channel at that layer — evidence the causal pathway ControlNet
-training would need to find is actually there. If neither direction moves
-classification, or both do about equally, that's evidence against it.
+A concept z-score of roughly |z| >= 2 against the random-rep distribution is
+the threshold worth taking seriously; anything smaller is not distinguishable
+from noise at this sample size and should be reported as such, not rounded
+up to "a real but small effect."
 
 Usage:
     python experiments/causal_intervention_painter.py \\
       experiment=mnist_thinker_v1_controlnet \\
       painter.checkpoint=runs/mnist_unet_painter/checkpoint_final.pt \\
       data=mnist_sudoku \\
-      +timesteps=[10,50] \\
-      +strengths=[0,0.25,0.5,1,2,4] \\
+      +timesteps=[50] \\
+      +strengths=[1,2,4] \\
       +target_row=4 +target_col=4 \\
       +num_concept_batches=8 \\
-      +num_test_images=32
+      +num_test_images=128 \\
+      +num_random_reps=10
 """
 
 from __future__ import annotations
@@ -272,15 +280,36 @@ def _build_concept_vectors(spec, activations, layer_name, painter, train_ds, sch
     return class_means, overall_mean, typical_norm, pool
 
 
+def _run_trial(specs, painter, x_noisy, t_batch, scheduler, per_layer_deltas, test_bboxes, target_row, target_col, cell_size, painter_size, eval_clf):
+    """Register every layer's injection hook simultaneously, run ONE forward
+    pass, return predicted classes for the target cell. per_layer_deltas:
+    dict[layer_name] -> (delta_tensor, pool_factor)."""
+    handles = []
+    for layer_name, (delta, pool) in per_layer_deltas.items():
+        spec = specs[layer_name]
+        handles.append(spec["module"].register_forward_hook(spec["inject"](delta, target_row, target_col, pool)))
+    try:
+        with torch.no_grad():
+            sample = DataSample(x_noisy=x_noisy, timesteps=t_batch)
+            eps_pred = painter(sample, steering=None).pred
+            x0_pred = x0_from_noise_pred(eps_pred, x_noisy, t_batch, scheduler)
+            patch = realign_and_crop_cell(x0_pred, test_bboxes, target_row, target_col, cell_size, painter_size)
+            return eval_clf(patch).argmax(dim=1)
+    finally:
+        for h in handles:
+            h.remove()
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
-    timesteps = [int(t) for t in cfg.get("timesteps", [10, 50])]
-    strengths = [float(k) for k in cfg.get("strengths", [0, 0.25, 0.5, 1, 2, 4])]
+    timesteps = [int(t) for t in cfg.get("timesteps", [50])]
+    strengths = [float(k) for k in cfg.get("strengths", [1, 2, 4])]
     target_row = int(cfg.get("target_row", 4))
     target_col = int(cfg.get("target_col", 4))
     num_concept_batches = int(cfg.get("num_concept_batches", 8))
     concept_batch_size = int(cfg.get("concept_batch_size", 64))
-    num_test_images = int(cfg.get("num_test_images", 32))
+    num_test_images = int(cfg.get("num_test_images", 128))
+    num_random_reps = int(cfg.get("num_random_reps", 10))
     cell_size = int(cfg.data.cell_size)
     painter_size = int(cfg.data.get("painter_size", cell_size * GRID))
     mnist_root = str(cfg.data.mnist_root)
@@ -297,6 +326,7 @@ def main(cfg: DictConfig):
     painter = getattr(model, "painter", model)
     painter.eval()
     unet = painter.unet
+    specs = _layer_specs(unet)
 
     eval_clf = load_or_train_classifier(classifier_path, mnist_root, cell_size, device)
     for p in eval_clf.parameters():
@@ -310,56 +340,71 @@ def main(cfg: DictConfig):
     test_bboxes = [compute_content_bbox(img, threshold=bbox_threshold) for img in test_batch.images.cpu()]
 
     print(f"target cell = (row={target_row}, col={target_col})   chance = {1/N_CLASSES:.3f}")
+    print(f"layers injected together each trial: {list(specs.keys())}")
+    print(f"n_test_images={len(content_samples)}  num_random_reps={num_random_reps}")
 
-    for layer_name, spec in _layer_specs(unet).items():
-        activations: dict = {}
+    for t in timesteps:
+        # Build concept vectors for every layer up front (each with its own
+        # capture hook, one layer at a time — this part doesn't need to be
+        # simultaneous, only the intervention/readout below does).
+        concept_by_layer = {}
+        for layer_name, spec in specs.items():
+            activations: dict = {}
 
-        def _capture(_m, _i, out, _spec=spec, _name=layer_name):
-            activations[_name] = _spec["capture"](_m, _i, out)
+            def _capture(_m, _i, out, _spec=spec, _name=layer_name):
+                activations[_name] = _spec["capture"](_m, _i, out)
 
-        for t in timesteps:
             cap_handle = spec["module"].register_forward_hook(_capture)
-            class_means, overall_mean, typical_norm, pool = _build_concept_vectors(
+            concept_by_layer[layer_name] = _build_concept_vectors(
                 spec, activations, layer_name, painter, train_ds, scheduler, t,
                 num_concept_batches, concept_batch_size, device, rng,
             )
             cap_handle.remove()
 
+        unit_concept_by_layer = {}
+        typical_norm_by_layer = {}
+        pool_by_layer = {}
+        for layer_name, (class_means, overall_mean, typical_norm, pool) in concept_by_layer.items():
             class_means_t = torch.from_numpy(class_means).float().to(device)
             overall_mean_t = torch.from_numpy(overall_mean).float().to(device)
+            deltas = class_means_t - overall_mean_t  # (N_CLASSES, C)
+            norms = deltas.norm(dim=-1).clamp_min(1e-8)
+            unit_concept_by_layer[layer_name] = deltas / norms.unsqueeze(-1)
+            typical_norm_by_layer[layer_name] = typical_norm
+            pool_by_layer[layer_name] = pool
 
-            t_batch = torch.full((test_batch.images.shape[0],), t, device=device, dtype=torch.long)
-            noise = torch.randn_like(test_batch.images)
-            x_noisy = scheduler.add_noise(test_batch.images, noise, t_batch)
+        t_batch = torch.full((test_batch.images.shape[0],), t, device=device, dtype=torch.long)
+        noise = torch.randn_like(test_batch.images)
+        x_noisy = scheduler.add_noise(test_batch.images, noise, t_batch)
 
-            print(f"\n=== layer={layer_name}  t={t}  typical_activation_norm={typical_norm:.3f} ===")
-            print(f"{'target_digit':>12} {'strength':>9} {'concept_acc':>12} {'random_acc':>11} {'concept_dir_norm/typical':>24}")
-            for target_digit in range(N_CLASSES):
-                concept_delta_dir = class_means_t[target_digit] - overall_mean_t
-                dir_norm = concept_delta_dir.norm().clamp_min(1e-8)
-                unit_concept = concept_delta_dir / dir_norm
-                random_dir = torch.randn_like(concept_delta_dir)
-                unit_random = random_dir / random_dir.norm().clamp_min(1e-8)
+        print(f"\n=== t={t} ===")
+        print(f"{'digit':>6} {'strength':>9} {'concept_acc':>12} {'random_mean':>12} {'random_std':>11} {'z':>7}")
+        for target_digit in range(N_CLASSES):
+            for k in strengths:
+                concept_deltas = {
+                    name: (k * typical_norm_by_layer[name] * unit_concept_by_layer[name][target_digit], pool_by_layer[name])
+                    for name in specs
+                }
+                preds = _run_trial(specs, painter, x_noisy, t_batch, scheduler, concept_deltas, test_bboxes, target_row, target_col, cell_size, painter_size, eval_clf)
+                concept_acc = (preds == target_digit).float().mean().item()
 
-                for k in strengths:
-                    results = {}
-                    for name, unit_dir in (("concept", unit_concept), ("random", unit_random)):
-                        delta = k * typical_norm * unit_dir
-                        inj_handle = spec["module"].register_forward_hook(
-                            spec["inject"](delta, target_row, target_col, pool)
-                        )
-                        with torch.no_grad():
-                            sample = DataSample(x_noisy=x_noisy, timesteps=t_batch)
-                            eps_pred = painter(sample, steering=None).pred
-                            x0_pred = x0_from_noise_pred(eps_pred, x_noisy, t_batch, scheduler)
-                            patch = realign_and_crop_cell(x0_pred, test_bboxes, target_row, target_col, cell_size, painter_size)
-                            preds = eval_clf(patch).argmax(dim=1)
-                            results[name] = (preds == target_digit).float().mean().item()
-                        inj_handle.remove()
-                    print(
-                        f"{target_digit:>12} {k:>9.2f} {results['concept']:>12.3f} {results['random']:>11.3f} "
-                        f"{(dir_norm / typical_norm).item():>24.3f}"
-                    )
+                random_accs = []
+                for _ in range(num_random_reps):
+                    random_deltas = {}
+                    for name in specs:
+                        rand = torch.randn_like(unit_concept_by_layer[name][target_digit])
+                        rand_unit = rand / rand.norm().clamp_min(1e-8)
+                        random_deltas[name] = (k * typical_norm_by_layer[name] * rand_unit, pool_by_layer[name])
+                    preds_r = _run_trial(specs, painter, x_noisy, t_batch, scheduler, random_deltas, test_bboxes, target_row, target_col, cell_size, painter_size, eval_clf)
+                    random_accs.append((preds_r == target_digit).float().mean().item())
+                random_mean = float(np.mean(random_accs))
+                random_std = float(np.std(random_accs))
+                # Floor, not 1e-6: with few reps random_std can land at
+                # exactly/near 0 by chance, which would blow z up to a
+                # meaningless magnitude rather than reflecting real certainty.
+                z = (concept_acc - random_mean) / max(random_std, 1e-3)
+
+                print(f"{target_digit:>6} {k:>9.2f} {concept_acc:>12.3f} {random_mean:>12.3f} {random_std:>11.3f} {z:>7.2f}")
 
 
 if __name__ == "__main__":
