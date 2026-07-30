@@ -403,8 +403,7 @@ class ClevrLatentEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.conv(x)
-        if feat.shape[-1] != self.grid_size:
-            feat = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
+        feat = F.adaptive_avg_pool2d(feat, (self.grid_size, self.grid_size))
         return feat.flatten(2).transpose(1, 2)  # (B, G², hidden)
 
 
