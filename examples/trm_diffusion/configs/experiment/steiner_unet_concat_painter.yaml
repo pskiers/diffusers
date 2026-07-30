@@ -1,0 +1,19 @@
+# @package _global_
+# Conditional Steiner UNetPainter (channel-concat, unscaled/paper-size
+# backbone) — stage 1. See steiner_unet_concat_small_painter for the
+# scaled-down variant.
+# Usage: python train_trm.py experiment=steiner_unet_concat_painter
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet_concat
+  - override /painter: steiner_unet_concat_conditional
+  - override /train: steiner
+  - override /eval_callbacks: steiner
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/steiner_unet_concat_painter"

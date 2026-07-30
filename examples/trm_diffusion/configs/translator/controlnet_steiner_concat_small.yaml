@@ -1,8 +1,7 @@
-# ControlNet translator: thinker logits → UNet down/mid block residuals.
-# painter_channels must match the (scaled-down) steiner_unet.yaml backbone.
+# ControlNet translator matching steiner_unet_concat_small.yaml's channels.
 _target_: models.translators.ControlNetTranslator
 in_channels: ${thinker.vocab_size}
-painter_channels: [32, 64, 64]
+painter_channels: [32, 64, 128]
 layers_per_block: 2
 painter_size: ${data.image_size}
 grid: 8             # image_size // grid_factor = 128 // 16

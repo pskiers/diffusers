@@ -142,6 +142,7 @@ class UNetPainter(PainterBase, BaseModel):
         painter_dtype: Optional[str] = None,
         sampling_pipeline=None,
         vae_pixel_range: str = "[-1,1]",
+        pixel_range: str = "[0,1]",
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -155,6 +156,11 @@ class UNetPainter(PainterBase, BaseModel):
         # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
         # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
         self._vae_tanh = vae_pixel_range == "[-1,1]"
+        # Same idea as vae_pixel_range, but for pixel-space painters (no VAE),
+        # where the dataset's own native range may not be [0,1] — e.g. Steiner
+        # Tree's 3-level background/vertex/edge scheme is in [-1,1]. Unused
+        # when self.vae is set (vae_pixel_range governs that case instead).
+        self._pixel_tanh = pixel_range == "[-1,1]"
         self.condition_encoder: Optional[nn.Module] = (
             instantiate(condition_encoder) if condition_encoder is not None else None
         )
@@ -180,24 +186,37 @@ class UNetPainter(PainterBase, BaseModel):
         return (c, s, s)
 
     def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents → [0, 1] pixel images for logging."""
+        """Decode latents → pixel images for logging/eval, clamped to the
+        painter's own native range ([0, 1] by default; [-1, 1] pixel-space
+        painters like Steiner Tree pass pixel_range="[-1,1]"). Not rescaled
+        to [0, 1] in that case — callers that need a genuinely different
+        native range (rather than the usual [0, 1] display convention) are
+        expected to know it, e.g. eval/steiner_eval.py's thresholds are
+        defined directly in [-1, 1].
+        """
         if self.vae is not None:
             imgs = self.vae.decode(latents / self.scaling_factor).sample
             if self._vae_tanh:
                 return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             return imgs.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return latents.clamp(-1.0, 1.0)
         return latents.clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
-        """Convert dataset batch images → [0, 1] for display.
+        """Convert dataset batch images → the painter's native range for
+        display/eval (see decode_for_eval).
 
         Latent-space models receive dataset images in whatever range their VAE
-        was trained on (vae_pixel_range). Pixel-space models receive [0, 1] directly.
+        was trained on (vae_pixel_range). Pixel-space models receive [0, 1]
+        unless pixel_range="[-1,1]" was set (see decode_for_eval).
         """
         if self.vae is not None:
             if self._vae_tanh:
                 return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
             return images.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return images.clamp(-1.0, 1.0)
         return images.clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -477,6 +496,80 @@ class ControlNetSteeredUNetPainter(UNetPainter):
         if self.condition_encoder is not None:
             for p in self.condition_encoder.parameters():
                 p.requires_grad_(False)
+
+
+# ── Channel-concat conditioning (matches "Visual Diffusion Models are
+#    Geometric Solvers"'s actual architecture) ───────────────────────────────
+
+
+class ConcatConditionedUNetPainter(UNetPainter):
+    """UNetPainter conditioned by channel-concatenating a spatial condition
+    image with the noisy input before the UNet call, rather than through a
+    condition_encoder producing extra UNet kwargs (cross-attention tokens,
+    ControlNet residuals, ...). Matches the paper's own conditioning
+    mechanism: `unet`'s in_channels must equal image_channels +
+    condition_channels; out_channels matches only the generated image, since
+    the condition channels are never noised (only sample.x_noisy is — the
+    condition is concatenated back on fresh, un-noised, at every timestep).
+
+    No condition_encoder is used at all here, so condition_keys is fixed to
+    ["spatial_conditions"] (rather than derived from one) — this is what
+    PainterBase.null_condition_sample / the training loop's CFG dropout read
+    to zero the condition for classifier-free guidance.
+
+    Args:
+        image_channels: channel count of the image being generated (and thus
+            of sample.x_noisy / the noise sampled at inference time) —
+            `unet`'s in_channels minus this is the condition's channel count.
+        **kwargs: forwarded to UNetPainter.__init__.
+    """
+
+    condition_keys = ["spatial_conditions"]
+
+    def __init__(self, *args, image_channels: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._image_channels = image_channels
+
+    @property
+    def noise_shape(self) -> tuple:
+        s = self.unet.config.sample_size
+        return (self._image_channels, s, s)
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        x = sample.x_noisy
+        if sample.spatial_conditions is not None:
+            x = torch.cat([x, sample.spatial_conditions], dim=1)
+        kwargs = steering.to_painter_kwargs() if steering is not None else {}
+        noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+
+class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter):
+    """Frozen ConcatConditionedUNetPainter loaded from a checkpoint, with
+    ControlNet-style TRM steering added as a SEPARATE, additive signal — the
+    painter keeps concatenating its own (frozen) condition image exactly as
+    trained; the TRM's steering doesn't replace that, it's an independent
+    residual injection on top (mirrors ControlNetSteeredUNetPainter for the
+    unconditional case — see that class's docstring for why steering
+    "on top of" rather than "instead of" is the intended split).
+
+    Args:
+        checkpoint: path to a checkpoint_*.pt saved by train_trm.py for a
+                    ConcatConditionedUNetPainter run.
+        **kwargs:   forwarded to ConcatConditionedUNetPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, **kwargs):
+        super().__init__(**kwargs)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        self.unet.__class__ = ControlPainterUNet
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
 
 
 # ── Generic trainable DiT painter ────────────────────────────────────────────
