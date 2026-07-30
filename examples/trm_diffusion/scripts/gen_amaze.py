@@ -40,6 +40,10 @@ MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
 QUEEN_TRAIN = int(os.environ.get("QUEEN_TRAIN", "30000"))
 QUEEN_CELL_SIZE = os.environ.get("QUEEN_CELL_SIZE", "64")
 QUEEN_RADIUS = os.environ.get("QUEEN_RADIUS", "16")
+# Downsize the train split to the model input resolution (data.image_size) after
+# generation so per-step data loading isn't bound on the large source PNGs (the
+# maze generator renders ~102 px/cell -> ~830-1300px images). 0 disables.
+TRAIN_IMAGE_SIZE = int(os.environ.get("TRAIN_IMAGE_SIZE", "144"))
 # Parallel worker processes, split the batch across processes
 QUEEN_NPROC = _nproc("QUEEN_NPROC")
 MAZE_NPROC = _nproc("MAZE_NPROC")
@@ -360,6 +364,86 @@ def copy_val(train_dir: Path, test_all_parquet: Path) -> None:
     print(f">> val ← copy of {test_all_parquet} → {dst}")
 
 
+# Train split reads only these two image columns (resized); the rest are eval-only.
+_RESIZE_COLS = ("m_original_img", "sol_img")
+_DROP_COLS = ("original_img", "mask_img", "cell_map")
+
+
+def _resize_train_parquet(train_dir: Path) -> None:
+    """Downsize the train split's images to TRAIN_IMAGE_SIZE in place (idempotent).
+
+    The maze generator renders at ~102 px/cell (~830-1300px images); AmazeDataset
+    would otherwise BICUBIC-antialias-resize each to the model input size on the CPU
+    every epoch, making training data-loading-bound (hexagon ~8x slower than queens
+    on identical model params). Precomputing that resize once -- byte-identical to
+    AmazeDataset's transform -- turns per-step loading into a near no-op and shrinks
+    the parquet. Only the train split is touched; val/test stay at native resolution
+    for eval scoring, and the original is kept as *.orig.parquet. torch/PIL are
+    imported lazily so plain test generation stays torch-free.
+    """
+    if TRAIN_IMAGE_SIZE <= 0:
+        return
+    train_pq = train_dir / "maze_dataset_train.parquet"
+    if not train_pq.is_file():
+        return
+
+    import base64
+    import io
+
+    from PIL import Image
+    from torchvision import transforms
+
+    def _decode(raw):
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            return None
+        if isinstance(raw, Image.Image):
+            return raw.convert("RGB")
+        if isinstance(raw, (bytes, bytearray)):
+            return Image.open(io.BytesIO(bytes(raw))).convert("RGB")
+        if isinstance(raw, str):
+            s = raw.split(",", 1)[1] if raw.startswith("data:") else raw
+            return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
+        raise TypeError(f"Unsupported image cell type: {type(raw)}")
+
+    def _to_png(im):
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue()
+
+    df = pd.read_parquet(train_pq)
+    present = [c for c in _RESIZE_COLS if c in df.columns]
+    if not present:
+        return
+    probe = _decode(df.iloc[0][present[0]])
+    if probe is not None and max(probe.size) <= TRAIN_IMAGE_SIZE:
+        print(f">> train split already <= {TRAIN_IMAGE_SIZE}px — skip resize")
+        return
+
+    resize = transforms.Resize(
+        (TRAIN_IMAGE_SIZE, TRAIN_IMAGE_SIZE),
+        interpolation=transforms.InterpolationMode.BICUBIC,
+        antialias=True,
+    )
+    for col in present:
+        out = []
+        for v in df[col]:
+            im = _decode(v)
+            out.append(None if im is None else _to_png(resize(im)))
+        df[col] = out
+    dropped = [c for c in _DROP_COLS if c in df.columns]
+    if dropped:
+        df = df.drop(columns=dropped)
+
+    p = str(train_pq)
+    backup = p[: -len(".parquet")] + ".orig.parquet"
+    if not os.path.exists(backup):
+        os.replace(p, backup)
+    tmp = p + ".tmp"
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, p)
+    print(f">> resized train → {TRAIN_IMAGE_SIZE}px, dropped {dropped or '[]'}, backup {os.path.basename(backup)}")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def _parse_kv(tokens: list[str]) -> dict[str, str]:
     kv = {}
@@ -408,12 +492,14 @@ def main(argv: list[str]) -> None:
         gen_maze_train(geom, scale)
         all_pq = ensure_maze_test_all()
         copy_val(train_maze_dir(geom, scale), all_pq)
+        _resize_train_parquet(train_maze_dir(geom, scale))
         print(f"Done → {train_maze_dir(geom, scale)}")
     else:
         scale = n if n is not None else 7
         gen_queens_train(scale)
         all_pq = ensure_queens_test_all()
         copy_val(train_queens_dir(scale), all_pq)
+        _resize_train_parquet(train_queens_dir(scale))
         print(f"Done → {train_queens_dir(scale)}")
 
 
