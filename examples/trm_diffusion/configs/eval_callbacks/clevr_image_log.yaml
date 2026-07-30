@@ -4,3 +4,7 @@
   n_scenes: 16
   min_objects: 3
   max_objects: 8
+  reveal_n_objects: ${data.reveal_n_objects}
+  reveal_radius_frac: ${data.reveal_radius_frac}
+  include_centroid_mask: ${data.include_centroid_mask}
+  image_size: ${data.image_size}
