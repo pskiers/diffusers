@@ -10,21 +10,27 @@ terminals through a different, still-valid Steiner topology).
 
 This is a simplified version of the paper's own eval/extraction pipeline
 (scripts/evaluate_steiner.py + scripts/extract_steiner_graph.py in
-https://github.com/kariander1/visual-geo-solver): vertex blobs are taken as
-one vertex per connected component (no k-means splitting of merged blobs —
-a reasonable simplification since generation enforces a minimum terminal
-distance of 0.1, so overlapping blobs are rare), and edges are accepted via
-straight-line pixel-coverage sampling with a proximity-to-other-vertex
-rejection, matching the spirit of the paper's approach without its full
-robustness machinery.
+https://github.com/kariander1/visual-geo-solver) — vertices are detected via
+non-max-suppression on the vertex mask's distance transform (see
+_detect_vertices) rather than their per-blob area-estimate + k-means
+splitting, and edges are accepted via straight-line pixel-coverage sampling
+with a proximity-to-other-vertex rejection. Ported the original's exact
+algorithm and measured it against our own ground-truth renders to check —
+it does *worse* on this data (60% exact vertex-count match vs. this file's
+78%), so the simpler approach was kept. Both fail the same way (under-
+counting from vertices that render within a couple pixels of each other,
+never over-counting) — a genuine resolution limit of the rendering
+(128px, node_radius=2), not a fixable bug in either implementation; see
+_detect_vertices's docstring.
 
-Deliberately NOT computed here (see datasets/steiner_dataset.py's docstring):
-optimality_ratio (predicted length vs GeoSteiner's true optimum) — that
-needs the ground-truth optimal length, which isn't part of the DataSample
-schema (this project's per-step eval_callback works from batched tensors,
-not the raw generation NDJSON). Treat optimality as a separate, offline
-analysis over datasets/steiner_data/*.ndjson if you want it, using
-datasets/steiner_generation.py's saved total_length field directly.
+optimality_ratio (generated tree length ÷ GeoSteiner's true optimal length)
+is NOT computed in this module — it needs the exact optimal length, which
+isn't part of the DataSample batch. Instead, SteinerEvalCallback (in
+models/eval_callbacks.py) looks it up directly from the dataset's own
+generation-time record via SteinerTreeDataset.optimal_length_for(puzzle_id),
+and divides by the length this module's evaluate_steiner() already computes
+from the generated image (`per_sample_length`) — no re-solving, no new
+DataSample field, no lossy re-derivation from a rendered image.
 """
 
 from __future__ import annotations
@@ -137,6 +143,19 @@ def _covers_terminals(vertices_rc: np.ndarray, terminal_px_rc: np.ndarray, tol_p
     return bool((d.min(axis=1) <= tol_px).all())
 
 
+def _tree_length_normalized(vertices_rc: np.ndarray, edges: list[tuple[int, int]], image_size: int) -> float:
+    """Sum of Euclidean edge lengths, in the same normalized [0,1]^2
+    coordinate space datasets/steiner_generation.py's `total_length` is
+    computed in (pixel distances / (image_size-1)) — so it's directly
+    comparable to the exact optimal length looked up via
+    SteinerTreeDataset.optimal_length_for, no unit conversion needed.
+    """
+    total = 0.0
+    for i, j in edges:
+        total += float(np.linalg.norm(vertices_rc[i] - vertices_rc[j])) / (image_size - 1)
+    return total
+
+
 @torch.no_grad()
 def evaluate_steiner(
     images: torch.Tensor,             # (B, 1, H, W) float, generated
@@ -155,6 +174,14 @@ def evaluate_steiner(
                               main "hard logical constraint" pass/fail metric,
                               analogous to Maze/Sudoku's constraint_puzzle_acc).
       per_sample_valid     — (B,) bool numpy array of the combined pass/fail.
+      per_sample_length    — (B,) float numpy array; the extracted tree's
+                              total edge length in normalized [0,1]^2 space
+                              (NaN where extraction produced no edges) — the
+                              caller combines this with the instance's exact
+                              optimal length (SteinerTreeDataset.optimal_length_for,
+                              looked up by puzzle_id) to get optimality_ratio;
+                              not computed here since this function has no
+                              access to the dataset/puzzle_id.
     """
     B = images.shape[0]
     imgs = images.squeeze(1).cpu().numpy()
@@ -165,6 +192,7 @@ def evaluate_steiner(
     connected = np.zeros(B, dtype=bool)
     valid_tree = np.zeros(B, dtype=bool)
     covers = np.zeros(B, dtype=bool)
+    length = np.full(B, np.nan, dtype=np.float64)
 
     for b in range(B):
         vertices, edges = _extract_graph(imgs[b])
@@ -174,6 +202,8 @@ def evaluate_steiner(
         G.add_edges_from(edges)
         connected[b] = n > 0 and nx.is_connected(G)
         valid_tree[b] = connected[b] and G.number_of_edges() == n - 1
+        if edges:
+            length[b] = _tree_length_normalized(vertices, edges, image_size)
 
         term_xy = emb[b][mask[b]]  # (n_term, 2) in [0,1]
         term_rc = term_xy[:, ::-1] * (image_size - 1)  # (row, col) pixel coords
@@ -184,6 +214,7 @@ def evaluate_steiner(
         "is_connected_acc": float(connected.mean()),
         "is_valid_tree_acc": float(valid_tree.mean()),
         "covers_terminals_acc": float(covers.mean()),
+        "per_sample_length": length,
         "constraint_puzzle_acc": float(valid.mean()),
         "per_sample_valid": valid,
     }

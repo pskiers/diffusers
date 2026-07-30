@@ -143,9 +143,17 @@ class SteinerTreeDataset(Dataset):
                 line = line.strip()
                 if line:
                     self.instances.append(json.loads(line))
+        self._length_by_id = {inst["instance_id"]: inst["total_length"] for inst in self.instances}
 
     def __len__(self) -> int:
         return len(self.instances)
+
+    def optimal_length_for(self, puzzle_id: int) -> Optional[float]:
+        """Exact optimal tree length GeoSteiner computed for this instance at
+        generation time (see datasets/steiner_generation.py) — used by
+        eval/steiner_eval.py to score optimality without re-solving or
+        re-deriving it lossily from a rendered image."""
+        return self._length_by_id.get(int(puzzle_id))
 
     def __getitem__(self, idx: int) -> DataSample:
         inst = self.instances[idx]

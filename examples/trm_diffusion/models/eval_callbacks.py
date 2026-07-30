@@ -650,7 +650,13 @@ class SteinerEvalCallback(EvalCallbackBase):
     Returns: is_connected_acc, is_valid_tree_acc, covers_terminals_acc,
     constraint_puzzle_acc (see eval.steiner_eval.evaluate_steiner for exact
     definitions, including a documented resolution-limit caveat on the
-    latter three).
+    latter three) — plus, when the dataloader's dataset exposes
+    `optimal_length_for(puzzle_id)` (SteinerTreeDataset does),
+    optimality_ratio: mean(generated tree length / exact optimal length)
+    over samples that pass the validity checks. The exact optimal length is
+    looked up from the dataset's own generation-time record (GeoSteiner's
+    output), not re-solved or re-derived lossily from a rendered image — see
+    SteinerTreeDataset.optimal_length_for's docstring.
 
     Args:
         image_size: must match the dataset's rendering resolution.
@@ -682,8 +688,11 @@ class SteinerEvalCallback(EvalCallbackBase):
         pipeline = model.sampling_pipeline
         n_total = self.num_samples
         n_log = self.num_log_images
+        dataset = getattr(dataloader, "dataset", None)
+        length_lookup = getattr(dataset, "optimal_length_for", None)
 
         all_connected, all_valid_tree, all_covers, all_constraint = [], [], [], []
+        all_ratios: list = []
         panels: list = []
         n_done = 0
 
@@ -708,6 +717,17 @@ class SteinerEvalCallback(EvalCallbackBase):
             all_covers.append(acc["covers_terminals_acc"])
             all_constraint.append(acc["constraint_puzzle_acc"])
 
+            if length_lookup is not None:
+                puzzle_ids = batch["puzzle_id"].cpu().tolist()
+                gen_len = acc["per_sample_length"]
+                valid = acc["per_sample_valid"]
+                for i in range(B_cur):
+                    if not valid[i] or not np.isfinite(gen_len[i]):
+                        continue
+                    opt_len = length_lookup(puzzle_ids[i])
+                    if opt_len is not None and opt_len > 0:
+                        all_ratios.append(float(gen_len[i]) / float(opt_len))
+
             if _wandb is not None and len(panels) < n_log:
                 n_new = min(n_log - len(panels), B_cur)
                 cond_cpu = batch["spatial_conditions"].cpu()
@@ -725,6 +745,13 @@ class SteinerEvalCallback(EvalCallbackBase):
             "covers_terminals_acc": float(np.mean(all_covers)),
             "constraint_puzzle_acc": float(np.mean(all_constraint)),
         }
+        if length_lookup is not None:
+            # Fraction of *all* evaluated samples (not just valid ones) that a
+            # ratio was computable for — lets a low mean ratio be read
+            # alongside how much of the eval set it's actually based on.
+            result["optimality_ratio_coverage"] = len(all_ratios) / max(n_done, 1)
+            if all_ratios:
+                result["optimality_ratio"] = float(np.mean(all_ratios))
         if panels:
             result["samples"] = panels
         return result
