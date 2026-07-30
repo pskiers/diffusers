@@ -2,7 +2,9 @@
 _target_: models.painter_base.UNetPainter
 _recursive_: false
 unet: ${backbone}
-painter_dtype: null
+# bf16 autocast for the UNet forward (painter_base._autocast): ~1.3-1.8x faster on
+# A100, no accelerator.mixed_precision needed. Set to null to train in fp32.
+painter_dtype: bfloat16
 eval_callbacks: ${eval_callbacks}
 optim_cfg:
   _target_: configs.schemas.PainterOptimConfig

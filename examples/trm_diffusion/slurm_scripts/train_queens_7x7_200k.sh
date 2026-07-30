@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=120G
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
@@ -21,6 +21,11 @@ N=7
 CELL_SIZE=20
 SEQ_LEN=49
 GRID=7
+# ── max 48h budget ───────────────────────────────────────────────────────────────
+PAINTER_STEPS=${PAINTER_STEPS:-40000}
+THINKER_STEPS=${THINKER_STEPS:-45000}
+PAINTER_MAX_SECONDS=${PAINTER_MAX_SECONDS:-64800}   # 18h
+THINKER_MAX_SECONDS=${THINKER_MAX_SECONDS:-86400}   # 24h
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
 RUN_NAME="${RUN_NAME:-${2:-train_queens_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
@@ -42,6 +47,8 @@ DATA_DIR="${PROJECT_ROOT}/data/amaze/train_queens_n${N}"
 srun python train_trm.py experiment=amaze_unet_painter \
   data.amaze_root="${DATA_DIR}" \
   eval_callbacks=amaze_queens \
+  train.num_steps=${PAINTER_STEPS} \
+  train.max_seconds=${PAINTER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_painter"
 
@@ -53,6 +60,8 @@ srun python train_trm.py experiment=amaze_thinker_v1_controlnet \
   thinker.seq_len=${SEQ_LEN} \
   translator.grid=${GRID} \
   eval_callbacks=amaze_queens \
+  train.num_steps=${THINKER_STEPS} \
+  train.max_seconds=${THINKER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_thinker"
 

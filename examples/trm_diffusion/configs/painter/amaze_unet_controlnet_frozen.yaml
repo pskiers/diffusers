@@ -5,7 +5,9 @@ _target_: models.painter_base.ControlNetSteeredUNetPainter
 _recursive_: false
 checkpoint: ???  # REQUIRED: path to amaze_unet_painter checkpoint
 unet: ${backbone}
-painter_dtype: null
+# bf16 for the frozen-painter forward, which the thinker runs n_sup*K times per
+# step — the dominant thinker cost. Set to null for fp32.
+painter_dtype: bfloat16
 optim_cfg:
   _target_: configs.schemas.PainterOptimConfig
   lr: 3e-5

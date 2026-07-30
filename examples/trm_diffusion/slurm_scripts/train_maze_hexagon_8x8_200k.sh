@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=120G
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
@@ -23,6 +23,12 @@ N=8
 CELL_SIZE=18
 SEQ_LEN=64
 GRID=8
+
+# ── max 48h budget ───────────────────────────────────────────────────────────────
+PAINTER_STEPS=${PAINTER_STEPS:-40000}
+THINKER_STEPS=${THINKER_STEPS:-45000}
+PAINTER_MAX_SECONDS=${PAINTER_MAX_SECONDS:-64800}   # 18h
+THINKER_MAX_SECONDS=${THINKER_MAX_SECONDS:-86400}   # 24h
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
 RUN_NAME="${RUN_NAME:-${2:-train_maze_${GEOMETRY}_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
@@ -45,6 +51,8 @@ DATA_DIR="${PROJECT_ROOT}/data/amaze/train_maze_${GEOMETRY}_n${N}"
 # ── Stage 1: standalone painter ──────────────────────────────────────────────
 srun python train_trm.py experiment=amaze_unet_painter \
   data.amaze_root="${DATA_DIR}" \
+  train.num_steps=${PAINTER_STEPS} \
+  train.max_seconds=${PAINTER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_painter"
 
@@ -55,6 +63,8 @@ srun python train_trm.py experiment=amaze_thinker_v1_controlnet \
   data.cell_size=${CELL_SIZE} \
   thinker.seq_len=${SEQ_LEN} \
   translator.grid=${GRID} \
+  train.num_steps=${THINKER_STEPS} \
+  train.max_seconds=${THINKER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_thinker"
 

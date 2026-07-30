@@ -33,6 +33,7 @@ Latent-space painters additionally expose:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from typing import Optional
 
@@ -279,6 +280,16 @@ class UNetPainter(PainterBase, BaseModel):
 
     # ── Training / eval / optimizer ─────────────────────────────────────────
 
+    def _autocast(self, device: torch.device):
+        """bf16/fp16 autocast when painter_dtype is set (via config), else fp32.
+
+        Mirrors the frozen-painter autocast in painter_thinkers, so enabling
+        painter_dtype speeds a run without touching accelerator.mixed_precision.
+        """
+        if self.painter_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=device.type, dtype=self.painter_dtype)
+
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
         optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
         return [
@@ -312,8 +323,9 @@ class UNetPainter(PainterBase, BaseModel):
                 drop = torch.rand(sample.x_noisy.shape[0], device=device) < self.train_cfg.cfg_prob
                 sample = self._apply_cfg_dropout(sample, drop)
 
-            result = self(sample)
-            total_loss, components = self.loss_fn(result.pred, result.logits, sample)
+            with self._autocast(device):
+                result = self(sample)
+                total_loss, components = self.loss_fn(result.pred, result.logits, sample)
             accelerator.backward(total_loss / (global_batch_size * K))
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
@@ -338,8 +350,9 @@ class UNetPainter(PainterBase, BaseModel):
             except StopIteration:
                 break
             sample = self._prepare_training_sample(batch, accelerator.device)
-            result = self(sample)
-            _, components = self.loss_fn(result.pred, result.logits, sample)
+            with self._autocast(accelerator.device):
+                result = self(sample)
+                _, components = self.loss_fn(result.pred, result.logits, sample)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1

@@ -2,7 +2,7 @@ amaze_root: "data/amaze"
 image_size: 144
 painter_size: 144
 cell_size: 20
-num_workers: 12
+num_workers: 4
 num_channels: 3
 
 train_dataset:

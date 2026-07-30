@@ -26,6 +26,7 @@ mode: "thinker_base"
 train:
   batch_size: 192
   gradient_accumulation_steps: 4
+  max_seconds: 0 # (0 = no limit)
 
 eval:
   batch_size: 128
