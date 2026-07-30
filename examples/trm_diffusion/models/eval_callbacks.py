@@ -29,6 +29,7 @@ from eval.mnist_eval import (
     sample_grids,
 )
 from eval.maze_eval import evaluate_mazes, make_maze_panel_image
+from eval.steiner_eval import evaluate_steiner, make_steiner_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -630,6 +631,100 @@ class MazeEvalCallback(EvalCallbackBase):
             result[f"cell_acc_size{s}"] = float(cell_acc[m].mean())
             result[f"puzzle_acc_size{s}"] = float(exact[m].mean())
             result[f"constraint_puzzle_acc_size{s}"] = float(valid[m].mean())
+        if panels:
+            result["samples"] = panels
+        return result
+
+
+# ── Steiner Tree ──────────────────────────────────────────────────────────────
+
+
+class SteinerEvalCallback(EvalCallbackBase):
+    """
+    DDIM sampling eval for Steiner Tree models: sample images, extract a
+    graph from each (vertex/edge detection — see eval/steiner_eval.py), and
+    score connectivity, valid-tree-edge-count, and terminal coverage. No
+    learned classifier is needed — like Maze, cells/pixels are read directly
+    off the known rendering scheme rather than classified by a trained model.
+
+    Returns: is_connected_acc, is_valid_tree_acc, covers_terminals_acc,
+    constraint_puzzle_acc (see eval.steiner_eval.evaluate_steiner for exact
+    definitions, including a documented resolution-limit caveat on the
+    latter three).
+
+    Args:
+        image_size: must match the dataset's rendering resolution.
+        num_samples: total number of samples to evaluate.
+        num_log_images: number of panel images to log to WandB.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 128,
+        num_samples: int = 1000,
+        num_log_images: int = 8,
+    ):
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.num_log_images = num_log_images
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "SteinerEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_total = self.num_samples
+        n_log = self.num_log_images
+
+        all_connected, all_valid_tree, all_covers, all_constraint = [], [], [], []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
+        for batch in tqdm(dataloader, "Steiner eval", total=n_batches):
+            if n_done >= n_total:
+                break
+            B_cur = batch["images"].shape[0]
+
+            conditions = model._batch_to_sample(batch, device)
+            generated = pipeline.sample_one_batch(model, conditions, device)
+            generated = model.decode_for_eval(generated)  # (B, 1, H, W) in [-1, 1]-ish
+
+            acc = evaluate_steiner(
+                generated,
+                batch["embedding_conditions"].to(device),
+                batch["embedding_mask"].to(device),
+                self.image_size,
+            )
+            all_connected.append(acc["is_connected_acc"])
+            all_valid_tree.append(acc["is_valid_tree_acc"])
+            all_covers.append(acc["covers_terminals_acc"])
+            all_constraint.append(acc["constraint_puzzle_acc"])
+
+            if _wandb is not None and len(panels) < n_log:
+                n_new = min(n_log - len(panels), B_cur)
+                cond_cpu = batch["spatial_conditions"].cpu()
+                true_cpu = batch["images"].cpu()
+                gen_cpu = generated.cpu()
+                for i in range(n_new):
+                    panel = make_steiner_panel_image(cond_cpu[i], gen_cpu[i], true_cpu[i])
+                    panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_cur
+
+        result: dict = {
+            "is_connected_acc": float(np.mean(all_connected)),
+            "is_valid_tree_acc": float(np.mean(all_valid_tree)),
+            "covers_terminals_acc": float(np.mean(all_covers)),
+            "constraint_puzzle_acc": float(np.mean(all_constraint)),
+        }
         if panels:
             result["samples"] = panels
         return result

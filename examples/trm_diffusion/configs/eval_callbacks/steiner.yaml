@@ -1,0 +1,6 @@
+# Steiner eval callback: DDIM sampling + graph extraction/validity checks
+# (no learned classifier needed).
+- _target_: models.eval_callbacks.SteinerEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 1024
+  num_log_images: 8

@@ -1,0 +1,17 @@
+# @package _global_
+# Unconditional Steiner Tree UNetPainter.
+# Usage: python train_trm.py experiment=steiner_unet_painter
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet
+  - override /painter: steiner_unet
+  - override /train: steiner
+  - override /eval_callbacks: steiner
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/steiner_unet_painter"
