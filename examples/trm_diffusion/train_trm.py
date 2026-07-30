@@ -25,6 +25,7 @@ import os
 import signal
 import logging
 import sys
+import time
 from pathlib import Path
 
 import hydra
@@ -238,6 +239,9 @@ def main(cfg: DictConfig):
     next_eval = eval_every
     next_save = save_every
 
+    max_seconds = float(cfg.train.get("max_seconds", 0) or 0)
+    loop_start = time.monotonic()
+
     train_iter = iter(train_dl)
     unwrapped = accelerator.unwrap_model(model)
     progress_bar = tqdm(
@@ -310,6 +314,14 @@ def main(cfg: DictConfig):
                 accelerator, model, optimizers, global_step, cfg.run.output_dir, f"step-{global_step}", ema_helper
             )
             next_save = global_step + save_every
+
+        if max_seconds and time.monotonic() - loop_start >= max_seconds:
+            if accelerator.is_main_process:
+                logger.info(
+                    f"Wall-clock budget {max_seconds:.0f}s reached at step {global_step}/{num_steps}; "
+                    "stopping to save a final checkpoint."
+                )
+            break
 
     if accelerator.is_main_process:
         save_checkpoint(accelerator, model, optimizers, global_step, cfg.run.output_dir, "final", ema_helper)
