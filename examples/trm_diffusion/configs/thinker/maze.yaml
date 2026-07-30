@@ -1,0 +1,37 @@
+# Maze TRM.
+# seq_len = 64 (one token per cell, grid_size=8); vocab_size = 2 (off-path/on-path)
+_target_: models.trm_wrappers.SpatialTRM
+vocab_size: 2
+seq_len: 64
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 512
+puzzle_emb_len: 16
+num_puzzle_identifiers: 20000
+halt_exploration_prob: 0.0
+freeze_weights: false
+batch_size: 384
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
+  puzzle_emb:
+    _target_: configs.schemas.PuzzleEmbOptimConfig
+    lr: 1e-4
+    weight_decay: 1.0
+    warmup_steps: 2000
+    lr_min_ratio: 1.0
+with_timestep_emb: false

@@ -28,6 +28,7 @@ from eval.mnist_eval import (
     plot_thinker_ts_curve,
     sample_grids,
 )
+from eval.maze_eval import evaluate_mazes, make_maze_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -515,3 +516,120 @@ class ScaledSudokuEvalCallback(SudokuEvalCallback):
 
     def _prepare_for_eval(self, generated: torch.Tensor) -> torch.Tensor:
         return extract_and_resize_sudoku(generated, self.painter_size, self.bbox_threshold)
+
+
+# ── Maze ──────────────────────────────────────────────────────────────────────
+
+
+class MazeEvalCallback(EvalCallbackBase):
+    """
+    DDIM sampling eval for Maze models: sample images, then evaluate against
+    the maze's own wall structure. No learned classifier is needed — unlike
+    Sudoku's MNIST digit cells, MazeDataset renders every cell as a flat
+    color from a small fixed palette, so cells are classified by nearest-
+    color matching (see eval/maze_eval.py).
+
+    Returns: cell_acc, puzzle_acc, constraint_puzzle_acc (see
+    eval.maze_eval.evaluate_mazes for exact definitions).
+
+    Args:
+        grid_size, cell_size: must match the dataset's rendering parameters.
+        num_samples: total number of samples to evaluate.
+        num_log_images: number of panel images to log to WandB.
+    """
+
+    def __init__(
+        self,
+        grid_size: int = 8,
+        cell_size: int = 16,
+        num_samples: int = 1000,
+        num_log_images: int = 8,
+    ):
+        self.grid_size = grid_size
+        self.cell_size = cell_size
+        self.num_samples = num_samples
+        self.num_log_images = num_log_images
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "MazeEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_total = self.num_samples
+        n_log = self.num_log_images
+
+        per_sample_cell_acc, per_sample_exact, per_sample_valid, per_sample_size = [], [], [], []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
+        for batch in tqdm(dataloader, "Maze eval", total=n_batches):
+            if n_done >= n_total:
+                break
+            B_cur = batch["images"].shape[0]
+
+            conditions = model._batch_to_sample(batch, device)
+            generated = pipeline.sample_one_batch(model, conditions, device)
+            generated = model.decode_for_eval(generated)  # (B, 3, H, W) in [0, 1]
+
+            acc = evaluate_mazes(
+                generated,
+                batch["spatial_conditions"].to(device),
+                batch["solution"].to(device),
+                batch["solution_mask"].to(device),
+                batch["token_conditions"].to(device),
+                self.grid_size,
+                self.cell_size,
+            )
+            per_sample_cell_acc.append(acc["per_sample_cell_acc"])
+            per_sample_exact.append(acc["per_sample_exact"])
+            per_sample_valid.append(acc["per_sample_valid"])
+            per_sample_size.append(acc["per_sample_active_size"])
+
+            if _wandb is not None and len(panels) < n_log:
+                n_new = min(n_log - len(panels), B_cur)
+                sol_np = batch["solution"].numpy()
+                mask_np = batch["solution_mask"].numpy()
+                tok_np = batch["token_conditions"].numpy()
+                cond_cpu = batch["spatial_conditions"].cpu()
+                gen_cpu = generated.cpu()
+                for i in range(n_new):
+                    panel = make_maze_panel_image(
+                        cond_cpu[i], gen_cpu[i], tok_np[i], sol_np[i], mask_np[i],
+                        self.grid_size, self.cell_size,
+                    )
+                    panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_cur
+
+        cell_acc = np.concatenate(per_sample_cell_acc)
+        exact = np.concatenate(per_sample_exact)
+        valid = np.concatenate(per_sample_valid)
+        size = np.concatenate(per_sample_size)
+
+        result: dict = {
+            "cell_acc": float(cell_acc.mean()),
+            "puzzle_acc": float(exact.mean()),
+            "constraint_puzzle_acc": float(valid.mean()),
+        }
+        # Difficulty breakdown: same three metrics, restricted to each active
+        # maze size seen in this eval pass — e.g. constraint_puzzle_acc_size3
+        # (matches the published SketchVLM benchmark's scale) vs
+        # constraint_puzzle_acc_size8 (hardest size trained on), so a curriculum
+        # over min/max_active_size doesn't hide a harder-size regression inside
+        # one pooled average.
+        for s in sorted(set(size.tolist())):
+            m = size == s
+            result[f"cell_acc_size{s}"] = float(cell_acc[m].mean())
+            result[f"puzzle_acc_size{s}"] = float(exact[m].mean())
+            result[f"constraint_puzzle_acc_size{s}"] = float(valid[m].mean())
+        if panels:
+            result["samples"] = panels
+        return result

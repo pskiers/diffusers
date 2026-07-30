@@ -1,0 +1,12 @@
+# Trainable Maze UNetPainter (pixel-space, unconditional).
+_target_: models.painter_base.UNetPainter
+_recursive_: false
+unet: ${backbone}
+painter_dtype: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
