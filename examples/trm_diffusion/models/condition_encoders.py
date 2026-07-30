@@ -782,9 +782,15 @@ class ObjectFeatureEncoderV1RevealFused(ConditionEncoderBase):
             keep = (torch.rand(p.shape, device=p.device) > p).float()
             noisy_for_enc = x_noisy * keep[:, None, None, None]
 
-        reveal_resized = spatial_conditions
-        if spatial_conditions.shape[-2:] != noisy_for_enc.shape[-2:]:
-            reveal_resized = F.interpolate(spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False)
+        # Always interpolate (never branch on a runtime shape comparison): the
+        # reveal image is always at image_size resolution vs. the latent's
+        # grid_size, so this is never a no-op in practice, and a data-
+        # dependent Python `if` here is exactly the kind of thing that trips
+        # torch.compile/inductor into a guard/lowering failure (interpolating
+        # to an already-matching size is a cheap identity op anyway).
+        reveal_resized = F.interpolate(
+            spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False
+        )
         combined = torch.cat([noisy_for_enc, reveal_resized], dim=1)
         img_tokens = self.latent_encoder(combined)  # (B, G², hidden)
 
@@ -844,9 +850,12 @@ class ObjectFeatureEncoderV1CentroidMaskFused(ConditionEncoderBase):
             keep = (torch.rand(p.shape, device=p.device) > p).float()
             noisy_for_enc = x_noisy * keep[:, None, None, None]
 
-        mask_resized = spatial_conditions
-        if spatial_conditions.shape[-2:] != noisy_for_enc.shape[-2:]:
-            mask_resized = F.interpolate(spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False)
+        # Always interpolate unconditionally — see ObjectFeatureEncoderV1RevealFused
+        # for why a runtime shape-comparison branch here is worth avoiding even
+        # though mask_size is built to already match grid_size in practice.
+        mask_resized = F.interpolate(
+            spatial_conditions, size=noisy_for_enc.shape[-2:], mode="bilinear", align_corners=False
+        )
         combined = torch.cat([noisy_for_enc, mask_resized], dim=1)
         img_tokens = self.latent_encoder(combined)  # (B, G², hidden)
 
