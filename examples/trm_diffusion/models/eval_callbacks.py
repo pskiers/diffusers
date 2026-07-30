@@ -30,6 +30,7 @@ from eval.mnist_eval import (
 )
 from eval.maze_eval import evaluate_mazes, make_maze_panel_image
 from eval.steiner_eval import evaluate_steiner, make_steiner_panel_image
+from eval.polygon_eval import evaluate_polygon, make_polygon_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -749,6 +750,111 @@ class SteinerEvalCallback(EvalCallbackBase):
             # Fraction of *all* evaluated samples (not just valid ones) that a
             # ratio was computable for — lets a low mean ratio be read
             # alongside how much of the eval set it's actually based on.
+            result["optimality_ratio_coverage"] = len(all_ratios) / max(n_done, 1)
+            if all_ratios:
+                result["optimality_ratio"] = float(np.mean(all_ratios))
+        if panels:
+            result["samples"] = panels
+        return result
+
+
+# ── Max-Area Polygon ───────────────────────────────────────────────────────────
+
+
+class PolygonEvalCallback(EvalCallbackBase):
+    """
+    DDIM sampling eval for Max-Area Polygon models: sample images, detect
+    which of the known-point-pairs form edges (distance-transform-based —
+    see eval/polygon_eval.py), and score whether they form a valid simple
+    polygon using every point (Hamiltonian cycle + no self-intersections,
+    checked from exact known coordinates, not pixels).
+
+    Returns: constraint_puzzle_acc, optimality_ratio, optimality_ratio_coverage
+    (see eval.polygon_eval.evaluate_polygon and PolygonDataset.optimal_area_for
+    for exact definitions — mirrors SteinerEvalCallback's shape).
+
+    Args:
+        image_size: must match the dataset's rendering resolution.
+        num_samples: total number of samples to evaluate.
+        num_log_images: number of panel images to log to WandB.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 128,
+        num_samples: int = 1000,
+        num_log_images: int = 8,
+    ):
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.num_log_images = num_log_images
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "PolygonEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_total = self.num_samples
+        n_log = self.num_log_images
+        dataset = getattr(dataloader, "dataset", None)
+        area_lookup = getattr(dataset, "optimal_area_for", None)
+
+        all_constraint: list = []
+        all_ratios: list = []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (n_total + pipeline.batch_size - 1) // pipeline.batch_size
+        for batch in tqdm(dataloader, "Polygon eval", total=n_batches):
+            if n_done >= n_total:
+                break
+            B_cur = batch["images"].shape[0]
+
+            conditions = model._batch_to_sample(batch, device)
+            generated = pipeline.sample_one_batch(model, conditions, device)
+            generated = model.decode_for_eval(generated)  # (B, 1, H, W) in [-1, 1]-ish
+
+            acc = evaluate_polygon(
+                generated,
+                batch["embedding_conditions"].to(device),
+                batch["embedding_mask"].to(device),
+                self.image_size,
+            )
+            all_constraint.append(acc["constraint_puzzle_acc"])
+
+            if area_lookup is not None:
+                puzzle_ids = batch["puzzle_id"].cpu().tolist()
+                gen_area = acc["per_sample_area"]
+                valid = acc["per_sample_valid"]
+                for i in range(B_cur):
+                    if not valid[i] or not np.isfinite(gen_area[i]):
+                        continue
+                    opt_area = area_lookup(puzzle_ids[i])
+                    if opt_area is not None and opt_area > 0:
+                        all_ratios.append(float(gen_area[i]) / float(opt_area))
+
+            if _wandb is not None and len(panels) < n_log:
+                n_new = min(n_log - len(panels), B_cur)
+                cond_cpu = batch["spatial_conditions"].cpu()
+                true_cpu = batch["images"].cpu()
+                gen_cpu = generated.cpu()
+                for i in range(n_new):
+                    panel = make_polygon_panel_image(cond_cpu[i], gen_cpu[i], true_cpu[i])
+                    panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_cur
+
+        result: dict = {
+            "constraint_puzzle_acc": float(np.mean(all_constraint)),
+        }
+        if area_lookup is not None:
             result["optimality_ratio_coverage"] = len(all_ratios) / max(n_done, 1)
             if all_ratios:
                 result["optimality_ratio"] = float(np.mean(all_ratios))

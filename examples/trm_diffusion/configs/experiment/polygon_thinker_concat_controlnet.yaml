@@ -1,0 +1,29 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen conditional (channel-concat, unscaled/
+# paper-size) Polygon painter — ControlNet steering added as a SEPARATE,
+# additive signal on top of the painter's own (already-trained) conditioning,
+# not a replacement of it. Requires a trained polygon_unet_concat_painter
+# checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=polygon_thinker_concat_controlnet \
+#     painter.checkpoint=runs/polygon_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: polygon
+  - override /backbone: polygon_unet_concat
+  - override /painter: polygon_unet_concat_controlnet_frozen
+  - override /thinker: polygon
+  - override /translator: controlnet_polygon_concat
+  - override /condition_encoder: polygon_spatial_v0
+  - override /train: polygon_thinker
+  - override /eval: polygon_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: polygon_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/polygon_thinker_concat_controlnet"

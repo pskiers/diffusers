@@ -1,0 +1,17 @@
+# Frozen ConcatConditionedUNetPainter (unscaled/paper-size) for ControlNet
+# thinker steering — stage 2. The frozen painter keeps concatenating its own
+# condition exactly as trained; the TRM's ControlNet steering is a SEPARATE,
+# additive signal on top, not a replacement of the painter's own conditioning.
+_target_: models.painter_base.ConcatConditionedControlNetSteeredUNetPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to polygon_unet_concat_painter checkpoint
+unet: ${backbone}
+image_channels: 1
+painter_dtype: null
+pixel_range: "[-1,1]"
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

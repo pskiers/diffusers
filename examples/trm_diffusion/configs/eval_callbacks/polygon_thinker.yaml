@@ -1,0 +1,4 @@
+- _target_: models.eval_callbacks.PolygonEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 1024
+  num_log_images: 8

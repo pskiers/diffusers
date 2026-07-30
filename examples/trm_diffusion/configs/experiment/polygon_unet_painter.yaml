@@ -1,0 +1,17 @@
+# @package _global_
+# Unconditional Max-Area Polygon UNetPainter.
+# Usage: python train_trm.py experiment=polygon_unet_painter
+
+defaults:
+  - override /data: polygon
+  - override /backbone: polygon_unet
+  - override /painter: polygon_unet
+  - override /train: polygon
+  - override /eval_callbacks: polygon
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/polygon_unet_painter"

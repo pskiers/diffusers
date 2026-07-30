@@ -1,0 +1,10 @@
+# ControlNet translator matching polygon_unet_concat.yaml's (unscaled/
+# paper-size) channels.
+_target_: models.translators.ControlNetTranslator
+in_channels: ${thinker.vocab_size}
+painter_channels: [64, 128, 256, 512]
+layers_per_block: 2
+painter_size: ${data.image_size}
+grid: 8             # image_size // grid_factor = 128 // 16
+bridge_mode: "normalized"
+with_timestep_emb: true
