@@ -1,4 +1,6 @@
 import dataclasses
+from typing import Optional
+
 import torch
 from hydra.utils import instantiate
 from tqdm.auto import tqdm
@@ -200,6 +202,60 @@ class ThinkerFrozenPainterBase(BaseModel):
         noise_pred = self.run_painter(sample, logits_for_tpt)
         return noise_pred, logits, z_H_next, z_L_next
 
+    def forward_with_carry(
+        self,
+        sample: DataSample,
+        z_H: Optional[torch.Tensor] = None,
+        z_L: Optional[torch.Tensor] = None,
+        n_sup: Optional[int] = None,
+        null_steering: bool = False,
+    ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
+        instead of always resetting it, and allows overriding n_sup.
+
+        z_H/z_L=None (the default) reproduces forward()'s behavior exactly:
+        a fresh get_initial_states() reset. Passing in a previous call's
+        returned carry instead lets a caller thread reasoning state across
+        denoising timesteps — out of the training distribution (training
+        only ever sees a fresh reset), so this is for inference-time
+        ablation only (see experiments/ablate_trm_loop_budget.py), not used
+        by forward() itself.
+
+        Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
+        null_steering, the carry is passed through unchanged so callers can
+        thread state uniformly regardless of null_steering.
+        """
+        bsz = sample.x_noisy.shape[0]
+
+        if null_steering:
+            logits = torch.zeros(
+                bsz, self.thinker.inner.config.seq_len, self.thinker.vocab_size,
+                device=sample.x_noisy.device,
+            )
+        else:
+            enc_emb = self._encode_condition(sample)
+            puzzle_ids = sample.puzzle_id
+
+            if z_H is None or z_L is None:
+                z_H, z_L = self.get_initial_states(bsz)
+                z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
+
+            n_sup = n_sup if n_sup is not None else self.n_sup
+            logits = None
+            for _ in range(n_sup):
+                logits, z_H, z_L = self.thinker.reasoning_step(
+                    enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
+                )
+
+        noise_pred = self.run_painter(sample, logits)
+
+        pred = DiffusionPrediction(
+            pred=noise_pred,
+            pred_type=self.painter.scheduler.config.prediction_type,
+            logits=None if null_steering else logits,
+        )
+        return pred, z_H, z_L
+
     def forward(self, sample: DataSample, null_steering: bool = False, **kwargs) -> DiffusionPrediction:
         """Single inference pass: encode → think (n_sup steps) → translate → paint.
 
@@ -215,33 +271,8 @@ class ThinkerFrozenPainterBase(BaseModel):
         (models/sampling.py), as opposed to null_condition_sample() below,
         which also zeros the painter's own conditioning.
         """
-        bsz = sample.x_noisy.shape[0]
-
-        if null_steering:
-            logits = torch.zeros(
-                bsz, self.thinker.inner.config.seq_len, self.thinker.vocab_size,
-                device=sample.x_noisy.device,
-            )
-        else:
-            enc_emb = self._encode_condition(sample)
-            puzzle_ids = sample.puzzle_id
-
-            z_H, z_L = self.get_initial_states(bsz)
-            z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
-
-            logits = None
-            for _ in range(self.n_sup):
-                logits, z_H, z_L = self.thinker.reasoning_step(
-                    enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
-                )
-
-        noise_pred = self.run_painter(sample, logits)
-
-        return DiffusionPrediction(
-            pred=noise_pred,
-            pred_type=self.painter.scheduler.config.prediction_type,
-            logits=None if null_steering else logits,
-        )
+        pred, _, _ = self.forward_with_carry(sample, null_steering=null_steering)
+        return pred
 
     def null_condition_sample(self, sample: DataSample) -> DataSample:
         """Return a copy with all condition fields zeroed for the CFG unconditional pass.
