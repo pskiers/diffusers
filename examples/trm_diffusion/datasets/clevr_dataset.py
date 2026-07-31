@@ -135,6 +135,35 @@ def make_mask_from_scene(scene_dict, mask_size=32, H_inv=None):
     return mask
 
 
+def make_presence_mask_from_scene(scene_dict, mask_size=32, sigma_frac=0.12):
+    """Single-channel spatial mask marking WHERE objects are — nothing else.
+
+    Unlike make_mask_from_scene, this has no per-attribute channels (no
+    color/shape/material/size), and every blob uses the SAME fixed sigma
+    (sigma_frac * mask_size) regardless of the object's own size — using the
+    object's true 3-D radius the way make_mask_from_scene does would let a
+    "large" object's blob leak its size via a bigger footprint. A clean
+    ablation for isolating pure positional information from identity.
+
+    Returns (1, mask_size, mask_size) float32 tensor.
+    """
+    objects = scene_dict["objects"]
+    mask = torch.zeros(1, mask_size, mask_size, dtype=torch.float32)
+
+    ys = torch.arange(mask_size, dtype=torch.float32)
+    xs = torch.arange(mask_size, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    sigma = max(sigma_frac * mask_size, 0.5)
+
+    for obj in objects:
+        cx = obj["pixel_coords"][0] / ORIG_W * mask_size
+        cy = obj["pixel_coords"][1] / ORIG_H * mask_size
+        blob = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma**2))
+        mask[0] = mask[0].maximum(blob)
+
+    return mask
+
+
 def make_reveal_from_scene(
     image: torch.Tensor,
     scene_dict: dict,
@@ -653,6 +682,7 @@ class CLEVRHybridDataset(Dataset):
         reveal_n_objects: int = 0,
         reveal_radius_frac: float = 0.12,
         include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
     ):
         """
         Args:
@@ -672,11 +702,18 @@ class CLEVRHybridDataset(Dataset):
             reveal_radius_frac: reveal-circle radius, as a fraction of image
                 size, when reveal_n_objects > 0.
             include_centroid_mask: if True, ALSO populate `spatial_conditions`
-                with the per-attribute Gaussian-blob mask (make_mask_from_scene)
-                at every object's true position — additive on top of `mode`'s
-                own `embedding_conditions`, unlike mode="mask" which replaces
-                it entirely. Mutually exclusive with reveal_n_objects (only one
-                spatial_conditions source at a time).
+                with a spatial map of every object's true position — additive
+                on top of `mode`'s own `embedding_conditions`, unlike
+                mode="mask" which replaces it entirely. Mutually exclusive
+                with reveal_n_objects (only one spatial_conditions source at
+                a time).
+            centroid_mask_presence_only: if True, the centroid mask is a
+                single presence channel (make_presence_mask_from_scene) —
+                WHERE objects are and nothing else, not even size (every
+                blob uses the same fixed sigma). If False (default), the
+                mask also carries per-object color/shape/material/size
+                (make_mask_from_scene). Only meaningful when
+                include_centroid_mask=True.
         """
         self.root_dir = root_dir
         self.mode = mode
@@ -686,6 +723,7 @@ class CLEVRHybridDataset(Dataset):
         self.reveal_n_objects = reveal_n_objects
         self.reveal_radius_frac = reveal_radius_frac
         self.include_centroid_mask = include_centroid_mask
+        self.centroid_mask_presence_only = centroid_mask_presence_only
         if reveal_n_objects > 0 and include_centroid_mask:
             raise ValueError("reveal_n_objects and include_centroid_mask are mutually exclusive.")
 
@@ -704,7 +742,7 @@ class CLEVRHybridDataset(Dataset):
         # H_inv maps 3-D ground-plane coords → pixel coords so we can derive
         # perspective-correct Gaussian blob radii for each object.
         self.H_inv = None
-        if mode == "mask" or include_centroid_mask:
+        if mode == "mask" or (include_centroid_mask and not centroid_mask_presence_only):
             print("Calibrating perspective projection for mask generation...")
             self.H_inv = calibrate_mask_projection(self.scenes)
 
@@ -758,6 +796,8 @@ class CLEVRHybridDataset(Dataset):
         spatial_conditions = None
         if self.reveal_n_objects > 0:
             spatial_conditions = make_reveal_from_scene(image_t, scene, self.reveal_n_objects, self.reveal_radius_frac)
+        elif self.include_centroid_mask and self.centroid_mask_presence_only:
+            spatial_conditions = make_presence_mask_from_scene(scene, self.mask_size)
         elif self.include_centroid_mask:
             spatial_conditions = make_mask_from_scene(scene, self.mask_size, self.H_inv)
 

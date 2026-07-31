@@ -37,6 +37,7 @@ from datasets.clevr_dataset import (
     CLEVRHybridDataset,
     calibrate_mask_projection,
     make_mask_from_scene,
+    make_presence_mask_from_scene,
     make_reveal_from_scene,
     make_tensor_from_scene,
     ORIG_W,
@@ -59,6 +60,7 @@ def _scene_to_data_sample(
     reveal_n_objects: int = 0,
     reveal_radius_frac: float = 0.12,
     include_centroid_mask: bool = False,
+    centroid_mask_presence_only: bool = False,
     mask_size: int = 32,
     H_inv=None,
 ) -> DataSample:
@@ -79,6 +81,8 @@ def _scene_to_data_sample(
         image = Image.open(os.path.join(image_dir, scene["image_filename"])).convert("RGB")
         image_t = transform(image)
         spatial_conditions = make_reveal_from_scene(image_t, scene, reveal_n_objects, reveal_radius_frac)
+    elif include_centroid_mask and centroid_mask_presence_only:
+        spatial_conditions = make_presence_mask_from_scene(scene, mask_size)
     elif include_centroid_mask:
         spatial_conditions = make_mask_from_scene(scene, mask_size, H_inv)
 
@@ -111,9 +115,9 @@ class ClevrImageLogCallback(EvalCallbackBase):
         min_objects:    Minimum number of objects per scene.
         max_objects:    Maximum number of objects per scene.
         split:          Dataset split to sample scenes from.
-        reveal_n_objects, reveal_radius_frac, include_centroid_mask, image_size:
-            must match data.reveal_n_objects / data.reveal_radius_frac /
-            data.include_centroid_mask / data.image_size whenever the bound
+        reveal_n_objects, reveal_radius_frac, include_centroid_mask,
+        centroid_mask_presence_only, image_size:
+            must match the same-named data.* config keys whenever the bound
             condition encoder needs spatial_conditions (reveal/centroid-mask
             variants) — otherwise generation crashes on spatial_conditions=None.
     """
@@ -129,6 +133,7 @@ class ClevrImageLogCallback(EvalCallbackBase):
         reveal_n_objects: int = 0,
         reveal_radius_frac: float = 0.12,
         include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
         image_size: int = 256,
     ):
         self._mode = mode
@@ -138,7 +143,11 @@ class ClevrImageLogCallback(EvalCallbackBase):
         filename_split = "val" if split == "validation" else split
         image_dir = os.path.join(root_dir, "CLEVR_v1.0", "images", filename_split)
         transform = T.Compose([T.Resize((image_size, image_size)), T.ToTensor(), T.Normalize([0.5], [0.5])])
-        H_inv = calibrate_mask_projection(scenes) if include_centroid_mask else None
+        H_inv = (
+            calibrate_mask_projection(scenes)
+            if include_centroid_mask and not centroid_mask_presence_only
+            else None
+        )
 
         self._base_samples = [
             _scene_to_data_sample(
@@ -149,6 +158,7 @@ class ClevrImageLogCallback(EvalCallbackBase):
                 reveal_n_objects=reveal_n_objects,
                 reveal_radius_frac=reveal_radius_frac,
                 include_centroid_mask=include_centroid_mask,
+                centroid_mask_presence_only=centroid_mask_presence_only,
                 mask_size=image_size // 8,
                 H_inv=H_inv,
             )
@@ -193,9 +203,9 @@ class ClevrMetricsCallback(EvalCallbackBase):
         max_objects:    Maximum number of objects per scene.
         batch_size:     Generation batch size.
         split:          Dataset split to sample scenes from.
-        reveal_n_objects, reveal_radius_frac, include_centroid_mask, image_size:
-            must match data.reveal_n_objects / data.reveal_radius_frac /
-            data.include_centroid_mask / data.image_size whenever the bound
+        reveal_n_objects, reveal_radius_frac, include_centroid_mask,
+        centroid_mask_presence_only, image_size:
+            must match the same-named data.* config keys whenever the bound
             condition encoder needs spatial_conditions (reveal/centroid-mask
             variants) — otherwise generation crashes on spatial_conditions=None.
     """
@@ -211,6 +221,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
         reveal_n_objects: int = 0,
         reveal_radius_frac: float = 0.12,
         include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
         image_size: int = 256,
     ):
         self._root_dir = root_dir
@@ -222,6 +233,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
         self._reveal_n_objects = reveal_n_objects
         self._reveal_radius_frac = reveal_radius_frac
         self._include_centroid_mask = include_centroid_mask
+        self._centroid_mask_presence_only = centroid_mask_presence_only
         self._image_size = image_size
 
         # Lazy-loaded on first main-process call.
@@ -245,7 +257,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
         self._transform = T.Compose(
             [T.Resize((self._image_size, self._image_size)), T.ToTensor(), T.Normalize([0.5], [0.5])]
         )
-        if self._include_centroid_mask:
+        if self._include_centroid_mask and not self._centroid_mask_presence_only:
             self._H_inv = calibrate_mask_projection(self._scenes)
 
         dino_proc = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
@@ -291,6 +303,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
                 reveal_n_objects=self._reveal_n_objects,
                 reveal_radius_frac=self._reveal_radius_frac,
                 include_centroid_mask=self._include_centroid_mask,
+                centroid_mask_presence_only=self._centroid_mask_presence_only,
                 mask_size=self._image_size // 8,
                 H_inv=self._H_inv,
             )

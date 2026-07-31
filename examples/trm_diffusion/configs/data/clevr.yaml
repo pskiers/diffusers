@@ -15,6 +15,12 @@ max_objects: 10
 reveal_n_objects: 0        # if >0, reveal a real-image crop around this many objects' true positions
 reveal_radius_frac: 0.12
 include_centroid_mask: false
+# If include_centroid_mask=true: presence-only mask (1 channel, WHERE objects
+# are and nothing else — not even size, every blob uses the same fixed sigma)
+# vs. the default full mask (16 channels, WHERE + color/shape/material/size).
+# Pair with condition_encoder=object_feature_v1_centroidmask_presence_fused_x0hint
+# (mask_channels: 1) instead of the *_centroidmask_fused_x0hint config.
+centroid_mask_presence_only: false
 
 train_dataset:
   _target_: datasets.clevr_dataset.CLEVRHybridDataset
@@ -26,6 +32,7 @@ train_dataset:
   reveal_n_objects: "${data.reveal_n_objects}"
   reveal_radius_frac: "${data.reveal_radius_frac}"
   include_centroid_mask: "${data.include_centroid_mask}"
+  centroid_mask_presence_only: "${data.centroid_mask_presence_only}"
 
 val_dataset:
   _target_: datasets.clevr_dataset.CLEVRHybridDataset
@@ -37,3 +44,4 @@ val_dataset:
   reveal_n_objects: "${data.reveal_n_objects}"
   reveal_radius_frac: "${data.reveal_radius_frac}"
   include_centroid_mask: "${data.include_centroid_mask}"
+  centroid_mask_presence_only: "${data.centroid_mask_presence_only}"
