@@ -53,9 +53,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import hydra
 import numpy as np
