@@ -1,0 +1,21 @@
+# Concat-conditioned Ball Drop backbone. in_channels=6 (3 image + 3 condition
+# channels, concatenated — see ConcatConditionedUNetPainter), out_channels=3.
+# Same scaled-down shape as Steiner/Polygon's conditional-small tier — a bit
+# wider at the deepest level than the unconditional backbone since this one
+# also has to learn to satisfy the condition, not just match the target
+# distribution.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 6
+out_channels: 3
+block_out_channels: [32, 64, 128]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

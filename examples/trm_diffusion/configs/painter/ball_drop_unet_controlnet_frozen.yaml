@@ -1,0 +1,14 @@
+# Frozen UNetPainter for ControlNet thinker steering — stage 2.
+# Loads a trained ball_drop_unet_painter checkpoint and freezes the UNet.
+# No trainable painter params — only the thinker and translator train.
+_target_: models.painter_base.ControlNetSteeredUNetPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to ball_drop_unet_painter checkpoint
+unet: ${backbone}
+painter_dtype: null
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

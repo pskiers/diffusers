@@ -1,0 +1,13 @@
+# Thinker-side condition encoder: spatial image CNN (V0, no noisy input),
+# same pattern as Maze/Steiner/Polygon's spatial_v0 encoders — reads the
+# (ball start + target bucket highlight)-only condition image and keeps
+# pixel-spatial correspondence, rather than CLEVR's permutation-invariant
+# per-object token set. in_channels=3: Ball Drop's condition is RGB (unlike
+# Steiner/Polygon's single-channel scheme — see datasets/ball_drop_dataset.py).
+_target_: models.condition_encoders.SpatialConditionEncoder
+in_channels: 3
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.grid_factor}
+with_timestep_emb: true

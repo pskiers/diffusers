@@ -1,0 +1,29 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen conditional (channel-concat) Ball Drop
+# painter — ControlNet steering added as a SEPARATE, additive signal on top
+# of the painter's own (already-trained) conditioning, not a replacement of
+# it (see ConcatConditionedControlNetSteeredUNetPainter). Requires a trained
+# ball_drop_unet_concat_painter checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=ball_drop_thinker_concat_controlnet \
+#     painter.checkpoint=runs/ball_drop_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: ball_drop
+  - override /backbone: ball_drop_unet_concat
+  - override /painter: ball_drop_unet_concat_controlnet_frozen
+  - override /thinker: ball_drop
+  - override /translator: controlnet_ball_drop_concat
+  - override /condition_encoder: ball_drop_spatial_v0
+  - override /train: ball_drop_thinker
+  - override /eval: ball_drop_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: ball_drop_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/ball_drop_thinker_concat_controlnet"

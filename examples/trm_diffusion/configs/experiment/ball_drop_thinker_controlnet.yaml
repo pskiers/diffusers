@@ -1,0 +1,26 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen unconditional Ball Drop UNet (ControlNet
+# steering). Requires a trained ball_drop_unet_painter checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=ball_drop_thinker_controlnet \
+#     painter.checkpoint=runs/ball_drop_unet_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: ball_drop
+  - override /backbone: ball_drop_unet
+  - override /painter: ball_drop_unet_controlnet_frozen
+  - override /thinker: ball_drop
+  - override /translator: controlnet_ball_drop
+  - override /condition_encoder: ball_drop_spatial_v0
+  - override /train: ball_drop_thinker
+  - override /eval: ball_drop_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: ball_drop_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/ball_drop_thinker_controlnet"

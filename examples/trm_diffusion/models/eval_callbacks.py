@@ -34,6 +34,7 @@ from eval.mnist_eval import (
 from eval.maze_eval import evaluate_mazes, make_maze_panel_image
 from eval.steiner_eval import evaluate_steiner, make_steiner_panel_image
 from eval.polygon_eval import evaluate_polygon, make_polygon_panel_image, _orders_equivalent
+from eval.ball_drop_eval import evaluate_ball_drop, make_ball_drop_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -1066,6 +1067,189 @@ class PolygonEvalCallback(EvalCallbackBase):
                 result[f"ratio_std{suffix}"] = float(np.std(all_ratios))
         if order_lookup is not None and all_exact_match:
             result[f"opt_rate{suffix}"] = float(np.mean(all_exact_match))
+        if panels:
+            result["samples"] = panels
+        return result
+
+
+# ── Ball Drop ───────────────────────────────────────────────────────────────
+
+
+class BallDropEvalCallback(EvalCallbackBase):
+    """
+    Best-of-N DDIM sampling eval for Ball Drop models: sample images, extract
+    the drawn solution line(s) (pixel-color based — see eval/ball_drop_eval.py),
+    re-simulate physics from the instance's recorded ball start position, and
+    check whether the ball settles in the recorded target bucket.
+
+    Unlike SteinerEvalCallback/PolygonEvalCallback, there is no ratio/
+    optimality dimension — this is a reachability/success task (any line
+    placement that lands the ball in the target bucket is equally valid, see
+    datasets/ball_drop_generation.py's docstring), so the only per-instance
+    question is pass/fail, not "how good."
+
+    Main metric:
+      valid_rate — fraction of instances with >=1 candidate (out of
+                   num_candidates independent noise samples) whose drawn
+                   line(s) route the ball into the target bucket.
+
+    Diagnostic metrics (per individual generated candidate, not best-of-N):
+      constraint_puzzle_acc, settled_rate (ball settled at all, regardless
+      of bucket — distinguishes "wrong bucket" from "physics never
+      resolved"), mean_lines_extracted.
+
+    extra_eval_sets adds additional held-out test sets with metrics suffixed
+    `_{name}` — in particular the real loganbolton/sketchvlm-physics-ball-drop
+    benchmark (see datasets/ball_drop_real_data.py), a genuine external
+    generalization check unlike Steiner/Polygon's synthetic OOD point
+    ranges: those 198 instances were solved by SketchVLM's own (undisclosed)
+    physics generator, not ours, and re-simulating them with our pymunk
+    parameters reproduces their recorded outcome ~88.9% of the time — see
+    that module's docstring for the validation. Each entry:
+        {name, hf_filename, hf_repo (optional),
+         num_samples (optional, defaults to this callback's num_samples)}
+
+    Args:
+        image_size: must match the dataset's rendering resolution.
+        num_samples: number of puzzle instances to evaluate on the primary
+                     (in-distribution) dataloader.
+        num_candidates: independent noise samples per instance for the
+                        best-of-N selection. Lower this (or num_samples) if
+                        periodic training-time eval is too slow — chunking
+                        rationale identical to SteinerEvalCallback's.
+        num_log_images: WandB panel images (primary dataloader only), shown
+                        using each logged instance's best-of-N candidate.
+        extra_eval_sets: optional list of held-out test-set specs.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 128,
+        num_samples: int = 1000,
+        num_candidates: int = 10,
+        num_log_images: int = 8,
+        extra_eval_sets: Optional[list] = None,
+    ):
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.num_candidates = num_candidates
+        self.num_log_images = num_log_images
+        self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
+        self._extra_dataloaders = None  # built lazily on first __call__
+
+    def _build_extra_dataloaders(self, batch_size: int) -> list:
+        from datasets.ball_drop_dataset import BallDropDataset
+
+        loaders = []
+        for spec in self._extra_specs:
+            ds_kwargs = {"image_size": self.image_size}
+            if spec.get("hf_repo") is not None:
+                ds_kwargs["hf_repo"] = spec["hf_repo"]
+            if spec.get("hf_filename") is not None:
+                ds_kwargs["hf_filename"] = spec["hf_filename"]
+            ds = BallDropDataset(**ds_kwargs)
+            dl = DataLoader(
+                ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=BallDropDataset.collate_fn
+            )
+            loaders.append((spec["name"], spec.get("num_samples", self.num_samples), dl))
+        return loaders
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "BallDropEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        if self._extra_dataloaders is None:
+            self._extra_dataloaders = self._build_extra_dataloaders(dataloader.batch_size)
+
+        result = self._eval_one(model, dataloader, accelerator, self.num_samples, suffix="", log_panels=True)
+        for name, n_samples, extra_dl in self._extra_dataloaders:
+            result.update(
+                self._eval_one(model, extra_dl, accelerator, n_samples, suffix=f"_{name}", log_panels=False)
+            )
+        return result
+
+    def _eval_one(self, model, dataloader, accelerator, n_total: int, suffix: str, log_panels: bool) -> dict:
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_log = self.num_log_images if log_panels else 0
+        dataset = getattr(dataloader, "dataset", None)
+        spec_lookup = getattr(dataset, "physics_spec_for", None)
+        chunk = max(1, pipeline.batch_size // self.num_candidates)
+
+        weighted_constraint, weighted_settled, weighted_lines = [], [], []
+        all_any_valid: list = []
+        panels: list = []
+        n_done = 0
+
+        if spec_lookup is None:
+            import logging
+            logging.getLogger(__name__).warning(
+                "BallDropEvalCallback: dataset has no physics_spec_for method, skipping eval."
+            )
+            return {}
+
+        n_batches = (n_total + dataloader.batch_size - 1) // dataloader.batch_size
+        for batch in tqdm(dataloader, "Ball drop eval" + suffix, total=n_batches):
+            if n_done >= n_total:
+                break
+            B_full = batch["images"].shape[0]
+
+            for start in range(0, B_full, chunk):
+                end = min(start + chunk, B_full)
+                sub = batch.slice(start, end)
+                B = end - start
+
+                puzzle_ids = sub["puzzle_id"].cpu().tolist()
+                specs = [spec_lookup(pid) for pid in puzzle_ids]
+                ball_start_x = np.array([s["ball_start_x"] for s in specs], dtype=np.float64)
+                target_bucket = np.array([s["target_bucket"] for s in specs], dtype=np.int64)
+
+                conditions = model._batch_to_sample(sub, device)
+                gen_bn = pipeline.sample_best_of_n(model, conditions, device, self.num_candidates)  # (B, N, C, H, W)
+                N = gen_bn.shape[1]
+                gen_flat = model.decode_for_eval(gen_bn.reshape(B * N, *gen_bn.shape[2:]))  # (B*N, 3, H, W)
+
+                ball_start_x_rep = np.repeat(ball_start_x, N)
+                target_bucket_rep = np.repeat(target_bucket, N)
+                acc = evaluate_ball_drop(gen_flat, ball_start_x_rep, target_bucket_rep, self.image_size)
+
+                w = B * N
+                weighted_constraint.append((acc["constraint_puzzle_acc"], w))
+                weighted_settled.append((float(acc["per_sample_settled"].mean()), w))
+                weighted_lines.append((float(acc["per_sample_num_lines_extracted"].mean()), w))
+
+                valid_bn = np.asarray(acc["per_sample_valid"]).reshape(B, N)
+                any_valid = valid_bn.any(axis=1)
+                all_any_valid.append(any_valid)
+
+                if _wandb is not None and len(panels) < n_log:
+                    n_new = min(n_log - len(panels), B)
+                    cond_cpu = sub["spatial_conditions"].cpu()
+                    true_cpu = sub["images"].cpu()
+                    gen_bn_cpu = gen_flat.reshape(B, N, *gen_flat.shape[1:]).cpu()
+                    for i in range(n_new):
+                        # No "best" objective here (success is binary) — log
+                        # the first valid candidate if any, else candidate 0.
+                        row = valid_bn[i]
+                        idx = int(np.argmax(row)) if row.any() else 0
+                        panel = make_ball_drop_panel_image(cond_cpu[i], gen_bn_cpu[i, idx], true_cpu[i])
+                        panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_full
+
+        any_valid_all = np.concatenate(all_any_valid) if all_any_valid else np.zeros(0, dtype=bool)
+        result: dict = {
+            f"constraint_puzzle_acc{suffix}": _weighted_mean(weighted_constraint),
+            f"settled_rate{suffix}": _weighted_mean(weighted_settled),
+            f"mean_lines_extracted{suffix}": _weighted_mean(weighted_lines),
+            f"valid_rate{suffix}": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
+        }
         if panels:
             result["samples"] = panels
         return result

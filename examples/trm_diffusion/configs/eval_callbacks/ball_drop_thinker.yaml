@@ -1,0 +1,13 @@
+# Same best-of-10 + real-sketchvlm-benchmark protocol as
+# configs/eval_callbacks/ball_drop.yaml (see its comments) — run against the
+# TRM+frozen-painter model, so the same metrics are directly comparable
+# against the plain conditional painter's.
+- _target_: models.eval_callbacks.BallDropEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 256
+  num_candidates: 10
+  num_log_images: 8
+  extra_eval_sets:
+    - name: real_sketchvlm
+      hf_filename: val_real_sketchvlm.ndjson
+      num_samples: 198

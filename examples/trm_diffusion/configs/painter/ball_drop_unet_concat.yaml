@@ -1,0 +1,19 @@
+# Trainable, conditional Ball Drop UNetPainter (channel-concat conditioning)
+# — stage 1. Unlike ball_drop_unet.yaml (unconditional), this painter sees
+# the (ball start + target bucket) condition image directly during its own
+# training, matching Steiner/Polygon's conditional-DM track. Trained with
+# CFG dropout (train.cfg_prob, see configs/train/ball_drop.yaml) so it can
+# also be sampled unconditionally.
+_target_: models.painter_base.ConcatConditionedUNetPainter
+_recursive_: false
+unet: ${backbone}
+image_channels: 3
+painter_dtype: null
+pixel_range: "[-1,1]"
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
