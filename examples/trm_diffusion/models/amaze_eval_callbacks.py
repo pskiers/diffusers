@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import wandb as _wandb
 from datasets.data_sample import DataSample
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from models.eval_callbacks import EvalCallbackBase
@@ -49,9 +50,25 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
         if not accelerator.is_main_process:
             return {}
 
-        scorer = self._make_scorer(accelerator.device)
+        # The metrics compare each generated image against a specific puzzle's GT
+        def _uses_spatial_conditioning(model) -> bool:
+            """True if ``model`` actually reads ``spatial_conditions`` as input."""
+            keys: set[str] = set()
+            painter_keys = getattr(model, "condition_keys", None)
+            if painter_keys:
+                keys.update(painter_keys)
+            condition_encoder = getattr(model, "condition_encoder", None)
+            if condition_encoder is not None:
+                keys.update(getattr(condition_encoder, "condition_keys", None) or [])
+            return "spatial_conditions" in keys
+
+        uses_conditioning = _uses_spatial_conditioning(model)
+
+        scorer = self._make_scorer(accelerator.device) if uses_conditioning else None
         pipeline = model.sampling_pipeline
-        n_total = self.num_samples
+
+        n_total = self.num_samples if scorer is not None else self.num_log_images # Unconditional painter logs a few images
+        n_attempts = self.num_attempts if scorer is not None else 1
         n_done = 0
         panels = []
 
@@ -66,7 +83,7 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
             # K attempts/sample (K=1 -> plain Pass@1). Distinct seed per attempt so
             # the attempts differ.
             attempts = []
-            for k in range(self.num_attempts):
+            for k in range(n_attempts):
                 gen_k = torch.Generator(device=accelerator.device).manual_seed(k)
                 sampled = pipeline.sample_one_batch(model, conditions, accelerator.device, generator=gen_k)
                 attempts.append(model.decode_for_eval(sampled)[:B].cpu())
@@ -82,10 +99,21 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
                 scorer.compute_and_accumulate_metrics(inputs, metadata)
 
             if _wandb is not None and len(panels) < self.num_log_images:
+                cond_imgs = getattr(conditions, "spatial_conditions", None) if uses_conditioning else None
+                if cond_imgs is not None:
+                    cond_imgs = cond_imgs[:B].detach().float().cpu().clamp(0.0, 1.0)
+
                 for i in range(min(B, self.num_log_images - len(panels))):
+                    if cond_imgs is not None:
+                        # Side-by-side [generated | condition]. (cond_imgs is already float) so
+                        panel = make_grid([generated[i].float(), cond_imgs[i]], nrow=2)
+                        caption = f"{self._log_caption} sample {n_done + i} [generated | condition]"
+                    else:
+                        panel = generated[i]
+                        caption = f"{self._log_caption} sample {n_done + i}"
                     panels.append(_wandb.Image(
-                        (generated[i].permute(1, 2, 0).numpy() * 255).astype("uint8"),
-                        caption=f"{self._log_caption} sample {n_done + i}",
+                        (panel.permute(1, 2, 0).numpy() * 255).astype("uint8"),
+                        caption=caption,
                     ))
 
             n_done += B

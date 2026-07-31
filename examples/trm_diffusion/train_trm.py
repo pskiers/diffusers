@@ -122,10 +122,20 @@ def main(cfg: DictConfig):
             wandb_id = wandb.util.generate_id()
             id_file.write_text(wandb_id)
 
+        init_timeout = float(os.environ.get("WANDB_INIT_TIMEOUT", "300"))
+        wandb_config = OmegaConf.to_container(cfg, resolve=True)
+        init_kwargs = {
+            "wandb": {
+                "name": run_name,
+                "id": wandb_id,
+                "resume": "allow",
+                "settings": wandb.Settings(init_timeout=init_timeout),
+            }
+        }
         accelerator.init_trackers(
             project_name=wandb_project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": {"name": run_name, "id": wandb_id, "resume": "allow"}},
+            config=wandb_config,
+            init_kwargs=init_kwargs,
         )
 
     torch.manual_seed(cfg.train.seed + accelerator.process_index)
