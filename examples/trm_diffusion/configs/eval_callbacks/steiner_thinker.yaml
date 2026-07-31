@@ -1,4 +1,21 @@
+# Same best-of-10 + OOD-point-range protocol as configs/eval_callbacks/steiner.yaml
+# (see its comments) — run against the TRM+frozen-painter model, so the same
+# metrics are directly comparable against the plain conditional painter's.
 - _target_: models.eval_callbacks.SteinerEvalCallback
   image_size: ${data.image_size}
-  num_samples: 1024
+  num_samples: 256
+  num_candidates: 10
   num_log_images: 8
+  extra_eval_sets:
+    - name: pts21_30
+      hf_filename: val_21_30.ndjson
+      max_points: 30
+      num_samples: 128
+    - name: pts31_40
+      hf_filename: val_31_40.ndjson
+      max_points: 40
+      num_samples: 128
+    - name: pts41_50
+      hf_filename: val_41_50.ndjson
+      max_points: 50
+      num_samples: 128

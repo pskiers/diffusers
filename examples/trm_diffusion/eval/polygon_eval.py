@@ -112,6 +112,20 @@ def _cycle_edges_self_intersect(points_xy: np.ndarray, order: list[int]) -> bool
     return False
 
 
+def _orders_equivalent(a: list[int], b: list[int]) -> bool:
+    """True if cyclic vertex orders `a` and `b` describe the same polygon.
+
+    A polygon's vertex list has no canonical start index or traversal
+    direction, so two orders describe the same polygon iff one is a
+    rotation of the other, or a rotation of its reversal."""
+    if len(a) != len(b):
+        return False
+    n = len(a)
+    doubled = b + b
+    doubled_rev = b[::-1] + b[::-1]
+    return any(doubled[s : s + n] == a or doubled_rev[s : s + n] == a for s in range(n))
+
+
 def _hamiltonian_cycle_order(n: int, edges: list[tuple[int, int]]) -> list[int] | None:
     """Search for *some* Hamiltonian cycle within `edges` (does not require
     the edge set to be exactly one cycle — tolerates extra "phantom" edges
@@ -169,6 +183,12 @@ def evaluate_polygon(
                               combines this with the instance's exact
                               optimal area (PolygonDataset.optimal_area_for,
                               looked up by puzzle_id) to get optimality_ratio.
+      per_sample_order      — length-B list; the recovered vertex order
+                              (point indices into embedding_conditions'
+                              non-pad slots) where valid, else None — the
+                              caller compares this against
+                              PolygonDataset.optimal_order_for (via
+                              _orders_equivalent) to score exact-match rate.
     """
     B = images.shape[0]
     imgs = images.squeeze(1).cpu().numpy()
@@ -177,6 +197,7 @@ def evaluate_polygon(
 
     valid = np.zeros(B, dtype=bool)
     area = np.full(B, np.nan, dtype=np.float64)
+    orders: list = [None] * B
 
     for b in range(B):
         pts_xy = emb[b][mask[b]]  # (n, 2) in [0,1]
@@ -192,11 +213,13 @@ def evaluate_polygon(
             continue
         valid[b] = True
         area[b] = abs(_area_signed([tuple(p) for p in pts_xy], order))
+        orders[b] = order
 
     return {
         "constraint_puzzle_acc": float(valid.mean()),
         "per_sample_valid": valid,
         "per_sample_area": area,
+        "per_sample_order": orders,
     }
 
 

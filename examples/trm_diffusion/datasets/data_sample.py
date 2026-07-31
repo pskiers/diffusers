@@ -113,6 +113,17 @@ class DataSample:
             kwargs[f.name] = val.to(device) if isinstance(val, Tensor) else val
         return DataSample(**kwargs)
 
+    def slice(self, start: int, end: int) -> DataSample:
+        """Return a new DataSample with every tensor field's batch dim sliced
+        to [start:end] — e.g. to sub-chunk a dataloader batch before an
+        expensive per-instance operation (best-of-N sampling) so the actual
+        model batch size stays bounded regardless of the dataloader's."""
+        kwargs = {}
+        for f in fields(DataSample):
+            val = getattr(self, f.name)
+            kwargs[f.name] = val[start:end] if isinstance(val, Tensor) else val
+        return DataSample(**kwargs)
+
 
 # ── Collation ────────────────────────────────────────────────────────────────
 

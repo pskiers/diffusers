@@ -139,6 +139,7 @@ class PolygonDataset(Dataset):
                 if line:
                     self.instances.append(json.loads(line))
         self._area_by_id = {inst["instance_id"]: inst["polygon_area"] for inst in self.instances}
+        self._order_by_id = {inst["instance_id"]: inst["polygon_order"] for inst in self.instances}
 
     def __len__(self) -> int:
         return len(self.instances)
@@ -149,6 +150,15 @@ class PolygonDataset(Dataset):
         eval/polygon_eval.py to score optimality without re-solving or
         re-deriving it lossily from a rendered image."""
         return self._area_by_id.get(int(puzzle_id))
+
+    def optimal_order_for(self, puzzle_id: int) -> Optional[list]:
+        """Exact optimal vertex order (point indices) the solver found for
+        this instance at generation time — used by PolygonEvalCallback to
+        check whether the recovered polygon matches the true optimum exactly
+        (not just by area), via eval.polygon_eval._orders_equivalent
+        (cyclic/reflection-invariant comparison, since a polygon's vertex
+        list has no canonical start or direction)."""
+        return self._order_by_id.get(int(puzzle_id))
 
     def __getitem__(self, idx: int) -> DataSample:
         inst = self.instances[idx]
