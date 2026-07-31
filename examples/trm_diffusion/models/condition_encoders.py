@@ -276,14 +276,21 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
                     Hydra before reaching this constructor. Must accept an
                     ``x_noisy`` kwarg.
         threshold: minimum diffusion timestep the hint is ever computed at.
+        enabled:   if False, forward() skips the hint entirely and passes
+                    x_noisy straight through to inner unchanged — an
+                    ablation/diagnostic switch (e.g. to check whether a
+                    checkpoint trained before the hint mechanism was
+                    correctly wired up actually relies on it), not something
+                    to disable for real training/inference.
     """
 
     needs_sample = True
 
-    def __init__(self, inner: ConditionEncoderBase, threshold: int):
+    def __init__(self, inner: ConditionEncoderBase, threshold: int, enabled: bool = True):
         super().__init__()
         self.inner = inner
         self.threshold = threshold
+        self.enabled = enabled
         self._painter = None
 
     @property
@@ -333,7 +340,7 @@ class X0PredHintConditionEncoder(ConditionEncoderBase):
         x_noisy/timesteps (e.g. ObjectFeatureEncoderV1Reveal/CentroidMask's
         spatial_conditions). Only x_noisy is intercepted and replaced with
         the hint; everything else is the inner encoder's business."""
-        hint = self._x0_pred_hint(sample, x_noisy, timesteps) if timesteps is not None else x_noisy
+        hint = self._x0_pred_hint(sample, x_noisy, timesteps) if (self.enabled and timesteps is not None) else x_noisy
         return self.inner(condition, x_noisy=hint, timesteps=timesteps, **extra)
 
 
