@@ -113,14 +113,11 @@ def main(cfg: DictConfig):
     if wandb_project and accelerator.is_main_process:
         import wandb
 
-        # Persist a stable wandb run id so a later eval job (sample_amaze_metrics.py) can resume THIS run and log its metrics into the same panel. resume="allow"
+        # Persist a stable wandb run id so a later eval job (sample_amaze_metrics.py)
         run_name = Path(cfg.run.output_dir).name
         id_file = Path(cfg.run.output_dir) / "wandb_run_id.txt"
-        if id_file.exists():
-            wandb_id = id_file.read_text().strip()
-        else:
-            wandb_id = wandb.util.generate_id()
-            id_file.write_text(wandb_id)
+        resume_existing = id_file.exists()
+        wandb_id = id_file.read_text().strip() if resume_existing else wandb.util.generate_id()
 
         init_timeout = float(os.environ.get("WANDB_INIT_TIMEOUT", "300"))
         wandb_config = OmegaConf.to_container(cfg, resolve=True)
@@ -128,7 +125,7 @@ def main(cfg: DictConfig):
             "wandb": {
                 "name": run_name,
                 "id": wandb_id,
-                "resume": "allow",
+                "resume": "allow" if resume_existing else None,
                 "settings": wandb.Settings(init_timeout=init_timeout),
             }
         }
@@ -137,6 +134,8 @@ def main(cfg: DictConfig):
             config=wandb_config,
             init_kwargs=init_kwargs,
         )
+        if not resume_existing:
+            id_file.write_text(wandb_id)
 
     torch.manual_seed(cfg.train.seed + accelerator.process_index)
 
