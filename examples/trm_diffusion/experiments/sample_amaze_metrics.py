@@ -54,12 +54,14 @@ def _build_amaze_dataset(cfg: DictConfig, dataset_path: str) -> AmazeDataset:
 @torch.no_grad()
 def sample_and_score(
     model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int
-) -> list[dict]:
+) -> tuple[list[dict], dict | None]:
     """Sample `samples_per_puzzle` attempts per puzzle and score them with the AmazeMetrics evaluator.
 
-    Returns one row per puzzle:
+    Returns ``(rows, sample_pair)`` where ``rows`` has one entry per puzzle:
     - first-attempt Violation/Coverage/MSE-In/MSE-Out, Pass@1 (exact solve on the first attempt)
     - Pass@K (exact solve within K attempts / best-of-K).
+    ``sample_pair`` is one representative {'generated', 'condition'} image pair
+    (first puzzle, first attempt) for the summary table, or None if empty.
     """
     from eval.amaze_eval import AmazeMetrics
 
@@ -70,6 +72,7 @@ def sample_and_score(
     puzzles_per_batch = max(1, batch_size // K)   # keep all K attempts of a puzzle in the same batch
 
     rows = []
+    sample_pair = None
     for start in range(0, len(ds), puzzles_per_batch):
         puzzles = [ds[i] for i in range(start, min(start + puzzles_per_batch, len(ds)))]
         # Replicate each puzzle K times ([p0]*K + [p1]*K + ...): identical conditions,
@@ -83,6 +86,12 @@ def sample_and_score(
 
         P = len(puzzles)
         inputs = decoded.reshape(P, K, *decoded.shape[1:])               # (P, K, C, H, W)
+        if sample_pair is None and P > 0:
+            cond = puzzles[0].spatial_conditions
+            sample_pair = {
+                "generated": inputs[0, 0].clone(),
+                "condition": cond.detach().cpu() if cond is not None else None,
+            }
         metadata = [p.metadata if p.metadata is not None else {} for p in puzzles]
 
         # Pass@K is best-of-K: the evaluator sets pass_at_{K} = any(exact solve) over the K attempts (eval/amaze_eval.py).
@@ -96,7 +105,7 @@ def sample_and_score(
                 "pass1": rec["pass"],        # exact solve on the first attempt
                 "pass5": pass_at_k,          # exact solve within K attempts (best-of-K)
             })
-    return rows
+    return rows, sample_pair
 
 
 def _aggregate(rows: list[dict]) -> dict:
@@ -123,7 +132,35 @@ def _print_metrics_row(label: str, agg: dict) -> None:
     print("=" * 78)
 
 
-def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict) -> None:
+def _print_metrics_table(label: str, named_aggs: list) -> None:
+    """Print a multi-row metrics table (one row per (name, agg) pair)."""
+    print("\n" + "=" * 90)
+    print(f"Metrics — {label}")
+    print("=" * 90)
+    print(f"{'Group':>12} {'Violation':>10} {'Coverage':>10} {'MSE-In':>10} {'MSE-Out':>10} {'Pass@1':>10} {'Pass@5':>10}")
+    for name, agg in named_aggs:
+        print(f"{name:>12} {agg['violation']*100:>9.2f}% {agg['coverage']*100:>9.2f}% "
+              f"{agg['mse_inside']:>10.4f} {agg['mse_outside']:>10.4f} "
+              f"{agg['pass1']*100:>9.2f}% {agg['pass5']*100:>9.2f}%")
+    print("=" * 90)
+
+
+def _make_wandb_image(tensor):
+    """Convert a (C,H,W) [0,1] tensor to a wandb.Image (HWC uint8); None -> None."""
+    if tensor is None:
+        return None
+    import numpy as np
+    import wandb
+
+    arr = tensor.detach().float().clamp(0, 1).cpu().numpy()
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    return wandb.Image((arr * 255).astype("uint8"))
+
+
+def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict, samples: dict | None = None) -> None:
     """Attach to the training run's wandb run and log the metrics into the SAME panel/run as training.
 
     The run id comes from +wandb_run_id=<id> or from <checkpoint_dir>/wandb_run_id.txt (written by train_trm.py). Missing project
@@ -164,14 +201,45 @@ def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict) -> Non
         for key, val in overall.items():
             run.summary[f"{prefix}/overall/{key}"] = val
 
-        breakdown = result.get("per_geometry") or result.get("per_scale") or {}
-        table = wandb.Table(columns=["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"])
-        for name, agg in breakdown.items():
-            table.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
+        # Per-shape tables (with a [generated | condition] image per row) go to
+        # BOTH the JSON (result["per_shape"]) and wandb. maze -> one table per
+        # shape under a distinct key; queens -> a single per-scale table.
+        samples = samples or {}
+        img_cols = ["group", "generated", "condition",
+                    "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
+
+        def _img_table(named_pairs):
+            t = wandb.Table(columns=img_cols)
+            for name, agg, pair in named_pairs:
+                pair = pair or {}
+                t.add_data(name, _make_wandb_image(pair.get("generated")),
+                           _make_wandb_image(pair.get("condition")),
+                           agg["violation"], agg["coverage"], agg["mse_inside"],
                            agg["mse_outside"], agg["pass1"], agg["pass5"])
-        table.add_data("OVERALL", overall["violation"], overall["coverage"], overall["mse_inside"],
-                       overall["mse_outside"], overall["pass1"], overall["pass5"])
-        run.log({f"{prefix}/metrics_table": table})
+            return t
+
+        per_shape = result.get("per_shape")
+        per_scale = result.get("per_scale")
+        if per_shape:
+            # One table PER SHAPE under a distinct key -> square/hexagon/triangle/circle
+            # never overwrite each other. Each row is a scale with its images.
+            for g, by_scale in per_shape.items():
+                rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(f"{g}_{s}")) for s in MAZE_SCALES]
+                run.log({f"{prefix}/{g}_table": _img_table(rows)})
+            # Per-geometry aggregation (scalars + one metrics-only table).
+            per_geometry = result.get("per_geometry") or {}
+            gtable = wandb.Table(columns=["geometry", "violation", "coverage",
+                                          "mse_inside", "mse_outside", "pass1", "pass5"])
+            for g, agg in per_geometry.items():
+                for key, val in agg.items():
+                    run.summary[f"{prefix}/per_geometry/{g}/{key}"] = val
+                gtable.add_data(g, agg["violation"], agg["coverage"], agg["mse_inside"],
+                                agg["mse_outside"], agg["pass1"], agg["pass5"])
+            run.log({f"{prefix}/per_geometry_table": gtable})
+        elif per_scale:
+            rows = [(f"{s}x{s}", per_scale[s], samples.get(s)) for s in per_scale]
+            run.log({f"{prefix}/per_scale_table": _img_table(rows)})
+
         logger.info(f"wandb: logged {task} metrics into run {run_id} (project {project}).")
     except Exception as e:
         logger.warning(f"wandb: logging failed ({e!r}); results already saved to JSON.")
@@ -215,7 +283,7 @@ def main(cfg: DictConfig):
     logger.info(f"Sampling with batch_size={sample_batch_size} (K={samples_per_puzzle} attempts/puzzle).")
 
     if task == "maze":
-        per_combo = {}
+        per_combo, combo_samples = {}, {}
         for geometry in MAZE_GEOMETRIES:
             for scale in MAZE_SCALES:
                 combo = data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
@@ -224,25 +292,44 @@ def main(cfg: DictConfig):
 
                 logger.info(f"[maze/{geometry}/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
 
-                rows = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
+                rows, sample_pair = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
                 per_combo[f"{geometry}_{scale}"] = rows
+                combo_samples[f"{geometry}_{scale}"] = sample_pair
 
         all_rows = [r for rows in per_combo.values() for r in rows]
+        per_combo_agg = {k: _aggregate(v) for k, v in per_combo.items()}
         per_geometry = {
             g: _aggregate([r for s in MAZE_SCALES for r in per_combo[f"{g}_{s}"]])
             for g in MAZE_GEOMETRIES
         }
         overall = _aggregate(all_rows)
 
-        _print_metrics_row("Maze (Continuous) — overall, 4 geometries x 7 scales x 100 DFS mazes", overall)
+        # Per-shape breakdown: one table per geometry, one row per scale.
+        for g in MAZE_GEOMETRIES:
+            _print_metrics_table(
+                f"Maze — {g} (per scale)",
+                [(f"{s}x{s}", per_combo_agg[f"{g}_{s}"]) for s in MAZE_SCALES],
+            )
+        # Per-geometry aggregation (over all scales).
+        _print_metrics_table("Maze — per geometry", [(g, per_geometry[g]) for g in MAZE_GEOMETRIES])
+        # Overall.
+        _print_metrics_row("Maze (Continuous) — overall, 4 geometries x 7 scales", overall)
 
-        for g, agg in per_geometry.items():
-            _print_metrics_row(f"Maze — {g} only", agg)
-
-        result = {"task": "maze", "overall": overall, "per_geometry": per_geometry, "n_puzzles": len(all_rows)}
+        # Nested per-shape tables (shape -> scale -> metrics): stored as distinct
+        # tables in the JSON and, later, as distinct wandb tables per shape.
+        per_shape = {
+            g: {str(s): per_combo_agg[f"{g}_{s}"] for s in MAZE_SCALES}
+            for g in MAZE_GEOMETRIES
+        }
+        result = {
+            "task": "maze", "overall": overall,
+            "per_shape": per_shape, "per_geometry": per_geometry,
+            "n_puzzles": len(all_rows),
+        }
+        samples = combo_samples
 
     else:
-        per_scale = {}
+        per_scale, scale_samples = {}, {}
         for scale in QUEEN_SCALES:
             combo = data_root / "test_queens" / f"n{scale}_test.parquet"
             _require_test_parquet(combo, "queens")
@@ -250,21 +337,19 @@ def main(cfg: DictConfig):
 
             logger.info(f"[queens/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
 
-            rows = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
+            rows, sample_pair = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
             per_scale[str(scale)] = rows
+            scale_samples[str(scale)] = sample_pair
 
         all_rows = [r for rows in per_scale.values() for r in rows]
-
         overall = _aggregate(all_rows)
-
-        _print_metrics_row("Queen (Discrete) — overall, 7 scales (4..10) x 50 puzzles", overall)
-
         per_scale_agg = {s: _aggregate(rows) for s, rows in per_scale.items()}
 
-        for s, agg in per_scale_agg.items():
-            _print_metrics_row(f"Queen — n={s} only", agg)
+        _print_metrics_table("Queen — per scale", [(f"{s}x{s}", per_scale_agg[s]) for s in per_scale_agg])
+        _print_metrics_row("Queen (Discrete) — overall, 7 scales (4..10)", overall)
 
         result = {"task": "queens", "overall": overall, "per_scale": per_scale_agg, "n_puzzles": len(all_rows)}
+        samples = scale_samples
 
     result["checkpoint"] = str(checkpoint)
     result["step"] = step
@@ -274,7 +359,7 @@ def main(cfg: DictConfig):
     logger.info(f"Results saved -> {out_path}")
 
     if accelerator.is_main_process:
-        _log_wandb(cfg, str(checkpoint), task, result)
+        _log_wandb(cfg, str(checkpoint), task, result, samples)
 
 
 if __name__ == "__main__":
