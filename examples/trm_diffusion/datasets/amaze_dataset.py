@@ -47,23 +47,32 @@ class AmazeDataset(Dataset):
             raise ValueError("AmazeDataset num_channels must be 1 or 3")
         self.num_channels = num_channels
 
-        # dataset_path may be a directory (loads maze_dataset_<split>.parquet
-        # from it) OR a direct .parquet FILE (flat layout, e.g.
-        # test_maze/square_3.parquet — the split is then ignored).
+        # dataset_path may be a directory (loads the split parquet from it) OR a
+        # direct .parquet FILE (flat layout, e.g. test_maze/hex/n3_hex_test.parquet
+        # — the split is then ignored).
         if str(dataset_path).endswith(".parquet") and os.path.isfile(dataset_path):
             file_path = str(dataset_path)
         else:
-            if split == "train":
-                file_name = "maze_dataset_train.parquet"
-            elif split == "val":
-                file_name = "maze_dataset_val.parquet"
-            elif split == "test":
-                file_name = "maze_dataset_test.parquet"
-            else:
+            # New layout uses train.parquet / validate.parquet; keep the legacy
+            # maze_dataset_*.parquet names as a fallback for older datasets.
+            candidates = {
+                "train": ("train.parquet", "maze_dataset_train.parquet"),
+                "val": ("validate.parquet", "maze_dataset_val.parquet"),
+                "test": ("test.parquet", "maze_dataset_test.parquet"),
+            }.get(split)
+            if candidates is None:
                 raise ValueError("AmazeDataset split must be 'train', 'val', or 'test'")
-            file_path = os.path.join(dataset_path, file_name)
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Amaze dataset file not found: {file_path}")
+            file_path = next(
+                (os.path.join(dataset_path, name)
+                 for name in candidates
+                 if os.path.exists(os.path.join(dataset_path, name))),
+                None,
+            )
+            if file_path is None:
+                raise FileNotFoundError(
+                    f"Amaze dataset file not found in {dataset_path} "
+                    f"(looked for {' or '.join(candidates)})"
+                )
 
         self.data = pd.read_parquet(file_path)
         if self.data.empty:

@@ -218,7 +218,7 @@ def main(cfg: DictConfig):
         per_combo = {}
         for geometry in MAZE_GEOMETRIES:
             for scale in MAZE_SCALES:
-                combo = data_root / "test_maze" / f"{geometry}_{scale}.parquet"
+                combo = data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
                 _require_test_parquet(combo, "maze")
                 ds = _build_amaze_dataset(cfg, str(combo))
 
@@ -244,7 +244,7 @@ def main(cfg: DictConfig):
     else:
         per_scale = {}
         for scale in QUEEN_SCALES:
-            combo = data_root / "test_queens" / f"n{scale}.parquet"
+            combo = data_root / "test_queens" / f"n{scale}_test.parquet"
             _require_test_parquet(combo, "queens")
             ds = _build_amaze_dataset(cfg, str(combo))
 

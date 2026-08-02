@@ -40,13 +40,11 @@ MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
 QUEEN_TRAIN = int(os.environ.get("QUEEN_TRAIN", "30000"))
 QUEEN_CELL_SIZE = os.environ.get("QUEEN_CELL_SIZE", "64")
 QUEEN_RADIUS = os.environ.get("QUEEN_RADIUS", "16")
-# Downsize the train split to the model input resolution (data.image_size) after
-# generation so per-step data loading isn't bound on the large source PNGs (the
-# maze generator renders ~102 px/cell -> ~830-1300px images). 0 disables.
-TRAIN_IMAGE_SIZE = int(os.environ.get("TRAIN_IMAGE_SIZE", "144"))
 # Parallel worker processes, split the batch across processes
 QUEEN_NPROC = _nproc("QUEEN_NPROC")
 MAZE_NPROC = _nproc("MAZE_NPROC")
+
+TRAIN_IMAGE_SIZE = int(os.environ.get("TRAIN_IMAGE_SIZE", "144"))
 
 _UNIVERSAL = ["recursiveBacktrack", "simplifiedPrims", "truePrims", "wilson", "aldousBroder", "huntAndKill"]
 TRAIN_ALGOS = {
@@ -65,36 +63,62 @@ QUEEN_TEST_SEED = 8_000_000      # per-scale: QUEEN_TEST_SEED + scale
 
 
 # ── Path helpers ─────────────────────────────────────────────────────────────
+# Test files (native resolution, one parquet each):
+#   test_queens/all_test.parquet, test_queens/n{n}_test.parquet
+#   test_maze/all_test.parquet
+#   test_maze/{shape}/all_{shape}_test.parquet
+#   test_maze/{shape}/n{n}_{shape}_test.parquet
+# Train leaves (train.parquet + validate.parquet; image_size in the leaf name):
+#   train_queens/{all|n{n}}_train_size{S}/
+#   train_maze/all_train_size{S}/                       (all shapes, all sizes)
+#   train_maze/{shape}/{all_{shape}|n{n}_{shape}}_train_size{S}/
 def test_maze_dir() -> Path:
     return OUT_ROOT / "test_maze"
-
-
-def test_maze_combo_file(geometry: str, scale: int) -> Path:
-    return test_maze_dir() / f"{geometry}_{scale}.parquet"
 
 
 def test_maze_all_file() -> Path:
     return test_maze_dir() / "all_test.parquet"
 
 
+def test_maze_shape_dir(shape: str) -> Path:
+    return test_maze_dir() / shape
+
+
+def test_maze_shape_all_file(shape: str) -> Path:
+    return test_maze_shape_dir(shape) / f"all_{shape}_test.parquet"
+
+
+def test_maze_combo_file(shape: str, scale: int) -> Path:
+    return test_maze_shape_dir(shape) / f"n{scale}_{shape}_test.parquet"
+
+
 def test_queens_dir() -> Path:
     return OUT_ROOT / "test_queens"
-
-
-def test_queens_scale_file(scale: int) -> Path:
-    return test_queens_dir() / f"n{scale}.parquet"
 
 
 def test_queens_all_file() -> Path:
     return test_queens_dir() / "all_test.parquet"
 
 
-def train_maze_dir(geometry: str, scale: int) -> Path:
-    return OUT_ROOT / f"train_maze_{geometry}_n{scale}"
+def test_queens_scale_file(scale: int) -> Path:
+    return test_queens_dir() / f"n{scale}_test.parquet"
 
 
-def train_queens_dir(scale: int) -> Path:
-    return OUT_ROOT / f"train_queens_n{scale}"
+def _scope_tag(size) -> str:
+    return "all" if str(size).upper() == "ALL" else f"n{size}"
+
+
+def train_queens_dir(size, image_size: int = TRAIN_IMAGE_SIZE) -> Path:
+    return OUT_ROOT / "train_queens" / f"{_scope_tag(size)}_train_size{image_size}"
+
+
+def train_maze_dir(shape: str, size, image_size: int = TRAIN_IMAGE_SIZE) -> Path:
+    root = OUT_ROOT / "train_maze"
+    if str(shape).upper() == "ALL":
+        return root / f"all_train_size{image_size}"
+    tag = _scope_tag(size)
+    leaf = f"all_{shape}_train_size{image_size}" if tag == "all" else f"{tag}_{shape}_train_size{image_size}"
+    return root / shape / leaf
 
 
 # ── Subprocess helper ────────────────────────────────────────────────────────
@@ -220,29 +244,69 @@ def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_rat
         shutil.rmtree(work, ignore_errors=True)
 
 
-def ensure_maze_test_combo(geometry: str, scale: int) -> None:
+def ensure_maze_test_combo(shape: str, scale: int) -> None:
     """Generate one paper-spec test combo file (skip if already present)."""
-    target = test_maze_combo_file(geometry, scale)
+    target = test_maze_combo_file(shape, scale)
     if target.exists():
-        print(f"   test_maze/{target.name} already exists — skip")
+        print(f"   {target.parent.name}/{target.name} already exists — skip")
         return
     entries = _maze_entries(
-        geometry, scale, MAZE_TEST_PER_SCALE, [TEST_ALGORITHM],
+        shape, scale, MAZE_TEST_PER_SCALE, [TEST_ALGORITHM],
         seed_base=MAZE_TEST_SEED + scale * 10_000,
     )
     _gen_maze_split(entries, target.parent, target.name, train_ratio=0.0)
 
 
-def gen_maze_train(geometry: str, scale: int) -> None:
-    """Generate a single-geometry train set (skip if already present)."""
-    target = train_maze_dir(geometry, scale) / "maze_dataset_train.parquet"
+def ensure_maze_test_shape_all(shape: str) -> Path:
+    """Ensure every scale combo for ``shape`` exists, then merge them into
+    test_maze/{shape}/all_{shape}_test.parquet (skip existing)."""
+    for scale in MAZE_SCALES:
+        ensure_maze_test_combo(shape, scale)
+    all_pq = test_maze_shape_all_file(shape)
+    if not all_pq.exists():
+        _merge_parquets([test_maze_combo_file(shape, s) for s in MAZE_SCALES], all_pq)
+    return all_pq
+
+
+def _maze_train_entries(shapes: list[str], scales: list[int]) -> list[dict]:
+    """Build MAZE_TRAIN maze entries distributed uniformly across the shape×scale
+    combos. Each combo gets a disjoint, position-stable seed range so the same
+    (shape, scale) yields identical puzzles whether generated alone or mixed."""
+    combos = [(g, s) for g in shapes for s in scales]
+    per_combo = _split_count(MAZE_TRAIN, len(combos))
+    entries: list[dict] = []
+    for (g, s), cnt in zip(combos, per_combo):
+        if cnt <= 0:
+            continue
+        gi, si = MAZE_GEOMETRIES.index(g), MAZE_SCALES.index(s)
+        seed_base = MAZE_TRAIN_SEED + (gi * len(MAZE_SCALES) + si) * 100_000
+        entries += _maze_entries(g, s, cnt, TRAIN_ALGOS.get(g, _UNIVERSAL), seed_base)
+    return entries
+
+
+def gen_maze_train(shape: str, size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
+    """Generate a maze train leaf (train.parquet, skip if present).
+
+    shape=all         → all shapes, all sizes.
+    shape, size=all   → one shape, all sizes.
+    shape, size=n     → one shape, one size.
+    """
+    target_dir = train_maze_dir(shape, size, image_size)
+    target = target_dir / "train.parquet"
     if target.exists():
-        print(f">> {target.parent.name}/maze_dataset_train.parquet already exists — skip")
+        print(f">> {target_dir.name}/train.parquet already exists — skip")
         return
-    algos = TRAIN_ALGOS.get(geometry, _UNIVERSAL)
-    print(f">> generating {MAZE_TRAIN} train mazes: {geometry} {scale}×{scale} (algos={len(algos)})")
-    entries = _maze_entries(geometry, scale, MAZE_TRAIN, algos, seed_base=MAZE_TRAIN_SEED)
-    _gen_maze_split(entries, target.parent, "maze_dataset_train.parquet", train_ratio=1.0)
+
+    if str(shape).upper() == "ALL":
+        shapes, scales, desc = MAZE_GEOMETRIES, MAZE_SCALES, "all shapes × all sizes"
+    elif str(size).upper() == "ALL":
+        shapes, scales, desc = [shape], MAZE_SCALES, f"{shape} × all sizes"
+    else:
+        shapes, scales, desc = [shape], [int(size)], f"{shape} {size}×{size}"
+
+    print(f">> generating {MAZE_TRAIN} train mazes: {desc}")
+    entries = _maze_train_entries(shapes, scales)
+    _gen_maze_split(entries, target_dir, "train.parquet", train_ratio=1.0)
 
 
 # ── Queen generation ─────────────────────────────────────────────────────────
@@ -290,6 +354,32 @@ def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
         raise
 
 
+def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
+    """Render ``count`` queen puzzles spread uniformly across QUEEN_SCALES and
+    merge them into a single mixed-size parquet. Each puzzle keeps its own ``n``
+    in the ``sample_json`` metadata, so the train set is a random mix of sizes.
+    Returns (parquet_path, work_dir); the caller must rmtree work_dir."""
+    work = Path(tempfile.mkdtemp(prefix="amaze_queen_mixed_"))
+    try:
+        per_scale = _split_count(count, len(QUEEN_SCALES))
+        parts = []
+        for scale, c in zip(QUEEN_SCALES, per_scale):
+            if c <= 0:
+                continue
+            # Disjoint seed ranges per scale (>> per-worker offsets inside the pool).
+            sub_produced, sub_work = _gen_queens_pool(scale, c, seed_base + scale * 100_000)
+            dst = work / f"pool_n{scale}.parquet"
+            shutil.move(str(sub_produced), str(dst))
+            shutil.rmtree(sub_work, ignore_errors=True)
+            parts.append(dst)
+        produced = work / "maze_dataset_train.parquet"
+        _merge_parquets(parts, produced)
+        return produced, work
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
 def ensure_queens_test_scale(scale: int) -> None:
     """Generate one paper-spec queen test scale file (skip if already present)."""
     target = test_queens_scale_file(scale)
@@ -304,15 +394,23 @@ def ensure_queens_test_scale(scale: int) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def gen_queens_train(scale: int) -> None:
-    """Generate a queen train set at n=scale (skip if already present)."""
-    target = train_queens_dir(scale) / "maze_dataset_train.parquet"
+def gen_queens_train(size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
+    """Generate a queen train leaf (train.parquet, skip if present).
+
+    ``size`` is an int (single ``n=size`` board) or the string ``"ALL"`` (30k
+    puzzles of mixed sizes uniformly sampled across QUEEN_SCALES)."""
+    target_dir = train_queens_dir(size, image_size)
+    target = target_dir / "train.parquet"
     if target.exists():
-        print(f">> {target.parent.name}/maze_dataset_train.parquet already exists — skip")
+        print(f">> {target_dir.name}/train.parquet already exists — skip")
         return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    print(f">> generating {QUEEN_TRAIN} train queen puzzles: n={scale}")
-    produced, work = _gen_queens_pool(scale, QUEEN_TRAIN, QUEEN_TRAIN_SEED)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if str(size).upper() == "ALL":
+        print(f">> generating {QUEEN_TRAIN} train queen puzzles: mixed scales {QUEEN_SCALES}")
+        produced, work = _gen_queens_mixed_pool(QUEEN_TRAIN, QUEEN_TRAIN_SEED)
+    else:
+        print(f">> generating {QUEEN_TRAIN} train queen puzzles: n={size}")
+        produced, work = _gen_queens_pool(int(size), QUEEN_TRAIN, QUEEN_TRAIN_SEED)
     try:
         shutil.move(str(produced), str(target))
     finally:
@@ -331,37 +429,33 @@ def _merge_parquets(parts: list[Path], out_path: Path) -> None:
 
 
 def ensure_maze_test_all() -> Path:
-    """Ensure the full diversified maze test set + merged all_test file exist."""
-    for geometry in MAZE_GEOMETRIES:
-        for scale in MAZE_SCALES:
-            ensure_maze_test_combo(geometry, scale)
+    """Ensure the full maze test tree: per-shape combos, per-shape all_{shape}_test,
+    and the top-level all_test (all shapes × all sizes). Skips existing files."""
+    shape_all = [ensure_maze_test_shape_all(shape) for shape in MAZE_GEOMETRIES]
     all_pq = test_maze_all_file()
     if not all_pq.exists():
-        parts = [test_maze_combo_file(g, s)
-                 for g in MAZE_GEOMETRIES for s in MAZE_SCALES]
-        _merge_parquets(parts, all_pq)
+        _merge_parquets(shape_all, all_pq)
     return all_pq
 
 
 def ensure_queens_test_all() -> Path:
-    """Ensure the full diversified queen test set + merged all_test file exist."""
+    """Ensure the full queen test set: per-scale n{n}_test + merged all_test."""
     for scale in QUEEN_SCALES:
         ensure_queens_test_scale(scale)
     all_pq = test_queens_all_file()
     if not all_pq.exists():
-        parts = [test_queens_scale_file(s) for s in QUEEN_SCALES]
-        _merge_parquets(parts, all_pq)
+        _merge_parquets([test_queens_scale_file(s) for s in QUEEN_SCALES], all_pq)
     return all_pq
 
 
-def copy_val(train_dir: Path, test_all_parquet: Path) -> None:
-    """Copy the merged diversified test set into the train dir as the val split."""
-    dst = train_dir / "maze_dataset_val.parquet"
+def copy_val(train_dir: Path, test_parquet: Path) -> None:
+    """Copy the matching test set into the train leaf as validate.parquet."""
+    dst = train_dir / "validate.parquet"
     if dst.exists():
-        print(f">> {train_dir.name}/maze_dataset_val.parquet already exists — skip")
+        print(f">> {train_dir.name}/validate.parquet already exists — skip")
         return
-    shutil.copyfile(test_all_parquet, dst)
-    print(f">> val ← copy of {test_all_parquet} → {dst}")
+    shutil.copyfile(test_parquet, dst)
+    print(f">> validate ← copy of {test_parquet.name} → {dst}")
 
 
 # Train split reads only these two image columns (resized); the rest are eval-only.
@@ -369,8 +463,8 @@ _RESIZE_COLS = ("m_original_img", "sol_img")
 _DROP_COLS = ("original_img", "mask_img", "cell_map")
 
 
-def _resize_train_parquet(train_dir: Path) -> None:
-    """Downsize the train split's images to TRAIN_IMAGE_SIZE in place (idempotent).
+def _resize_train_parquet(train_dir: Path, image_size: int | None = None) -> None:
+    """Downsize the train split's images to ``image_size`` (default TRAIN_IMAGE_SIZE) in place (idempotent).
 
     The maze generator renders at ~102 px/cell (~830-1300px images); AmazeDataset
     would otherwise BICUBIC-antialias-resize each to the model input size on the CPU
@@ -381,9 +475,11 @@ def _resize_train_parquet(train_dir: Path) -> None:
     for eval scoring, and the original is kept as *.orig.parquet. torch/PIL are
     imported lazily so plain test generation stays torch-free.
     """
-    if TRAIN_IMAGE_SIZE <= 0:
+    if image_size is None:
+        image_size = TRAIN_IMAGE_SIZE
+    if image_size <= 0:
         return
-    train_pq = train_dir / "maze_dataset_train.parquet"
+    train_pq = train_dir / "train.parquet"
     if not train_pq.is_file():
         return
 
@@ -415,12 +511,12 @@ def _resize_train_parquet(train_dir: Path) -> None:
     if not present:
         return
     probe = _decode(df.iloc[0][present[0]])
-    if probe is not None and max(probe.size) <= TRAIN_IMAGE_SIZE:
-        print(f">> train split already <= {TRAIN_IMAGE_SIZE}px — skip resize")
+    if probe is not None and max(probe.size) <= image_size:
+        print(f">> train split already <= {image_size}px — skip resize")
         return
 
     resize = transforms.Resize(
-        (TRAIN_IMAGE_SIZE, TRAIN_IMAGE_SIZE),
+        (image_size, image_size),
         interpolation=transforms.InterpolationMode.BICUBIC,
         antialias=True,
     )
@@ -441,66 +537,90 @@ def _resize_train_parquet(train_dir: Path) -> None:
     tmp = p + ".tmp"
     df.to_parquet(tmp, index=False)
     os.replace(tmp, p)
-    print(f">> resized train → {TRAIN_IMAGE_SIZE}px, dropped {dropped or '[]'}, backup {os.path.basename(backup)}")
+    print(f">> resized train → {image_size}px, dropped {dropped or '[]'}, backup {os.path.basename(backup)}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
-def _parse_kv(tokens: list[str]) -> dict[str, str]:
-    kv = {}
-    for tok in tokens:
-        if "=" not in tok:
-            raise SystemExit(f"Expected key=value, got '{tok}'")
-        k, v = tok.split("=", 1)
-        kv[k.strip()] = v.strip()
-    return kv
+def _norm_size(value):
+    """Return 'all' or an int for a --size token; None stays None."""
+    if value is None:
+        return None
+    if str(value).upper() == "ALL":
+        return "all"
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"--size must be 'all' or an integer, got '{value}'")
 
 
 def main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(add_help=True, description="Amaze dataset generator")
     parser.add_argument("mode", choices=["train", "test"])
     parser.add_argument("task", help="maze | queens (amaze == maze)")
-    parser.add_argument("kv", nargs="*", help="n=<int> type=<geom>")
+    parser.add_argument("--shape", default=None,
+                        help="maze train: all|" + "|".join(MAZE_GEOMETRIES))
+    parser.add_argument("--size", default=None, help="train: all | <int>")
+    parser.add_argument("--image-size", type=int, default=TRAIN_IMAGE_SIZE, dest="image_size")
     args = parser.parse_args(argv)
 
     task = "maze" if args.task in ("maze", "amaze") else args.task
     if task not in ("maze", "queens"):
         raise SystemExit(f"Unknown task '{args.task}' (use maze|queens)")
-    kv = _parse_kv(args.kv)
-    n = int(kv["n"]) if "n" in kv else None
-    geom = kv.get("type")
-
-    if task == "maze" and geom is not None and geom not in MAZE_GEOMETRIES:
-        raise SystemExit(f"Unknown maze type '{geom}' (use {'|'.join(MAZE_GEOMETRIES)})")
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    # ── TEST: always (re)generate the full tree, skipping what already exists. ──
     if args.mode == "test":
-        # Full paper-spec test set (n=/type= are ignored — the test set is the
-        # complete diversified sweep).
-        if task == "maze":
-            all_pq = ensure_maze_test_all()
-        else:
-            all_pq = ensure_queens_test_all()
+        all_pq = ensure_maze_test_all() if task == "maze" else ensure_queens_test_all()
         print(f"Done → {all_pq.parent}")
         return
 
-    # mode == "train": single-geometry/scale train + val (= copy of the test set, generated once if absent).
+    # ── TRAIN: only the requested --shape/--size combo. ───────────────────────
+    size = _norm_size(args.size)
+    if size is None:
+        raise SystemExit("train requires --size <all|int>")
+
     if task == "maze":
-        if geom is None:
-            raise SystemExit("maze train requires type=<geometry>")
-        scale = n if n is not None else 8
-        gen_maze_train(geom, scale)
-        all_pq = ensure_maze_test_all()
-        copy_val(train_maze_dir(geom, scale), all_pq)
-        _resize_train_parquet(train_maze_dir(geom, scale))
-        print(f"Done → {train_maze_dir(geom, scale)}")
+        shape = args.shape
+        if shape is None:
+            raise SystemExit("maze train requires --shape <all|" + "|".join(MAZE_GEOMETRIES) + ">")
+        if str(shape).upper() == "ALL":
+            shape = "all"
+            if size != "all":
+                raise SystemExit("--shape all is only valid with --size all")
+        elif shape not in MAZE_GEOMETRIES:
+            raise SystemExit(f"Unknown --shape '{shape}' (use all|{'|'.join(MAZE_GEOMETRIES)})")
+        if isinstance(size, int) and size not in MAZE_SCALES:
+            raise SystemExit(f"--size {size} not in {MAZE_SCALES}")
+
+        gen_maze_train(shape, size, args.image_size)
+        if shape == "all":
+            test_pq = ensure_maze_test_all()
+        elif size == "all":
+            test_pq = ensure_maze_test_shape_all(shape)
+        else:
+            ensure_maze_test_combo(shape, size)
+            test_pq = test_maze_combo_file(shape, size)
+        leaf = train_maze_dir(shape, size, args.image_size)
+        copy_val(leaf, test_pq)
+        _resize_train_parquet(leaf, args.image_size)
+        print(f"Done → {leaf}")
     else:
-        scale = n if n is not None else 7
-        gen_queens_train(scale)
-        all_pq = ensure_queens_test_all()
-        copy_val(train_queens_dir(scale), all_pq)
-        _resize_train_parquet(train_queens_dir(scale))
-        print(f"Done → {train_queens_dir(scale)}")
+        if args.shape is not None:
+            print("note: --shape is ignored for queens")
+        if isinstance(size, int) and size not in QUEEN_SCALES:
+            raise SystemExit(f"--size {size} not in {QUEEN_SCALES}")
+
+        gen_queens_train(size, args.image_size)
+        if size == "all":
+            test_pq = ensure_queens_test_all()
+        else:
+            ensure_queens_test_scale(size)
+            test_pq = test_queens_scale_file(size)
+        leaf = train_queens_dir(size, args.image_size)
+        copy_val(leaf, test_pq)
+        _resize_train_parquet(leaf, args.image_size)
+        print(f"Done → {leaf}")
 
 
 if __name__ == "__main__":
