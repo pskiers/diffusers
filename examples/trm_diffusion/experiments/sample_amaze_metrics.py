@@ -52,7 +52,9 @@ def _build_amaze_dataset(cfg: DictConfig, dataset_path: str) -> AmazeDataset:
 
 
 @torch.no_grad()
-def sample_and_score(model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int) -> list[dict]:
+def sample_and_score(
+    model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int
+) -> list[dict]:
     """Sample `samples_per_puzzle` attempts per puzzle and score them with the AmazeMetrics evaluator.
 
     Returns one row per puzzle:
@@ -63,33 +65,37 @@ def sample_and_score(model, ds: AmazeDataset, task: str, device, samples_per_puz
 
     pipeline = model.sampling_pipeline
     scorer = AmazeMetrics(device=device, task=task)
-    pass_k_key = f"pass_at_{samples_per_puzzle}"
+    K = samples_per_puzzle
+    pass_k_key = f"pass_at_{K}"
+    puzzles_per_batch = max(1, batch_size // K)   # keep all K attempts of a puzzle in the same batch
+
     rows = []
-    for idx in range(len(ds)):
-        sample = ds[idx]
-        batch = ds.collate_fn([sample])
-        conditions = model._batch_to_sample(batch, device)
+    for start in range(0, len(ds), puzzles_per_batch):
+        puzzles = [ds[i] for i in range(start, min(start + puzzles_per_batch, len(ds)))]
+        # Replicate each puzzle K times ([p0]*K + [p1]*K + ...): identical conditions,
+        # independent initial noise -> K distinct attempts per puzzle in a single loop.
+        flat = [p for p in puzzles for _ in range(K)]
+        conditions = model._batch_to_sample(ds.collate_fn(flat), device)
 
-        attempts = []
-        for k in range(samples_per_puzzle):
-            generator = torch.Generator(device=device).manual_seed(base_seed + idx * 1000 + k)
-            generated = pipeline.sample_one_batch(model, conditions, device, generator=generator)
-            attempts.append(model.decode_for_eval(generated)[0].cpu())   # (C, H, W) in [0, 1]
+        generator = torch.Generator(device=device).manual_seed(base_seed + start)
+        generated = pipeline.sample_one_batch(model, conditions, device, generator=generator)
+        decoded = model.decode_for_eval(generated).cpu()                 # (P*K, C, H, W) in [0, 1]
 
-        inputs = torch.stack(attempts, dim=0).unsqueeze(0)               # (1, K, C, H, W)
-
-        [rec] = scorer.compute_and_accumulate_metrics(inputs, [sample.metadata] if sample.metadata is not None else [{}])
+        P = len(puzzles)
+        inputs = decoded.reshape(P, K, *decoded.shape[1:])               # (P, K, C, H, W)
+        metadata = [p.metadata if p.metadata is not None else {} for p in puzzles]
 
         # Pass@K is best-of-K: the evaluator sets pass_at_{K} = any(exact solve) over the K attempts (eval/amaze_eval.py).
-        pass_at_k = rec[pass_k_key] if samples_per_puzzle > 1 else rec["pass"]
-        rows.append({
-            "violation": rec["background_violation"],
-            "coverage": rec["gt_cell_coverage"],
-            "mse_inside": rec["mse_inside"],
-            "mse_outside": rec["mse_outside"],
-            "pass1": rec["pass"],        # exact solve on the first attempt
-            "pass5": pass_at_k,          # exact solve within K attempts (best-of-K)
-        })
+        for rec in scorer.compute_and_accumulate_metrics(inputs, metadata):
+            pass_at_k = rec[pass_k_key] if K > 1 else rec["pass"]
+            rows.append({
+                "violation": rec["background_violation"],
+                "coverage": rec["gt_cell_coverage"],
+                "mse_inside": rec["mse_inside"],
+                "mse_outside": rec["mse_outside"],
+                "pass1": rec["pass"],        # exact solve on the first attempt
+                "pass5": pass_at_k,          # exact solve within K attempts (best-of-K)
+            })
     return rows
 
 
@@ -135,22 +141,42 @@ def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict) -> Non
 
     import wandb
 
-    run = wandb.init(project=project, id=run_id, resume="allow")
-    prefix = f"amaze_eval/{task}"
-    overall = result["overall"]
-    for key, val in overall.items():
-        run.summary[f"{prefix}/overall/{key}"] = val
+    # Attaching to the training run can hang on Athena when resuming a poisoned/half-created run id
+    # (see repo notes). Bound init and never let optional logging block or crash the eval — the JSON
+    # results are already on disk before this runs.
+    init_timeout = int(cfg.get("wandb_init_timeout", 60))
+    try:
+        run = wandb.init(
+            project=project, id=run_id, resume="allow",
+            settings=wandb.Settings(init_timeout=init_timeout),
+        )
+    except Exception as e:
+        id_file = Path(checkpoint).parent / "wandb_run_id.txt"
+        logger.warning(
+            f"wandb: init failed/timed out after {init_timeout}s ({e!r}), skipping wandb logging "
+            f"(results already saved to JSON). If the run id is poisoned, delete {id_file} and retry."
+        )
+        return
 
-    breakdown = result.get("per_geometry") or result.get("per_scale") or {}
-    table = wandb.Table(columns=["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"])
-    for name, agg in breakdown.items():
-        table.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
-                       agg["mse_outside"], agg["pass1"], agg["pass5"])
-    table.add_data("OVERALL", overall["violation"], overall["coverage"], overall["mse_inside"],
-                   overall["mse_outside"], overall["pass1"], overall["pass5"])
-    run.log({f"{prefix}/metrics_table": table})
-    wandb.finish()
-    logger.info(f"wandb: logged {task} metrics into run {run_id} (project {project}).")
+    try:
+        prefix = f"amaze_eval/{task}"
+        overall = result["overall"]
+        for key, val in overall.items():
+            run.summary[f"{prefix}/overall/{key}"] = val
+
+        breakdown = result.get("per_geometry") or result.get("per_scale") or {}
+        table = wandb.Table(columns=["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"])
+        for name, agg in breakdown.items():
+            table.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
+                           agg["mse_outside"], agg["pass1"], agg["pass5"])
+        table.add_data("OVERALL", overall["violation"], overall["coverage"], overall["mse_inside"],
+                       overall["mse_outside"], overall["pass1"], overall["pass5"])
+        run.log({f"{prefix}/metrics_table": table})
+        logger.info(f"wandb: logged {task} metrics into run {run_id} (project {project}).")
+    except Exception as e:
+        logger.warning(f"wandb: logging failed ({e!r}); results already saved to JSON.")
+    finally:
+        wandb.finish()
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
@@ -183,6 +209,11 @@ def main(cfg: DictConfig):
     model = accelerator.unwrap_model(model)
     model.eval()
 
+    # Pack whole puzzles + their K attempts into denoising batches of this size (defaults to the
+    # sampling pipeline's own batch_size) instead of sampling one puzzle at a time.
+    sample_batch_size = int(cfg.get("sample_batch_size", model.sampling_pipeline.batch_size))
+    logger.info(f"Sampling with batch_size={sample_batch_size} (K={samples_per_puzzle} attempts/puzzle).")
+
     if task == "maze":
         per_combo = {}
         for geometry in MAZE_GEOMETRIES:
@@ -193,7 +224,7 @@ def main(cfg: DictConfig):
 
                 logger.info(f"[maze/{geometry}/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
 
-                rows = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed)
+                rows = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
                 per_combo[f"{geometry}_{scale}"] = rows
 
         all_rows = [r for rows in per_combo.values() for r in rows]
@@ -219,7 +250,7 @@ def main(cfg: DictConfig):
 
             logger.info(f"[queens/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
 
-            rows = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed)
+            rows = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
             per_scale[str(scale)] = rows
 
         all_rows = [r for rows in per_scale.values() for r in rows]
