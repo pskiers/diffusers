@@ -16,10 +16,18 @@ is untouched):
              NOTE: carrying is out of the training distribution (training
              only ever sees a fresh reset) — a regression here is a real,
              expected possible outcome, not just a bug.
-  schedule — vary n_sup per denoising step (front-loaded / back-loaded, vs.
-             flat) at matched total compute. Needs schedule_flat_n and
+  schedule — vary n_sup per denoising step (front-loaded / back-loaded /
+             a bump or dip centered anywhere in the trajectory, vs. flat) at
+             matched total compute. Needs schedule_flat_n and
              schedule_reset_every set explicitly (informed by inspecting the
              static/carry results first) — run this axis in a second pass.
+             +ablation.schedule_directions=[bump] sweeps a Gaussian-shaped
+             budget bump; schedule_peaks (fraction of the trajectory, 0=first
+             step..1=last step, default [0.5]) sets where it's centered and
+             schedule_widths (std as a fraction of num_inference_steps,
+             default [0.25]) sets how thin (e.g. 0.08) or wide (e.g. 0.4) the
+             boosted range is. "dip" is the inverse (low at the peak, high on
+             both sides).
 
 For every configuration, reports the same 4 accuracies as SudokuEvalCallback
 (cell_acc, puzzle_acc, constraint_puzzle_acc, given_consistent_puzzle_acc)
@@ -44,6 +52,15 @@ Usage:
       experiment=mnist_thinker_v1_controlnet ... checkpoint=... \\
       +ablation.axes=[schedule] +ablation.schedule_flat_n=4 \\
       +ablation.schedule_reset_every=5
+
+    # A thin budget spike vs. a wide bump, both centered a third of the way
+    # through the trajectory (peak=0.33), matched total compute:
+    python experiments/ablate_trm_loop_budget.py \\
+      experiment=mnist_thinker_v1_controlnet ... checkpoint=... \\
+      +ablation.axes=[schedule] +ablation.schedule_flat_n=4 \\
+      +ablation.schedule_reset_every=5 \\
+      +ablation.schedule_directions=[bump] +ablation.schedule_peaks=[0.33] \\
+      +ablation.schedule_widths=[0.08,0.4]
 
 Config overrides work exactly like train_trm.py / eval.py.
 """
@@ -109,7 +126,9 @@ def _load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") 
 # ── Schedules ────────────────────────────────────────────────────────────────
 
 
-def _matched_budget_schedule(direction: str, flat_n: int, num_steps: int, ratio: float = 3.0) -> list[int]:
+def _matched_budget_schedule(
+    direction: str, flat_n: int, num_steps: int, ratio: float = 3.0, peak: float = 0.5, width: float = 0.25
+) -> list[int]:
     """Per-step n_sup ramp summing to flat_n * num_steps (matched total
     compute vs. the flat baseline), so a schedule vs. flat comparison isolates
     the effect of *reallocating* budget across time from the effect of
@@ -118,11 +137,31 @@ def _matched_budget_schedule(direction: str, flat_n: int, num_steps: int, ratio:
     direction="front": high budget at step 0 (the first denoising step, at
     the highest noise level) tapering to low budget near the end.
     direction="back": the reverse ramp.
+    direction="bump": a Gaussian bump peaking at step `peak * (num_steps-1)`
+    and decaying to low budget away from it. `peak` in [0, 1] positions the
+    bump anywhere along the trajectory (0=first step, 0.5=middle, 1=last
+    step). `width` is the bump's std as a fraction of num_steps — small
+    (e.g. 0.08) concentrates the extra budget into a thin range of steps;
+    large (e.g. 0.4) spreads it over most of the trajectory while still
+    peaking at `peak`.
+    direction="dip": the inverse bump — low budget at `peak`, high on both
+    sides of it (same `peak`/`width` semantics).
     """
     total = flat_n * num_steps
     lo = max(1, round(flat_n / ratio))
     hi = max(lo + 1, round(flat_n * ratio))
-    raw = np.linspace(hi, lo, num_steps) if direction == "front" else np.linspace(lo, hi, num_steps)
+    if direction == "front":
+        raw = np.linspace(hi, lo, num_steps)
+    elif direction == "back":
+        raw = np.linspace(lo, hi, num_steps)
+    elif direction in ("bump", "dip"):
+        center = peak * (num_steps - 1)
+        sigma = max(width * num_steps, 1e-6)
+        positions = np.arange(num_steps)
+        shape = np.exp(-0.5 * ((positions - center) / sigma) ** 2)
+        raw = lo + (hi - lo) * shape if direction == "bump" else hi - (hi - lo) * shape
+    else:
+        raise ValueError(f"Unknown schedule direction: {direction!r}")
     raw = raw * (total / raw.sum())
     sched = np.maximum(1, np.round(raw)).astype(int)
 
@@ -292,6 +331,8 @@ def main(cfg: DictConfig):
     schedule_reset_every = ab.get("schedule_reset_every", None)
     schedule_directions: list[str] = list(ab.get("schedule_directions", ["front", "back"]))
     schedule_ratio: float = ab.get("schedule_ratio", 3.0)
+    schedule_peaks: list[float] = list(ab.get("schedule_peaks", [0.5]))
+    schedule_widths: list[float] = list(ab.get("schedule_widths", [0.25]))
     out_path: str = ab.get("out", str(Path(checkpoint).parent / "loop_budget_ablation.json"))
 
     if "schedule" in axes and schedule_flat_n is None:
@@ -373,10 +414,21 @@ def main(cfg: DictConfig):
     if "schedule" in axes:
         reset_fn = _make_reset_fn(schedule_reset_every)
         flat_sched = [schedule_flat_n] * num_inference_steps
-        for label, sched in [("flat", flat_sched)] + [
-            (d, _matched_budget_schedule(d, schedule_flat_n, num_inference_steps, schedule_ratio))
-            for d in schedule_directions
-        ]:
+
+        schedule_variants: list[tuple[str, list[int]]] = [("flat", flat_sched)]
+        for d in schedule_directions:
+            if d in ("bump", "dip"):
+                for peak in schedule_peaks:
+                    for width in schedule_widths:
+                        sched = _matched_budget_schedule(
+                            d, schedule_flat_n, num_inference_steps, schedule_ratio, peak, width
+                        )
+                        schedule_variants.append((f"{d}/peak={peak}/width={width}", sched))
+            else:
+                sched = _matched_budget_schedule(d, schedule_flat_n, num_inference_steps, schedule_ratio)
+                schedule_variants.append((d, sched))
+
+        for label, sched in schedule_variants:
             key = f"schedule/{label}/flat_n={schedule_flat_n}/reset_every={schedule_reset_every}"
             logger.info(f"Running {key} (per-step n_sup={sched}) ...")
             results[key] = _run_config(
