@@ -4,10 +4,17 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+# Cap per-worker native thread pools BEFORE importing numpy/pandas/pyarrow. This
+for _thr_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS", "ARROW_NUM_THREADS", "RAYON_NUM_THREADS",
+                 "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_thr_var, "1")
 
 import pandas as pd
 
@@ -148,7 +155,14 @@ def _run_parallel(cmds: list) -> None:
     for argv, proc in procs:
         _out, err = proc.communicate()
         if proc.returncode != 0:
-            errors.append(f"Command failed ({proc.returncode}): {' '.join(argv)}\n--- stderr ---\n{err}")
+            rc = proc.returncode
+            note = ""
+            if rc < 0:
+                try:
+                    note = f" [killed by {signal.Signals(-rc).name}]"
+                except Exception:
+                    note = f" [killed by signal {-rc}]"
+            errors.append(f"Command failed ({rc}){note}: {' '.join(argv)}\n--- stderr ---\n{err}")
     if errors:
         raise RuntimeError("\n\n".join(errors))
 
