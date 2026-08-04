@@ -3,6 +3,19 @@
 # backbone) — stage 1. See polygon_unet_concat_small_painter for the
 # scaled-down variant.
 # Usage: python train_trm.py experiment=polygon_unet_concat_painter
+#
+# 2026-08-03: aligned to the paper's actual released training recipe — see
+# steiner_unet_concat_painter.yaml's docstring for the full rationale (same
+# paper, same shared training code, identical findings apply here):
+# epsilon-prediction, no CFG (train.cfg_prob=0, sampling=direct, 99
+# inference steps), effective batch 1024 (128*8), lr=6e-4/warmup=100/
+# lr_min_ratio=0.1. NOT changed: their custom UNet's BatchNorm+ReLU (ours
+# stays GroupNorm+SiLU via diffusers' UNet2DModel) — flagged as a known gap.
+# The 128/8 batch/accum split is sized for a 24GB card — on an 80-90GB H100
+# override via CLI (train.batch_size=256 train.gradient_accumulation_steps=4,
+# same effective batch, fewer/bigger microbatches) rather than editing this
+# default; see steiner_unet_concat_painter.yaml's comment for the memory
+# estimate this is based on.
 
 defaults:
   - override /data: polygon
@@ -10,10 +23,25 @@ defaults:
   - override /painter: polygon_unet_concat_conditional
   - override /train: polygon
   - override /eval_callbacks: polygon
-  - override /sampling: cfg
+  - override /diffusion: ddpm_epsilon
+  - override /sampling: direct
   - _self_
 
 mode: "painter_base"
 
 run:
   output_dir: "runs/polygon_unet_concat_painter"
+
+train:
+  cfg_prob: 0.0
+  batch_size: 256
+  gradient_accumulation_steps: 4
+
+sampling:
+  num_inference_steps: 99
+
+painter:
+  optim_cfg:
+    lr: 6e-4
+    warmup_steps: 100
+    lr_min_ratio: 0.1

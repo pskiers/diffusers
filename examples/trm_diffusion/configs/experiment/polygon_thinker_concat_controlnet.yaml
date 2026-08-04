@@ -9,6 +9,11 @@
 #   python train_trm.py experiment=polygon_thinker_concat_controlnet \
 #     painter.checkpoint=runs/polygon_unet_concat_painter/checkpoint_final.pt
 
+# 2026-08-03: diffusion overridden to ddpm_epsilon — see
+# steiner_thinker_concat_controlnet.yaml's comment for the full rationale
+# (must match polygon_unet_concat_painter's now-corrected epsilon-prediction
+# training). Sampling stays CFG deliberately (thinker's own steering
+# ablation, unrelated to the painter's original training-time CFG).
 defaults:
   - override /data: polygon
   - override /backbone: polygon_unet_concat
@@ -20,6 +25,7 @@ defaults:
   - override /eval: polygon_thinker
   - override /loss: combined_mse
   - override /eval_callbacks: polygon_thinker
+  - override /diffusion: ddpm_epsilon
   - override /sampling: cfg
   - _self_
 

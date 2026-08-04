@@ -9,6 +9,15 @@
 #   python train_trm.py experiment=steiner_thinker_concat_controlnet \
 #     painter.checkpoint=runs/steiner_unet_concat_painter/checkpoint_final.pt
 
+# 2026-08-03: diffusion overridden to ddpm_epsilon to match
+# steiner_unet_concat_painter's now-corrected training recipe (epsilon
+# prediction) — the frozen painter checkpoint's scheduler config MUST agree
+# with however it was trained, or its outputs get silently misinterpreted.
+# Sampling stays CFG here deliberately (unlike the painter's own fix) — this
+# is the thinker stage's own steering-ablation contrast (with vs. without
+# the whole two-stage conditioning), a project-specific addition with no
+# analog in the paper's single-stage model, not the painter's original
+# training-time CFG which no longer applies once frozen.
 defaults:
   - override /data: steiner
   - override /backbone: steiner_unet_concat
@@ -20,6 +29,7 @@ defaults:
   - override /eval: steiner_thinker
   - override /loss: combined_mse
   - override /eval_callbacks: steiner_thinker
+  - override /diffusion: ddpm_epsilon
   - override /sampling: cfg
   - _self_
 

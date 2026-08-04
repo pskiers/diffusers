@@ -1,9 +1,16 @@
 # Unscaled/paper-size concat-conditioned backbone: the paper's actual
-# reported architecture (4 levels, base_channels=64, attention at 3 of 4
-# levels — ~63M params), condition channel-concatenated before the UNet (see
-# ConcatConditionedUNetPainter) rather than out-of-band conditioning kwargs.
-# Kept as the "faithful to the paper" comparison point; see
-# steiner_unet_concat_small.yaml for the scaled-down variant used day to day.
+# reported architecture (4 levels, base_channels=64, condition channel-
+# concatenated before the UNet — see ConcatConditionedUNetPainter) rather
+# than out-of-band conditioning kwargs. Kept as the "faithful to the paper"
+# comparison point; see steiner_unet_concat_small.yaml for the scaled-down
+# variant used day to day.
+#
+# Attention placement (2026-08-03 fix): the paper's own model/diffusion.py
+# only puts attention at the *deepest* 2 of 4 encoder levels (enc2, enc3) +
+# bottleneck + the mirrored 2 decoder levels — NOT 3 of 4 as this file
+# previously claimed/implemented. AttnDownBlock2D at level 1 (64x64
+# resolution) doesn't exist in their model and is ~16x more expensive than
+# attention at 32x32 (attention cost scales with token count squared).
 _target_: diffusers.UNet2DModel
 sample_size: 128
 in_channels: 2
@@ -11,13 +18,13 @@ out_channels: 1
 block_out_channels: [64, 128, 256, 512]
 down_block_types:
   - "DownBlock2D"
-  - "AttnDownBlock2D"
+  - "DownBlock2D"
   - "AttnDownBlock2D"
   - "AttnDownBlock2D"
 up_block_types:
   - "AttnUpBlock2D"
   - "AttnUpBlock2D"
-  - "AttnUpBlock2D"
+  - "UpBlock2D"
   - "UpBlock2D"
 norm_num_groups: 32
 layers_per_block: 2
