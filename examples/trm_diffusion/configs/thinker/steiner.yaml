@@ -37,3 +37,4 @@ optim_cfg:
     warmup_steps: 2000
     lr_min_ratio: 1.0
 with_timestep_emb: false
+with_halt_head: false

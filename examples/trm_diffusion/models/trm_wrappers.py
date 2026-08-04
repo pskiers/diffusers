@@ -289,7 +289,10 @@ class SpatialTRM(BaseModel):
         future_min = suffix_min[1:]  # future_min[t] = min(losses[t+1:]), t = 0..n_sup-2
         targets = (losses[:-1] - future_min).reshape(-1)  # ((n_sup-1)*B,)
 
-        z_H0_stack = torch.stack(z_H0_list[:-1], dim=0)  # (n_sup-1, B, hidden_size)
+        # z_H0_list entries come straight from the TRM's forward_dtype (bfloat16
+        # in every real config) — halt_head is a plain fp32 Linear, same as
+        # predict_halt_value's own cast.
+        z_H0_stack = torch.stack(z_H0_list[:-1], dim=0).float()  # (n_sup-1, B, hidden_size)
         preds = self.halt_head(z_H0_stack.reshape(-1, z_H0_stack.shape[-1])).squeeze(-1)
 
         loss = F.mse_loss(preds, targets)
