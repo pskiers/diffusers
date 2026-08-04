@@ -1,6 +1,6 @@
 # Direct (unconditional) DDIM sampling — single model call per step, no CFG.
 _target_: models.sampling.SamplingPipeline
-num_inference_steps: 20
+num_inference_steps: 99
 batch_size: 384
 predictor:
   _target_: models.sampling.DirectPredictor

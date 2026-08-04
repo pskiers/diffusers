@@ -3,8 +3,8 @@ compile: true
 
 batch_size: 256
 num_steps: 100000
-gradient_accumulation_steps: 2
-cfg_prob: 0.1
+gradient_accumulation_steps: 4
+cfg_prob: 0.0  # paper's released checkpoint is always-conditional, no CFG dropout
 
 noisy_swap:
   prob: 0.0

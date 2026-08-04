@@ -8,12 +8,12 @@ _target_: models.painter_base.ConcatConditionedUNetPainter
 _recursive_: false
 unet: ${backbone}
 image_channels: 1
-painter_dtype: null
+painter_dtype: "bfloat16"
 pixel_range: "[-1,1]"
 eval_callbacks: ${eval_callbacks}
 optim_cfg:
   _target_: configs.schemas.PainterOptimConfig
-  lr: 1e-4
+  lr: 6e-4
   weight_decay: 0.01
-  warmup_steps: 2000
-  lr_min_ratio: 1.0
+  warmup_steps: 100
+  lr_min_ratio: 0.1

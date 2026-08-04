@@ -4,39 +4,15 @@
 # scaled-down variant.
 # Usage: python train_trm.py experiment=steiner_unet_concat_painter
 #
-# 2026-08-03: aligned to the paper's actual released training recipe
-# (github.com/kariander1/visual-geo-solver), found by reading their real
-# model/scheduler/training code, not just their config file:
-#   - diffusion: ddpm_epsilon — they predict epsilon (noise), not x0/"sample".
-#   - sampling: direct, 99 inference steps — their released checkpoint is
-#     trained with p_null=0 (never sees a null/dropped condition) and
-#     evaluated at guidance_scale=1 (their own sampler skips the
-#     unconditional forward pass entirely at scale=1) — a plain always-
-#     conditional model, no CFG anywhere. Their eval script also samples
-#     the (near-)full ~99 of 100 trained timesteps, not a 5x-more-aggressive
-#     20-step skip.
-#   - train.cfg_prob=0, effective batch 1024 (matching their batch_size=128/
-#     grad_accum_steps=8) — was cfg_prob=0.1, effective batch 512. The
-#     128/8 split below is sized for a 24GB card; on an 80-90GB H100 use
-#     e.g. batch_size=256/gradient_accumulation_steps=4 (same effective
-#     batch, fewer/bigger microbatches — better tensor-core utilization) —
-#     override via CLI (train.batch_size=256 train.gradient_accumulation_steps=4)
-#     rather than editing this default, since it's a hardware fit, not a
-#     correctness fix. ~25GB measured peak (uncompiled) at batch=128 on an
-#     A5000, so 256 should fit comfortably with headroom; 512/2 might also
-#     fit on 90GB but wasn't verified — try it and fall back if it OOMs.
-#   - painter.optim_cfg lr=6e-4 (was 1e-4), warmup_steps=100 (was 2000,
-#     matches their num_warmup_steps=100 literally — note this is a much
-#     shorter warmup *fraction* of train.num_steps than in their own much
-#     shorter (epoch-based) schedule, since our num_steps budget wasn't
-#     changed to match theirs — see this file's docstring in memory for why),
-#     lr_min_ratio=0.1 (was 1.0 — our ScheduledOptimizer's cosine-decay-to-
-#     min_ratio shape with num_cycles=0.5 is already an exact match for
-#     their lr_scheduler_config, just needed the right numbers).
+# Aligned to the paper's actual released training recipe
+# (github.com/kariander1/visual-geo-solver): epsilon prediction, no CFG,
+# lr=6e-4/warmup=100/lr_min_ratio=0.1, 99 sampling steps, compile disabled
+# (compile+bf16 -> NaN on this backbone). See configs/train/steiner.yaml,
+# configs/painter/steiner_unet_concat_conditional.yaml, and
+# configs/sampling/direct.yaml for the actual values.
 # NOT changed: BatchNorm-vs-GroupNorm and ReLU-vs-SiLU (their custom UNet
 # uses BatchNorm+ReLU; ours is diffusers' UNet2DModel, GroupNorm+SiLU) —
-# matching that exactly would need a fully custom UNet implementation, not
-# a config change; flagged as a known remaining gap, not fixed here.
+# flagged as a known remaining gap, not a config change.
 
 defaults:
   - override /data: steiner
@@ -52,17 +28,3 @@ mode: "painter_base"
 
 run:
   output_dir: "runs/steiner_unet_concat_painter"
-
-train:
-  cfg_prob: 0.0
-  batch_size: 256
-  gradient_accumulation_steps: 4
-
-sampling:
-  num_inference_steps: 99
-
-painter:
-  optim_cfg:
-    lr: 6e-4
-    warmup_steps: 100
-    lr_min_ratio: 0.1

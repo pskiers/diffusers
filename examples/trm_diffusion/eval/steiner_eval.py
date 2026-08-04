@@ -64,6 +64,12 @@ from scipy import ndimage
 VERTEX_THRESH = -0.5
 EDGE_THRESH = 0.5
 
+# Safety cap on detected vertices before attempting edge search — see its
+# use in _extract_graph. Comfortably above the largest legitimate case
+# (41-50 terminals + Steiner points, well under 150) while far below what
+# noise can produce (~1500 spurious peaks observed on untrained output).
+MAX_VERTICES = 150
+
 
 def _detect_vertices(vertex_mask: np.ndarray, node_radius: float = 2.0, suppress_mult: float = 1.2) -> np.ndarray:
     """Greedy peak-picking on the vertex mask's distance transform.
@@ -154,6 +160,17 @@ def _extract_graph(
     vertices = _detect_vertices(vertex_mask, node_radius)
     if len(vertices) == 0:
         return np.zeros((0, 2)), []
+    if len(vertices) > MAX_VERTICES:
+        # Noise (e.g. an early/untrained model) can produce hundreds of
+        # spurious vertex-mask peaks — the O(n^2) edge search below (with an
+        # O(n) passes_through_other_vertex check per candidate edge) is
+        # otherwise unbounded and has been observed to take 60-140s for a
+        # single sample at ~1500 vertices. Bail out immediately: no real
+        # tree render ever needs anywhere near MAX_VERTICES, so exceeding it
+        # is already diagnostic of garbage input — every downstream check
+        # (connected/valid_tree/covers_terminals) correctly fails on an
+        # empty edge list anyway.
+        return vertices, []
     if terminal_rc is not None and len(terminal_rc) > 0:
         snap_threshold = max(2.0, node_radius * 2.5)
         vertices = _snap_terminals_to_reference(vertices, terminal_rc, snap_threshold)
