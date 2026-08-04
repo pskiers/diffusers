@@ -1,0 +1,10 @@
+# Same as cfg.yaml (classifier-free guidance, scale 2.0), but sampling the
+# near-full trained trajectory (99 of 100 timesteps) — matches direct.yaml's
+# step count so a CFG-trained paper-size Steiner/Polygon model is compared
+# under the same sampling budget as the paper's own cfg_prob=0 checkpoint.
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 99
+batch_size: 256
+predictor:
+  _target_: models.sampling.CFGPredictor
+  scale: 2.0

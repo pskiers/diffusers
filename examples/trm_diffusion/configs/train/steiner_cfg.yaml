@@ -1,0 +1,17 @@
+# Same paper-faithful recipe as steiner.yaml, except cfg_prob>0 — trains a
+# null-condition dropout so the model can be sampled with classifier-free
+# guidance (paper's own released checkpoint uses cfg_prob=0 / guidance
+# scale=1, see steiner_unet_concat_painter.yaml's docstring). Pairs with
+# configs/sampling/cfg_99.yaml.
+seed: 42
+compile: true
+
+batch_size: 256
+num_steps: 100000
+gradient_accumulation_steps: 4
+cfg_prob: 0.1
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

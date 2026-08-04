@@ -1,0 +1,24 @@
+# @package _global_
+# Same paper-size Steiner UNetPainter as steiner_unet_concat_painter.yaml
+# (architecture, epsilon prediction, optimizer/lr schedule all identical),
+# except trained with classifier-free guidance dropout (train.cfg_prob=0.1
+# via configs/train/steiner_cfg.yaml) and sampled with CFG (scale 2.0) via
+# configs/sampling/cfg_99.yaml, instead of the paper's own cfg_prob=0 /
+# guidance-scale=1 recipe. Ablation: does CFG help beyond the paper's
+# reported numbers, holding everything else fixed.
+# Usage: python train_trm.py experiment=steiner_unet_concat_painter_cfg
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet_concat
+  - override /painter: steiner_unet_concat_conditional
+  - override /train: steiner_cfg
+  - override /eval_callbacks: steiner
+  - override /diffusion: ddpm_epsilon
+  - override /sampling: cfg_99
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/steiner_unet_concat_painter_cfg"
