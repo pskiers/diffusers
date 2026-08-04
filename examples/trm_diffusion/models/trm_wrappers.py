@@ -72,12 +72,15 @@ class SpatialTRM(BaseModel):
         batch_size: int = 1,
         freeze_weights: bool = False,
         with_timestep_emb: bool = False,
+        with_halt_head: bool = False,
+        halt_head_lr: float = 1e-3,
     ):
         super().__init__()
         self.n_sup = n_sup
         self.vocab_size = vocab_size
         self.freeze_weights = freeze_weights
         self.with_timestep_emb = with_timestep_emb
+        self.with_halt_head = with_halt_head
         self.optim_cfg = optim_cfg
 
         if with_timestep_emb:
@@ -85,6 +88,20 @@ class SpatialTRM(BaseModel):
             self.thinker_temb_proj = nn.Linear(256, hidden_size)
             nn.init.zeros_(self.thinker_temb_proj.weight)
             nn.init.zeros_(self.thinker_temb_proj.bias)
+
+        if with_halt_head:
+            # Predicts, from z_H at reasoning step t, the expected future loss
+            # reduction still available from continuing (see train_halt_head).
+            # Zero-init: starts out predicting "no expected improvement" (a
+            # neutral halt-early prior), mirroring the vendored q_head's own
+            # init trick. Trained by its own optimizer (below), decoupled from
+            # the main thinker optimizer/LR schedule/global_step — the aux
+            # loss is only computable once per full n_sup trajectory, not
+            # once per n_sup iteration like everything else.
+            self.halt_head = nn.Linear(hidden_size, 1)
+            nn.init.zeros_(self.halt_head.weight)
+            nn.init.zeros_(self.halt_head.bias)
+            self.halt_optimizer = torch.optim.Adam(self.halt_head.parameters(), lr=halt_head_lr)
 
         # puzzle_emb_len is only meaningful when puzzle_emb_ndim > 0
         effective_puzzle_emb_len = puzzle_emb_len if puzzle_emb_ndim > 0 else 0
@@ -122,6 +139,12 @@ class SpatialTRM(BaseModel):
         optims = []
 
         exclude_ids: set[int] = set()
+
+        # halt_head has its own dedicated optimizer (self.halt_optimizer, set
+        # up in __init__) — exclude it from the main thinker optimizer.
+        if self.with_halt_head:
+            for p in self.halt_head.parameters():
+                exclude_ids.add(id(p))
 
         # puzzle emb optim
         if hasattr(self.inner, "puzzle_emb"):
@@ -226,6 +249,54 @@ class SpatialTRM(BaseModel):
             self.inner._emb_bias = None
 
         return logits, new_carry.z_H, new_carry.z_L
+
+    # ── Adaptive-halting head (continuous-space substitute for the vendored
+    #    q_head, which needs a binary correctness reward this codebase's
+    #    diffusion targets don't have) ─────────────────────────────────────
+
+    def predict_halt_value(self, z_H: torch.Tensor) -> torch.Tensor:
+        """Predicted expected future loss reduction from continuing past the
+        reasoning step that produced this z_H (reads the same pooled token
+        the vendored q_head uses). Near/below zero → diminishing returns,
+        safe to halt; call sites decide the actual threshold.
+        """
+        if not self.with_halt_head:
+            raise RuntimeError("predict_halt_value requires with_halt_head=True at construction.")
+        return self.halt_head(z_H[:, 0].float()).squeeze(-1)
+
+    def train_halt_head(self, z_H0_list: list[torch.Tensor], loss_list: list[torch.Tensor]) -> float:
+        """Train the halt head on one micro-batch's full n_sup trajectory.
+
+        z_H0_list / loss_list: length-n_sup lists of (B, hidden_size) / (B,)
+        tensors, one per reasoning step, already detached — z_H0_list[t] is
+        z_H[:, 0] right after step t, loss_list[t] is that step's per-sample
+        diffusion loss (both computed by the caller, e.g.
+        ThinkerFrozenPainterBase.train_step).
+
+        Target for step t is the future loss reduction still available:
+        loss_t - min(loss_{t+1 .. n_sup-1}). The last step is skipped (no
+        future to compare against). Trained via its own optimizer
+        (self.halt_optimizer) — does not touch the main thinker optimizer or
+        global_step.
+        """
+        n_sup = len(loss_list)
+        if n_sup < 2:
+            return 0.0
+
+        losses = torch.stack(loss_list, dim=0)  # (n_sup, B)
+        # suffix_min[t] = min(losses[t:]) via cummin on the reversed sequence
+        suffix_min = torch.flip(torch.cummin(torch.flip(losses, dims=[0]), dim=0).values, dims=[0])
+        future_min = suffix_min[1:]  # future_min[t] = min(losses[t+1:]), t = 0..n_sup-2
+        targets = (losses[:-1] - future_min).reshape(-1)  # ((n_sup-1)*B,)
+
+        z_H0_stack = torch.stack(z_H0_list[:-1], dim=0)  # (n_sup-1, B, hidden_size)
+        preds = self.halt_head(z_H0_stack.reshape(-1, z_H0_stack.shape[-1])).squeeze(-1)
+
+        loss = F.mse_loss(preds, targets)
+        self.halt_optimizer.zero_grad()
+        loss.backward()
+        self.halt_optimizer.step()
+        return loss.item()
 
     @torch.no_grad()
     def predict(

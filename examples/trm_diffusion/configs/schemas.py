@@ -83,6 +83,12 @@ class EvalConfig:
     num_ddim_steps: int = 20
     num_log_images: int = 10
     classifier_path: Optional[str] = None
+    # Adaptive-halting head (see SpatialTRM.with_halt_head) — default source
+    # for ThinkerFrozenPainterBase.forward()'s use_halt_head/halt_threshold
+    # when a call site doesn't override them explicitly. No effect unless the
+    # thinker was built with with_halt_head=True.
+    use_halt_head: bool = False
+    halt_threshold: float = 0.0
 
 
 # ── Optimizer configs ──────────────────────────────────────────────────────────

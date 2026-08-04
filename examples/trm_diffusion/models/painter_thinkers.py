@@ -209,6 +209,8 @@ class ThinkerFrozenPainterBase(BaseModel):
         z_L: Optional[torch.Tensor] = None,
         n_sup: Optional[int] = None,
         null_steering: bool = False,
+        use_halt_head: bool = False,
+        halt_threshold: float = 0.0,
     ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
         instead of always resetting it, and allows overriding n_sup.
@@ -220,6 +222,12 @@ class ThinkerFrozenPainterBase(BaseModel):
         only ever sees a fresh reset), so this is for inference-time
         ablation only (see experiments/ablate_trm_loop_budget.py), not used
         by forward() itself.
+
+        use_halt_head/halt_threshold: opt-in early exit from the n_sup loop
+        (requires thinker.with_halt_head=True at construction) — after each
+        reasoning step, stop once the halt head's batch-mean predicted future
+        loss reduction drops to/below halt_threshold. Off by default, so
+        existing call sites are unaffected.
 
         Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
         null_steering, the carry is passed through unchanged so callers can
@@ -246,6 +254,8 @@ class ThinkerFrozenPainterBase(BaseModel):
                 logits, z_H, z_L = self.thinker.reasoning_step(
                     enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
                 )
+                if use_halt_head and self.thinker.predict_halt_value(z_H).mean() <= halt_threshold:
+                    break
 
         noise_pred = self.run_painter(sample, logits)
 
@@ -256,7 +266,14 @@ class ThinkerFrozenPainterBase(BaseModel):
         )
         return pred, z_H, z_L
 
-    def forward(self, sample: DataSample, null_steering: bool = False, **kwargs) -> DiffusionPrediction:
+    def forward(
+        self,
+        sample: DataSample,
+        null_steering: bool = False,
+        use_halt_head: Optional[bool] = None,
+        halt_threshold: Optional[float] = None,
+        **kwargs,
+    ) -> DiffusionPrediction:
         """Single inference pass: encode → think (n_sup steps) → translate → paint.
 
         No guidance is applied here.  Use CFGPredictor / NoisyGuidancePredictor
@@ -270,8 +287,22 @@ class ThinkerFrozenPainterBase(BaseModel):
         the steering-only CFG null used by SteeringCFGPredictor
         (models/sampling.py), as opposed to null_condition_sample() below,
         which also zeros the painter's own conditioning.
+
+        use_halt_head/halt_threshold default to self.eval_cfg's
+        use_halt_head/halt_threshold (settable via +eval.use_halt_head=true
+        +eval.halt_threshold=... on the train_trm.py/eval.py command line,
+        same pattern as train.force_unconditional_painter) when not passed
+        explicitly — so existing call sites in models/sampling.py (which all
+        just call model(sample)) transparently pick up the config value
+        instead of needing to be modified themselves.
         """
-        pred, _, _ = self.forward_with_carry(sample, null_steering=null_steering)
+        if use_halt_head is None:
+            use_halt_head = self.eval_cfg.use_halt_head
+        if halt_threshold is None:
+            halt_threshold = self.eval_cfg.halt_threshold
+        pred, _, _ = self.forward_with_carry(
+            sample, null_steering=null_steering, use_halt_head=use_halt_head, halt_threshold=halt_threshold
+        )
         return pred
 
     def null_condition_sample(self, sample: DataSample) -> DataSample:
@@ -378,8 +409,16 @@ class ThinkerFrozenPainterBase(BaseModel):
         total_losses: dict[str, float] = {}
         lr = 0.0
 
+        # Buffers for the adaptive-halting head's auxiliary loss (see
+        # SpatialTRM.train_halt_head) — one (z_H[:, 0], per-sample loss) pair
+        # per reasoning step, per micro-batch. Only the pooled token is kept
+        # (not the full z_H), and everything is detached: this rides on
+        # tensors already produced by the main loop, no extra graph/compute.
+        use_halt_head = getattr(self.thinker, "with_halt_head", False)
+        halt_histories = [{"z_H0": [], "loss": []} for _ in mb_data] if use_halt_head else None
+
         for _ in range(self.n_sup):
-            for d in mb_data:
+            for i, d in enumerate(mb_data):
                 noise_pred, logits, d["z_H"], d["z_L"] = self.reasoning_step(
                     d["sample"], d["z_H"], d["z_L"]
                 )
@@ -388,6 +427,13 @@ class ThinkerFrozenPainterBase(BaseModel):
                     total_losses[k] = total_losses.get(k, 0.0) + v
                 if step_loss.requires_grad:
                     accelerator.backward(step_loss / (global_batch_size * K))
+
+                if halt_histories is not None:
+                    per_sample_loss = (
+                        (noise_pred.float() - d["sample"].target.float()).pow(2).flatten(1).mean(1)
+                    )
+                    halt_histories[i]["z_H0"].append(d["z_H"][:, 0].detach())
+                    halt_histories[i]["loss"].append(per_sample_loss.detach())
 
             accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
             enc_params = self.get_encoder_params()
@@ -400,6 +446,13 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         n = self.n_sup * K
         losses = {k: v / n for k, v in total_losses.items()}
+
+        if halt_histories is not None:
+            halt_loss_sum = sum(
+                self.thinker.train_halt_head(h["z_H0"], h["loss"]) for h in halt_histories
+            )
+            losses["halt_head_loss"] = halt_loss_sum / K
+
         return losses, lr, global_step
 
     # ── Evaluation ────────────────────────────────────────────────────────────

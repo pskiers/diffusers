@@ -122,6 +122,8 @@ def _eval_cfg(cfg: DictConfig) -> EvalConfig:
         num_ddim_steps=int(ev.get("num_ddim_steps", 20)),
         num_log_images=int(ev.get("num_log_images", 10)),
         classifier_path=ev.get("classifier_path", None),
+        use_halt_head=bool(ev.get("use_halt_head", False)),
+        halt_threshold=float(ev.get("halt_threshold", 0.0)),
     )
 
 
