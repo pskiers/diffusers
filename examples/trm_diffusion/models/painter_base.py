@@ -563,6 +563,67 @@ class ConcatConditionedUNetPainter(UNetPainter):
         return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
 
 
+class ConcatCrossAttnConditionedUNetPainter(UNetPainter):
+    """UNetPainter conditioned BOTH ways at once: a spatial condition image
+    (e.g. CLEVR's centroid mask) is channel-concatenated onto x_noisy before
+    the UNet call (like ConcatConditionedUNetPainter), AND a condition_encoder
+    still runs to provide cross-attention kwargs (like the base UNetPainter) —
+    e.g. per-object embeddings via ObjectFeatureEncoder. Use this when the two
+    conditioning signals are independent (a spatial ground-truth mask plus a
+    per-object token sequence) rather than needing the mask routed through the
+    condition_encoder itself.
+
+    `unet`'s in_channels must equal image_channels + the spatial_conditions
+    channel count; out_channels matches only the generated image, since the
+    condition channels are never noised (only sample.x_noisy is — the
+    condition is concatenated back on fresh, un-noised, at every timestep).
+
+    condition_keys is the condition_encoder's own keys plus
+    "spatial_conditions", so both are zeroed for CFG dropout /
+    null_condition_sample.
+
+    Args:
+        image_channels: channel count of the image being generated (and thus
+            of sample.x_noisy / the noise sampled at inference time) —
+            `unet`'s in_channels minus this is the condition's channel count.
+        **kwargs: forwarded to UNetPainter.__init__.
+    """
+
+    def __init__(self, *args, image_channels: int = 4, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._image_channels = image_channels
+
+    @property
+    def noise_shape(self) -> tuple:
+        s = self.unet.config.sample_size
+        return (self._image_channels, s, s)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        keys = list(super().condition_keys)
+        if "spatial_conditions" not in keys:
+            keys.append("spatial_conditions")
+        return keys
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        x = sample.x_noisy
+        if sample.spatial_conditions is not None:
+            x = torch.cat([x, sample.spatial_conditions], dim=1)
+        kwargs: dict = {}
+        if self.condition_encoder is not None:
+            args = [getattr(sample, k) for k in self.condition_encoder.condition_keys]
+            kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
+        if steering is not None:
+            kwargs.update(steering.to_painter_kwargs())
+        with self._unet_autocast(x.device.type):
+            noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+
 class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter):
     """Frozen ConcatConditionedUNetPainter loaded from a checkpoint, with
     ControlNet-style TRM steering added as a SEPARATE, additive signal — the
