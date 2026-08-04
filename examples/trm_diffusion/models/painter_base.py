@@ -176,6 +176,19 @@ class UNetPainter(PainterBase, BaseModel):
     def condition_keys(self) -> list[str]:
         return self.condition_encoder.condition_keys if self.condition_encoder is not None else []
 
+    def _unet_autocast(self, device_type: str):
+        """Scopes painter_dtype (if set) to just the UNet call — mirrors
+        ThinkerFrozenPainterBase.run_painter's scoping. Keeps
+        _prepare_training_sample's add_noise/target math and the loss
+        computation in fp32; only the UNet forward (the actual expensive
+        compute) runs under autocast. Deliberately narrower than an
+        Accelerate-level mixed_precision setting, which would autocast
+        everything indiscriminately — see train_trm.py's own comment on why
+        this codebase avoids that."""
+        if self.painter_dtype is not None:
+            return torch.autocast(device_type=device_type, dtype=self.painter_dtype)
+        return torch.autocast(device_type=device_type, enabled=False)
+
     # ── Latent helpers ───────────────────────────────────────────────────────
 
     @property
@@ -239,7 +252,8 @@ class UNetPainter(PainterBase, BaseModel):
             kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
         if steering is not None:
             kwargs.update(steering.to_painter_kwargs())
-        noise_pred = self.unet(sample.x_noisy, sample.timesteps, **kwargs).sample
+        with self._unet_autocast(sample.x_noisy.device.type):
+            noise_pred = self.unet(sample.x_noisy, sample.timesteps, **kwargs).sample
         return DiffusionPrediction(
             pred=noise_pred,
             pred_type=self.scheduler.config.prediction_type,
@@ -544,7 +558,8 @@ class ConcatConditionedUNetPainter(UNetPainter):
         if sample.spatial_conditions is not None:
             x = torch.cat([x, sample.spatial_conditions], dim=1)
         kwargs = steering.to_painter_kwargs() if steering is not None else {}
-        noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
+        with self._unet_autocast(x.device.type):
+            noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
         return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
 
 
