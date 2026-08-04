@@ -691,32 +691,29 @@ class SteinerEvalCallback(EvalCallbackBase):
     needed — like Maze, pixels are read directly off the known rendering
     scheme.
 
-    Main (paper-protocol) metrics:
-      valid_rate     — fraction of instances with >=1 valid candidate among
-                       the N generated.
-      ratio_mean/std — mean/std of (best valid candidate's length / exact
-                       optimal length), over instances with >=1 valid
-                       candidate. The exact optimal length is looked up from
-                       the dataset's own generation-time record via
-                       dataloader.dataset.optimal_length_for(puzzle_id) (see
-                       SteinerTreeDataset), not re-solved or re-derived
-                       lossily from a rendered image.
-      ratio_coverage — fraction of *all* evaluated instances a ratio was
-                       computable for (an instance with 0 valid candidates
-                       contributes to the denominator but not the mean).
+    Metrics, one group per evaluated point range (see extra_eval_sets),
+    logged as "{range}/valid_rate", "{range}/ratio_mean", "{range}/ratio_std"
+    — e.g. "10-20/valid_rate", "21-30/ratio_mean" — no other metrics are
+    logged (kept deliberately minimal):
+      {range}/valid_rate     — fraction of instances with >=1 valid
+                               candidate among the N generated.
+      {range}/ratio_mean/std — mean/std of (best valid candidate's length /
+                               exact optimal length), over instances with
+                               >=1 valid candidate. The exact optimal length
+                               is looked up from the dataset's own
+                               generation-time record via
+                               dataloader.dataset.optimal_length_for(puzzle_id)
+                               (see SteinerTreeDataset), not re-solved or
+                               re-derived lossily from a rendered image.
 
-    Diagnostic metrics (per individual generated candidate, not best-of-N —
-    e.g. "60% of all candidates are valid trees" vs. valid_rate's "95% of
-    instances have >=1 valid candidate out of N"):
-      is_connected_acc, is_valid_tree_acc, covers_terminals_acc,
-      constraint_puzzle_acc.
-
-    extra_eval_sets adds out-of-distribution point-range test sets (the
-    paper's own 21-30/31-40/41-50 generalization splits, evaluated with the
-    *same trained model* — no retraining needed, since embedding_conditions/
-    embedding_mask are eval-only fields never fed to the network; the model
-    only ever sees the rendered condition image regardless of point count).
-    Metrics from each extra set are suffixed `_{name}`. Each entry:
+    The primary (in-distribution) dataloader is evaluated as its own named
+    range (primary_range_name, default "10-20") exactly like extra_eval_sets
+    entries — no special-cased unsuffixed keys. extra_eval_sets adds
+    out-of-distribution point-range test sets (the paper's own 21-30/31-40/
+    41-50 generalization splits, evaluated with the *same trained model* —
+    no retraining needed, since embedding_conditions/embedding_mask are
+    eval-only fields never fed to the network; the model only ever sees the
+    rendered condition image regardless of point count). Each entry:
         {name, hf_filename, max_points, hf_repo (optional),
          num_samples (optional, defaults to this callback's num_samples)}
 
@@ -734,6 +731,7 @@ class SteinerEvalCallback(EvalCallbackBase):
                         doesn't blow up GPU memory, only wall-clock.
         num_log_images: WandB panel images (primary dataloader only), shown
                         using each logged instance's best-of-N candidate.
+        primary_range_name: label for the primary dataloader's metric group.
         extra_eval_sets: optional list of OOD point-range test-set specs.
     """
 
@@ -743,12 +741,14 @@ class SteinerEvalCallback(EvalCallbackBase):
         num_samples: int = 1000,
         num_candidates: int = 10,
         num_log_images: int = 8,
+        primary_range_name: str = "10-20",
         extra_eval_sets: Optional[list] = None,
     ):
         self.image_size = image_size
         self.num_samples = num_samples
         self.num_candidates = num_candidates
         self.num_log_images = num_log_images
+        self.primary_range_name = primary_range_name
         self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
         self._extra_dataloaders = None  # built lazily on first __call__
 
@@ -782,14 +782,14 @@ class SteinerEvalCallback(EvalCallbackBase):
         if self._extra_dataloaders is None:
             self._extra_dataloaders = self._build_extra_dataloaders(dataloader.batch_size)
 
-        result = self._eval_one(model, dataloader, accelerator, self.num_samples, suffix="", log_panels=True)
+        result = self._eval_one(
+            model, dataloader, accelerator, self.num_samples, self.primary_range_name, log_panels=True
+        )
         for name, n_samples, extra_dl in self._extra_dataloaders:
-            result.update(
-                self._eval_one(model, extra_dl, accelerator, n_samples, suffix=f"_{name}", log_panels=False)
-            )
+            result.update(self._eval_one(model, extra_dl, accelerator, n_samples, name, log_panels=False))
         return result
 
-    def _eval_one(self, model, dataloader, accelerator, n_total: int, suffix: str, log_panels: bool) -> dict:
+    def _eval_one(self, model, dataloader, accelerator, n_total: int, range_name: str, log_panels: bool) -> dict:
         device = accelerator.device
         pipeline = model.sampling_pipeline
         n_log = self.num_log_images if log_panels else 0
@@ -800,14 +800,13 @@ class SteinerEvalCallback(EvalCallbackBase):
         # of how many candidates-per-instance we're generating.
         chunk = max(1, pipeline.batch_size // self.num_candidates)
 
-        weighted_connected, weighted_valid_tree, weighted_covers, weighted_constraint = [], [], [], []
         all_any_valid: list = []
         all_ratios: list = []
         panels: list = []
         n_done = 0
 
         n_batches = (n_total + dataloader.batch_size - 1) // dataloader.batch_size
-        for batch in tqdm(dataloader, "Steiner eval" + suffix, total=n_batches):
+        for batch in tqdm(dataloader, f"Steiner eval [{range_name}]", total=n_batches):
             if n_done >= n_total:
                 break
             B_full = batch["images"].shape[0]
@@ -825,12 +824,6 @@ class SteinerEvalCallback(EvalCallbackBase):
                 emb_cond_rep = sub["embedding_conditions"].to(device).repeat_interleave(N, dim=0)
                 emb_mask_rep = sub["embedding_mask"].to(device).repeat_interleave(N, dim=0)
                 acc = evaluate_steiner(gen_flat, emb_cond_rep, emb_mask_rep, self.image_size)
-
-                w = B * N
-                weighted_connected.append((acc["is_connected_acc"], w))
-                weighted_valid_tree.append((acc["is_valid_tree_acc"], w))
-                weighted_covers.append((acc["covers_terminals_acc"], w))
-                weighted_constraint.append((acc["constraint_puzzle_acc"], w))
 
                 valid_bn = np.asarray(acc["per_sample_valid"]).reshape(B, N)
                 length_bn = np.asarray(acc["per_sample_length"]).reshape(B, N)
@@ -860,17 +853,11 @@ class SteinerEvalCallback(EvalCallbackBase):
 
         any_valid_all = np.concatenate(all_any_valid) if all_any_valid else np.zeros(0, dtype=bool)
         result: dict = {
-            f"is_connected_acc{suffix}": _weighted_mean(weighted_connected),
-            f"is_valid_tree_acc{suffix}": _weighted_mean(weighted_valid_tree),
-            f"covers_terminals_acc{suffix}": _weighted_mean(weighted_covers),
-            f"constraint_puzzle_acc{suffix}": _weighted_mean(weighted_constraint),
-            f"valid_rate{suffix}": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
+            f"{range_name}/valid_rate": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
         }
-        if length_lookup is not None:
-            result[f"ratio_coverage{suffix}"] = len(all_ratios) / max(n_done, 1)
-            if all_ratios:
-                result[f"ratio_mean{suffix}"] = float(np.mean(all_ratios))
-                result[f"ratio_std{suffix}"] = float(np.std(all_ratios))
+        if all_ratios:
+            result[f"{range_name}/ratio_mean"] = float(np.mean(all_ratios))
+            result[f"{range_name}/ratio_std"] = float(np.std(all_ratios))
         if panels:
             result["samples"] = panels
         return result
@@ -890,32 +877,34 @@ class PolygonEvalCallback(EvalCallbackBase):
     checked from exact known coordinates, not pixels), and score the single
     best (largest-area) survivor.
 
-    Main (paper-protocol) metrics:
-      valid_rate     — fraction of instances with >=1 valid candidate among
-                       the N generated.
-      ratio_mean/std — mean/std of (best valid candidate's area / exact
-                       optimal area), over instances with >=1 valid
-                       candidate, looked up via
-                       dataloader.dataset.optimal_area_for(puzzle_id) (see
-                       PolygonDataset) — not re-solved or re-derived lossily
-                       from a rendered image.
-      ratio_coverage — fraction of *all* evaluated instances a ratio was
-                       computable for.
-      opt_rate       — fraction of instances (with >=1 valid candidate)
-                       whose best candidate's recovered vertex order is
-                       *exactly* the optimal polygon (up to rotation/
-                       reflection — see eval.polygon_eval._orders_equivalent
-                       and PolygonDataset.optimal_order_for), not just close
-                       in area — matches the paper's "Opt. Rate" column.
+    Metrics, one group per evaluated point range (see extra_eval_sets),
+    logged as "{range}/valid_rate", "{range}/ratio_mean", "{range}/ratio_std",
+    "{range}/opt_rate" — e.g. "7-12/valid_rate", "13-15/opt_rate" — no other
+    metrics are logged (kept deliberately minimal):
+      {range}/valid_rate     — fraction of instances with >=1 valid
+                               candidate among the N generated.
+      {range}/ratio_mean/std — mean/std of (best valid candidate's area /
+                               exact optimal area), over instances with >=1
+                               valid candidate, looked up via
+                               dataloader.dataset.optimal_area_for(puzzle_id)
+                               (see PolygonDataset) — not re-solved or
+                               re-derived lossily from a rendered image.
+      {range}/opt_rate       — fraction of instances (with >=1 valid
+                               candidate) whose best candidate's recovered
+                               vertex order is *exactly* the optimal polygon
+                               (up to rotation/reflection — see
+                               eval.polygon_eval._orders_equivalent and
+                               PolygonDataset.optimal_order_for), not just
+                               close in area — matches the paper's
+                               "Opt. Rate" column.
 
-    Diagnostic metric (per individual generated candidate, not best-of-N):
-      constraint_puzzle_acc.
-
-    extra_eval_sets adds out-of-distribution point-range test sets (the
-    paper's own 13-15 generalization split, evaluated with the *same
-    trained model* — no retraining needed, since embedding_conditions/
-    embedding_mask are eval-only fields never fed to the network). Metrics
-    from each extra set are suffixed `_{name}`. Each entry:
+    The primary (in-distribution) dataloader is evaluated as its own named
+    range (primary_range_name, default "7-12") exactly like extra_eval_sets
+    entries — no special-cased unsuffixed keys. extra_eval_sets adds
+    out-of-distribution point-range test sets (the paper's own 13-15
+    generalization split, evaluated with the *same trained model* — no
+    retraining needed, since embedding_conditions/embedding_mask are
+    eval-only fields never fed to the network). Each entry:
         {name, hf_filename, max_points, hf_repo (optional),
          num_samples (optional, defaults to this callback's num_samples)}
 
@@ -930,6 +919,7 @@ class PolygonEvalCallback(EvalCallbackBase):
                         chunking rationale (identical here).
         num_log_images: WandB panel images (primary dataloader only), shown
                         using each logged instance's best-of-N candidate.
+        primary_range_name: label for the primary dataloader's metric group.
         extra_eval_sets: optional list of OOD point-range test-set specs.
     """
 
@@ -939,12 +929,14 @@ class PolygonEvalCallback(EvalCallbackBase):
         num_samples: int = 1000,
         num_candidates: int = 10,
         num_log_images: int = 8,
+        primary_range_name: str = "7-12",
         extra_eval_sets: Optional[list] = None,
     ):
         self.image_size = image_size
         self.num_samples = num_samples
         self.num_candidates = num_candidates
         self.num_log_images = num_log_images
+        self.primary_range_name = primary_range_name
         self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
         self._extra_dataloaders = None  # built lazily on first __call__
 
@@ -978,14 +970,14 @@ class PolygonEvalCallback(EvalCallbackBase):
         if self._extra_dataloaders is None:
             self._extra_dataloaders = self._build_extra_dataloaders(dataloader.batch_size)
 
-        result = self._eval_one(model, dataloader, accelerator, self.num_samples, suffix="", log_panels=True)
+        result = self._eval_one(
+            model, dataloader, accelerator, self.num_samples, self.primary_range_name, log_panels=True
+        )
         for name, n_samples, extra_dl in self._extra_dataloaders:
-            result.update(
-                self._eval_one(model, extra_dl, accelerator, n_samples, suffix=f"_{name}", log_panels=False)
-            )
+            result.update(self._eval_one(model, extra_dl, accelerator, n_samples, name, log_panels=False))
         return result
 
-    def _eval_one(self, model, dataloader, accelerator, n_total: int, suffix: str, log_panels: bool) -> dict:
+    def _eval_one(self, model, dataloader, accelerator, n_total: int, range_name: str, log_panels: bool) -> dict:
         device = accelerator.device
         pipeline = model.sampling_pipeline
         n_log = self.num_log_images if log_panels else 0
@@ -994,7 +986,6 @@ class PolygonEvalCallback(EvalCallbackBase):
         order_lookup = getattr(dataset, "optimal_order_for", None)
         chunk = max(1, pipeline.batch_size // self.num_candidates)
 
-        weighted_constraint: list = []
         all_any_valid: list = []
         all_ratios: list = []
         all_exact_match: list = []
@@ -1002,7 +993,7 @@ class PolygonEvalCallback(EvalCallbackBase):
         n_done = 0
 
         n_batches = (n_total + dataloader.batch_size - 1) // dataloader.batch_size
-        for batch in tqdm(dataloader, "Polygon eval" + suffix, total=n_batches):
+        for batch in tqdm(dataloader, f"Polygon eval [{range_name}]", total=n_batches):
             if n_done >= n_total:
                 break
             B_full = batch["images"].shape[0]
@@ -1020,8 +1011,6 @@ class PolygonEvalCallback(EvalCallbackBase):
                 emb_cond_rep = sub["embedding_conditions"].to(device).repeat_interleave(N, dim=0)
                 emb_mask_rep = sub["embedding_mask"].to(device).repeat_interleave(N, dim=0)
                 acc = evaluate_polygon(gen_flat, emb_cond_rep, emb_mask_rep, self.image_size)
-
-                weighted_constraint.append((acc["constraint_puzzle_acc"], B * N))
 
                 valid_bn = np.asarray(acc["per_sample_valid"]).reshape(B, N)
                 area_bn = np.asarray(acc["per_sample_area"]).reshape(B, N)
@@ -1057,16 +1046,13 @@ class PolygonEvalCallback(EvalCallbackBase):
 
         any_valid_all = np.concatenate(all_any_valid) if all_any_valid else np.zeros(0, dtype=bool)
         result: dict = {
-            f"constraint_puzzle_acc{suffix}": _weighted_mean(weighted_constraint),
-            f"valid_rate{suffix}": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
+            f"{range_name}/valid_rate": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
         }
-        if area_lookup is not None:
-            result[f"ratio_coverage{suffix}"] = len(all_ratios) / max(n_done, 1)
-            if all_ratios:
-                result[f"ratio_mean{suffix}"] = float(np.mean(all_ratios))
-                result[f"ratio_std{suffix}"] = float(np.std(all_ratios))
+        if all_ratios:
+            result[f"{range_name}/ratio_mean"] = float(np.mean(all_ratios))
+            result[f"{range_name}/ratio_std"] = float(np.std(all_ratios))
         if order_lookup is not None and all_exact_match:
-            result[f"opt_rate{suffix}"] = float(np.mean(all_exact_match))
+            result[f"{range_name}/opt_rate"] = float(np.mean(all_exact_match))
         if panels:
             result["samples"] = panels
         return result

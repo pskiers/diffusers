@@ -23,6 +23,25 @@ never over-counting) — a genuine resolution limit of the rendering
 (128px, node_radius=2), not a fixable bug in either implementation; see
 _detect_vertices's docstring.
 
+IMPORTANT — terminal snapping (2026-08-03 fix): the paper's extraction
+*does* snap detected vertices onto the exact ground-truth terminal
+coordinates when close enough (extract_steiner_graph.py's
+_snap_vertices_to_reference), which we had NOT ported. Without it, every
+detected vertex — including ones sitting exactly on a terminal — carries a
+few tenths of a pixel of detection noise, and per_sample_length is measured
+between these noisy positions. Since a valid tree's *true* length can never
+be shorter than GeoSteiner's exact optimum, any measured length < optimum is
+necessarily a measurement artifact, not a real solution — and empirically,
+36.5% of our *own ground-truth* renders (no model involved) round-tripped to
+a ratio < 1 before this fix (mean 1.0015, min 0.994), confirming it was a
+real bug, not sampling noise. _snap_terminals_to_reference below ports their
+fix: any detected vertex within snap_threshold of a known terminal is
+replaced by that terminal's *exact* coordinate before length is computed,
+eliminating quantization error on terminal-adjacent edges (Steiner junction
+points, which have no reference to snap to, keep their raw detected
+position — some residual noise there is unavoidable and matches the
+paper's own approach).
+
 optimality_ratio (generated tree length ÷ GeoSteiner's true optimal length)
 is NOT computed in this module — it needs the exact optimal length, which
 isn't part of the DataSample batch. Instead, SteinerEvalCallback (in
@@ -83,15 +102,48 @@ def _detect_vertices(vertex_mask: np.ndarray, node_radius: float = 2.0, suppress
     return np.array(vertices, dtype=np.float64) if vertices else np.zeros((0, 2))
 
 
+def _snap_terminals_to_reference(
+    vertices_rc: np.ndarray, terminal_rc: np.ndarray, snap_threshold: float
+) -> np.ndarray:
+    """Greedily snap each detected vertex onto its nearest not-yet-used
+    terminal reference point, if within `snap_threshold` — ports the paper's
+    extract_steiner_graph.py._snap_vertices_to_reference. Each terminal
+    claims at most one vertex (closest first, by terminal), and a claimed
+    vertex's position is replaced by the terminal's *exact* coordinate —
+    the whole point being to eliminate detection-quantization error on
+    terminal-adjacent edges (see this module's docstring)."""
+    if len(vertices_rc) == 0 or len(terminal_rc) == 0:
+        return vertices_rc
+    snapped = vertices_rc.copy()
+    available = set(range(len(vertices_rc)))
+    for ref in terminal_rc:
+        best_idx, best_dist = None, float("inf")
+        for i in available:
+            d = float(np.linalg.norm(vertices_rc[i] - ref))
+            if d < best_dist:
+                best_dist, best_idx = d, i
+        if best_idx is not None and best_dist <= snap_threshold:
+            snapped[best_idx] = ref
+            available.discard(best_idx)
+    return snapped
+
+
 def _extract_graph(
     img: np.ndarray,           # (H, W) float, background~0 vertex~-1 edge~+1
     node_radius: float = 2.0,
-    coverage_threshold: float = 0.8,
+    coverage_threshold: float = 0.9,  # matches the paper's actual eval-time config (not its CLI default of 0.7)
     proximity_threshold: float = 4.0,
+    terminal_rc: np.ndarray | None = None,  # (n_term, 2) exact terminal (row, col) pixel coords, for snapping
 ) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Detect vertices (via non-max-suppression on the vertex mask's distance
     transform — see _detect_vertices) and edges (straight-line pixel coverage
     between vertex pairs) in a generated Steiner-tree raster.
+
+    When `terminal_rc` is given, detected vertices near a known terminal are
+    snapped onto its exact coordinate (see _snap_terminals_to_reference)
+    before edges/length are computed from them — matches the paper's own
+    extraction pipeline and is required for per_sample_length to never dip
+    below the true optimum on terminal-adjacent edges.
 
     Returns (vertices: (n, 2) float array of (row, col) pixel coords, edges:
     list of (i, j) index pairs).
@@ -102,6 +154,9 @@ def _extract_graph(
     vertices = _detect_vertices(vertex_mask, node_radius)
     if len(vertices) == 0:
         return np.zeros((0, 2)), []
+    if terminal_rc is not None and len(terminal_rc) > 0:
+        snap_threshold = max(2.0, node_radius * 2.5)
+        vertices = _snap_terminals_to_reference(vertices, terminal_rc, snap_threshold)
 
     def line_coverage(p, q, n_samples=30):
         rows = np.linspace(p[0], q[0], n_samples)
@@ -195,7 +250,10 @@ def evaluate_steiner(
     length = np.full(B, np.nan, dtype=np.float64)
 
     for b in range(B):
-        vertices, edges = _extract_graph(imgs[b])
+        term_xy = emb[b][mask[b]]  # (n_term, 2) in [0,1]
+        term_rc = term_xy[:, ::-1] * (image_size - 1)  # (row, col) pixel coords
+
+        vertices, edges = _extract_graph(imgs[b], terminal_rc=term_rc)
         n = len(vertices)
         G = nx.Graph()
         G.add_nodes_from(range(n))
@@ -205,8 +263,6 @@ def evaluate_steiner(
         if edges:
             length[b] = _tree_length_normalized(vertices, edges, image_size)
 
-        term_xy = emb[b][mask[b]]  # (n_term, 2) in [0,1]
-        term_rc = term_xy[:, ::-1] * (image_size - 1)  # (row, col) pixel coords
         covers[b] = _covers_terminals(vertices, term_rc, tol_px)
 
     valid = connected & valid_tree & covers
