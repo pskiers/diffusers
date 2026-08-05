@@ -42,9 +42,15 @@ MAZE_TEST_PER_SCALE = int(os.environ.get("MAZE_TEST_PER_SCALE", "100"))  # DFS-o
 QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]            # 7 scales
 QUEEN_TEST_PER_SCALE = int(os.environ.get("QUEEN_TEST_PER_SCALE", "50")) # 7 × 50 = 350
 
-# ── Train sizes (env-overridable, mirror the legacy shell script) ────────────
+# ── Train sizes ────────────
 MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
 QUEEN_TRAIN = int(os.environ.get("QUEEN_TRAIN", "30000"))
+QUEEN_TRAIN_SCALE_CAPS = {
+    int(k): int(v)
+    for tok in os.environ.get("QUEEN_TRAIN_SCALE_CAPS", "4:60,5:3040").split(",")
+    if tok.strip()
+    for k, v in [tok.split(":")]
+}
 QUEEN_CELL_SIZE = os.environ.get("QUEEN_CELL_SIZE", "64")
 QUEEN_RADIUS = os.environ.get("QUEEN_RADIUS", "16")
 # Parallel worker processes, split the batch across processes
@@ -368,16 +374,33 @@ def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
         raise
 
 
+def _queen_mixed_counts(count: int) -> dict[int, int]:
+    """Distribute ``count`` puzzles over QUEEN_SCALES: scales listed in
+    QUEEN_TRAIN_SCALE_CAPS are pinned to their (richness-limited) cap, and the
+    remaining budget is split evenly across the uncapped scales."""
+    capped = {s: min(QUEEN_TRAIN_SCALE_CAPS[s], count)
+              for s in QUEEN_SCALES if s in QUEEN_TRAIN_SCALE_CAPS}
+    free = [s for s in QUEEN_SCALES if s not in capped]
+    remaining = max(0, count - sum(capped.values()))
+    free_counts = _split_count(remaining, len(free)) if free else []
+    return {**capped, **dict(zip(free, free_counts))}
+
+
 def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
-    """Render ``count`` queen puzzles spread uniformly across QUEEN_SCALES and
-    merge them into a single mixed-size parquet. Each puzzle keeps its own ``n``
-    in the ``sample_json`` metadata, so the train set is a random mix of sizes.
-    Returns (parquet_path, work_dir); the caller must rmtree work_dir."""
+    """Render ``count`` queen puzzles across QUEEN_SCALES and merge them into a
+    single mixed-size parquet. Small boards have a tiny distinct-puzzle space, so
+    they are capped by QUEEN_TRAIN_SCALE_CAPS (S < M / QUEEN_TEST_PER_SCALE) to
+    keep the training draw well below the space size — otherwise training covers
+    the whole space and the disjoint-seed test set leaks. The remaining budget is
+    split evenly across the uncapped (large) scales. Each puzzle keeps its own
+    ``n`` in ``sample_json``. Returns (parquet_path, work_dir)."""
     work = Path(tempfile.mkdtemp(prefix="amaze_queen_mixed_"))
     try:
-        per_scale = _split_count(count, len(QUEEN_SCALES))
+        per_scale = _queen_mixed_counts(count)
+        print(f">> queen mixed per-scale counts: {per_scale}", flush=True)
         parts = []
-        for scale, c in zip(QUEEN_SCALES, per_scale):
+        for scale in QUEEN_SCALES:
+            c = per_scale.get(scale, 0)
             if c <= 0:
                 continue
             # Disjoint seed ranges per scale (>> per-worker offsets inside the pool).
@@ -412,7 +435,8 @@ def gen_queens_train(size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
     """Generate a queen train leaf (train.parquet, skip if present).
 
     ``size`` is an int (single ``n=size`` board) or the string ``"ALL"`` (30k
-    puzzles of mixed sizes uniformly sampled across QUEEN_SCALES)."""
+    puzzles of mixed sizes across QUEEN_SCALES, distributed by
+    QUEEN_TRAIN_SCALE_CAPS — small scales capped, large scales split evenly)."""
     target_dir = train_queens_dir(size, image_size)
     target = target_dir / "train.parquet"
     if target.exists():
