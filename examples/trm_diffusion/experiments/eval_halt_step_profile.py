@@ -7,12 +7,13 @@ experiments/ablate_trm_loop_budget.py's "halt" axis only reports one number
 per config (total_sup_calls, summed over the whole trajectory) — useful for
 picking a good operating point, but it hides *where* in the trajectory those
 calls are spent, and collapses every sample in a batch into one number. This
-script instead runs the real, per-sample-masked halting rule (see
-ThinkerFrozenPainterBase.forward_with_carry: each sample freezes at its own
-halt step instead of the whole batch halting together on a batch-mean
-decision) and records each individual sample's actual halting step via the
-halt_steps_out hook — so what's reported here is genuine per-sample data
-from the real generation, not an estimate. For each denoising step it
+script instead runs the real, per-sample dynamic-re-batching halting rule
+(see ThinkerFrozenPainterBase.forward_with_carry: each sample is removed
+from the active batch at its own halt step, genuinely shrinking later
+iterations' compute, instead of the whole batch halting together on a
+batch-mean decision) and records each individual sample's actual halting
+step via the halt_steps_out hook — so what's reported here is genuine
+per-sample data from the real generation, not an estimate. For each denoising step it
 reports mean/median/std/min/max/frac_full_budget, pooled across the cached
 validation batches and both CFG branches (conditional + unconditional, if
 cfg_scale != 1) — answering both "does the head spend more steps on
@@ -84,14 +85,14 @@ def _run_profile_sampling(
     total_calls: list[int],
     halt_steps_by_denoise_idx: list[list[torch.Tensor]],
 ) -> None:
-    """Runs the real, per-sample-masked halting rule (use_halt_head=True)
-    and records both the actual compute cost (total_calls, one int per
-    denoising step per cached batch — bounded by the hardest sample in the
-    batch, same accounting as ablate_trm_loop_budget.py's halt axis) and
-    each individual sample's own halting step (halt_steps_by_denoise_idx,
-    one (B,) tensor per denoising step per cached batch, pooling the
-    conditional and unconditional CFG branches together as independent
-    reasoning calls)."""
+    """Runs the real, per-sample dynamic-re-batching halting rule
+    (use_halt_head=True) and records both the actual compute cost
+    (total_calls, the average steps-per-sample used per denoising step per
+    cached batch — same accounting as ablate_trm_loop_budget.py's halt
+    axis) and each individual sample's own halting step
+    (halt_steps_by_denoise_idx, one (B,) tensor per denoising step per
+    cached batch, pooling the conditional and unconditional CFG branches
+    together as independent reasoning calls)."""
     device = x_init.device
     model.scheduler.set_timesteps(num_inference_steps, device=device)
     x = x_init.clone()

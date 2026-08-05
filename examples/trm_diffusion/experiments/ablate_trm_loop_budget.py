@@ -30,16 +30,21 @@ is untouched):
              both sides).
   halt     — replace the fixed n_sup schedule with the trained adaptive-
              halting head (requires thinker.with_halt_head=True and a
-             checkpoint trained via experiments/train_halt_head.py): every
-             reasoning step is capped at model.n_sup but the head can exit
-             early. Sweeps ablation.halt_thresholds x reset_every_values,
-             instruments the actual number of reasoning steps used (not a
-             theoretical count, since it depends on the head's per-batch
+             checkpoint trained via experiments/train_halt_head.py): each
+             sample is dynamically removed from the active batch the moment
+             its own prediction crosses halt_threshold (see
+             forward_with_carry), capped at model.n_sup — real, per-sample
+             compute savings, not a shared batch-level decision. Sweeps
+             ablation.halt_thresholds x reset_every_values, instruments the
+             actual average reasoning-steps-per-sample used (not a
+             theoretical count, since it depends on the head's per-sample
              decisions), and reports the same accuracy metrics as the other
              axes so its quality/compute trade-off can be compared directly
              against the static/carry Pareto frontier. See also
              experiments/eval_halt_head.py for an offline check of the head's
-             regression quality in isolation (no sampling required).
+             regression quality in isolation (no sampling required), and
+             experiments/eval_halt_step_profile.py for the real per-sample
+             step distribution broken out per denoising step.
 
 For every configuration, reports the same 4 accuracies as SudokuEvalCallback
 (cell_acc, puzzle_acc, constraint_puzzle_acc, given_consistent_puzzle_acc)
@@ -279,16 +284,20 @@ def _run_halt_ablation_sampling(
     cfg_scale: float,
     halt_threshold: float,
     reset_fn: Callable[[int], bool],
-    total_sup_calls: list[int],
+    total_sup_calls: list[float],
 ) -> torch.Tensor:
     """Like _run_ablation_sampling, but n_sup at each denoising step is
     decided by the trained halt head (use_halt_head=True) instead of a fixed
-    schedule — reasoning is capped at model.n_sup (the trained ceiling) and
-    the head can exit early. Appends this trajectory's total reasoning-step
-    count (summed across denoising steps and both CFG branches, if any) to
-    `total_sup_calls` — the real compute used, since it depends on the
-    head's per-batch decisions and can't be computed ahead of time the way
-    the static/carry axes' n_sup_fn can.
+    schedule, via dynamic re-batching (see forward_with_carry) — samples are
+    physically removed from the active batch the moment they individually
+    halt, so this is real, not nominal, per-sample compute savings. Appends
+    this trajectory's total average-reasoning-steps-per-sample (summed
+    across denoising steps and both CFG branches, if any — each
+    forward_with_carry call already reports the mean over its own samples,
+    since dynamic re-batching means different samples in the same call can
+    use different numbers of steps) to `total_sup_calls` — the real compute
+    used, since it depends on the head's per-sample decisions and can't be
+    computed ahead of time the way the static/carry axes' n_sup_fn can.
     """
     device = x_init.device
     model.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -296,7 +305,7 @@ def _run_halt_ablation_sampling(
 
     z_H_c = z_L_c = None
     z_H_u = z_L_u = None
-    steps_used: list[int] = []
+    steps_used: list[float] = []
 
     for step_idx, t in enumerate(model.scheduler.timesteps):
         t_batch = t.expand(x.shape[0]).to(device)
@@ -376,24 +385,23 @@ def _run_halt_config(
     reset_fn: Callable[[int], bool],
 ) -> dict:
     """Like _run_config, but for the halt-head-driven axis: total_sup_calls
-    is measured per cached batch (via _run_halt_ablation_sampling) rather
-    than computed ahead of time from a fixed n_sup_fn.
+    is measured per cached batch (via _run_halt_ablation_sampling, which
+    already averages per-sample within a batch — see forward_with_carry's
+    dynamic re-batching) rather than computed ahead of time from a fixed
+    n_sup_fn.
 
-    _run_halt_ablation_sampling's total_sup_calls value is shared across
-    every sample in its batch (masking doesn't change how many loop
-    iterations run, only which sample's state freezes early) — but cached
-    batches aren't guaranteed to all be the same size (_build_cached_batches
-    stops as soon as num_samples is reached, which could land mid-batch, or
-    on the dataloader's own final drop_last=False partial batch), so the
-    cross-batch average is explicitly sample-count-weighted rather than a
-    plain mean-of-batches."""
+    Cached batches aren't guaranteed to all be the same size
+    (_build_cached_batches stops as soon as num_samples is reached, which
+    could land mid-batch, or on the dataloader's own final
+    drop_last=False partial batch), so the cross-batch average is
+    explicitly sample-count-weighted rather than a plain mean-of-batches."""
     all_cell, all_puzzle, all_constraint, all_given_consistent = [], [], [], []
-    total_sup_calls: list[int] = []
+    total_sup_calls: list[float] = []
     sample_counts: list[int] = []
     t0 = time.time()
 
     for cb in cached_batches:
-        batch_calls: list[int] = []
+        batch_calls: list[float] = []
         x = _run_halt_ablation_sampling(
             model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale,
             halt_threshold, reset_fn, batch_calls,
