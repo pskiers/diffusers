@@ -1,0 +1,11 @@
+# Inscribed Square eval callback: single-sample DDIM sampling (matching the
+# paper's own evaluation protocol — see eval/squares_eval.py's docstring for
+# why there's no best-of-N here, unlike Steiner/Polygon/BallDrop) +
+# squareness (Eq. 2) / alignment (Eq. 1) scoring, directly comparable to the
+# paper's Table 1 Square↑/Align↑ columns. If a training run's periodic eval
+# is too slow, lower num_samples here.
+- _target_: models.eval_callbacks.SquaresEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 256
+  num_candidates: 1
+  num_log_images: 8

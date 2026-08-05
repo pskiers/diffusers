@@ -1,0 +1,25 @@
+# Unscaled/paper-size concat-conditioned backbone for the Inscribed Square
+# task — identical architecture to steiner_unet_concat.yaml/
+# polygon_unet_concat.yaml: config_curves.yaml's model: block (time_emb_dim,
+# num_levels, attention_heads, attention_locations, base_channels) is the
+# exact same values as config_steiner.yaml/config_polygonalization_max.yaml
+# use, so this is the same 4-level, base_channels=64, attention-at-deepest-
+# 2-of-4-levels backbone, just with its own in/out channel count for this
+# task's 1-channel image + 1-channel condition.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 2
+out_channels: 1
+block_out_channels: [64, 128, 256, 512]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

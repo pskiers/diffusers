@@ -35,6 +35,7 @@ from eval.maze_eval import evaluate_mazes, make_maze_panel_image
 from eval.steiner_eval import evaluate_steiner, make_steiner_panel_image
 from eval.polygon_eval import evaluate_polygon, make_polygon_panel_image, _orders_equivalent
 from eval.ball_drop_eval import evaluate_ball_drop, make_ball_drop_panel_image
+from eval.squares_eval import evaluate_squares, make_squares_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -1235,6 +1236,119 @@ class BallDropEvalCallback(EvalCallbackBase):
             f"settled_rate{suffix}": _weighted_mean(weighted_settled),
             f"mean_lines_extracted{suffix}": _weighted_mean(weighted_lines),
             f"valid_rate{suffix}": float(any_valid_all.mean()) if len(any_valid_all) else float("nan"),
+        }
+        if panels:
+            result["samples"] = panels
+        return result
+
+
+# ── Inscribed Square ──────────────────────────────────────────────────────────
+
+
+class SquaresEvalCallback(EvalCallbackBase):
+    """
+    DDIM sampling eval for the Inscribed Square dataset: sample squares
+    conditioned on a curve, score with squareness_metric (paper Eq. 2) /
+    alignment_score (paper Eq. 1) — see eval/squares_eval.py. Directly
+    comparable to the paper's Table 1 Square↑/Align↑ columns, not to the
+    original repo's own wandb training curves (which log a different,
+    decay_scale-based training-progress diagnostic instead — see that
+    module's docstring for why this callback deliberately doesn't use it).
+
+    Unlike SteinerEvalCallback/PolygonEvalCallback/BallDropEvalCallback,
+    there is no best-of-N valid-candidate selection: neither metric is a
+    pass/fail constraint check (a generated square always gets scored, never
+    discarded), and the paper's own reported evaluation protocol samples
+    exactly once per instance. num_candidates > 1 here instead averages both
+    metrics over that many independent generations per instance, for a less
+    noisy per-instance estimate — a deliberate extension, not a reproduction
+    of a best-of-N selection.
+
+    Main metrics:
+      squareness_mean — mean squareness_metric over all generated candidates.
+      alignment_mean  — mean alignment_score over all generated candidates,
+                        in raw pixel units (typically negative — see
+                        alignment_score's docstring).
+
+    Args:
+        image_size: must match the dataset's rendering resolution.
+        num_samples: number of puzzle instances to evaluate.
+        num_candidates: independent noise samples per instance to average
+                        metrics over (default 1, matching the paper's own
+                        single-sample evaluation protocol).
+        num_log_images: WandB panel images, each showing curve | generated |
+                        ground-truth square for one instance (candidate 0).
+    """
+
+    def __init__(
+        self,
+        image_size: int = 128,
+        num_samples: int = 256,
+        num_candidates: int = 1,
+        num_log_images: int = 8,
+    ):
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.num_candidates = num_candidates
+        self.num_log_images = num_log_images
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "SquaresEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_log = self.num_log_images
+        chunk = max(1, pipeline.batch_size // self.num_candidates)
+
+        weighted_squareness, weighted_alignment = [], []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (self.num_samples + dataloader.batch_size - 1) // dataloader.batch_size
+        for batch in tqdm(dataloader, "Inscribed Square eval", total=n_batches):
+            if n_done >= self.num_samples:
+                break
+            B_full = batch["images"].shape[0]
+
+            for start in range(0, B_full, chunk):
+                end = min(start + chunk, B_full)
+                sub = batch.slice(start, end)
+                B = end - start
+
+                conditions = model._batch_to_sample(sub, device)
+                gen_bn = pipeline.sample_best_of_n(model, conditions, device, self.num_candidates)  # (B, N, C, H, W)
+                N = gen_bn.shape[1]
+                gen_flat = model.decode_for_eval(gen_bn.reshape(B * N, *gen_bn.shape[2:]))  # (B*N, 1, H, W)
+
+                cond_rep = sub["spatial_conditions"].to(device).repeat_interleave(N, dim=0)
+                acc = evaluate_squares(gen_flat, cond_rep)
+
+                w = B * N
+                weighted_squareness.append((acc["squareness_mean"], w))
+                weighted_alignment.append((acc["alignment_mean"], w))
+
+                if _wandb is not None and len(panels) < n_log:
+                    n_new = min(n_log - len(panels), B)
+                    cond_cpu = sub["spatial_conditions"].cpu()
+                    true_cpu = sub["images"].cpu()
+                    gen_bn_cpu = gen_flat.reshape(B, N, *gen_flat.shape[1:]).cpu()
+                    for i in range(n_new):
+                        panel = make_squares_panel_image(cond_cpu[i], gen_bn_cpu[i, 0], true_cpu[i])
+                        panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+
+            n_done += B_full
+
+        result: dict = {
+            "squareness_mean": _weighted_mean(weighted_squareness),
+            "alignment_mean": _weighted_mean(weighted_alignment),
         }
         if panels:
             result["samples"] = panels

@@ -1,0 +1,12 @@
+seed: 42
+compile: true
+
+batch_size: 256
+num_steps: 100000
+gradient_accumulation_steps: 4
+cfg_prob: 0.0  # paper's released checkpoint is always-conditional, no CFG dropout (p_null=0)
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

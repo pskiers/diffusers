@@ -1,0 +1,21 @@
+# Trainable, conditional Inscribed-Square UNetPainter (channel-concat
+# conditioning, unscaled/paper-size backbone). Condition = curve outline,
+# target = filled square — two independent renders (see
+# datasets/squares_dataset.py), not a "solution overlaid on puzzle" scheme
+# like Steiner/Polygon, but conditioning mechanism is the same channel-concat
+# as those (matches the paper's own model/diffusion.py, which channel-concats
+# the condition before its UNet too).
+_target_: models.painter_base.ConcatConditionedUNetPainter
+_recursive_: false
+unet: ${backbone}
+image_channels: 1
+painter_dtype: "bfloat16"
+pixel_range: "[-1,1]"
+mean_reduced_loss: true  # loss_fn is plain mean-reduced MSE — see UNetPainter.__init__
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 6e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  lr_min_ratio: 0.1
