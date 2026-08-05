@@ -28,6 +28,26 @@ is untouched):
              default [0.25]) sets how thin (e.g. 0.08) or wide (e.g. 0.4) the
              boosted range is. "dip" is the inverse (low at the peak, high on
              both sides).
+  halt     — replace the fixed n_sup schedule with the trained adaptive-
+             halting head (requires thinker.with_halt_head=True and a
+             checkpoint trained via experiments/train_halt_head.py): every
+             reasoning step is capped at model.n_sup but the head can exit
+             early. Sweeps ablation.halt_thresholds x reset_every_values,
+             instruments the actual number of reasoning steps used (not a
+             theoretical count, since it depends on the head's per-batch
+             decisions), and reports the same accuracy metrics as the other
+             axes so its quality/compute trade-off can be compared directly
+             against the static/carry Pareto frontier. See also
+             experiments/eval_halt_head.py for an offline check of the head's
+             regression quality in isolation (no sampling required).
+
+For every configuration, reports the same 4 accuracies as SudokuEvalCallback
+(cell_acc, puzzle_acc, constraint_puzzle_acc, given_consistent_puzzle_acc)
+plus a compute proxy (total_sup_calls = summed n_sup across the trajectory,
+x2 under CFG since the unconditional branch reasons too) and wall-clock time.
+For the "halt" axis, total_sup_calls is the actual average reasoning-step
+count observed (per full generation trajectory, averaged across the cached
+batches) rather than a value computable ahead of time from the config.
 
 For every configuration, reports the same 4 accuracies as SudokuEvalCallback
 (cell_acc, puzzle_acc, constraint_puzzle_acc, given_consistent_puzzle_acc)
@@ -61,6 +81,15 @@ Usage:
       +ablation.schedule_reset_every=5 \\
       +ablation.schedule_directions=[bump] +ablation.schedule_peaks=[0.33] \\
       +ablation.schedule_widths=[0.08,0.4]
+
+    # Evaluate the trained halt head end-to-end against the static/carry
+    # frontier from the first run above (same checkpoint format as
+    # train_halt_head.py's output, i.e. thinker.with_halt_head=true):
+    python experiments/ablate_trm_loop_budget.py \\
+      experiment=mnist_thinker_v1_controlnet ... \\
+      thinker.with_halt_head=true \\
+      checkpoint=runs/mnist_thinker_x0hint_v1_80/checkpoint_with_halt_head.pt \\
+      +ablation.axes=[halt] +ablation.halt_thresholds=[-0.05,-0.02,0.0,0.02,0.05]
 
 Config overrides work exactly like train_trm.py / eval.py.
 """
@@ -241,6 +270,60 @@ def _total_sup_calls(n_sup_fn: Callable[[int, int, int], int], num_steps: int, c
     return total * (2 if cfg_scale != 1.0 else 1)
 
 
+@torch.no_grad()
+def _run_halt_ablation_sampling(
+    model,
+    conditions,
+    x_init: torch.Tensor,
+    num_inference_steps: int,
+    cfg_scale: float,
+    halt_threshold: float,
+    reset_fn: Callable[[int], bool],
+    total_sup_calls: list[int],
+) -> torch.Tensor:
+    """Like _run_ablation_sampling, but n_sup at each denoising step is
+    decided by the trained halt head (use_halt_head=True) instead of a fixed
+    schedule — reasoning is capped at model.n_sup (the trained ceiling) and
+    the head can exit early. Appends this trajectory's total reasoning-step
+    count (summed across denoising steps and both CFG branches, if any) to
+    `total_sup_calls` — the real compute used, since it depends on the
+    head's per-batch decisions and can't be computed ahead of time the way
+    the static/carry axes' n_sup_fn can.
+    """
+    device = x_init.device
+    model.scheduler.set_timesteps(num_inference_steps, device=device)
+    x = x_init.clone()
+
+    z_H_c = z_L_c = None
+    z_H_u = z_L_u = None
+    steps_used: list[int] = []
+
+    for step_idx, t in enumerate(model.scheduler.timesteps):
+        t_batch = t.expand(x.shape[0]).to(device)
+        step_sample = dataclasses.replace(conditions, x_noisy=x, timesteps=t_batch)
+
+        if reset_fn(step_idx):
+            z_H_c = z_L_c = None
+            z_H_u = z_L_u = None
+
+        pred_c, z_H_c, z_L_c = model.forward_with_carry(
+            step_sample, z_H_c, z_L_c, use_halt_head=True, halt_threshold=halt_threshold, steps_used=steps_used,
+        )
+        noise_pred = pred_c.pred
+
+        if cfg_scale != 1.0:
+            null_sample = model.null_condition_sample(step_sample)
+            pred_u, z_H_u, z_L_u = model.forward_with_carry(
+                null_sample, z_H_u, z_L_u, use_halt_head=True, halt_threshold=halt_threshold, steps_used=steps_used,
+            )
+            noise_pred = pred_u.pred + cfg_scale * (noise_pred - pred_u.pred)
+
+        x = model.scheduler.step(noise_pred, t, x).prev_sample
+
+    total_sup_calls.append(sum(steps_used))
+    return x
+
+
 # ── Config runner ──────────────────────────────────────────────────────────
 
 
@@ -275,6 +358,49 @@ def _run_config(
         "puzzle_acc": float(np.mean(all_puzzle)),
         "constraint_puzzle_acc": float(np.mean(all_constraint)),
         "total_sup_calls": _total_sup_calls(n_sup_fn, num_inference_steps, cfg_scale),
+        "wall_time_sec": elapsed,
+    }
+    if all_given_consistent:
+        result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent))
+    return result
+
+
+def _run_halt_config(
+    model,
+    classifier,
+    cell_size: int,
+    cached_batches: list[dict],
+    num_inference_steps: int,
+    cfg_scale: float,
+    halt_threshold: float,
+    reset_fn: Callable[[int], bool],
+) -> dict:
+    """Like _run_config, but for the halt-head-driven axis: total_sup_calls
+    is measured per cached batch (via _run_halt_ablation_sampling) rather
+    than computed ahead of time from a fixed n_sup_fn."""
+    all_cell, all_puzzle, all_constraint, all_given_consistent = [], [], [], []
+    total_sup_calls: list[int] = []
+    t0 = time.time()
+
+    for cb in cached_batches:
+        x = _run_halt_ablation_sampling(
+            model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale,
+            halt_threshold, reset_fn, total_sup_calls,
+        )
+        generated = model.decode_for_eval(x)
+        acc = evaluate_grids(generated, cb["solutions"], classifier, cell_size, given_masks=cb["given_masks"])
+        all_cell.append(acc["cell_acc"])
+        all_puzzle.append(acc["puzzle_acc"])
+        all_constraint.append(acc.get("constraint_puzzle_acc", 0.0))
+        if acc.get("given_consistent_puzzle_acc") is not None:
+            all_given_consistent.append(acc["given_consistent_puzzle_acc"])
+
+    elapsed = time.time() - t0
+    result = {
+        "cell_acc": float(np.mean(all_cell)),
+        "puzzle_acc": float(np.mean(all_puzzle)),
+        "constraint_puzzle_acc": float(np.mean(all_constraint)),
+        "total_sup_calls": float(np.mean(total_sup_calls)),
         "wall_time_sec": elapsed,
     }
     if all_given_consistent:
@@ -333,6 +459,7 @@ def main(cfg: DictConfig):
     schedule_ratio: float = ab.get("schedule_ratio", 3.0)
     schedule_peaks: list[float] = list(ab.get("schedule_peaks", [0.5]))
     schedule_widths: list[float] = list(ab.get("schedule_widths", [0.25]))
+    halt_thresholds: list[float] = list(ab.get("halt_thresholds", [-0.05, -0.02, 0.0, 0.02, 0.05]))
     out_path: str = ab.get("out", str(Path(checkpoint).parent / "loop_budget_ablation.json"))
 
     if "schedule" in axes and schedule_flat_n is None:
@@ -438,6 +565,23 @@ def main(cfg: DictConfig):
             results[key]["schedule"] = sched
             logger.info(f"  → {results[key]}")
 
+    if "halt" in axes:
+        if not getattr(model.thinker, "with_halt_head", False):
+            raise SystemExit(
+                "ablation.axes includes 'halt' but the model was built without a halt head — "
+                "add thinker.with_halt_head=true and point checkpoint= at a checkpoint produced "
+                "by experiments/train_halt_head.py."
+            )
+        for reset_every in reset_every_values:
+            for th in halt_thresholds:
+                key = f"halt/reset_every={reset_every}/threshold={th}"
+                logger.info(f"Running {key} ...")
+                results[key] = _run_halt_config(
+                    model, classifier, cell_size, cached_batches, num_inference_steps, cfg_scale,
+                    th, _make_reset_fn(reset_every),
+                )
+                logger.info(f"  → {results[key]}")
+
     if accelerator.is_main_process:
         print("\n" + "=" * 100)
         print(f"{'config':<45}{'cell_acc':>10}{'puzzle_acc':>12}{'constr_acc':>12}{'given_cons':>12}{'sup_calls':>10}")
@@ -445,7 +589,7 @@ def main(cfg: DictConfig):
         for key, r in results.items():
             print(
                 f"{key:<45}{r['cell_acc']:>10.4f}{r['puzzle_acc']:>12.4f}{r['constraint_puzzle_acc']:>12.4f}"
-                f"{r.get('given_consistent_puzzle_acc', float('nan')):>12.4f}{r['total_sup_calls']:>10d}"
+                f"{r.get('given_consistent_puzzle_acc', float('nan')):>12.4f}{r['total_sup_calls']:>10.1f}"
             )
         print("=" * 100)
 

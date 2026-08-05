@@ -211,6 +211,7 @@ class ThinkerFrozenPainterBase(BaseModel):
         null_steering: bool = False,
         use_halt_head: bool = False,
         halt_threshold: float = 0.0,
+        steps_used: Optional[list] = None,
     ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
         instead of always resetting it, and allows overriding n_sup.
@@ -228,6 +229,12 @@ class ThinkerFrozenPainterBase(BaseModel):
         reasoning step, stop once the halt head's batch-mean predicted future
         loss reduction drops to/below halt_threshold. Off by default, so
         existing call sites are unaffected.
+
+        steps_used: optional list; if given, the number of reasoning steps
+        actually taken this call is appended to it (for measuring the halt
+        head's real compute savings — see experiments/ablate_trm_loop_budget.py's
+        "halt" axis). None by default, so existing call sites are unaffected.
+        Not appended to under null_steering (no reasoning step is taken).
 
         Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
         null_steering, the carry is passed through unchanged so callers can
@@ -250,12 +257,16 @@ class ThinkerFrozenPainterBase(BaseModel):
 
             n_sup = n_sup if n_sup is not None else self.n_sup
             logits = None
+            step_count = 0
             for _ in range(n_sup):
                 logits, z_H, z_L = self.thinker.reasoning_step(
                     enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
                 )
+                step_count += 1
                 if use_halt_head and self.thinker.predict_halt_value(z_H).mean() <= halt_threshold:
                     break
+            if steps_used is not None:
+                steps_used.append(step_count)
 
         noise_pred = self.run_painter(sample, logits)
 
