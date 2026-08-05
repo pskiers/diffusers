@@ -158,12 +158,14 @@ def _threshold_metrics(all_preds: torch.Tensor, all_losses: torch.Tensor, thresh
     in that sample's own trajectory (the oracle, compute-unaware optimum).
     """
     n_sup, n = all_preds.shape
+    device = all_preds.device
     halts = all_preds <= threshold  # (n_sup, N)
     has_halt = halts.any(dim=0)
     # first True index along dim 0, or n_sup - 1 (run to completion) if none
-    first_halt = torch.where(has_halt, halts.float().argmax(dim=0), torch.full((n,), n_sup - 1))
+    full_traj = torch.full((n,), n_sup - 1, device=device, dtype=torch.int64)
+    first_halt = torch.where(has_halt, halts.float().argmax(dim=0), full_traj)
 
-    halt_loss = all_losses[first_halt, torch.arange(n)]
+    halt_loss = all_losses[first_halt, torch.arange(n, device=device)]
     oracle_loss = all_losses.min(dim=0).values
     regret = (halt_loss - oracle_loss)
 
