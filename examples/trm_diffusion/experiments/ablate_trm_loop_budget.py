@@ -377,16 +377,29 @@ def _run_halt_config(
 ) -> dict:
     """Like _run_config, but for the halt-head-driven axis: total_sup_calls
     is measured per cached batch (via _run_halt_ablation_sampling) rather
-    than computed ahead of time from a fixed n_sup_fn."""
+    than computed ahead of time from a fixed n_sup_fn.
+
+    _run_halt_ablation_sampling's total_sup_calls value is shared across
+    every sample in its batch (masking doesn't change how many loop
+    iterations run, only which sample's state freezes early) — but cached
+    batches aren't guaranteed to all be the same size (_build_cached_batches
+    stops as soon as num_samples is reached, which could land mid-batch, or
+    on the dataloader's own final drop_last=False partial batch), so the
+    cross-batch average is explicitly sample-count-weighted rather than a
+    plain mean-of-batches."""
     all_cell, all_puzzle, all_constraint, all_given_consistent = [], [], [], []
     total_sup_calls: list[int] = []
+    sample_counts: list[int] = []
     t0 = time.time()
 
     for cb in cached_batches:
+        batch_calls: list[int] = []
         x = _run_halt_ablation_sampling(
             model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale,
-            halt_threshold, reset_fn, total_sup_calls,
+            halt_threshold, reset_fn, batch_calls,
         )
+        total_sup_calls.append(batch_calls[0])
+        sample_counts.append(cb["solutions"].shape[0])
         generated = model.decode_for_eval(x)
         acc = evaluate_grids(generated, cb["solutions"], classifier, cell_size, given_masks=cb["given_masks"])
         all_cell.append(acc["cell_acc"])
@@ -400,7 +413,7 @@ def _run_halt_config(
         "cell_acc": float(np.mean(all_cell)),
         "puzzle_acc": float(np.mean(all_puzzle)),
         "constraint_puzzle_acc": float(np.mean(all_constraint)),
-        "total_sup_calls": float(np.mean(total_sup_calls)),
+        "total_sup_calls": float(np.average(total_sup_calls, weights=sample_counts)),
         "wall_time_sec": elapsed,
     }
     if all_given_consistent:
