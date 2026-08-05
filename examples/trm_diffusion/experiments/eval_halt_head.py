@@ -253,15 +253,15 @@ def main(cfg: DictConfig):
         for k, v in calibration.items():
             print(f"  {k:<18} {v}")
 
-        print("\n" + "=" * 100)
-        print(f"{'threshold':>10}{'avg_steps':>12}{'frac_full':>12}{'avg_regret':>13}{'median_regret':>15}")
-        print("=" * 100)
+        print("\n" + "=" * 110)
+        print(f"{'threshold':>12}{'avg_steps':>12}{'frac_full':>12}{'avg_regret':>15}{'median_regret':>17}")
+        print("=" * 110)
         for r in threshold_sweep:
             print(
-                f"{r['threshold']:>10.3f}{r['avg_steps_used']:>12.2f}{r['frac_full_trajectory']:>12.3f}"
-                f"{r['avg_regret']:>13.4f}{r['median_regret']:>15.4f}"
+                f"{r['threshold']:>12.6f}{r['avg_steps_used']:>12.2f}{r['frac_full_trajectory']:>12.3f}"
+                f"{r['avg_regret']:>15.6f}{r['median_regret']:>17.6f}"
             )
-        print("=" * 100)
+        print("=" * 110)
 
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
