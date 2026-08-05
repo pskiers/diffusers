@@ -10,6 +10,7 @@ unet: ${backbone}
 image_channels: 1
 painter_dtype: "bfloat16"
 pixel_range: "[-1,1]"
+mean_reduced_loss: true  # loss_fn is plain mean-reduced MSE — see UNetPainter.__init__
 eval_callbacks: ${eval_callbacks}
 optim_cfg:
   _target_: configs.schemas.PainterOptimConfig

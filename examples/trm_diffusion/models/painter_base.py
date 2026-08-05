@@ -143,6 +143,7 @@ class UNetPainter(PainterBase, BaseModel):
         sampling_pipeline=None,
         vae_pixel_range: str = "[-1,1]",
         pixel_range: str = "[0,1]",
+        mean_reduced_loss: bool = False,
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -171,6 +172,17 @@ class UNetPainter(PainterBase, BaseModel):
             if painter_dtype is not None
             else None
         )
+        # loss_fn (models/losses.py) is already batch-mean-reduced, unlike the
+        # original TRM pretrain.py's sum-reduced CE loss that the
+        # `global_batch_size * K` divisor in train_step below was designed to
+        # match. Dividing a mean-reduced loss by global_batch_size again
+        # shrinks gradients by an extra ~global_batch_size, risking an AdamW
+        # eps-floor instability once per-parameter gradients get small (e.g.
+        # late in a well-converging run). mean_reduced_loss=True divides only
+        # by the micro-batch accumulation count K instead, matching the
+        # paper's own train_diffusion.py (`loss = loss / grad_accum_steps`).
+        # Default False preserves existing behavior for every other painter.
+        self._mean_reduced_loss = mean_reduced_loss
 
     @property
     def condition_keys(self) -> list[str]:
@@ -324,6 +336,16 @@ class UNetPainter(PainterBase, BaseModel):
             )
         ]
 
+    def _loss_backward_divisor(self, global_batch_size: int, K: int) -> float:
+        """Divisor applied to `loss_fn`'s (already batch-mean-reduced) output
+        before `accelerator.backward()`. Default matches original pretrain.py's
+        convention for sum-reduced losses (divide by global_batch_size once;
+        the K micro-batch accumulation cancels the extra K here). See
+        `mean_reduced_loss` in __init__ for the corrected divisor (K only),
+        opt-in per instance since most painters' loss_fn is mean-reduced but
+        haven't been verified against this double-normalization."""
+        return K if self._mean_reduced_loss else global_batch_size * K
+
     def train_step(
         self,
         micro_batches,
@@ -337,6 +359,7 @@ class UNetPainter(PainterBase, BaseModel):
         K = len(micro_batches)
         device = accelerator.device
         loss_sums: dict[str, float] = {}
+        divisor = self._loss_backward_divisor(global_batch_size, K)
 
         for mb in micro_batches:
             sample = self._prepare_training_sample(mb, device)
@@ -347,7 +370,7 @@ class UNetPainter(PainterBase, BaseModel):
 
             result = self(sample)
             total_loss, components = self.loss_fn(result.pred, result.logits, sample)
-            accelerator.backward(total_loss / (global_batch_size * K))
+            accelerator.backward(total_loss / divisor)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
 
