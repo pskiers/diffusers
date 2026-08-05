@@ -212,6 +212,8 @@ class ThinkerFrozenPainterBase(BaseModel):
         use_halt_head: bool = False,
         halt_threshold: float = 0.0,
         steps_used: Optional[list] = None,
+        halt_preds_out: Optional[list] = None,
+        halt_steps_out: Optional[list] = None,
     ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
         instead of always resetting it, and allows overriding n_sup.
@@ -224,17 +226,43 @@ class ThinkerFrozenPainterBase(BaseModel):
         ablation only (see experiments/ablate_trm_loop_budget.py), not used
         by forward() itself.
 
-        use_halt_head/halt_threshold: opt-in early exit from the n_sup loop
-        (requires thinker.with_halt_head=True at construction) — after each
-        reasoning step, stop once the halt head's batch-mean predicted future
-        loss reduction drops to/below halt_threshold. Off by default, so
+        use_halt_head/halt_threshold: opt-in early exit (requires
+        thinker.with_halt_head=True at construction), applied per sample via
+        masking rather than one collective batch-mean decision: each sample
+        keeps updating its own (z_H, z_L, logits) until ITS OWN prediction
+        drops to/below halt_threshold, at which point it's frozen at that
+        value while the rest of the batch keeps reasoning. The loop itself
+        still runs (and every sample is still computed every iteration —
+        masking doesn't skip compute for already-halted samples, it only
+        discards their update) until every sample has halted or n_sup is
+        reached, so the real compute cost of a call is bounded by its
+        slowest/hardest sample, same as before — masking changes what
+        result each sample ends up with, not how many iterations the batch
+        as a whole takes. Off by default, so existing call sites are
+        unaffected.
+
+        steps_used: optional list; if given, the number of reasoning-loop
+        iterations actually performed this call (i.e. the real compute cost
+        — bounded by the hardest sample in the batch) is appended to it —
+        see experiments/ablate_trm_loop_budget.py's "halt" axis. None by
+        default, so existing call sites are unaffected.
+        Not appended to under null_steering (no reasoning step is taken).
+
+        halt_preds_out: optional list; if given, predict_halt_value(z_H) —
+        the full per-sample (B,) tensor at that step's (possibly
+        per-sample-frozen) z_H — is appended to it after every reasoning
+        step, regardless of use_halt_head. Pairs with n_sup=self.n_sup and
+        use_halt_head=False to record every individual sample's own
+        prediction across the full, untruncated trajectory — see
+        experiments/eval_halt_step_distribution.py. None by default, so
         existing call sites are unaffected.
 
-        steps_used: optional list; if given, the number of reasoning steps
-        actually taken this call is appended to it (for measuring the halt
-        head's real compute savings — see experiments/ablate_trm_loop_budget.py's
-        "halt" axis). None by default, so existing call sites are unaffected.
-        Not appended to under null_steering (no reasoning step is taken).
+        halt_steps_out: optional list; if given and use_halt_head=True, the
+        per-sample (B,) tensor of the reasoning step at which each sample
+        individually halted (n_sup if it never did) is appended to it — the
+        real per-sample halting-step distribution, not an estimate. See
+        experiments/eval_halt_step_profile.py. None by default, so existing
+        call sites are unaffected.
 
         Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
         null_steering, the carry is passed through unchanged so callers can
@@ -256,17 +284,42 @@ class ThinkerFrozenPainterBase(BaseModel):
                 z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
 
             n_sup = n_sup if n_sup is not None else self.n_sup
+            device = sample.x_noisy.device
             logits = None
             step_count = 0
+            halted = torch.zeros(bsz, dtype=torch.bool, device=device) if use_halt_head else None
+            halt_step = torch.full((bsz,), n_sup, dtype=torch.long, device=device) if use_halt_head else None
+
             for _ in range(n_sup):
-                logits, z_H, z_L = self.thinker.reasoning_step(
+                new_logits, new_z_H, new_z_L = self.thinker.reasoning_step(
                     enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
                 )
                 step_count += 1
-                if use_halt_head and self.thinker.predict_halt_value(z_H).mean() <= halt_threshold:
-                    break
+
+                if use_halt_head:
+                    active = ~halted  # samples not yet halted still get this step's update
+                    active_mask = active.view(-1, 1, 1)
+                    z_H = torch.where(active_mask, new_z_H, z_H)
+                    z_L = torch.where(active_mask, new_z_L, z_L)
+                    logits = new_logits if logits is None else torch.where(active_mask, new_logits, logits)
+
+                    pred = self.thinker.predict_halt_value(z_H)
+                    if halt_preds_out is not None:
+                        halt_preds_out.append(pred.detach())
+                    newly_halted = active & (pred <= halt_threshold)
+                    halt_step = torch.where(newly_halted, torch.full_like(halt_step, step_count), halt_step)
+                    halted = halted | newly_halted
+                    if halted.all():
+                        break
+                else:
+                    logits, z_H, z_L = new_logits, new_z_H, new_z_L
+                    if halt_preds_out is not None:
+                        halt_preds_out.append(self.thinker.predict_halt_value(z_H).detach())
+
             if steps_used is not None:
                 steps_used.append(step_count)
+            if halt_steps_out is not None and use_halt_head:
+                halt_steps_out.append(halt_step.detach())
 
         noise_pred = self.run_painter(sample, logits)
 
