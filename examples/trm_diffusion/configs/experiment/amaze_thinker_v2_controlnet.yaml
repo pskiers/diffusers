@@ -1,0 +1,55 @@
+# @package _global_
+# Stage 2: TRM thinker (V2, ControlNet) with a frozen Amaze UNet painter.
+# V2 = multi-scale queens (n=4..10): the TRM reasons on a 12x12 = 144-token grid
+# (cell_size=12 -> condition encoder pools 144/12 = 12 per side) instead of V1's
+# 7x7 = 49. Pair with a painter trained on the same multi-scale mix (Painter V2).
+# Usage:
+#   python train_trm.py experiment=amaze_thinker_v2_controlnet \
+#     data.amaze_root=data/amaze/train_queens/all_train_size144 \
+#     painter.checkpoint=runs/<painter_v2>/checkpoint_final.pt
+
+defaults:
+  - override /data: amaze
+  - override /backbone: amaze_unet
+  - override /painter: amaze_unet_controlnet_frozen
+  - override /thinker: mnist
+  - override /translator: controlnet
+  - override /condition_encoder: amaze_spatial_v1
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: amaze
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+# 12x12 reasoning grid. These three MUST stay consistent:
+#   data.cell_size (encoder pool factor) = 144 / 12 = 12
+#   thinker.seq_len = 12 * 12 = 144
+#   translator.grid = 12
+data:
+  cell_size: 12
+
+# Amaze is 3-channel RGB at 144x144.
+# NOTE: 144 tokens is ~3x V1's 49 -> heavier TRM attention/activations. If the
+# 40GB A100 OOMs, halve train.batch_size to 96 and set gradient_accumulation_steps
+# to 8 (keeps the effective batch 768).
+train:
+  batch_size: 192
+  gradient_accumulation_steps: 4
+  max_seconds: 0 # (0 = no limit)
+
+eval:
+  batch_size: 128
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+  seq_len: 144
+
+translator:
+  grid: 12
+
+run:
+  output_dir: "runs/amaze_thinker_v2_controlnet"
