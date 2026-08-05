@@ -359,6 +359,7 @@ class UNetPainter(PainterBase, BaseModel):
         K = len(micro_batches)
         device = accelerator.device
         loss_sums: dict[str, float] = {}
+        loss_maxes: dict[str, float] = {}
         divisor = self._loss_backward_divisor(global_batch_size, K)
 
         for mb in micro_batches:
@@ -373,13 +374,26 @@ class UNetPainter(PainterBase, BaseModel):
             accelerator.backward(total_loss / divisor)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
+                # Per-microbatch max, not just the K-averaged mean below — a
+                # single outlier microbatch within this accumulation window
+                # would otherwise be smoothed away by the averaging and
+                # invisible in logs right when it matters most.
+                loss_maxes[k] = max(loss_maxes.get(k, v), v)
 
-        accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        # clip_grad_norm_'s return value (pre-clip total norm, possibly
+        # inf/nan) was previously discarded — logging it is the cheapest way
+        # to tell a real gradient-explosion event (huge/nan norm right at the
+        # loss spike) apart from something else entirely (loss jumps with a
+        # perfectly normal grad norm) the next time this happens.
+        grad_norm = accelerator.clip_grad_norm_(self.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)
 
-        return {k: v / K for k, v in loss_sums.items()}, lr, global_step + 1
+        metrics = {k: v / K for k, v in loss_sums.items()}
+        metrics.update({f"{k}_max": v for k, v in loss_maxes.items()})
+        metrics["grad_norm"] = float(grad_norm)
+        return metrics, lr, global_step + 1
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
