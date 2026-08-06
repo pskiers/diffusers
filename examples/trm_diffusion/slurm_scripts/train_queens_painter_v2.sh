@@ -47,15 +47,9 @@ AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
   python scripts/gen_amaze.py train queens --size all
 DATA_DIR="${PROJECT_ROOT}/data/amaze/train_queens/all_train_size144"
 
-# ── Stage 1: standalone unconditional painter on the mixed set ───────────────
-# The painter is UNCONDITIONAL, so eval must NOT score conditional queens metrics
-# (Pass@1 / coverage / violation are meaningless without a puzzle->solution map).
-# eval_callbacks=image_gen only logs sample images (ImageGenEvalCallback returns
-# no metrics). (The amaze_queens callback would also auto-skip scoring because the
-# painter's condition_keys are empty — image_gen just makes that explicit.)
 srun python train_trm.py experiment=amaze_unet_painter \
   data.amaze_root="${DATA_DIR}" \
-  eval_callbacks=image_gen \
+  eval_callbacks=amaze_queens \
   train.num_steps=${PAINTER_STEPS} \
   train.max_seconds=${PAINTER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
