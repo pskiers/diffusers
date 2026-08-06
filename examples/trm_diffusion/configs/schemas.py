@@ -120,6 +120,7 @@ class PainterOptimConfig:
     warmup_steps: int
     lr_min_ratio: float = 0.0
     betas: tuple[float, float] = (0.9, 0.999)
+    use_adam_atan2: bool = False  # AdamATan2 instead of AdamW — see trm_wrappers.py
 
 
 # ── Latent DiT configs ────────────────────────────────────────────────────────

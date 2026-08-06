@@ -325,7 +325,14 @@ class UNetPainter(PainterBase, BaseModel):
     # ── Training / eval / optimizer ─────────────────────────────────────────
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
-        optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
+        if self.optim_cfg.use_adam_atan2:
+            from adam_atan2 import AdamATan2
+
+            optim = AdamATan2(
+                self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay, betas=self.optim_cfg.betas
+            )
+        else:
+            optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
         return [
             ScheduledOptimizer(
                 optim,
