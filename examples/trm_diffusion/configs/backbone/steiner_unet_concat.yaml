@@ -11,6 +11,13 @@
 # previously claimed/implemented. AttnDownBlock2D at level 1 (64x64
 # resolution) doesn't exist in their model and is ~16x more expensive than
 # attention at 32x32 (attention cost scales with token count squared).
+#
+# layers_per_block (2026-08-06 fix): the paper's UNet uses exactly 1 resnet
+# block per level; layers_per_block=2 was ~3x too many params (63M vs the
+# real 20M — see models/paper_unet.py for a verbatim, size-correct port).
+# layers_per_block=1 alone only gets to ~44M — diffusers' block/mid_block
+# internals (extra resnet at the bottleneck, heavier attention) account for
+# the rest and aren't exposed as a config knob; accepted as a known gap.
 _target_: diffusers.UNet2DModel
 sample_size: 128
 in_channels: 2
@@ -27,4 +34,4 @@ up_block_types:
   - "UpBlock2D"
   - "UpBlock2D"
 norm_num_groups: 32
-layers_per_block: 2
+layers_per_block: 1
