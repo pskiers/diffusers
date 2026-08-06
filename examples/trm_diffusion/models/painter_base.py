@@ -325,11 +325,17 @@ class UNetPainter(PainterBase, BaseModel):
     # ── Training / eval / optimizer ─────────────────────────────────────────
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
-        if self.optim_cfg.use_adam_atan2:
+        # optim_cfg is a raw DictConfig, not an instantiated PainterOptimConfig
+        # (painter configs set _recursive_: false) — dataclass defaults never
+        # apply, so optional fields need an explicit fallback via .get().
+        if self.optim_cfg.get("use_adam_atan2", False):
             from adam_atan2 import AdamATan2
 
             optim = AdamATan2(
-                self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay, betas=self.optim_cfg.betas
+                self.parameters(),
+                lr=0,
+                weight_decay=self.optim_cfg.weight_decay,
+                betas=self.optim_cfg.get("betas", (0.9, 0.999)),
             )
         else:
             optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
