@@ -18,3 +18,4 @@ optim_cfg:
   weight_decay: 0.01
   warmup_steps: 100
   lr_min_ratio: 0.1
+  use_adam_atan2: false
