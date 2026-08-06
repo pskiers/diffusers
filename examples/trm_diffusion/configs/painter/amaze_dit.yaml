@@ -1,0 +1,14 @@
+# Standalone pixel-space DiT painter, conditioned on the puzzle image by channel concatenation. No VAE, no cross-attention.
+# This is no-TRM diffusion baseline.
+_target_: models.painter_base.ConcatDiTPainter
+_recursive_: false
+unet: ${backbone}
+condition_field: spatial_conditions # DataSample field concatenated onto x_noisy
+painter_dtype: bfloat16
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

@@ -21,6 +21,11 @@ usage() {
   exit 1
 }
 
+# sbatch slurm_scripts/eval_amaze_table.sh queens runs/queens_7x7_painter/checkpoint_final.pt runs/queens_7x7_thinker/checkpoint_final.pt
+# sbatch slurm_scripts/eval_amaze_table.sh maze runs/maze_hex_8x8_painter/checkpoint_final.pt runs/maze_hex_8x8_thinker/checkpoint_final.pt
+# sbatch slurm_scripts/eval_amaze_table.sh maze runs/maze_square_8x8_painter/checkpoint_final.pt runs/maze_square_8x8_thinker/checkpoint_final.pt
+
+
 TASK="${TASK:-${1:-}}"
 PAINTER_CKPT="${PAINTER_CKPT:-${2:-}}"
 THINKER_CKPT="${THINKER_CKPT:-${3:-}}"

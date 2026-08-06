@@ -369,6 +369,59 @@ class UNetPainter(PainterBase, BaseModel):
             self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
 
 
+# ── Pixel-space concat-conditioned DiT painter (no-TRM baseline) ──────────────
+
+
+class ConcatDiTPainter(UNetPainter):
+    """Standalone pixel-space DiT painter conditioned on a spatially-aligned
+    image by channel concatenation.
+
+    The backbone (``unet``) is a diffusers ``Transformer2DModel`` whose
+    ``in_channels`` = noisy channels + condition channels and ``out_channels`` =
+    noisy channels. ``forward`` concatenates ``sample.<condition_field>`` (the
+    puzzle image) onto the noisy image before patchify, so the condition cannot
+    be bypassed — no cross-attention, no VAE. This is the no-TRM diffusion
+    baseline for Amaze (queens / maze).
+
+    Reuses UNetPainter's training / eval / sampling machinery; only the forward
+    pass, the generated-tensor channel count (``out_channels``), and
+    ``condition_keys`` differ.
+    """
+
+    def __init__(self, *args, condition_field: str = "spatial_conditions", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._condition_field = condition_field
+
+    @property
+    def condition_keys(self) -> list[str]:
+        # Declared directly (no condition_encoderW
+        return [self._condition_field]
+
+    @property
+    def noise_shape(self) -> tuple:
+        """Generated tensor has ``out_channels`` (the condition supplies the
+        extra input channels via concat, so it is not part of the output)."""
+        s = self.unet.config.sample_size
+        c = self.unet.config.out_channels
+        return (c, s, s)
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        cond = getattr(sample, self._condition_field, None)
+        if cond is None:
+            cond = torch.zeros_like(sample.x_noisy)
+        x = torch.cat([sample.x_noisy, cond], dim=1)
+        class_labels = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        pred = self.unet(x, timestep=sample.timesteps, class_labels=class_labels).sample
+        return DiffusionPrediction(
+            pred=pred,
+            pred_type=self.scheduler.config.prediction_type,
+        )
+
+
 # ── UNet2DModel with ControlNet residual injection ────────────────────────────
 
 

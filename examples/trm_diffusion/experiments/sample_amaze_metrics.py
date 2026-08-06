@@ -24,7 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 logger = get_logger(__name__, log_level="INFO")
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
-MAZE_SCALES = [3, 5, 7, 9, 11, 13, 16]
+MAZE_SCALES = [3, 5, 7, 8, 9, 11, 13, 16]
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]  # circle uses layers, not width/height
 QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
 

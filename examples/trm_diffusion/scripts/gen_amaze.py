@@ -280,11 +280,12 @@ def ensure_maze_test_combo(shape: str, scale: int) -> None:
 def ensure_maze_test_shape_all(shape: str) -> Path:
     """Ensure every scale combo for ``shape`` exists, then merge them into
     test_maze/{shape}/all_{shape}_test.parquet (skip existing)."""
-    for scale in MAZE_SCALES:
+    test_scales = MAZE_SCALES + [8]
+    for scale in test_scales:
         ensure_maze_test_combo(shape, scale)
     all_pq = test_maze_shape_all_file(shape)
     if not all_pq.exists():
-        _merge_parquets([test_maze_combo_file(shape, s) for s in MAZE_SCALES], all_pq)
+        _merge_parquets([test_maze_combo_file(shape, s) for s in test_scales], all_pq)
     return all_pq
 
 

@@ -1,0 +1,16 @@
+# Pixel-space pure DiT backbone for the standalone (no-TRM)
+# Conditioning is by channel concatenation done in ConcatDiTPainter: in_channels = noisy(3) + condition(3) = 6, out_channels = 3.
+# 144 / patch 12 = 12x12 = 144 tokens (matches Thinker V2's reasoning grid).
+# Timestep enters via adaLN-zero. No cross-attention (encoder_hidden_states is None internally).
+_target_: diffusers.DiTTransformer2DModel
+num_attention_heads: 8
+attention_head_dim: 64 # inner_dim = 8 * 64 = 512
+in_channels: 6
+out_channels: 3
+num_layers: 12
+sample_size: 144 # divisible by patch 12 -> 12x12 grid
+patch_size: 12
+num_embeds_ada_norm: 1
+norm_type: "ada_norm_zero"
+attention_bias: true
+activation_fn: "gelu-approximate"
