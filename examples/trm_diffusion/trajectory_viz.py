@@ -25,6 +25,16 @@ Usage:
 
     # Output path (default: <checkpoint_dir>/trajectory.png):
     python trajectory_viz.py ... +output=results/traj.png
+
+    # Match train_trm.py's environment more closely (it compiles self.unet;
+    # this script doesn't by default):
+    python trajectory_viz.py ... +compile=true
+
+    # Also re-check teacher-forced loss (train_dl and eval_dl, eval() mode)
+    # against what was logged live during training — isolates "the reloaded
+    # model itself denoises worse" from "something about sampling/iteration
+    # specifically is broken":
+    python trajectory_viz.py ... +loss_check_batches=20
 """
 
 from __future__ import annotations
@@ -58,6 +68,26 @@ def _to_img(t: torch.Tensor) -> torch.Tensor:
     return t[0] if t.shape[0] == 1 else t.permute(1, 2, 0)
 
 
+@torch.no_grad()
+def _quick_loss(model, dataloader, device, max_batches: int) -> tuple[float, int]:
+    """Teacher-forced diff_loss over up to max_batches, model in eval() mode
+    (matching how train_trm.py's eval_step computes val/diff_loss) — but
+    without running eval_callbacks, so this stays fast."""
+    total, n = 0.0, 0
+    dl_iter = iter(dataloader)
+    for _ in range(max_batches):
+        try:
+            batch = next(dl_iter)
+        except StopIteration:
+            break
+        sample = model._prepare_training_sample(batch, device)
+        result = model(sample)
+        _, components = model.loss_fn(result.pred, result.logits, sample)
+        total += components.get("diff_loss", 0.0)
+        n += 1
+    return (total / n if n else float("nan")), n
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     import matplotlib
@@ -83,7 +113,7 @@ def main(cfg: DictConfig):
     accelerator = Accelerator(mixed_precision=cfg.precision.mixed_precision)
     device = accelerator.device
 
-    _, eval_ds = build_datasets(cfg)
+    train_ds, eval_ds = build_datasets(cfg)
     collate_fn = getattr(type(eval_ds), "collate_fn", None)
     dl = DataLoader(eval_ds, batch_size=num_samples, shuffle=False, collate_fn=collate_fn)
     batch = next(iter(dl))
@@ -93,6 +123,8 @@ def main(cfg: DictConfig):
     step = _load_checkpoint(model, str(checkpoint), use_ema=use_ema, device="cpu")
     model = accelerator.prepare(model)
     unwrapped = accelerator.unwrap_model(model)
+    if cfg.get("compile", False):
+        unwrapped.compile_submodules()
     unwrapped.eval()
 
     conditions = unwrapped._batch_to_sample(batch, device)
@@ -120,12 +152,28 @@ def main(cfg: DictConfig):
     if 0 not in snapshots:
         snapshots[0] = unwrapped.decode_for_eval(x).cpu()
 
+    # Cross-check against the pipeline's own (already-tested) sampling call,
+    # same conditions/seed — if this disagrees with the manual loop's t=0
+    # snapshot above, the manual loop (used only for the trajectory columns)
+    # has its own bug; if it agrees, the manual loop is trustworthy and any
+    # discrepancy vs. eval.py's callback lies elsewhere (e.g. compile, or
+    # genuine sample-to-sample variance from a different noise draw).
+    generator2 = torch.Generator(device=device).manual_seed(seed)
+    with torch.no_grad():
+        official_x0 = pipeline.sample_one_batch(unwrapped, conditions, device, generator=generator2)
+    official_img = unwrapped.decode_for_eval(official_x0).cpu()
+
     gt = unwrapped.images_to_log(batch["images"][:B]).cpu()
     cond = batch.get("spatial_conditions") if hasattr(batch, "get") else None
     cond_imgs = unwrapped.images_to_log(cond[:B]).cpu() if cond is not None else None
 
     ts_sorted = sorted(snapshots.keys(), reverse=True)
-    col_labels = (["condition"] if cond_imgs is not None else []) + ["GT"] + [f"t={t}" for t in ts_sorted]
+    col_labels = (
+        (["condition"] if cond_imgs is not None else [])
+        + ["GT"]
+        + [f"t={t}" for t in ts_sorted]
+        + ["pipeline\nsample"]
+    )
     n_cols = len(col_labels)
 
     fig, axes = plt.subplots(B, n_cols, figsize=(n_cols * 2.2, B * 2.2), squeeze=False)
@@ -139,6 +187,8 @@ def main(cfg: DictConfig):
         for t in ts_sorted:
             axes[row, col].imshow(_to_img(snapshots[t][row]), cmap="gray", vmin=0, vmax=1)
             col += 1
+        axes[row, col].imshow(_to_img(official_img[row]), cmap="gray", vmin=0, vmax=1)
+        col += 1
         for c in range(n_cols):
             axes[row, c].axis("off")
             if row == 0:
@@ -149,6 +199,18 @@ def main(cfg: DictConfig):
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=150)
     print(f"Saved trajectory grid -> {output}")
+
+    loss_check_batches = int(cfg.get("loss_check_batches", 0))
+    if loss_check_batches > 0:
+        loss_bs = cfg.eval.get("batch_size", cfg.train.batch_size)
+        train_collate_fn = getattr(type(train_ds), "collate_fn", None)
+        train_loss_dl = DataLoader(train_ds, batch_size=loss_bs, shuffle=True, collate_fn=train_collate_fn)
+        val_loss_dl = DataLoader(eval_ds, batch_size=loss_bs, shuffle=False, collate_fn=collate_fn)
+        train_loss, n_train = _quick_loss(unwrapped, train_loss_dl, device, loss_check_batches)
+        val_loss, n_val = _quick_loss(unwrapped, val_loss_dl, device, loss_check_batches)
+        print(f"train_dl diff_loss (eval() mode, {n_train} batches of {loss_bs}): {train_loss:.6f}")
+        print(f"val_dl   diff_loss (eval() mode, {n_val} batches of {loss_bs}): {val_loss:.6f}")
+        print("Compare both against the train/diff_loss and val/diff_loss curves logged during training.")
 
 
 if __name__ == "__main__":
