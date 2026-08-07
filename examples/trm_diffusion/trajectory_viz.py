@@ -35,6 +35,13 @@ Usage:
     # model itself denoises worse" from "something about sampling/iteration
     # specifically is broken":
     python trajectory_viz.py ... +loss_check_batches=20
+
+    # Empirically test/fix "BatchNorm running stats drifted to extreme
+    # values" (see models/paper_unet.py): reset every BatchNorm's running_
+    # mean/var and re-accumulate them from N real train()-mode forward
+    # passes — no weights touched, only the running-stat buffers. Applied
+    # before sampling/loss-check, so it affects both if used together:
+    python trajectory_viz.py ... +recalibrate_bn_batches=100
 """
 
 from __future__ import annotations
@@ -88,6 +95,33 @@ def _quick_loss(model, dataloader, device, max_batches: int) -> tuple[float, int
     return (total / n if n else float("nan")), n
 
 
+@torch.no_grad()
+def _recalibrate_batchnorm(model, dataloader, device, n_batches: int) -> int:
+    """Reset every BatchNorm's running_mean/running_var/num_batches_tracked
+    (nn.BatchNorm2d.reset_running_stats()) and re-accumulate them from
+    n_batches of real train()-mode forward passes — no gradients, no weight
+    updates, only the running-stat buffers change. Empirically tests (and,
+    if it works, fixes) the "running stats drifted to extreme values"
+    theory without retraining a single parameter."""
+    bn_modules = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    for m in bn_modules:
+        m.reset_running_stats()
+
+    was_training = model.training
+    model.train()
+    dl_iter = iter(dataloader)
+    for _ in range(n_batches):
+        try:
+            batch = next(dl_iter)
+        except StopIteration:
+            dl_iter = iter(dataloader)
+            batch = next(dl_iter)
+        sample = model._prepare_training_sample(batch, device)
+        model(sample)
+    model.train(was_training)
+    return len(bn_modules)
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     import matplotlib
@@ -126,6 +160,15 @@ def main(cfg: DictConfig):
     if cfg.get("compile", False):
         unwrapped.compile_submodules()
     unwrapped.eval()
+
+    recalibrate_bn_batches = int(cfg.get("recalibrate_bn_batches", 0))
+    if recalibrate_bn_batches > 0:
+        recal_collate_fn = getattr(type(train_ds), "collate_fn", None)
+        recal_dl = DataLoader(
+            train_ds, batch_size=cfg.train.batch_size, shuffle=True, collate_fn=recal_collate_fn
+        )
+        n_bn = _recalibrate_batchnorm(unwrapped, recal_dl, device, recalibrate_bn_batches)
+        print(f"Recalibrated {n_bn} BatchNorm modules from {recalibrate_bn_batches} train-mode batches")
 
     conditions = unwrapped._batch_to_sample(batch, device)
     pipeline = unwrapped.sampling_pipeline

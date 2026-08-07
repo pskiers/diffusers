@@ -427,10 +427,15 @@ class UNetPainter(PainterBase, BaseModel):
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
         del dl_iter  # release workers before callbacks re-iterate the dataloader
-        self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
+        # eval_callbacks (sampling-based) must also see the model in eval()
+        # mode — they're supposed to reflect real inference-time behavior.
+        # self.train() only runs after them, so a mode-sensitive layer (e.g.
+        # BatchNorm, unlike GroupNorm) can't silently fall back to train-time
+        # statistics during what's meant to be an eval-mode callback.
         for cb in self.eval_callbacks:
             metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
         return metrics
 
     def compile_submodules(self):
@@ -923,10 +928,10 @@ class DiTPainter(PainterBase, BaseModel):
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
         del dl_iter  # release workers before callbacks re-iterate the dataloader
-        self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
         for cb in self.eval_callbacks:
             metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
         return metrics
 
     def compile_submodules(self):
