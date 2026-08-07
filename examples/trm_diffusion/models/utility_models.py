@@ -36,7 +36,12 @@ def load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") -
         # Always load model_state first — covers frozen params and buffers
         # (e.g. H_init, L_init) that EMA doesn't track.
         sd = strip_compiled_prefix(ckpt["model_state"])
-        model.load_state_dict(sd, strict=False)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        logger.info(f"Loaded model_state (step={step}): missing={len(missing)}, unexpected={len(unexpected)}")
+        if missing:
+            logger.info(f"  Missing (first 10): {missing[:10]}")
+        if unexpected:
+            logger.info(f"  Unexpected (first 10): {unexpected[:10]}")
 
         if use_ema and ckpt.get("ema_state") is not None:
             # EMAHelper.state_dict() returns self.shadow directly:
@@ -53,9 +58,6 @@ def load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") -
                     logger.info(f"  Missing (first 5): {missing[:5]}")
                 return step
             logger.warning("EMA state is empty — using raw model_state")
-            logger.info(f"Loaded model_state (step={step})")
-        else:
-            logger.info(f"Loaded model_state (step={step}, use_ema=False)")
         return step
 
     # Fallback: raw state_dict
