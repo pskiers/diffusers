@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=amaze_train_queens_200k
+#SBATCH --job-name=amaze_maze_v2_hex_8x8
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --nodes=1
@@ -13,21 +13,24 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"   # dir containing train_trm.py
 VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/venv"
-TASK="queens"
-N=7
-# queens n=7 -> 7x7 board -> GRID=7, SEQ_LEN=49; CELL_SIZE=20 gives 144//20=7.
-CELL_SIZE=20
-SEQ_LEN=49
-GRID=7
+TASK="maze"
+GEOMETRY="hexagon"
+N=8
+# Thinker reasoning grid: image stays 144x144, grid = 144 // CELL_SIZE.
+# maze 8x8 -> 8x8 cells -> GRID=8, SEQ_LEN=64; CELL_SIZE=18 gives 144//18=8.
+CELL_SIZE=18
+SEQ_LEN=64
+GRID=8
+
 # ── max 48h budget ───────────────────────────────────────────────────────────────
 PAINTER_STEPS=${PAINTER_STEPS:-40000}
-THINKER_STEPS=${THINKER_STEPS:-45000}
+THINKER_STEPS=${THINKER_STEPS:-30000}
 PAINTER_MAX_SECONDS=${PAINTER_MAX_SECONDS:-64800}   # 18h
 THINKER_MAX_SECONDS=${THINKER_MAX_SECONDS:-86400}   # 24h
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
-RUN_NAME="${RUN_NAME:-${2:-train_queens_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
+RUN_NAME="${RUN_NAME:-${2:-maze_v2_${GEOMETRY}_${N}x${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
 module load CUDA/12.4.0
 module load GCCcore/14.3.0 nodejs/22.17.1
@@ -39,14 +42,15 @@ mkdir -p slurm_outputs runs
 
 export PYTHONUNBUFFERED=1
 
+# Generate the single-geometry train set + (once) the diversified test set, and
+# copy the test set in as the validation split. Idempotent.
 AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-  python scripts/gen_amaze.py train "${TASK}" n=${N}
-DATA_DIR="${PROJECT_ROOT}/data/amaze/train_queens_n${N}"
+  python scripts/gen_amaze.py train "${TASK}" --shape ${GEOMETRY} --size ${N}
+DATA_DIR="${PROJECT_ROOT}/data/amaze/train_maze/${GEOMETRY}/n${N}_${GEOMETRY}_train_size144"
 
 # ── Stage 1: standalone painter ──────────────────────────────────────────────
 srun python train_trm.py experiment=amaze_unet_painter \
   data.amaze_root="${DATA_DIR}" \
-  eval_callbacks=amaze_queens \
   train.num_steps=${PAINTER_STEPS} \
   train.max_seconds=${PAINTER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
@@ -59,15 +63,14 @@ srun python train_trm.py experiment=amaze_thinker_v1_controlnet \
   data.cell_size=${CELL_SIZE} \
   thinker.seq_len=${SEQ_LEN} \
   translator.grid=${GRID} \
-  eval_callbacks=amaze_queens \
   train.num_steps=${THINKER_STEPS} \
   train.max_seconds=${THINKER_MAX_SECONDS} \
   run.wandb_project="${WANDB_PROJECT}" \
   run.output_dir="runs/${RUN_NAME}_thinker"
 
-echo "Train queens n=${N} — painter + thinker complete."
+echo "Train maze ${GEOMETRY} ${N}x${N} — painter + thinker complete."
 
-# ── Stage 3: paper metrics → logged into the SAME wandb run as the thinker
+# ── Stage 3: paper metrics → logged into the SAME wandb run as the thinker ──
 if [[ "${RUN_METRICS:-1}" == "1" ]]; then
   srun python experiments/sample_amaze_metrics.py \
     experiment=amaze_thinker_v1_controlnet \

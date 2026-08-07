@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=amaze_train_maze_sq_30k
+#SBATCH --job-name=amaze_maze_v1_square_8x8
 #SBATCH --account=plgdyplomancipw3tt-gpu-a100
 #SBATCH --partition=plgrid-gpu-a100
 #SBATCH --nodes=1
@@ -24,7 +24,7 @@ CELL_SIZE=18
 SEQ_LEN=64
 GRID=8
 WANDB_PROJECT="${WANDB_PROJECT:-${1:-amaze}}"
-RUN_NAME="${RUN_NAME:-${2:-train_maze_${GEOMETRY}_n${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
+RUN_NAME="${RUN_NAME:-${2:-maze_v1_${GEOMETRY}_${N}x${N}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
 module load CUDA/12.4.0
 module load GCCcore/14.3.0 nodejs/22.17.1
@@ -37,8 +37,8 @@ mkdir -p slurm_outputs runs
 export PYTHONUNBUFFERED=1
 
 AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-  python scripts/gen_amaze.py train "${TASK}" n=${N} type=${GEOMETRY}
-DATA_DIR="${PROJECT_ROOT}/data/amaze/train_maze_${GEOMETRY}_n${N}"
+  python scripts/gen_amaze.py train "${TASK}" --shape ${GEOMETRY} --size ${N}
+DATA_DIR="${PROJECT_ROOT}/data/amaze/train_maze/${GEOMETRY}/n${N}_${GEOMETRY}_train_size144"
 
 # ── Stage 1: standalone painter ──────────────────────────────────────────────
 srun python train_trm.py experiment=amaze_unet_painter \
