@@ -25,6 +25,12 @@ Usage:
     # (see models/paper_unet.py) without retraining:
     python eval.py ... +recalibrate_bn_batches=100
 
+    # Save every eval callback's wandb.Image panel(s) to disk as PNGs — the
+    # callback builds these either way (best-of-N sample vs. condition vs.
+    # ground truth), but without an active wandb run they're normally just
+    # discarded when _save_metrics drops non-JSON-serializable values:
+    python eval.py ... +save_panels_dir=results/panels
+
     # Override which callbacks to run:
     python eval.py experiment=... checkpoint=... eval_callbacks=sudoku_ddim
 
@@ -203,11 +209,28 @@ def main(cfg: DictConfig):
             "Make sure your experiment config includes an eval_callbacks group."
         )
 
+    save_panels_dir = cfg.get("save_panels_dir", None)
+
     metrics: dict[str, float] = {}
     with torch.no_grad():
         for cb in callbacks:
             logger.info(f"Running {type(cb).__name__} …")
             cb_metrics = cb(unwrapped, eval_dl, accelerator, step=step)
+
+            # Extract this callback's own panels before merging into the
+            # aggregate `metrics` dict below — dict.update would otherwise
+            # silently overwrite an earlier callback's "samples" key with a
+            # later one's if more than one callback is configured.
+            panels = cb_metrics.get("samples") if accelerator.is_main_process else None
+            if save_panels_dir and panels:
+                panel_dir = Path(save_panels_dir) / type(cb).__name__
+                panel_dir.mkdir(parents=True, exist_ok=True)
+                for i, img in enumerate(panels):
+                    pil_img = getattr(img, "image", None)
+                    if pil_img is not None:
+                        pil_img.save(panel_dir / f"panel_{i:03d}.png")
+                logger.info(f"Saved {len(panels)} panel(s) -> {panel_dir}")
+
             metrics.update(cb_metrics)
             if accelerator.is_main_process and cb_metrics:
                 logger.info(
