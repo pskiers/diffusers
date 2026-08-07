@@ -59,6 +59,7 @@ from torch.utils.data import DataLoader
 
 from factory import build_datasets, build_model
 from models.utility_models import load_checkpoint as _load_checkpoint
+from models.utility_models import recalibrate_batchnorm as _recalibrate_batchnorm
 
 
 def _to_img(t: torch.Tensor) -> torch.Tensor:
@@ -93,33 +94,6 @@ def _quick_loss(model, dataloader, device, max_batches: int) -> tuple[float, int
         total += components.get("diff_loss", 0.0)
         n += 1
     return (total / n if n else float("nan")), n
-
-
-@torch.no_grad()
-def _recalibrate_batchnorm(model, dataloader, device, n_batches: int) -> int:
-    """Reset every BatchNorm's running_mean/running_var/num_batches_tracked
-    (nn.BatchNorm2d.reset_running_stats()) and re-accumulate them from
-    n_batches of real train()-mode forward passes — no gradients, no weight
-    updates, only the running-stat buffers change. Empirically tests (and,
-    if it works, fixes) the "running stats drifted to extreme values"
-    theory without retraining a single parameter."""
-    bn_modules = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
-    for m in bn_modules:
-        m.reset_running_stats()
-
-    was_training = model.training
-    model.train()
-    dl_iter = iter(dataloader)
-    for _ in range(n_batches):
-        try:
-            batch = next(dl_iter)
-        except StopIteration:
-            dl_iter = iter(dataloader)
-            batch = next(dl_iter)
-        sample = model._prepare_training_sample(batch, device)
-        model(sample)
-    model.train(was_training)
-    return len(bn_modules)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")

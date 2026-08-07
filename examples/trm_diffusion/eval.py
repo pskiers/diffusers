@@ -18,6 +18,13 @@ Usage:
     # Diagnostic: keep BatchNorm in train-mode stats during sampling:
     python eval.py ... +force_bn_train=true
 
+    # Reset every BatchNorm's running_mean/running_var and re-accumulate
+    # them from N real train()-mode forward passes over the train split —
+    # no weights touched, only the running-stat buffers. Fixes running
+    # stats that drifted to extreme values under training instability
+    # (see models/paper_unet.py) without retraining:
+    python eval.py ... +recalibrate_bn_batches=100
+
     # Override which callbacks to run:
     python eval.py experiment=... checkpoint=... eval_callbacks=sudoku_ddim
 
@@ -42,6 +49,7 @@ from torch.utils.data import DataLoader
 from factory import build_datasets, build_model
 from hydra.utils import instantiate
 from models.utility_models import load_checkpoint as _load_checkpoint
+from models.utility_models import recalibrate_batchnorm as _recalibrate_batchnorm
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -115,7 +123,7 @@ def main(cfg: DictConfig):
         logger.info(f"Metrics out: {metrics_path}")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    _, eval_ds = build_datasets(cfg)
+    train_ds, eval_ds = build_datasets(cfg)
     logger.info(f"Val dataset: {type(eval_ds).__name__}  ({len(eval_ds)} samples)")
 
     eval_collate_fn = getattr(type(eval_ds), "collate_fn", None)
@@ -170,6 +178,16 @@ def main(cfg: DictConfig):
 
     # ── Eval callbacks ────────────────────────────────────────────────────────
     unwrapped.eval()
+
+    recalibrate_bn_batches = int(cfg.get("recalibrate_bn_batches", 0))
+    if recalibrate_bn_batches > 0:
+        recal_collate_fn = getattr(type(train_ds), "collate_fn", None)
+        recal_dl = DataLoader(
+            train_ds, batch_size=cfg.train.batch_size, shuffle=True, collate_fn=recal_collate_fn
+        )
+        n_bn = _recalibrate_batchnorm(unwrapped, recal_dl, accelerator.device, recalibrate_bn_batches)
+        logger.info(f"Recalibrated {n_bn} BatchNorm modules from {recalibrate_bn_batches} train-mode batches")
+
     if cfg.get("force_bn_train", False):
         n_bn = 0
         for m in unwrapped.modules():

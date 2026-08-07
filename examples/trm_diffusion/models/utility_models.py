@@ -67,6 +67,35 @@ def load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") -
     return None
 
 
+@torch.no_grad()
+def recalibrate_batchnorm(model, dataloader, device, n_batches: int) -> int:
+    """Reset every BatchNorm's running_mean/running_var/num_batches_tracked
+    (nn.BatchNorm2d.reset_running_stats()) and re-accumulate them from
+    n_batches of real train()-mode forward passes — no gradients, no weight
+    updates, only the running-stat buffers change. Fixes (and was used to
+    empirically confirm) a checkpoint whose running stats drifted to
+    extreme values under training instability — see models/paper_unet.py.
+    Shared by eval.py and trajectory_viz.py.
+    """
+    bn_modules = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    for m in bn_modules:
+        m.reset_running_stats()
+
+    was_training = model.training
+    model.train()
+    dl_iter = iter(dataloader)
+    for _ in range(n_batches):
+        try:
+            batch = next(dl_iter)
+        except StopIteration:
+            dl_iter = iter(dataloader)
+            batch = next(dl_iter)
+        sample = model._prepare_training_sample(batch, device)
+        model(sample)
+    model.train(was_training)
+    return len(bn_modules)
+
+
 def load_frozen_custom_kl_vae(
     checkpoint_path: str,
     in_channels: int = 1,
