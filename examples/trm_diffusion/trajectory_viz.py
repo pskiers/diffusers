@@ -40,8 +40,8 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
-from eval import _load_checkpoint
 from factory import build_datasets, build_model
+from models.utility_models import load_checkpoint as _load_checkpoint
 
 
 def _to_img(t: torch.Tensor) -> torch.Tensor:
