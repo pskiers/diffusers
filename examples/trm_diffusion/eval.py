@@ -15,6 +15,9 @@ Usage:
     # Skip EMA, use raw model weights:
     python eval.py ... +use_ema=false
 
+    # Diagnostic: keep BatchNorm in train-mode stats during sampling:
+    python eval.py ... +force_bn_train=true
+
     # Override which callbacks to run:
     python eval.py experiment=... checkpoint=... eval_callbacks=sudoku_ddim
 
@@ -214,6 +217,14 @@ def main(cfg: DictConfig):
 
     # ── Eval callbacks ────────────────────────────────────────────────────────
     unwrapped.eval()
+    if cfg.get("force_bn_train", False):
+        n_bn = 0
+        for m in unwrapped.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                m.train()
+                n_bn += 1
+        logger.info(f"force_bn_train: {n_bn} BatchNorm modules set back to train()")
+
     callbacks = getattr(unwrapped, "eval_callbacks", [])
     if not callbacks:
         logger.warning(
