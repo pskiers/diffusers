@@ -10,7 +10,7 @@
 
 defaults:
   - override /data: polygon
-  - override /backbone: polygon_unet_concat
+  - override /backbone: polygon_unet_paper
   - override /painter: polygon_unet_concat_conditional
   - override /train: polygon_cfg
   - override /eval_callbacks: polygon

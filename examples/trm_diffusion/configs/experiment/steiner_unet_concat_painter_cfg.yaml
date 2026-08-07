@@ -10,7 +10,7 @@
 
 defaults:
   - override /data: steiner
-  - override /backbone: steiner_unet_concat
+  - override /backbone: steiner_unet_paper
   - override /painter: steiner_unet_concat_conditional
   - override /train: steiner_cfg
   - override /eval_callbacks: steiner

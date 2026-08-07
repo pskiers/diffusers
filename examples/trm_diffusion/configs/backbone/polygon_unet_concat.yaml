@@ -1,8 +1,8 @@
-# Unscaled/paper-size concat-conditioned backbone: the paper's actual
-# reported architecture (4 levels, base_channels=64), condition channel-
-# concatenated before the UNet. Kept as the "faithful to the paper"
-# comparison point; see polygon_unet_concat_small.yaml for the scaled-down
-# variant used day to day.
+# GroupNorm+SiLU ablation variant of the paper's UNet (diffusers.UNet2DModel,
+# param-count-matched, 4 levels, base_channels=64, condition channel-
+# concatenated before the UNet). The default backbone is now polygon_unet_
+# paper (models.paper_unet.PaperUNet, verbatim BatchNorm+ReLU port) — use
+# +backbone=polygon_unet_concat to ablate the norm/activation choice.
 #
 # Attention placement (2026-08-03 fix): the paper's own model/diffusion.py
 # only puts attention at the *deepest* 2 of 4 encoder levels (enc2, enc3) +

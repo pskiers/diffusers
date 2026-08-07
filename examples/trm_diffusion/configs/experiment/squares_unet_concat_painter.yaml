@@ -5,16 +5,17 @@
 #
 # Aligned to the paper's actual released training recipe
 # (github.com/kariander1/visual-geo-solver, config_curves.yaml): epsilon
-# prediction, no CFG (p_null=0), lr=6e-4/warmup=100/lr_min_ratio=0.1,
-# grad_accum_steps=4. See configs/train/squares.yaml and
+# prediction, no CFG (p_null=0), lr=6e-4/warmup=100/lr_min_ratio=0.1. Backbone
+# is now squares_unet_paper (models.paper_unet.PaperUNet, BatchNorm+ReLU) —
+# the paper's actual architecture, shared identically across all three
+# tasks. configs/backbone/squares_unet_concat.yaml (diffusers.UNet2DModel,
+# GroupNorm+SiLU) remains available as +backbone=squares_unet_concat for the
+# norm/activation-choice ablation. See configs/train/squares.yaml and
 # configs/painter/squares_unet_concat_conditional.yaml for the actual values.
-# NOT changed: BatchNorm-vs-GroupNorm and ReLU-vs-SiLU (their custom UNet
-# uses BatchNorm+ReLU; ours is diffusers' UNet2DModel, GroupNorm+SiLU) —
-# same known gap as Steiner/Polygon, flagged there, not fixed here either.
 
 defaults:
   - override /data: squares
-  - override /backbone: squares_unet_concat
+  - override /backbone: squares_unet_paper
   - override /painter: squares_unet_concat_conditional
   - override /train: squares
   - override /eval_callbacks: squares

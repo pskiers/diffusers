@@ -6,13 +6,16 @@
 #
 # Aligned to the paper's actual released training recipe — see
 # steiner_unet_concat_painter.yaml's docstring for the full rationale (same
-# paper, same shared training code, identical findings apply here). See
-# configs/train/polygon.yaml, configs/painter/polygon_unet_concat_conditional.yaml,
-# and configs/sampling/direct.yaml for the actual values.
+# paper, same shared training code, identical findings apply here). Backbone
+# is now polygon_unet_paper (models.paper_unet.PaperUNet, BatchNorm+ReLU) —
+# the paper explicitly states MaxAP uses "an identical U-Net backbone" to
+# the other two tasks. configs/backbone/polygon_unet_concat.yaml (diffusers.
+# UNet2DModel, GroupNorm+SiLU) remains available as +backbone=
+# polygon_unet_concat for the norm/activation-choice ablation.
 
 defaults:
   - override /data: polygon
-  - override /backbone: polygon_unet_concat
+  - override /backbone: polygon_unet_paper
   - override /painter: polygon_unet_concat_conditional
   - override /train: polygon
   - override /eval_callbacks: polygon

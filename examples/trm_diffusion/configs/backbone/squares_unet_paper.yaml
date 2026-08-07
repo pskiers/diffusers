@@ -1,0 +1,16 @@
+# The paper's own UNet architecture (model/diffusion.py): BatchNorm+ReLU
+# residual blocks instead of diffusers.UNet2DModel's GroupNorm+SiLU — see
+# models/paper_unet.py. Same architecture as steiner_unet_paper.yaml/
+# polygon_unet_paper.yaml (base_channels=64, 4 levels, attention at
+# bottleneck + deepest 2 encoder/decoder levels), matching
+# config_curves.yaml's model: block exactly — all three tasks share one
+# architecture in the paper, differing only in conditioning data.
+_target_: models.paper_unet.PaperUNet
+sample_size: 128
+in_channels: 2
+out_channels: 1
+base_channels: 64
+num_levels: 4
+time_emb_dim: 128
+attention_heads: 8
+attention_locations: ["bottleneck", "enc2", "enc3", "dec2", "dec3"]

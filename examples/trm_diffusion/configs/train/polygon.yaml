@@ -1,9 +1,9 @@
 seed: 42
 compile: true
 
-batch_size: 256
-num_steps: 100000
-gradient_accumulation_steps: 4
+batch_size: 512
+num_steps: 24400
+gradient_accumulation_steps: 8  # 512*8=4096 effective batch, matching the paper's 128/GPU*4GPUs*8accum
 cfg_prob: 0.0  # paper's released checkpoint is always-conditional, no CFG dropout
 
 noisy_swap:
