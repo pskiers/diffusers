@@ -445,6 +445,68 @@ class ConditioningPyramid1D(nn.Module):
         return residuals, self.mid_zero_conv(mid_res)
 
 
+class ConditioningPyramidPaperUNet(nn.Module):
+    """2D ControlNet-style conditioning pyramid for PaperUNet (models/paper_unet.py),
+    used via ControlPainterPaperUNet.
+
+    Like ConditioningPyramid1D (not ConditioningPyramid): PaperUNet captures
+    exactly ONE skip per level, before downsampling — so this produces one
+    residual per entry in block_out_channels plus one mid-block residual.
+    Unlike ConditioningPyramid1D, every level downsamples (PaperUNet has no
+    "skip the last downsample" step — the bottleneck always operates on the
+    fully-downsampled result), so there is no is_last exception here.
+
+    Zero convolutions (1x1, weight+bias zero-init) on every output — at init
+    this injects exactly zero, same ControlNet trick as ConditioningPyramid.
+    """
+
+    def __init__(self, in_channels, block_out_channels=(64, 128, 256, 512), n_groups=32):
+        super().__init__()
+        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList()
+        current_channels = block_out_channels[0]
+        for out_channels in block_out_channels:
+            self.down_blocks.append(nn.ModuleDict({
+                "proj": (
+                    nn.Conv2d(current_channels, out_channels, kernel_size=1)
+                    if current_channels != out_channels else nn.Identity()
+                ),
+                "res": nn.Sequential(
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                    nn.GroupNorm(min(n_groups, out_channels), out_channels),
+                    nn.SiLU(),
+                ),
+                # Matches PaperUNet's own downsamples: stride-2 conv at every level.
+                "downsample": nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            }))
+            current_channels = out_channels
+
+        self.mid_block = nn.Sequential(
+            nn.Conv2d(current_channels, current_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(n_groups, current_channels), current_channels),
+            nn.SiLU(),
+        )
+
+        self.zero_convs = nn.ModuleList([nn.Conv2d(c, c, kernel_size=1) for c in block_out_channels])
+        self.mid_zero_conv = nn.Conv2d(current_channels, current_channels, kernel_size=1)
+        for m in list(self.zero_convs) + [self.mid_zero_conv]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, blueprint):
+        x = self.conv_in(blueprint)
+        residuals = []
+        for i, layer in enumerate(self.down_blocks):
+            x = layer["proj"](x)
+            x = x + layer["res"](x)
+            residuals.append(self.zero_convs[i](x))
+            x = layer["downsample"](x)
+
+        mid_res = x + self.mid_block(x)
+        return residuals, self.mid_zero_conv(mid_res)
+
+
 class SpatialBridge(nn.Module):
     """
     Bilinear upsample + 2 conv layers.

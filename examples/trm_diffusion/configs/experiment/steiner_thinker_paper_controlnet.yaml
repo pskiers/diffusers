@@ -1,0 +1,33 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen conditional PaperUNet Steiner painter
+# (models.paper_unet.PaperUNet, the paper's own BatchNorm+ReLU architecture)
+# — ControlNet steering added as a SEPARATE, additive signal on top of the
+# painter's own (already-trained) conditioning, not a replacement of it.
+# Same mechanism as steiner_thinker_concat_controlnet.yaml (see that file's
+# docstring) — only the backbone/translator differ, via
+# ControlPainterPaperUNet/ControlNetTranslatorPaperUNet. Requires a trained
+# steiner_unet_concat_painter checkpoint (PaperUNet backbone).
+#
+# Usage:
+#   python train_trm.py experiment=steiner_thinker_paper_controlnet \
+#     painter.checkpoint=runs/steiner_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet_paper
+  - override /painter: steiner_unet_concat_controlnet_frozen
+  - override /thinker: steiner
+  - override /translator: controlnet_steiner_paper
+  - override /condition_encoder: steiner_spatial_v0
+  - override /train: steiner_thinker
+  - override /eval: steiner_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: steiner_thinker
+  - override /diffusion: ddpm_epsilon
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/steiner_thinker_paper_controlnet"

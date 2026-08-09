@@ -190,3 +190,65 @@ class PaperUNet(nn.Module):
 
         x = self.out_conv(x)
         return SimpleNamespace(sample=x)
+
+
+class ControlPainterPaperUNet(PaperUNet):
+    """PaperUNet extended with ControlNet-style residual injection — the
+    PaperUNet analog of ControlPainterUNet (which does the same for
+    diffusers.UNet2DModel). See ConditioningPyramidPaperUNet
+    (models/utility_models.py) for the matching translator-side pyramid:
+    PaperUNet captures exactly one skip per level (before downsampling,
+    which happens at every level including the last) rather than
+    UNet2DModel's multiple-residuals-per-level structure, so it needs its
+    own pyramid shape, not the existing ConditioningPyramid.
+
+    Only forward() differs from PaperUNet — this class is applied via the
+    same runtime __class__ swap ControlNetSteeredUNetPainter/
+    ConcatConditionedControlNetSteeredUNetPainter already use for
+    UNet2DModel, so no separate __init__/config is needed.
+
+    train() is pinned to eval mode: PaperUNet uses BatchNorm2d (unlike
+    UNet2DModel's GroupNorm), whose running stats update on every forward
+    call in train mode regardless of requires_grad — since this class is
+    only ever reached via the frozen-checkpoint swap, it must never leave
+    eval mode even if the outer model's .train() propagates into it.
+    """
+
+    def train(self, mode: bool = True):
+        return super().train(False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        down_block_additional_residuals=None,
+        mid_block_additional_residual=None,
+        **kwargs,
+    ) -> SimpleNamespace:
+        t_emb = self.time_embedding(timestep.view(-1))
+
+        skips = []
+        for i, (enc, downsample) in enumerate(zip(self.enc_blocks, self.downsamples)):
+            x = enc(x, t_emb)
+            if f"enc{i}" in self.attention_locations:
+                x = self.enc_attn_blocks[f"enc{i}"](x)
+            if down_block_additional_residuals is not None:
+                x = x + down_block_additional_residuals[i]
+            skips.append(x)
+            x = downsample(x)
+
+        x = self.bot(x, t_emb)
+        x = self.bot_attn(x)
+        if mid_block_additional_residual is not None:
+            x = x + mid_block_additional_residual
+
+        for i, (dec, skip) in enumerate(zip(self.dec_blocks, reversed(skips))):
+            x = self.upsample(x)
+            x = torch.cat([x, skip], dim=1)
+            x = dec(x, t_emb)
+            layer_num = self.num_levels - i - 1
+            if f"dec{layer_num}" in self.attention_locations:
+                x = self.dec_attn_blocks[f"dec{layer_num}"](x)
+
+        x = self.out_conv(x)
+        return SimpleNamespace(sample=x)

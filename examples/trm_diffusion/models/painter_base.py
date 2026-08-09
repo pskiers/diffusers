@@ -47,6 +47,7 @@ from diffusers.models.unets.unet_2d import UNet2DOutput
 from hydra.utils import instantiate
 
 from configs.schemas import PainterOptimConfig, TrainConfig, EvalConfig
+from models.paper_unet import ControlPainterPaperUNet, PaperUNet
 from models.utility_models import strip_compiled_prefix
 from datasets.data_sample import DataSample
 from models.base import BaseModel
@@ -538,6 +539,17 @@ class ControlPainterUNet(UNet2DModel):
 # ── Frozen UNet wrapper for TRM steering ─────────────────────────────────────
 
 
+def _swap_to_controlnet_unet(unet: nn.Module) -> None:
+    """Runtime __class__ swap to the ControlNet-residual-accepting variant
+    matching unet's actual architecture. UNet2DConditionModel already
+    accepts ControlNet residual kwargs natively, so it's left alone.
+    """
+    if isinstance(unet, PaperUNet):
+        unet.__class__ = ControlPainterPaperUNet
+    elif not isinstance(unet, UNet2DConditionModel):
+        unet.__class__ = ControlPainterUNet
+
+
 class ControlNetSteeredUNetPainter(UNetPainter):
     """Frozen UNetPainter loaded from a checkpoint for ControlNet-style thinker steering.
 
@@ -556,10 +568,7 @@ class ControlNetSteeredUNetPainter(UNetPainter):
         super().__init__(**kwargs)
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
-        # UNet2DConditionModel already accepts ControlNet residual kwargs natively.
-        # Only swap to ControlPainterUNet for plain UNet2DModel (pixel-space UNets).
-        if not isinstance(self.unet, UNet2DConditionModel):
-            self.unet.__class__ = ControlPainterUNet
+        _swap_to_controlnet_unet(self.unet)
         for p in self.unet.parameters():
             p.requires_grad_(False)
         if self.condition_encoder is not None:
@@ -698,7 +707,7 @@ class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter
         super().__init__(**kwargs)
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
-        self.unet.__class__ = ControlPainterUNet
+        _swap_to_controlnet_unet(self.unet)
         for p in self.unet.parameters():
             p.requires_grad_(False)
 
