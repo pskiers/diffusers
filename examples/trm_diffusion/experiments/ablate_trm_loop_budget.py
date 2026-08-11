@@ -45,6 +45,28 @@ is untouched):
              regression quality in isolation (no sampling required), and
              experiments/eval_halt_step_profile.py for the real per-sample
              step distribution broken out per denoising step.
+  skip_reuse — goes further than "halt": below ablation.skip_t_cutoffs
+             (an actual diffusion timestep t, not a step index), a
+             denoising step may skip reasoning ENTIRELY and reuse the
+             previous step's steering unchanged (no thinker/translator call
+             at all, not even one within-step-halted reasoning cycle).
+             Follows up on experiments/eval_steering_reuse.py, which found
+             the real cost of this substitution is concentrated in the
+             early, high-noise part of the trajectory and negligible below
+             some config-specific t — and that the halt head's own
+             pred_skip signal doesn't track that risk well (lowest exactly
+             where the real cost is highest). Skip decisions are therefore
+             gated on t alone by default (ablation.skip_use_head_gate=False);
+             set it True to additionally require the halt head's
+             batch-mean predict_halt_value <= ablation.
+             skip_pred_skip_threshold before skipping — a secondary gate
+             eval_steering_reuse.py did not find reliable, included for
+             completeness. ablation.skip_halt_threshold sets the WITHIN-step
+             halting threshold used whenever a step doesn't skip (requires
+             thinker.with_halt_head=True, same checkpoint requirement as
+             "halt"). Reports steps_skipped (average denoising steps per
+             trajectory that skipped reasoning) alongside the usual
+             accuracy/compute metrics.
 
 For every configuration, reports the same 4 accuracies as SudokuEvalCallback
 (cell_acc, puzzle_acc, constraint_puzzle_acc, given_consistent_puzzle_acc)
@@ -95,6 +117,16 @@ Usage:
       thinker.with_halt_head=true \\
       checkpoint=runs/mnist_thinker_x0hint_v1_80/checkpoint_with_halt_head.pt \\
       +ablation.axes=[halt] +ablation.halt_thresholds=[-0.05,-0.02,0.0,0.02,0.05]
+
+    # Skip-and-reuse axis, once eval_steering_reuse.py has suggested a t
+    # below which reuse looks safe (informed by that script's per-step
+    # breakdown, not guessed):
+    python experiments/ablate_trm_loop_budget.py \\
+      experiment=mnist_thinker_v1_controlnet ... \\
+      thinker.with_halt_head=true \\
+      checkpoint=runs/mnist_thinker_x0hint_v1_80/checkpoint_with_halt_head.pt \\
+      +ablation.axes=[skip_reuse] +ablation.skip_t_cutoffs=[0,20,35,50] \\
+      +ablation.skip_halt_threshold=0.0002
 
 Config overrides work exactly like train_trm.py / eval.py.
 """
@@ -429,6 +461,160 @@ def _run_halt_config(
     return result
 
 
+@torch.no_grad()
+def _run_skip_reuse_sampling(
+    model,
+    conditions,
+    x_init: torch.Tensor,
+    num_inference_steps: int,
+    cfg_scale: float,
+    halt_threshold: float,
+    t_cutoff: Optional[float],
+    use_head_gate: bool,
+    pred_skip_threshold: float,
+    reset_fn: Callable[[int], bool],
+    total_sup_calls: list[float],
+    total_skipped: list[int],
+) -> torch.Tensor:
+    """Like _run_halt_ablation_sampling, but denoising steps at or below
+    t_cutoff MAY skip reasoning entirely (no thinker/translator call at all)
+    and reuse the previous step's steering unchanged, instead of running
+    even one (possibly within-step-halted) reasoning step. Follows up on
+    experiments/eval_steering_reuse.py, which found the real cost of reusing
+    stale steering is concentrated in the early, high-noise part of the
+    trajectory and negligible below some config-specific t (re-run that
+    script on your own checkpoint/schedule before trusting a t_cutoff value
+    here) — and that the halt head's own pred_skip signal doesn't track
+    that risk well (lowest exactly where the real cost is highest). Hence
+    use_head_gate defaults to False elsewhere in this file (skip
+    unconditionally once t <= t_cutoff); set it True to additionally
+    require predict_halt_value(z_H) <= pred_skip_threshold before skipping,
+    as a secondary gate eval_steering_reuse.py did not find reliable.
+
+    The skip decision is made once per denoising step for the WHOLE batch
+    (batch-mean predict_halt_value when use_head_gate=True), not per sample
+    like the within-step halting — a per-sample skip would need different
+    samples to advance a different number of denoising steps, which the
+    single scheduler.step() call below (applied to the whole batch's x at
+    once) doesn't support.
+
+    Only the CFG-conditional branch can skip; the unconditional branch (if
+    cfg_scale != 1) always reasons normally, matching
+    eval_steering_reuse.py's scope.
+
+    Appends this trajectory's (a) total average within-step reasoning calls
+    actually used (0 contribution for skipped steps) and (b) number of
+    skipped denoising steps to total_sup_calls / total_skipped.
+    """
+    device = x_init.device
+    model.scheduler.set_timesteps(num_inference_steps, device=device)
+    x = x_init.clone()
+
+    z_H_c = z_L_c = None
+    z_H_u = z_L_u = None
+    prev_logits_c = None
+    steps_used: list[float] = []
+    n_skipped = 0
+
+    for step_idx, t in enumerate(model.scheduler.timesteps):
+        t_batch = t.expand(x.shape[0]).to(device)
+        step_sample = dataclasses.replace(conditions, x_noisy=x, timesteps=t_batch)
+
+        if reset_fn(step_idx):
+            z_H_c = z_L_c = None
+            z_H_u = z_L_u = None
+
+        can_skip = (
+            t_cutoff is not None
+            and float(t.item()) <= t_cutoff
+            and step_idx > 0
+            and z_H_c is not None
+            and prev_logits_c is not None
+        )
+        if can_skip and use_head_gate:
+            can_skip = bool((model.thinker.predict_halt_value(z_H_c).mean() <= pred_skip_threshold).item())
+
+        if can_skip:
+            noise_pred = model.run_painter(step_sample, prev_logits_c)
+            n_skipped += 1
+            # z_H_c/z_L_c/prev_logits_c carry forward unchanged — no reasoning happened this step.
+        else:
+            pred_c, z_H_c, z_L_c = model.forward_with_carry(
+                step_sample, z_H_c, z_L_c, use_halt_head=True, halt_threshold=halt_threshold,
+                steps_used=steps_used,
+            )
+            noise_pred = pred_c.pred
+            prev_logits_c = pred_c.logits
+
+        if cfg_scale != 1.0:
+            null_sample = model.null_condition_sample(step_sample)
+            pred_u, z_H_u, z_L_u = model.forward_with_carry(
+                null_sample, z_H_u, z_L_u, use_halt_head=True, halt_threshold=halt_threshold,
+            )
+            noise_pred = pred_u.pred + cfg_scale * (noise_pred - pred_u.pred)
+
+        x = model.scheduler.step(noise_pred, t, x).prev_sample
+
+    total_sup_calls.append(sum(steps_used))
+    total_skipped.append(n_skipped)
+    return x
+
+
+def _run_skip_reuse_config(
+    model,
+    classifier,
+    cell_size: int,
+    cached_batches: list[dict],
+    num_inference_steps: int,
+    cfg_scale: float,
+    halt_threshold: float,
+    t_cutoff: Optional[float],
+    use_head_gate: bool,
+    pred_skip_threshold: float,
+    reset_fn: Callable[[int], bool],
+) -> dict:
+    """Like _run_halt_config, but for the skip-and-reuse axis — adds
+    steps_skipped (average denoising steps per trajectory that skipped
+    reasoning entirely) alongside the usual accuracy/compute metrics."""
+    all_cell, all_puzzle, all_constraint, all_given_consistent = [], [], [], []
+    total_sup_calls: list[float] = []
+    total_skipped: list[int] = []
+    sample_counts: list[int] = []
+    t0 = time.time()
+
+    for cb in cached_batches:
+        batch_calls: list[float] = []
+        batch_skipped: list[int] = []
+        x = _run_skip_reuse_sampling(
+            model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale,
+            halt_threshold, t_cutoff, use_head_gate, pred_skip_threshold, reset_fn,
+            batch_calls, batch_skipped,
+        )
+        total_sup_calls.append(batch_calls[0])
+        total_skipped.append(batch_skipped[0])
+        sample_counts.append(cb["solutions"].shape[0])
+        generated = model.decode_for_eval(x)
+        acc = evaluate_grids(generated, cb["solutions"], classifier, cell_size, given_masks=cb["given_masks"])
+        all_cell.append(acc["cell_acc"])
+        all_puzzle.append(acc["puzzle_acc"])
+        all_constraint.append(acc.get("constraint_puzzle_acc", 0.0))
+        if acc.get("given_consistent_puzzle_acc") is not None:
+            all_given_consistent.append(acc["given_consistent_puzzle_acc"])
+
+    elapsed = time.time() - t0
+    result = {
+        "cell_acc": float(np.mean(all_cell)),
+        "puzzle_acc": float(np.mean(all_puzzle)),
+        "constraint_puzzle_acc": float(np.mean(all_constraint)),
+        "total_sup_calls": float(np.average(total_sup_calls, weights=sample_counts)),
+        "steps_skipped": float(np.average(total_skipped, weights=sample_counts)),
+        "wall_time_sec": elapsed,
+    }
+    if all_given_consistent:
+        result["given_consistent_puzzle_acc"] = float(np.mean(all_given_consistent))
+    return result
+
+
 def _build_cached_batches(model, dataloader, device, num_samples: int, seed: int) -> list[dict]:
     """Cache a fixed set of (conditions, solutions, given_masks, x_init)
     once, reused identically across every ablation config — a paired
@@ -481,6 +667,10 @@ def main(cfg: DictConfig):
     schedule_peaks: list[float] = list(ab.get("schedule_peaks", [0.5]))
     schedule_widths: list[float] = list(ab.get("schedule_widths", [0.25]))
     halt_thresholds: list[float] = list(ab.get("halt_thresholds", [-0.05, -0.02, 0.0, 0.02, 0.05]))
+    skip_t_cutoffs: list = list(ab.get("skip_t_cutoffs", [0, 20, 35, 50]))
+    skip_halt_threshold: float = ab.get("skip_halt_threshold", 0.0002)
+    skip_use_head_gate: bool = ab.get("skip_use_head_gate", False)
+    skip_pred_skip_threshold: float = ab.get("skip_pred_skip_threshold", 0.0)
     out_path: str = ab.get("out", str(Path(checkpoint).parent / "loop_budget_ablation.json"))
 
     if "schedule" in axes and schedule_flat_n is None:
@@ -600,6 +790,27 @@ def main(cfg: DictConfig):
                 results[key] = _run_halt_config(
                     model, classifier, cell_size, cached_batches, num_inference_steps, cfg_scale,
                     th, _make_reset_fn(reset_every),
+                )
+                logger.info(f"  → {results[key]}")
+
+    if "skip_reuse" in axes:
+        if not getattr(model.thinker, "with_halt_head", False):
+            raise SystemExit(
+                "ablation.axes includes 'skip_reuse' but the model was built without a halt head — "
+                "add thinker.with_halt_head=true and point checkpoint= at a checkpoint produced "
+                "by experiments/train_halt_head.py."
+            )
+        for reset_every in reset_every_values:
+            for t_cutoff in skip_t_cutoffs:
+                key = (
+                    f"skip_reuse/reset_every={reset_every}/t_cutoff={t_cutoff}"
+                    f"/head_gate={skip_use_head_gate}"
+                )
+                logger.info(f"Running {key} ...")
+                results[key] = _run_skip_reuse_config(
+                    model, classifier, cell_size, cached_batches, num_inference_steps, cfg_scale,
+                    skip_halt_threshold, t_cutoff, skip_use_head_gate, skip_pred_skip_threshold,
+                    _make_reset_fn(reset_every),
                 )
                 logger.info(f"  → {results[key]}")
 
