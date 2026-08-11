@@ -14,7 +14,7 @@ defaults:
   - override /painter: polygon_unet_concat_conditional
   - override /train: polygon_cfg
   - override /eval_callbacks: polygon
-  - override /diffusion: ddpm_epsilon
+  - override /diffusion: ddim_epsilon
   - override /sampling: cfg_99
   - _self_
 

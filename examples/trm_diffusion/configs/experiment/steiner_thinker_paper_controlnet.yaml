@@ -23,7 +23,7 @@ defaults:
   - override /eval: steiner_thinker
   - override /loss: combined_mse
   - override /eval_callbacks: steiner_thinker
-  - override /diffusion: ddpm_epsilon
+  - override /diffusion: ddim_epsilon
   - override /sampling: cfg
   - _self_
 

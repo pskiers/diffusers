@@ -14,7 +14,7 @@ defaults:
   - override /painter: steiner_unet_concat_conditional
   - override /train: steiner_cfg
   - override /eval_callbacks: steiner
-  - override /diffusion: ddpm_epsilon
+  - override /diffusion: ddim_epsilon
   - override /sampling: cfg_99
   - _self_
 
