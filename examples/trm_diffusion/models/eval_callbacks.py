@@ -1341,8 +1341,16 @@ class SquaresEvalCallback(EvalCallbackBase):
                     true_cpu = sub["images"].cpu()
                     gen_bn_cpu = gen_flat.reshape(B, N, *gen_flat.shape[1:]).cpu()
                     for i in range(n_new):
-                        panel = make_squares_panel_image(cond_cpu[i], gen_bn_cpu[i, 0], true_cpu[i])
-                        panels.append(_wandb.Image(panel, caption=f"sample[{n_done + i}]"))
+                        # candidate 0 of instance i sits at flat index i*N (see
+                        # cond_rep's repeat_interleave above)
+                        sq = float(acc["per_sample_squareness"][i * N])
+                        al = float(acc["per_sample_alignment"][i * N])
+                        panel = make_squares_panel_image(
+                            cond_cpu[i], gen_bn_cpu[i, 0], true_cpu[i], squareness=sq, alignment=al
+                        )
+                        panels.append(
+                            _wandb.Image(panel, caption=f"sample[{n_done + i}] squareness={sq:.3f} alignment={al:.1f}px")
+                        )
 
             n_done += B_full
 

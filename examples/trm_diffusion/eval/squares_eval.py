@@ -40,6 +40,8 @@ SteinerEvalCallback/PolygonEvalCallback for their binary constraint checks.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cv2
 import numpy as np
 import torch
@@ -154,18 +156,93 @@ def evaluate_squares(
     }
 
 
+def _fitted_box(mask: np.ndarray) -> Optional[np.ndarray]:
+    """(4, 2) int32 box points from the mask's largest-contour minAreaRect —
+    the same fit squareness_metric/alignment_score score against — or None
+    if the mask has no foreground pixels."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(cnt)
+    if rect[1][0] == 0 or rect[1][1] == 0:
+        return None
+    return cv2.boxPoints(rect).astype(np.int32)
+
+
 def make_squares_panel_image(
     condition: torch.Tensor,  # (1, H, W) float in [-1,1] — curve
     generated: torch.Tensor,  # (1, H, W) float in [-1,1] — model output
     reference: torch.Tensor,  # (1, H, W) float in [-1,1] — ground-truth square
+    squareness: Optional[float] = None,
+    alignment: Optional[float] = None,
 ) -> np.ndarray:
-    """condition | generated | reference, each mapped from [-1,1] to [0,255] grayscale."""
+    """Condition | Generated | Ground Truth | Overlay, each with a title bar,
+    plus per-sample squareness/alignment scores as a caption strip.
 
-    def to_uint8(t: torch.Tensor) -> np.ndarray:
+    The Overlay panel draws the *fitted minAreaRect* (the same box
+    squareness_metric/alignment_score actually score, via _fitted_box) of the
+    generated square in red and of the ground-truth square in green, both on
+    top of the curve — this makes the alignment_score number visually
+    checkable at a glance (do the corners actually sit on the curve?),
+    instead of requiring a mental cross-reference between separate panels.
+    """
+    H, W = condition.shape[-2], condition.shape[-1]
+    TITLE_H = 18
+    CAPTION_H = 18
+
+    def to_gray_uint8(t: torch.Tensor) -> np.ndarray:
         arr = t.clamp(-1, 1).cpu().numpy()
         if arr.ndim == 3:
             arr = arr[0]
         return ((arr + 1.0) * 127.5).astype(np.uint8)
 
-    sep = np.full((condition.shape[-2], 4), 128, dtype=np.uint8)
-    return np.concatenate([to_uint8(condition), sep, to_uint8(generated), sep, to_uint8(reference)], axis=1)
+    def to_bgr(gray: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    def with_title(img_bgr: np.ndarray, text: str) -> np.ndarray:
+        bar = np.full((TITLE_H, img_bgr.shape[1], 3), 255, dtype=np.uint8)
+        cv2.putText(bar, text, (2, TITLE_H - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1, cv2.LINE_AA)
+        return np.concatenate([bar, img_bgr], axis=0)
+
+    cond_gray = to_gray_uint8(condition)
+    gen_gray = to_gray_uint8(generated)
+    ref_gray = to_gray_uint8(reference)
+
+    # Overlay: curve (grayscale) + fitted generated box (red) + fitted GT box (green).
+    overlay = to_bgr(cond_gray)
+    gen_mask = to_binary_mask(generated)
+    ref_mask = to_binary_mask(reference)
+    ref_box = _fitted_box(ref_mask)
+    if ref_box is not None:
+        cv2.polylines(overlay, [ref_box], isClosed=True, color=(0, 200, 0), thickness=1, lineType=cv2.LINE_AA)
+    gen_box = _fitted_box(gen_mask)
+    if gen_box is not None:
+        cv2.polylines(overlay, [gen_box], isClosed=True, color=(0, 0, 255), thickness=1, lineType=cv2.LINE_AA)
+
+    sep = np.full((TITLE_H + H, 4, 3), 200, dtype=np.uint8)
+    panels = [
+        with_title(to_bgr(cond_gray), "Condition (curve)"),
+        sep,
+        with_title(to_bgr(gen_gray), "Generated"),
+        sep,
+        with_title(to_bgr(ref_gray), "Ground Truth"),
+        sep,
+        with_title(overlay, "Overlay"),
+    ]
+    grid = np.concatenate(panels, axis=1)
+
+    caption_bits = ["red=generated  green=ground truth"]
+    if squareness is not None:
+        caption_bits.append(f"squareness={squareness:.3f}")
+    if alignment is not None:
+        caption_bits.append(f"alignment={alignment:.1f}px")
+    if caption_bits:
+        caption_bar = np.full((CAPTION_H, grid.shape[1], 3), 255, dtype=np.uint8)
+        cv2.putText(
+            caption_bar, "  ".join(caption_bits), (2, CAPTION_H - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA,
+        )
+        grid = np.concatenate([grid, caption_bar], axis=0)
+
+    return grid

@@ -12,6 +12,12 @@
 # GroupNorm+SiLU) remains available as +backbone=squares_unet_concat for the
 # norm/activation-choice ablation. See configs/train/squares.yaml and
 # configs/painter/squares_unet_concat_conditional.yaml for the actual values.
+#
+# diffusion: ddim_epsilon (not ddpm_epsilon) — the paper's real sampler
+# (schedulers/ddim.py, eta=0.0) is fully deterministic; DDPMScheduler.step()
+# silently injects noise at every reverse step. See configs/diffusion/
+# ddim_epsilon.yaml's comment (found/fixed for Steiner/Polygon first, this
+# experiment had the same bug — training is unaffected, only sampling/eval).
 
 defaults:
   - override /data: squares
@@ -19,7 +25,7 @@ defaults:
   - override /painter: squares_unet_concat_conditional
   - override /train: squares
   - override /eval_callbacks: squares
-  - override /diffusion: ddpm_epsilon
+  - override /diffusion: ddim_epsilon
   - override /sampling: direct
   - _self_
 
