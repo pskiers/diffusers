@@ -2,7 +2,7 @@ seed: 42
 compile: true
 
 batch_size: 512
-num_steps: 24400
+num_steps: 30518  # 1,250,000 samples / 4096 effective batch * 100 epochs (was 24400, copy-pasted from steiner.yaml's 1M-sample figure -- wrong dataset size for polygon's 1.25M)
 gradient_accumulation_steps: 8  # 512*8=4096 effective batch, matching the paper's 128/GPU*4GPUs*8accum
 cfg_prob: 0.0  # paper's released checkpoint is always-conditional, no CFG dropout
 
