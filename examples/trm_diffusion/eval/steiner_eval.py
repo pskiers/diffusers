@@ -8,39 +8,18 @@ tree-edge count, and terminal coverage — independent of whether it matches
 the reference optimal tree (a model could legitimately connect the same
 terminals through a different, still-valid Steiner topology).
 
-This is a simplified version of the paper's own eval/extraction pipeline
-(scripts/evaluate_steiner.py + scripts/extract_steiner_graph.py in
-https://github.com/kariander1/visual-geo-solver) — vertices are detected via
-non-max-suppression on the vertex mask's distance transform (see
-_detect_vertices) rather than their per-blob area-estimate + k-means
-splitting, and edges are accepted via straight-line pixel-coverage sampling
-with a proximity-to-other-vertex rejection. Ported the original's exact
-algorithm and measured it against our own ground-truth renders to check —
-it does *worse* on this data (60% exact vertex-count match vs. this file's
-78%), so the simpler approach was kept. Both fail the same way (under-
-counting from vertices that render within a couple pixels of each other,
-never over-counting) — a genuine resolution limit of the rendering
-(128px, node_radius=2), not a fixable bug in either implementation; see
-_detect_vertices's docstring.
-
-IMPORTANT — terminal snapping (2026-08-03 fix): the paper's extraction
-*does* snap detected vertices onto the exact ground-truth terminal
-coordinates when close enough (extract_steiner_graph.py's
-_snap_vertices_to_reference), which we had NOT ported. Without it, every
-detected vertex — including ones sitting exactly on a terminal — carries a
-few tenths of a pixel of detection noise, and per_sample_length is measured
-between these noisy positions. Since a valid tree's *true* length can never
-be shorter than GeoSteiner's exact optimum, any measured length < optimum is
-necessarily a measurement artifact, not a real solution — and empirically,
-36.5% of our *own ground-truth* renders (no model involved) round-tripped to
-a ratio < 1 before this fix (mean 1.0015, min 0.994), confirming it was a
-real bug, not sampling noise. _snap_terminals_to_reference below ports their
-fix: any detected vertex within snap_threshold of a known terminal is
-replaced by that terminal's *exact* coordinate before length is computed,
-eliminating quantization error on terminal-adjacent edges (Steiner junction
-points, which have no reference to snap to, keep their raw detected
-position — some residual noise there is unavoidable and matches the
-paper's own approach).
+2026-08-12: this module used to carry an independent reimplementation of the
+extraction algorithm (different vertex-detection heuristic, different edge
+line-coverage check), justified at the time by it scoring better on an
+internal ground-truth calibration check. That's a real trade-off but not
+what was asked for — the goal of this whole reproduction effort is to match
+the paper's methodology exactly, even where a different choice measures
+better in isolation. So this now calls extract_steiner_graph.SteinerGraphExtractor
+directly — a verbatim vendored copy of the paper's own
+scripts/extract_steiner_graph.py (see that module's header) — and
+evaluate_steiner() below is a direct port of their scripts/evaluate_steiner.py's
+_calculate_metrics/_calculate_metrics_worker and
+_convert_tensor_to_discrete/_get_terminal_pixel_coords, not a reimplementation.
 
 optimality_ratio (generated tree length ÷ GeoSteiner's true optimal length)
 is NOT computed in this module — it needs the exact optimal length, which
@@ -57,175 +36,98 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 import torch
-from scipy import ndimage
 
-# Discretization cutoffs on the raw [-1, 1] rendered signal (matches the
-# paper's own eval-time thresholds): vertex <= -0.5, edge >= 0.5, else background.
-VERTEX_THRESH = -0.5
-EDGE_THRESH = 0.5
+from eval.extract_steiner_graph import SteinerGraphExtractor
 
-# Safety cap on detected vertices before attempting edge search — see its
-# use in _extract_graph. Comfortably above the largest legitimate case
-# (41-50 terminals + Steiner points, well under 150) while far below what
-# noise can produce (~1500 spurious peaks observed on untrained output).
-MAX_VERTICES = 150
+# Matches the paper's own real eval-time SteinerGraphExtractor construction
+# (scripts/evaluate_steiner.py's _init_graph_extractor / graph_extractor_config)
+# -- vertex_radius/edge_width from the dataset config (always 2/2 here),
+# coverage_threshold/proximity_threshold hardcoded to 0.9/4.0 regardless of
+# the class's own (0.7/2.0) or CLI (0.7/3.0) defaults.
+_EXTRACTOR = SteinerGraphExtractor(
+    vertex_radius=2, edge_width=2, coverage_threshold=0.9, proximity_threshold=4.0
+)
 
-
-def _detect_vertices(vertex_mask: np.ndarray, node_radius: float = 2.0, suppress_mult: float = 1.2) -> np.ndarray:
-    """Greedy peak-picking on the vertex mask's distance transform.
-
-    Steiner (junction) points aren't subject to the generator's terminal
-    min-distance constraint, so two of them (or a Steiner point and a
-    terminal) can legitimately render as one touching/overlapping blob —
-    plain connected-components-centroid (one vertex per blob) then
-    systematically undercounts those. Instead: repeatedly take the point
-    farthest from the mask's background (the distance transform's global
-    max) as a vertex, then suppress a disk of radius ~node_radius around it
-    and repeat — standard non-max-suppression.
-
-    Calibrated against ground-truth renders (datasets/steiner_data/val.ndjson):
-    `suppress_mult=1.2` gives an exact vertex-count match on ~78% of them (up
-    from ~53% with plain connected-components); the remainder are genuine
-    near-coincidences in the solver's own geometry (e.g. a terminal and its
-    optimal Steiner point landing ~2px apart at this resolution/node_radius) —
-    a resolution limit, not a detection bug. constraint_puzzle_acc should be
-    read as a slight underestimate of true tree validity for exactly this
-    reason, same as the original paper's own pixel-based evaluation.
-    """
-    dt = ndimage.distance_transform_edt(vertex_mask).astype(np.float64)
-    vertices = []
-    H, W = dt.shape
-    rr, cc = np.ogrid[:H, :W]
-    suppress_r2 = (node_radius * suppress_mult) ** 2
-    while True:
-        peak = dt.max()
-        if peak < 1.0:
-            break
-        r0, c0 = np.unravel_index(np.argmax(dt), dt.shape)
-        vertices.append((float(r0), float(c0)))
-        disk = (rr - r0) ** 2 + (cc - c0) ** 2 <= suppress_r2
-        dt[disk] = 0.0
-    return np.array(vertices, dtype=np.float64) if vertices else np.zeros((0, 2))
+# Wrapper-level safety net, NOT part of the ported algorithm: the real
+# extract_graph's edge search is O(n^2) vertex pairs, each with an O(n)
+# passes-through-vertex check -- effectively cubic. A real render never
+# exceeds ~60 vertices (41-50 terminals + Steiner points) x ~13px/vertex
+# disc (node_radius=2) =~ 780 vertex pixels; pure noise from an untrained
+# model measured 4030 vertex pixels -> 2214 vertices -> the edge search
+# alone didn't finish in 2 minutes. This is the exact same failure mode a
+# prior version of this file's own (non-ported) vertex-NMS hit and fixed
+# with a MAX_VERTICES cap -- keeping an equivalent cap here, but at the
+# call site rather than inside the vendored file, so the ported algorithm
+# itself stays byte-identical to the original for every input that isn't
+# adversarial/garbage.
+_MAX_VERTEX_PIXELS = 2000
 
 
-def _snap_terminals_to_reference(
-    vertices_rc: np.ndarray, terminal_rc: np.ndarray, snap_threshold: float
-) -> np.ndarray:
-    """Greedily snap each detected vertex onto its nearest not-yet-used
-    terminal reference point, if within `snap_threshold` — ports the paper's
-    extract_steiner_graph.py._snap_vertices_to_reference. Each terminal
-    claims at most one vertex (closest first, by terminal), and a claimed
-    vertex's position is replaced by the terminal's *exact* coordinate —
-    the whole point being to eliminate detection-quantization error on
-    terminal-adjacent edges (see this module's docstring)."""
-    if len(vertices_rc) == 0 or len(terminal_rc) == 0:
-        return vertices_rc
-    snapped = vertices_rc.copy()
-    available = set(range(len(vertices_rc)))
-    for ref in terminal_rc:
-        best_idx, best_dist = None, float("inf")
-        for i in available:
-            d = float(np.linalg.norm(vertices_rc[i] - ref))
-            if d < best_dist:
-                best_dist, best_idx = d, i
-        if best_idx is not None and best_dist <= snap_threshold:
-            snapped[best_idx] = ref
-            available.discard(best_idx)
-    return snapped
+def _convert_tensor_to_discrete(img: np.ndarray, image_size: int) -> np.ndarray:
+    """Direct port of evaluate_steiner.py's _convert_tensor_to_discrete /
+    score_steiner_sample_worker's inline equivalent: [-1,1] -> {0,127,255}."""
+    vertex_mask = img <= -0.5
+    edge_mask = img >= 0.5
+    discrete = np.full(img.shape, 127, dtype=np.uint8)
+    discrete[edge_mask] = 255
+    discrete[vertex_mask] = 0
+    if discrete.shape != (image_size, image_size):
+        import cv2
+        discrete = cv2.resize(discrete, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+    return discrete
 
 
-def _extract_graph(
-    img: np.ndarray,           # (H, W) float, background~0 vertex~-1 edge~+1
-    node_radius: float = 2.0,
-    coverage_threshold: float = 0.9,  # matches the paper's actual eval-time config (not its CLI default of 0.7)
-    proximity_threshold: float = 4.0,
-    terminal_rc: np.ndarray | None = None,  # (n_term, 2) exact terminal (row, col) pixel coords, for snapping
-) -> tuple[np.ndarray, list[tuple[int, int]]]:
-    """Detect vertices (via non-max-suppression on the vertex mask's distance
-    transform — see _detect_vertices) and edges (straight-line pixel coverage
-    between vertex pairs) in a generated Steiner-tree raster.
-
-    When `terminal_rc` is given, detected vertices near a known terminal are
-    snapped onto its exact coordinate (see _snap_terminals_to_reference)
-    before edges/length are computed from them — matches the paper's own
-    extraction pipeline and is required for per_sample_length to never dip
-    below the true optimum on terminal-adjacent edges.
-
-    Returns (vertices: (n, 2) float array of (row, col) pixel coords, edges:
-    list of (i, j) index pairs).
-    """
-    vertex_mask = img <= VERTEX_THRESH
-    edge_mask = img >= EDGE_THRESH
-
-    vertices = _detect_vertices(vertex_mask, node_radius)
-    if len(vertices) == 0:
-        return np.zeros((0, 2)), []
-    if len(vertices) > MAX_VERTICES:
-        # Noise (e.g. an early/untrained model) can produce hundreds of
-        # spurious vertex-mask peaks — the O(n^2) edge search below (with an
-        # O(n) passes_through_other_vertex check per candidate edge) is
-        # otherwise unbounded and has been observed to take 60-140s for a
-        # single sample at ~1500 vertices. Bail out immediately: no real
-        # tree render ever needs anywhere near MAX_VERTICES, so exceeding it
-        # is already diagnostic of garbage input — every downstream check
-        # (connected/valid_tree/covers_terminals) correctly fails on an
-        # empty edge list anyway.
-        return vertices, []
-    if terminal_rc is not None and len(terminal_rc) > 0:
-        snap_threshold = max(2.0, node_radius * 2.5)
-        vertices = _snap_terminals_to_reference(vertices, terminal_rc, snap_threshold)
-
-    def line_coverage(p, q, n_samples=30):
-        rows = np.linspace(p[0], q[0], n_samples)
-        cols = np.linspace(p[1], q[1], n_samples)
-        ri = np.clip(rows.round().astype(int), 0, edge_mask.shape[0] - 1)
-        ci = np.clip(cols.round().astype(int), 0, edge_mask.shape[1] - 1)
-        return float((edge_mask[ri, ci] | vertex_mask[ri, ci]).mean())
-
-    def passes_through_other_vertex(p, q, skip_i, skip_j):
-        seg = q - p
-        seg_len2 = float(seg @ seg)
-        if seg_len2 < 1e-9:
-            return False
-        for k, v in enumerate(vertices):
-            if k in (skip_i, skip_j):
-                continue
-            t = float((v - p) @ seg) / seg_len2
-            if 0.05 < t < 0.95:
-                proj = p + t * seg
-                if np.linalg.norm(v - proj) < proximity_threshold:
-                    return True
-        return False
-
-    edges = []
-    for i in range(len(vertices)):
-        for j in range(i + 1, len(vertices)):
-            if line_coverage(vertices[i], vertices[j]) >= coverage_threshold:
-                if not passes_through_other_vertex(vertices[i], vertices[j], i, j):
-                    edges.append((i, j))
-    return vertices, edges
+def _get_terminal_pixel_coords(terminals_xy: np.ndarray, image_size: int) -> list[tuple[float, float]]:
+    """Direct port of evaluate_steiner.py's _get_terminal_pixel_coords:
+    normalized [0,1] (x, y) -> pixel (x, y), clipped to [0, image_size-1]."""
+    denom = image_size - 1
+    return [
+        (float(np.clip(tx * denom, 0.0, float(denom))), float(np.clip(ty * denom, 0.0, float(denom))))
+        for tx, ty in terminals_xy
+    ]
 
 
-def _covers_terminals(vertices_rc: np.ndarray, terminal_px_rc: np.ndarray, tol_px: float) -> bool:
-    if len(terminal_px_rc) == 0:
-        return True
-    if len(vertices_rc) == 0:
-        return False
-    d = np.linalg.norm(vertices_rc[None, :, :] - terminal_px_rc[:, None, :], axis=-1)  # (n_term, n_vert)
-    return bool((d.min(axis=1) <= tol_px).all())
+def _calculate_metrics(
+    vertices: list[tuple[float, float]],
+    edges: list[tuple[int, int]],
+    terminals_xy: np.ndarray,  # (n_term, 2) normalized [0,1] (x, y)
+    image_size: int,
+    threshold: float = 0.03,
+) -> tuple[float | None, bool, bool, bool]:
+    """Direct port of evaluate_steiner.py's _calculate_metrics /
+    _calculate_metrics_worker (the two are identical in substance)."""
+    if not vertices:
+        return None, False, False, False
 
+    G = nx.Graph()
+    for i, _ in enumerate(vertices):
+        G.add_node(i)
+    G.add_edges_from(edges)
 
-def _tree_length_normalized(vertices_rc: np.ndarray, edges: list[tuple[int, int]], image_size: int) -> float:
-    """Sum of Euclidean edge lengths, in the same normalized [0,1]^2
-    coordinate space datasets/steiner_generation.py's `total_length` is
-    computed in (pixel distances / (image_size-1)) — so it's directly
-    comparable to the exact optimal length looked up via
-    SteinerTreeDataset.optimal_length_for, no unit conversion needed.
-    """
-    total = 0.0
-    for i, j in edges:
-        total += float(np.linalg.norm(vertices_rc[i] - vertices_rc[j])) / (image_size - 1)
-    return total
+    is_connected = nx.is_connected(G) if len(vertices) > 1 else True
+    is_valid_tree = is_connected and len(edges) == len(vertices) - 1
+
+    denom = image_size - 1
+    normalized_vertices = [(x / denom, y / denom) for x, y in vertices]
+
+    if not edges:
+        predicted_weight = 0.0
+    else:
+        predicted_weight = 0.0
+        for i, j in edges:
+            x1, y1 = normalized_vertices[i]
+            x2, y2 = normalized_vertices[j]
+            predicted_weight += float(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2))
+
+    covered_terminals = 0
+    for tx, ty in terminals_xy:
+        for vx, vy in normalized_vertices:
+            if np.sqrt((tx - vx) ** 2 + (ty - vy) ** 2) <= threshold:
+                covered_terminals += 1
+                break
+    covers_terminals = covered_terminals == len(terminals_xy)
+
+    return predicted_weight, is_valid_tree, is_connected, covers_terminals
 
 
 @torch.no_grad()
@@ -259,7 +161,6 @@ def evaluate_steiner(
     imgs = images.squeeze(1).cpu().numpy()
     emb = embedding_conditions.cpu().numpy()
     mask = embedding_mask.cpu().numpy()
-    tol_px = terminal_tol_frac * (image_size - 1)
 
     connected = np.zeros(B, dtype=bool)
     valid_tree = np.zeros(B, dtype=bool)
@@ -267,20 +168,28 @@ def evaluate_steiner(
     length = np.full(B, np.nan, dtype=np.float64)
 
     for b in range(B):
-        term_xy = emb[b][mask[b]]  # (n_term, 2) in [0,1]
-        term_rc = term_xy[:, ::-1] * (image_size - 1)  # (row, col) pixel coords
+        term_xy = emb[b][mask[b]]  # (n_term, 2) normalized [0,1] (x, y)
 
-        vertices, edges = _extract_graph(imgs[b], terminal_rc=term_rc)
-        n = len(vertices)
-        G = nx.Graph()
-        G.add_nodes_from(range(n))
-        G.add_edges_from(edges)
-        connected[b] = n > 0 and nx.is_connected(G)
-        valid_tree[b] = connected[b] and G.number_of_edges() == n - 1
-        if edges:
-            length[b] = _tree_length_normalized(vertices, edges, image_size)
+        discrete_img = _convert_tensor_to_discrete(imgs[b], image_size)
+        terminal_pixels = _get_terminal_pixel_coords(term_xy, image_size)
+        n_vertex_px = int((discrete_img == 0).sum())
+        if n_vertex_px > _MAX_VERTEX_PIXELS:
+            # Garbage input (e.g. an untrained model) -- skip the O(n^2)-to-
+            # O(n^3) edge search entirely; every downstream check already
+            # fails on an empty edge list anyway, same as the real
+            # algorithm would eventually conclude, just without the wait.
+            vertices, edges = [], []
+        else:
+            vertices, edges = _EXTRACTOR.extract_graph(discrete_img, reference_points=terminal_pixels)
 
-        covers[b] = _covers_terminals(vertices, term_rc, tol_px)
+        predicted_weight, is_valid_tree, is_connected, covers_terminals = _calculate_metrics(
+            vertices, edges, term_xy, image_size, threshold=terminal_tol_frac
+        )
+        connected[b] = is_connected
+        valid_tree[b] = is_valid_tree
+        covers[b] = covers_terminals
+        if predicted_weight is not None and edges:
+            length[b] = predicted_weight
 
     valid = connected & valid_tree & covers
     return {

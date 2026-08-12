@@ -2,40 +2,32 @@
 eval/squares_eval.py – Evaluation for the Inscribed Square dataset
 (datasets/squares_dataset.py).
 
-squareness_metric implements the paper's Eq. 2 (arXiv 2510.21697):
-Q(S) = area(S)/(w*h) * exp(-2|max(w,h)/min(w,h) - 1|) where (w,h) are the
-minimum-area enclosing rectangle's side lengths — ported from the original
-repo's utils/metrics.py, whose IoU-against-own-minAreaRect-mask formula is
-exactly Eq. 2 (IoU = area(S)/(w*h) whenever S is fully contained in its own
-minAreaRect box, which it always is by construction). Verified against the
-paper's own reported numbers: Table 1 reports GT squareness=0.924; scoring
-this repo's own freshly-generated ground-truth squares with this function
-gives 0.920 (300-sample sanity check) — matches.
+2026-08-12: this now calls eval_squares_metrics directly — a verbatim
+vendored copy of the paper's own scripts/eval_squares.py, recovered from the
+commit where that script was last self-contained and actually ran (see that
+module's header for why the current HEAD version can't be used at all: a
+later refactor left it with a broken self-import). evaluate_squares() below
+is a direct port of that script's __main__ per-sample loop, not a
+reimplementation.
 
-alignment_score implements the paper's Eq. 1: A(S,C) = -(1/4) * sum over the
-4 corners of dist(corner, C), i.e. the *negative mean pixel distance* from a
-predicted square's corners to the conditioning curve (higher/less negative
-= better; 0 = corners exactly on the curve) — ported from
-scripts/eval_squares.py's `alignment_pixel` (nearest-pixel lookup into a
-cv2.distanceTransform of the curve mask), which is what the paper's Table 1
-numbers were actually produced with.
+This is a substantive behavior change, not just a formula swap: the real
+pipeline snaps the generated square to the curve via a rigid-transform
+search (rotation ±15°, translation ±5px — snap_square_by_rigid_transform)
+*before* scoring squareness/alignment, on by default (`--no-snap` is opt-
+out). The previous version of this module scored the raw generated mask
+directly, with no such search, and its alignment formula looked up the
+distance transform at the box corner's own (rounded) position — the real
+pipeline instead snaps each corner to its *nearest actual foreground pixel*
+in the mask first (compute_alignment_score_from_box), then looks up the
+distance transform there. Both differences make scores from this module
+non-comparable to numbers logged before this fix.
 
-Do NOT confuse this with utils/metrics.py's separate `alignment_metric`
-(exp(-dist/decay_scale), bounded to (0,1]) — that's a different formula
-train_diffusion.py's own per-epoch training validation loop happens to use
-as a cheap bounded training-progress signal; it does not appear in the
-paper's reported evaluation table and isn't reproduced here, so results
-from this module are directly comparable to Table 1's Align/Square columns,
-not to wandb curves from the original repo's own training runs.
-
-Neither metric needs the exact ground-truth square: squareness_metric
-scores the generated square's shape against *itself* (is this blob square-
-shaped?), and alignment_score scores the generated square's corners against
-the rasterized *condition* curve mask (already available as
-spatial_conditions, no extra ground truth needed) — so there's no
-"predicted vs. target" comparison, and no best-of-N/valid-discard step (a
-generated square is always scored, never thrown out) as used by
-SteinerEvalCallback/PolygonEvalCallback for their binary constraint checks.
+squareness/alignment scores need only the generated square + the curve
+condition — no ground-truth square tensor — so there's still no "predicted
+vs. target" comparison and no best-of-N/valid-discard step (a generated
+square is always scored, never thrown out) the way
+SteinerEvalCallback/PolygonEvalCallback do for their binary constraint
+checks.
 """
 
 from __future__ import annotations
@@ -46,83 +38,24 @@ import cv2
 import numpy as np
 import torch
 
+from eval.eval_squares_metrics import (
+    _to_numpy255,
+    compute_alignment_score_from_box,
+    get_box,
+    snap_square_by_rigid_transform,
+    squareness_metric,
+)
+
 
 def to_binary_mask(img: torch.Tensor) -> np.ndarray:
     """(1, H, W) or (H, W) tensor in [-1, 1] -> (H, W) uint8 mask, 255 where
-    pixel < 0 (foreground/drawn), 0 elsewhere. Simpler than the original's
-    tensor_to_binary_mask (min-max rescale + threshold at 127): our renders
-    are always exactly {-1, +1}-valued by construction (see
-    datasets/squares_dataset.py), so a direct threshold at 0 is equivalent
-    and doesn't degenerate on a constant (all-background) image the way a
-    min-max normalization would."""
-    arr = img.detach().float().cpu().numpy()
-    if arr.ndim == 3:
-        arr = arr[0]
-    return (arr < 0).astype(np.uint8) * 255
-
-
-def squareness_metric(mask: np.ndarray) -> float:
-    """Ported from utils/metrics.py's squareness_metric (type='squareness'
-    branch only — 'rectangleness' isn't used by config_curves.yaml).
-
-    IoU between the mask's largest contour and its own minimum-area
-    bounding rectangle, penalized by deviation from a square aspect ratio.
-    1.0 = a perfect, fully-filled square blob.
-    """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-
-    cnt = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(cnt)
-    (w, h) = rect[1]
-    if w == 0 or h == 0:
-        return 0.0
-
-    box = cv2.boxPoints(rect).astype(np.int32)
-    rect_mask = np.zeros_like(mask, dtype=np.uint8)
-    cv2.fillConvexPoly(rect_mask, box, 255)
-
-    intersection = np.logical_and(mask > 0, rect_mask > 0).sum()
-    union = np.logical_or(mask > 0, rect_mask > 0).sum()
-    if union == 0:
-        return 0.0
-    iou = intersection / union
-
-    aspect_ratio = max(w, h) / min(w, h)
-    square_penalty = np.exp(-abs(aspect_ratio - 1) * 2)
-    return float(iou * square_penalty)
-
-
-def alignment_score(square_mask: np.ndarray, curve_mask: np.ndarray) -> float:
-    """Paper Eq. 1: A(S,C) = -(1/4) * sum_{p in corners(S)} dist(p, C).
-
-    Fits a minimum-area rectangle to the generated square mask (same box
-    squareness_metric uses) and looks up each of its 4 float corners in a
-    distance transform of the curve mask, via nearest-integer-pixel lookup
-    — matches scripts/eval_squares.py's `alignment_pixel` exactly (one of
-    three alignment variants in that script; the other two need either a
-    rigid-transform "snap" search or the exact parametric curve, both out
-    of scope for a periodic training-time callback — see this module's
-    docstring). Returns the *negative* mean distance in pixels: 0 = corners
-    exactly on the curve, more negative = further off. A missing/empty mask
-    returns -inf (worst possible score, never silently 0/best-case).
-    """
-    dist_transform = cv2.distanceTransform(255 - curve_mask, cv2.DIST_L2, 5)
-
-    contours, _ = cv2.findContours(square_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return float("-inf")
-
-    cnt = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect)  # (4, 2) float (x, y)
-
-    H, W = dist_transform.shape
-    ix = np.clip(np.rint(box[:, 0]).astype(int), 0, W - 1)
-    iy = np.clip(np.rint(box[:, 1]).astype(int), 0, H - 1)
-    mean_dist = float(dist_transform[iy, ix].mean())
-    return -mean_dist
+    pixel < 0 (foreground/drawn), 0 elsewhere — same threshold-at-0 rule as
+    eval_squares_metrics._to_numpy255, just accepting a torch tensor
+    directly (that one only accepts what its own _to_numpy01 already
+    handles, which is the same tensor-or-array + squeeze logic; kept as a
+    separate thin wrapper here only so callers outside evaluate_squares
+    — make_squares_panel_image — don't need to reach into eval_squares_metrics)."""
+    return _to_numpy255(img)
 
 
 @torch.no_grad()
@@ -135,7 +68,8 @@ def evaluate_squares(
 
     Returns dict with keys:
       squareness_mean, alignment_mean — batch means. alignment_mean is in
-        raw pixel units and typically negative (see alignment_score).
+        raw pixel units and typically negative (see compute_alignment_score_from_box's
+        avg_dist, negated to keep "higher = better").
       per_sample_squareness, per_sample_alignment — (B,) numpy arrays.
     """
     B = generated.shape[0]
@@ -143,10 +77,23 @@ def evaluate_squares(
     alignment = np.zeros(B, dtype=np.float64)
 
     for b in range(B):
-        square_mask = to_binary_mask(generated[b])
-        curve_mask = to_binary_mask(conditions[b])
+        curve_mask = _to_numpy255(conditions[b])
+        dist_transform = cv2.distanceTransform(255 - curve_mask, cv2.DIST_L2, 5)
+
+        # Direct port of scripts/eval_squares.py's __main__ (w_snap branch,
+        # the default): rigid-search the generated mask onto the curve
+        # *before* scoring, rather than scoring the raw generated output.
+        square_mask, _ = snap_square_by_rigid_transform(generated[b], conditions[b])
+
+        box = get_box(square_mask)
+        if box is None:
+            squareness[b] = 0.0
+            alignment[b] = float("-inf")
+            continue
+
+        _, _, _, avg_dist = compute_alignment_score_from_box(box, square_mask, dist_transform)
         squareness[b] = squareness_metric(square_mask)
-        alignment[b] = alignment_score(square_mask, curve_mask)
+        alignment[b] = -float(avg_dist)
 
     return {
         "squareness_mean": float(squareness.mean()),
@@ -157,17 +104,23 @@ def evaluate_squares(
 
 
 def _fitted_box(mask: np.ndarray) -> Optional[np.ndarray]:
-    """(4, 2) int32 box points from the mask's largest-contour minAreaRect —
-    the same fit squareness_metric/alignment_score score against — or None
-    if the mask has no foreground pixels."""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    """(4, 2) int32 box points via get_box (approxPolyDP-quad-or-minAreaRect-
+    fallback) — the same box compute_alignment_score_from_box actually
+    scores corners against — or None if the mask has no foreground pixels.
+
+    Note: this draws the box fit to the RAW (unsnapped) generated mask, for
+    a simple visual sanity check against embedding_conditions/the curve as
+    given. evaluate_squares() itself scores the mask *after*
+    snap_square_by_rigid_transform's rigid search, so the drawn box can look
+    slightly less curve-aligned than the actual reported alignment score
+    (computed post-snap) — visualizing the post-snap mask would need
+    threading that state through models/eval_callbacks.py's panel-logging
+    call site, not done here since it doesn't change what's measured, only
+    what's drawn."""
+    box = get_box(mask)
+    if box is None:
         return None
-    cnt = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(cnt)
-    if rect[1][0] == 0 or rect[1][1] == 0:
-        return None
-    return cv2.boxPoints(rect).astype(np.int32)
+    return box.astype(np.int32)
 
 
 def make_squares_panel_image(

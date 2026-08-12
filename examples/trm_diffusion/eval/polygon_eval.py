@@ -2,114 +2,37 @@
 eval/polygon_eval.py – Evaluation for the Max-Area Polygon dataset
 (datasets/polygon_dataset.py).
 
-Simpler than Steiner Tree's eval (eval/steiner_eval.py): a polygon uses only
-the *given* points as vertices — no new junction points are ever introduced
-— so vertex positions are always exactly known (from embedding_conditions),
-nothing to detect from pixels. Only edge *existence* between known point
-pairs needs reading off the generated image; validity (simple polygon,
-uses every point) and area are then computed from the exact known
-coordinates, not re-derived lossily from pixels.
-
-Mirrors eval/steiner_eval.py's overall shape: a constraint_puzzle_acc pass/
-fail check independent of the reference, plus optimality_ratio looked up by
-puzzle_id against the exact optimal value the offline solver already
-computed (datasets/polygon_generation.py's max_area_polygon) — see
-[[feedback-check-optimization-objective-not-just-validity]] in memory for
-why both matter (validity alone is trivially satisfiable and says nothing
-about whether the model found the *largest*-area polygon, not just *a*
-simple one).
+2026-08-12: this now calls extract_polygon_graph.PolygonGraphExtractor
+directly — a verbatim vendored copy of the paper's own
+scripts/extract_polygon_graph.py (see that module's header) — rather than
+an independent edge-detection/self-intersection reimplementation. Same
+reasoning as eval/steiner_eval.py's equivalent change: the goal of this
+reproduction is to match the paper's methodology exactly, not to
+independently re-derive something that scores similarly. evaluate_polygon()
+below is a direct port of scripts/evaluate_polygonization.py's
+_evaluate_instance's extraction-and-scoring core (tensor->binary conversion,
+extract_polygon_from_points call, is_valid_polygon check), not a
+reimplementation. Two real algorithmic differences this caught vs. the
+prior custom implementation: (1) their real edge detection is an exact
+Bresenham line-coverage-ratio check (skip=edge_width, 3x3 patch tolerance,
+threshold=0.9), not a distance-transform/percentile heuristic; (2) their
+real self-intersection check runs over *every detected edge* before even
+attempting to find a cycle (so a stray phantom chord that crosses another
+detected edge invalidates the whole sample), not just the edges of the
+Hamiltonian cycle that was eventually found — the prior implementation's
+docstring explicitly (and, it turns out, incorrectly) assumed the paper's
+own code tolerated non-cycle phantom edges the way ours did.
 """
 
 from __future__ import annotations
 
-import networkx as nx
+import cv2
 import numpy as np
 import torch
-from scipy.ndimage import distance_transform_edt
 
-from datasets.polygon_generation import _area_signed, _segments_properly_intersect
+from eval.extract_polygon_graph import PolygonGraphExtractor
 
-# Discretization cutoff on the raw [-1, 1] rendered signal (matches
-# datasets/polygon_dataset.py's render_polygon: background=0, edge=+1).
-EDGE_THRESH = 0.5
-
-# Max allowed distance (px) from sampled line points to the nearest edge-
-# colored pixel for a candidate edge to count as "detected" — calibrated
-# against ground-truth renders: true edges never exceed ~1.4px (rendering/
-# sampling noise), false chords are essentially never below ~3px except for
-# occasional near-collinear coincidences. See _detect_edges's docstring for
-# why exact-pixel/coverage-ratio matching was tried first and didn't work.
-# At this threshold, ground truth reconstructs exactly ~97.7% of the time
-# (vs. Steiner Tree's ~78% — easier here since vertices are always exactly
-# known, nothing to detect); area on successfully-reconstructed samples
-# matches the true optimum to ~1e-4 relative error (computed from exact
-# coordinates, not pixels, so the only error source is occasional phantom
-# edges breaking reconstruction, not area-measurement noise itself).
-EDGE_DIST_THRESH = 1.5
-
-
-def _detect_edges(
-    img: np.ndarray, points_rc: np.ndarray, n_samples: int = 50, margin_frac: float = 0.08
-) -> list[tuple[int, int]]:
-    """Check every pair of *known* points for a covered edge in the image,
-    via distance-to-nearest-edge-pixel rather than exact coverage-ratio
-    matching.
-
-    Coverage-ratio matching (sample points along the p->q line, require a
-    high fraction to land exactly on an edge-colored pixel) was tried first
-    and didn't work: the rendered edge is only edge_width=1px wide, so any
-    reasonable line-sampling algorithm (Bresenham or linspace+round) drifts
-    out of exact pixel alignment with how cv2.polylines actually drew it,
-    and there's no coverage threshold that cleanly separates true edges from
-    chords that merely pass near the (possibly star-shaped) polygon
-    boundary. Precomputing one distance-transform of the edge mask per image
-    and requiring line points stay close to *some* edge pixel (not
-    necessarily the exact sampled one) sidesteps the alignment-sensitivity
-    entirely and calibrates cleanly (see EDGE_DIST_THRESH).
-
-    Tolerates a handful of false-positive "phantom" edges (chords that
-    happen to run near the real boundary) rather than trying to eliminate
-    them outright — evaluate_polygon's Hamiltonian-cycle search (matching
-    the paper's own extract_polygon_graph.py approach) tolerates these by
-    searching for *a* valid tour within the detected edges rather than
-    requiring the edge set to already be exactly one.
-    """
-    edge_mask = img > EDGE_THRESH
-    dist_map = distance_transform_edt(~edge_mask)
-    n = len(points_rc)
-    m = int(n_samples * margin_frac)
-    edges = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            rows = np.linspace(points_rc[i][0], points_rc[j][0], n_samples)
-            cols = np.linspace(points_rc[i][1], points_rc[j][1], n_samples)
-            if n_samples > 2 * m:
-                rows, cols = rows[m:-m], cols[m:-m]
-            ri = np.clip(rows.round().astype(int), 0, dist_map.shape[0] - 1)
-            ci = np.clip(cols.round().astype(int), 0, dist_map.shape[1] - 1)
-            if len(ri) and np.percentile(dist_map[ri, ci], 90) <= EDGE_DIST_THRESH:
-                edges.append((i, j))
-    return edges
-
-
-def _cycle_edges_self_intersect(points_xy: np.ndarray, order: list[int]) -> bool:
-    """Exact check using the known point coordinates (not pixels) — same
-    segment-intersection test the offline solver itself uses. Only checks
-    the returned cycle's own consecutive edges, not every detected edge
-    (some of those may be unused "phantom" edges the cycle search ignored)."""
-    n = len(order)
-    edges = [(order[i], order[(i + 1) % n]) for i in range(n)]
-    for a in range(len(edges)):
-        i, j = edges[a]
-        for b in range(a + 1, len(edges)):
-            k, l = edges[b]
-            if len({i, j, k, l}) < 4:
-                continue  # shares a vertex — not a proper crossing
-            if _segments_properly_intersect(
-                tuple(points_xy[i]), tuple(points_xy[j]), tuple(points_xy[k]), tuple(points_xy[l])
-            ):
-                return True
-    return False
+_EXTRACTOR = PolygonGraphExtractor()  # matches the paper's real construction (all defaults)
 
 
 def _orders_equivalent(a: list[int], b: list[int]) -> bool:
@@ -124,42 +47,6 @@ def _orders_equivalent(a: list[int], b: list[int]) -> bool:
     doubled = b + b
     doubled_rev = b[::-1] + b[::-1]
     return any(doubled[s : s + n] == a or doubled_rev[s : s + n] == a for s in range(n))
-
-
-def _hamiltonian_cycle_order(n: int, edges: list[tuple[int, int]]) -> list[int] | None:
-    """Search for *some* Hamiltonian cycle within `edges` (does not require
-    the edge set to be exactly one cycle — tolerates extra "phantom" edges
-    not used by the returned tour, matching the paper's own
-    extract_polygon_graph.py._find_simple_cycle approach). Plain backtracking
-    DFS; fast enough at this dataset's scale (n <= 12).
-    """
-    if n < 3:
-        return None
-    G = nx.Graph()
-    G.add_nodes_from(range(n))
-    G.add_edges_from(edges)
-    if not nx.is_connected(G):
-        return None
-
-    def dfs(path: list[int], visited: set) -> list[int] | None:
-        if len(path) == n:
-            return path if path[0] in G[path[-1]] else None
-        for nxt in G[path[-1]]:
-            if nxt not in visited:
-                visited.add(nxt)
-                path.append(nxt)
-                result = dfs(path, visited)
-                if result is not None:
-                    return result
-                path.pop()
-                visited.remove(nxt)
-        return None
-
-    for start in G.nodes():
-        result = dfs([start], {start})
-        if result is not None:
-            return result
-    return None
 
 
 @torch.no_grad()
@@ -204,16 +91,23 @@ def evaluate_polygon(
         n = len(pts_xy)
         if n < 3:
             continue
-        pts_rc = pts_xy[:, ::-1] * (image_size - 1)  # (row, col) pixel coords
-        edges = _detect_edges(imgs[b], pts_rc)
-        order = _hamiltonian_cycle_order(n, edges)
-        if order is None:
-            continue
-        if _cycle_edges_self_intersect(pts_xy, order):
-            continue
-        valid[b] = True
-        area[b] = abs(_area_signed([tuple(p) for p in pts_xy], order))
-        orders[b] = order
+        gt_points = [tuple(p) for p in pts_xy]
+
+        # Direct port of evaluate_polygonization.py's tensor->binary
+        # conversion: [-1,1] -> [-127,127] float (kept continuous, not
+        # discretized to exact {0,127,-127} like Steiner's format).
+        pred_binary = (imgs[b] * 127.0).astype(np.float32)
+        if pred_binary.shape != (image_size, image_size):
+            pred_binary = cv2.resize(pred_binary, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+
+        vertices, pred_area, _pred_perimeter, _edges, vertex_indices = _EXTRACTOR.extract_polygon_from_points(
+            pred_binary, gt_points
+        )
+
+        if len(vertices) >= 3:  # direct port of evaluate_polygonization.py's _is_valid_polygon
+            valid[b] = True
+            area[b] = pred_area
+            orders[b] = vertex_indices
 
     return {
         "constraint_puzzle_acc": float(valid.mean()),
