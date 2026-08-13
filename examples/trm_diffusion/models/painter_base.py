@@ -145,6 +145,7 @@ class UNetPainter(PainterBase, BaseModel):
         vae_pixel_range: str = "[-1,1]",
         pixel_range: str = "[0,1]",
         mean_reduced_loss: bool = False,
+        min_train_timestep: int = 0,
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -184,6 +185,12 @@ class UNetPainter(PainterBase, BaseModel):
         # paper's own train_diffusion.py (`loss = loss / grad_accum_steps`).
         # Default False preserves existing behavior for every other painter.
         self._mean_reduced_loss = mean_reduced_loss
+        # Paper's train_diffusion.py samples t ~ randint(1, diffusion_steps) —
+        # excludes t=0 (an almost-noiseless input, which the paper's own
+        # scheduler.noise()/denoise_ddim() may not even handle meaningfully at
+        # index 0). Default 0 preserves existing behavior for every other
+        # painter; Steiner/Polygon/Squares set this to 1 to match exactly.
+        self._min_train_timestep = min_train_timestep
 
     @property
     def condition_keys(self) -> list[str]:
@@ -288,7 +295,9 @@ class UNetPainter(PainterBase, BaseModel):
             images = self.encode(images)  # pixel → latent (no_grad inside encode)
 
         noise = torch.randn_like(images)
-        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
+        timesteps = torch.randint(
+            self._min_train_timestep, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
+        )
         noisy = self.scheduler.add_noise(images, noise, timesteps)
         target = noise if self.scheduler.config.prediction_type == "epsilon" else images
 
