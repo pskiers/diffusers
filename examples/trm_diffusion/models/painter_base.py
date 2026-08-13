@@ -559,6 +559,41 @@ def _swap_to_controlnet_unet(unet: nn.Module) -> None:
         unet.__class__ = ControlPainterUNet
 
 
+def _load_frozen_checkpoint(painter: nn.Module, checkpoint: str, checkpoint_source: str = "trm_diffusion") -> None:
+    """Load frozen-painter weights, from either this codebase's own
+    train_trm.py checkpoint format or the paper's original repo's raw
+    checkpoint format (e.g. nirgoren/geometric-solver's checkpoints_steiner/
+    checkpoint_100.pth on HF) — lets a *_controlnet_frozen painter config
+    point straight at the paper's own released weights for TRM steering,
+    skipping this codebase's own painter training entirely (its own
+    from-scratch training doesn't need to reproduce the paper's numbers for
+    the TRM's steering signal to be worth developing against a known-good
+    base — see memory: trm_diffusion_real_data_and_recipe_audit /
+    cross-loading tests already verified these checkpoints reproduce the
+    paper's Table 2/3 through this codebase's own sampling+eval pipeline).
+
+    "trm_diffusion" (default): checkpoint's "model_state" key is a full
+    painter state_dict (this codebase's own format).
+
+    "original_repo": checkpoint's "state_dict" key is a *bare UNet* state_dict
+    only (their model IS the UNet, no painter/condition_encoder wrapper) —
+    loaded into painter.unet directly, not the whole painter. Prefixes
+    ("module." from DDP, "_orig_mod." from torch.compile, wherever they
+    appear) are stripped the same way the cross-loading verification
+    scripts did.
+    """
+    if checkpoint_source == "trm_diffusion":
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+    elif checkpoint_source == "original_repo":
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        raw = ckpt["state_dict"]
+        stripped = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in raw.items()}
+        painter.unet.load_state_dict(stripped, strict=True)
+    else:
+        raise ValueError(f"Unknown checkpoint_source: {checkpoint_source!r} (expected 'trm_diffusion' or 'original_repo')")
+
+
 class ControlNetSteeredUNetPainter(UNetPainter):
     """Frozen UNetPainter loaded from a checkpoint for ControlNet-style thinker steering.
 
@@ -569,14 +604,17 @@ class ControlNetSteeredUNetPainter(UNetPainter):
 
     Args:
         checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
-                    (must contain a "model_state" key).
+                    (must contain a "model_state" key), or — when
+                    checkpoint_source="original_repo" — a raw checkpoint from
+                    the paper's own repo (must contain a "state_dict" key).
+        checkpoint_source: "trm_diffusion" (default) or "original_repo" — see
+                    _load_frozen_checkpoint.
         **kwargs:   forwarded verbatim to UNetPainter.__init__.
     """
 
-    def __init__(self, checkpoint: str, **kwargs):
+    def __init__(self, checkpoint: str, checkpoint_source: str = "trm_diffusion", **kwargs):
         super().__init__(**kwargs)
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        _load_frozen_checkpoint(self, checkpoint, checkpoint_source)
         _swap_to_controlnet_unet(self.unet)
         for p in self.unet.parameters():
             p.requires_grad_(False)
@@ -708,14 +746,17 @@ class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter
 
     Args:
         checkpoint: path to a checkpoint_*.pt saved by train_trm.py for a
-                    ConcatConditionedUNetPainter run.
+                    ConcatConditionedUNetPainter run, or — when
+                    checkpoint_source="original_repo" — a raw checkpoint from
+                    the paper's own repo (must contain a "state_dict" key).
+        checkpoint_source: "trm_diffusion" (default) or "original_repo" — see
+                    _load_frozen_checkpoint.
         **kwargs:   forwarded to ConcatConditionedUNetPainter.__init__.
     """
 
-    def __init__(self, checkpoint: str, **kwargs):
+    def __init__(self, checkpoint: str, checkpoint_source: str = "trm_diffusion", **kwargs):
         super().__init__(**kwargs)
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        _load_frozen_checkpoint(self, checkpoint, checkpoint_source)
         _swap_to_controlnet_unet(self.unet)
         for p in self.unet.parameters():
             p.requires_grad_(False)
