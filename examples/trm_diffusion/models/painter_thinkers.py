@@ -2,6 +2,7 @@ import dataclasses
 from typing import Optional
 
 import torch
+import torch.nn as nn
 from hydra.utils import instantiate
 from tqdm.auto import tqdm
 
@@ -616,3 +617,208 @@ class ThinkerFrozenPainterBase(BaseModel):
             self.thinker_painter_translator.compile_submodules()
         else:
             self.thinker_painter_translator = torch.compile(self.thinker_painter_translator, fullgraph=False)
+
+
+# ── Persistent-carry ACT training (separate from ThinkerFrozenPainterBase —
+#    see its own docstring for why) ───────────────────────────────────────────
+
+
+def _masked_merge_sample(old: DataSample, new: DataSample, mask: torch.Tensor) -> DataSample:
+    """Per-row select: mask[j]=True takes new's row j, False keeps old's.
+
+    Assumes old and new agree on which fields are populated (true for any
+    two DataSamples built by the same painter._prepare_training_sample
+    pathway on the same dataset — collate_data_samples already enforces
+    that within one batch, and both call sites here go through the same
+    painter/dataset every time)."""
+    updates: dict = {}
+    for f in dataclasses.fields(DataSample):
+        old_v = getattr(old, f.name)
+        if old_v is None:
+            continue
+        new_v = getattr(new, f.name)
+        m = mask.view((-1,) + (1,) * (old_v.ndim - 1))
+        updates[f.name] = torch.where(m, new_v, old_v)
+    return dataclasses.replace(old, **updates)
+
+
+class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
+    """ThinkerFrozenPainterBase variant that trains with real ACT-style
+    persistent-carry batching, mirroring the actual TRM/HRM training loop
+    (see models.trm_wrappers.SpatialTRM.train_halt_head's docstring lineage
+    and this class's own commit history for the source research) instead of
+    the base class's fixed-n_sup deep-supervision loop. The base class is
+    untouched — this only overrides __init__ and train_step; forward,
+    forward_with_carry, eval_step, build_optimizers etc. are all inherited
+    as-is, since none of them need to change.
+
+    Requires thinker.with_halt_head=True.
+
+    Mechanics: each call to train_step advances exactly ONE reasoning step
+    for a persistent batch of "slots" (one per grad-accum micro-batch),
+    instead of n_sup steps for a disposable one. Per-sample (not per-slot):
+    any sample that halted on the PREVIOUS call gets a fresh example loaded
+    from THIS call's micro_batches and its (z_H, z_L, steps) reset before
+    this call's step runs; a sample that hasn't halted keeps its in-
+    progress state untouched, and this call's freshly-fetched replacement
+    candidate at that row is simply discarded — this matches the real
+    training loops exactly (they fetch one full fresh batch every
+    iteration regardless of how many samples actually need it, and
+    torch.where-merge on the halted mask, rather than fetching a variable
+    number of replacements). Consequently train_trm.py needs no changes:
+    it already fetches grad_accum_steps fresh micro_batches before every
+    train_step call.
+
+    global_step advances by 1 per call here, not by n_sup like the base
+    class — train.num_steps means something different under this class
+    (roughly num_steps_base_class * n_sup for an equivalent total compute
+    budget, though not exactly, since compute is reallocated rather than
+    uniform).
+
+    halt_exploration_prob: with this probability (per sample, per step),
+    force a random minimum step count in [2, n_sup] before that sample is
+    allowed to halt, regardless of what the halt head says — ports over
+    the real TRM/HRM training recipe's exploration mechanism
+    (halt_exploration_prob=0.1 in every real training run in both papers).
+    Without this, a sample the head starts (possibly wrongly) halting
+    early never generates the longer trajectory that would let the head's
+    own training correct that mistake — it only ever sees the short
+    trajectories its own decisions produce.
+
+    continue_bias_init: at construction, the halt head's bias is set to
+    this value (rather than the with_halt_head default of 0 — fine for
+    that case, where halting is just an auxiliary probe riding on an
+    otherwise-unaffected loop) so an untrained head starts by confidently
+    predicting "there is more to gain, keep going" rather than "ambivalent"
+    — mirrors the vendored q_head's own zero-weight + bias=-5 init trick,
+    which exists for exactly this reason: under real ACT-driven training,
+    halting gates the main training signal itself, so a bad early bias
+    risks starving training rather than just slowing the aux loss's own
+    convergence.
+
+    halt_threshold: the training-time halting threshold (distinct from
+    eval_cfg.halt_threshold, which only governs inference-time forward()/
+    forward_with_carry() defaults).
+    """
+
+    def __init__(
+        self,
+        *args,
+        halt_threshold: float = 0.0,
+        halt_exploration_prob: float = 0.1,
+        continue_bias_init: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if not getattr(self.thinker, "with_halt_head", False):
+            raise ValueError("ThinkerFrozenPainterACT requires thinker.with_halt_head=True.")
+        self.halt_threshold = halt_threshold
+        self.halt_exploration_prob = halt_exploration_prob
+        with torch.no_grad():
+            nn.init.constant_(self.thinker.halt_head.bias, continue_bias_init)
+        self._act_carry: Optional[list[dict]] = None
+
+    def train_step(
+        self,
+        micro_batches,
+        accelerator,
+        optimizers,
+        ema,
+        global_batch_size,
+        global_step,
+        **kwargs,
+    ):
+        device = accelerator.device
+        K = len(micro_batches)
+        n_sup = self.n_sup
+
+        if self._act_carry is None:
+            self._act_carry = []
+            for mb in micro_batches:
+                sample = self.painter._prepare_training_sample(mb, device)
+                bsz = sample.x_noisy.shape[0]
+                z_H, z_L = self.get_initial_states(bsz)
+                self._act_carry.append({
+                    "sample": sample,
+                    "z_H": z_H.to(device),
+                    "z_L": z_L.to(device),
+                    "steps": torch.zeros(bsz, dtype=torch.long, device=device),
+                    "halted": None,
+                    "hist_z": [[] for _ in range(bsz)],
+                    "hist_loss": [[] for _ in range(bsz)],
+                })
+
+        total_losses: dict[str, float] = {}
+        completed_histories: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        for i, slot in enumerate(self._act_carry):
+            prev_halted = slot["halted"]
+            if prev_halted is not None and prev_halted.any():
+                fresh_sample = self.painter._prepare_training_sample(micro_batches[i], device)
+                bsz = fresh_sample.x_noisy.shape[0]
+                fresh_z_H, fresh_z_L = self.get_initial_states(bsz)
+                fresh_z_H, fresh_z_L = fresh_z_H.to(device), fresh_z_L.to(device)
+
+                slot["sample"] = _masked_merge_sample(slot["sample"], fresh_sample, prev_halted)
+                m = prev_halted.view(-1, 1, 1)
+                slot["z_H"] = torch.where(m, fresh_z_H, slot["z_H"])
+                slot["z_L"] = torch.where(m, fresh_z_L, slot["z_L"])
+                slot["steps"] = torch.where(prev_halted, torch.zeros_like(slot["steps"]), slot["steps"])
+                for j in prev_halted.nonzero(as_tuple=True)[0].tolist():
+                    slot["hist_z"][j] = []
+                    slot["hist_loss"][j] = []
+
+            noise_pred, logits, slot["z_H"], slot["z_L"] = self.reasoning_step(
+                slot["sample"], slot["z_H"], slot["z_L"]
+            )
+            step_loss, loss_dict = self.loss_fn(noise_pred, logits, slot["sample"])
+            for k, v in loss_dict.items():
+                total_losses[k] = total_losses.get(k, 0.0) + v
+            if step_loss.requires_grad:
+                accelerator.backward(step_loss / (global_batch_size * K))
+
+            slot["steps"] = slot["steps"] + 1
+
+            per_sample_loss = (noise_pred.float() - slot["sample"].target.float()).pow(2).flatten(1).mean(1)
+            z_H0 = slot["z_H"][:, 0].detach()
+            loss_detached = per_sample_loss.detach()
+            for j in range(z_H0.shape[0]):
+                slot["hist_z"][j].append(z_H0[j])
+                slot["hist_loss"][j].append(loss_detached[j])
+
+            pred = self.thinker.predict_halt_value(slot["z_H"])
+            is_last_step = slot["steps"] >= n_sup
+            halted = is_last_step | (pred <= self.halt_threshold)
+
+            if self.halt_exploration_prob > 0 and n_sup > 1:
+                bsz = halted.shape[0]
+                explore = torch.rand(bsz, device=device) < self.halt_exploration_prob
+                min_steps = torch.where(
+                    explore,
+                    torch.randint(2, n_sup + 1, (bsz,), device=device),
+                    torch.zeros(bsz, dtype=torch.long, device=device),
+                )
+                halted = halted & (slot["steps"] >= min_steps)
+
+            slot["halted"] = halted
+
+            for j in halted.nonzero(as_tuple=True)[0].tolist():
+                z_seq = torch.stack(slot["hist_z"][j], dim=0)
+                l_seq = torch.stack(slot["hist_loss"][j], dim=0)
+                completed_histories.append((z_seq, l_seq))
+
+        accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+        enc_params = self.get_encoder_params()
+        if enc_params:
+            accelerator.clip_grad_norm_(enc_params, 1.0)
+        lr = apply_lr_and_step(optimizers, global_step)
+        global_step += 1
+        if ema is not None:
+            ema.update(self)
+
+        losses = {k: v / K for k, v in total_losses.items()}
+        if completed_histories:
+            losses["halt_head_loss"] = self.thinker.train_halt_head_ragged(completed_histories)
+            losses["act_steps_completed"] = float(len(completed_histories))
+
+        return losses, lr, global_step

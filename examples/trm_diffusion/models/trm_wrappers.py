@@ -301,6 +301,48 @@ class SpatialTRM(BaseModel):
         self.halt_optimizer.step()
         return loss.item()
 
+    @staticmethod
+    def _future_min_targets(loss_seq: torch.Tensor) -> torch.Tensor:
+        """loss_seq: (L, ...) → (L-1, ...) targets loss_t - min(loss_{t+1:}),
+        t = 0..L-2. Same formula train_halt_head uses inline; factored out
+        here only for train_halt_head_ragged's per-sample use (train_halt_head
+        itself is left untouched)."""
+        suffix_min = torch.flip(torch.cummin(torch.flip(loss_seq, dims=[0]), dim=0).values, dims=[0])
+        return loss_seq[:-1] - suffix_min[1:]
+
+    def train_halt_head_ragged(self, histories: list[tuple[torch.Tensor, torch.Tensor]]) -> float:
+        """Like train_halt_head, but for a set of INDEPENDENT per-sample
+        trajectories of possibly different lengths — used by
+        ThinkerFrozenPainterACT's persistent-carry training, where different
+        samples halt (and so flush their own history) at different calls,
+        rather than one shared n_sup-length trajectory for the whole batch.
+
+        histories: list of (z_H0_seq, loss_seq) pairs, one per sample that
+        just halted — (L, hidden_size) / (L,) tensors, already detached, for
+        THAT sample's own trajectory since its last reset. Histories with
+        L < 2 are skipped (no future to compare against, same as
+        train_halt_head). All qualifying per-step (input, target) pairs are
+        pooled into ONE batched MSE update via self.halt_optimizer.
+        """
+        inputs, targets = [], []
+        for z_H0_seq, loss_seq in histories:
+            if loss_seq.shape[0] < 2:
+                continue
+            targets.append(self._future_min_targets(loss_seq))
+            inputs.append(z_H0_seq[:-1].float())
+
+        if not inputs:
+            return 0.0
+
+        preds = self.halt_head(torch.cat(inputs, dim=0)).squeeze(-1)
+        target = torch.cat(targets, dim=0)
+
+        loss = F.mse_loss(preds, target)
+        self.halt_optimizer.zero_grad()
+        loss.backward()
+        self.halt_optimizer.step()
+        return loss.item()
+
     @torch.no_grad()
     def predict(
         self,
