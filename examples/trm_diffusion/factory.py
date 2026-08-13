@@ -1,7 +1,7 @@
 """
 factory.py — Build models, datasets, and schedulers from a Hydra DictConfig.
 
-Supports three training modes (set via cfg.mode in the experiment config):
+Supports four training modes (set via cfg.mode in the experiment config):
 
   painter_base  — Standalone painter (UNetPainter / DiTPainter).
                   The full model is declared under cfg.painter with a Hydra
@@ -17,6 +17,13 @@ Supports three training modes (set via cfg.mode in the experiment config):
                   ActionThinkerFrozenPainterBase (adds predict_action() for
                   models/dp_eval_callbacks.py's closed-loop rollouts). Used by
                   the PushT/BlockPush/ToolHang thinker experiments.
+
+  thinker_act   — Same wiring as thinker_base, but builds a
+                  ThinkerFrozenPainterACT: real ACT-style persistent-carry
+                  training (requires thinker.with_halt_head=true) instead of
+                  the fixed-n_sup deep-supervision loop. See
+                  models/painter_thinkers.py's ThinkerFrozenPainterACT
+                  docstring for the full mechanics.
 """
 
 from __future__ import annotations
@@ -169,6 +176,34 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             eval_callbacks=cfg.get("eval_callbacks") or None,
             scheduler=scheduler,
             sampling_pipeline=sampling,
+        )
+
+    if mode == "thinker_act":
+        # Same wiring as thinker_base, but ThinkerFrozenPainterACT replaces
+        # the fixed-n_sup deep-supervision loop with real ACT-style
+        # persistent-carry training (requires thinker.with_halt_head=true).
+        # Kept as a separate mode/class (rather than modifying thinker_base)
+        # so the existing sudoku/CLEVR thinker experiments are entirely
+        # untouched. act_halt_threshold/act_halt_exploration_prob/
+        # act_continue_bias_init live under cfg.train (CLI-overridable via
+        # train.act_halt_threshold=... etc.) since they're specific to this
+        # training loop, not applicable to thinker_base.
+        from models.painter_thinkers import ThinkerFrozenPainterACT
+
+        return ThinkerFrozenPainterACT(
+            thinker=cfg.thinker,
+            painter=cfg.painter,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            condition_encoder=cfg.condition_encoder,
+            loss=cfg.loss,
+            thinker_painter_translator=cfg.translator,
+            eval_callbacks=cfg.get("eval_callbacks") or None,
+            scheduler=scheduler,
+            sampling_pipeline=sampling,
+            halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
+            halt_exploration_prob=float(cfg.train.get("act_halt_exploration_prob", 0.1)),
+            continue_bias_init=float(cfg.train.get("act_continue_bias_init", 1.0)),
         )
 
     if mode == "action_thinker_base":
