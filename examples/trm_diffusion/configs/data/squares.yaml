@@ -1,4 +1,5 @@
 image_size: 128
+grid_factor: 16      # thinker/condition-encoder spatial downsampling factor -- see squares_spatial_v0.yaml
 curve_thickness: 1   # matches config_curves.yaml's curve_kwargs.thickness_range=[1]
 square_thickness: 1  # matches config_curves.yaml's square_kwargs.thickness=1
 fill_square: true    # matches config_curves.yaml's fill_square=true

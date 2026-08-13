@@ -1,0 +1,9 @@
+# Same single-sample DDIM + squareness/alignment protocol as
+# configs/eval_callbacks/squares.yaml (see its comments) — run against the
+# TRM+frozen-painter model, so the same metrics are directly comparable
+# against the plain conditional painter's.
+- _target_: models.eval_callbacks.SquaresEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 256
+  num_candidates: 1
+  num_log_images: 8

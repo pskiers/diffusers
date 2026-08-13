@@ -1,0 +1,40 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen conditional PaperUNet Squares painter
+# (models.paper_unet.PaperUNet, the paper's own BatchNorm+ReLU architecture)
+# — ControlNet steering added as a SEPARATE, additive signal on top of the
+# painter's own (already-trained) curve conditioning, not a replacement of
+# it. Same mechanism as steiner_thinker_paper_controlnet.yaml/
+# polygon_thinker_paper_controlnet.yaml — only the backbone/translator/
+# condition_encoder differ, and even those are structurally identical
+# (SpatialConditionEncoder only ever reads `spatial_conditions` as a raster
+# and runs a CNN over it, whether that raster holds sparse terminal points
+# or a dense curve outline). Requires a trained squares_unet_concat_painter
+# checkpoint (PaperUNet backbone), or the paper's own released
+# checkpoints_curves/checkpoint_520.pth via
+# +painter.checkpoint_source=original_repo (see
+# squares_unet_concat_controlnet_frozen.yaml) — note that checkpoint is a
+# mid-training snapshot (epoch 520/1000), not fully converged.
+#
+# Usage:
+#   python train_trm.py experiment=squares_thinker_paper_controlnet \
+#     painter.checkpoint=runs/squares_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: squares
+  - override /backbone: squares_unet_paper
+  - override /painter: squares_unet_concat_controlnet_frozen
+  - override /thinker: squares
+  - override /translator: controlnet_squares_paper
+  - override /condition_encoder: squares_spatial_v0
+  - override /train: squares_thinker
+  - override /eval: squares_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: squares_thinker
+  - override /diffusion: ddim_epsilon
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/squares_thinker_paper_controlnet"

@@ -1,0 +1,13 @@
+# ControlNet translator for the PaperUNet backbone (squares_unet_paper) —
+# matches its channel progression exactly (base_channels=64, 4 levels).
+# Identical shape to controlnet_steiner_paper.yaml/controlnet_polygon_paper.yaml
+# (architecture is task-independent) — see
+# models.translators.ControlNetTranslatorPaperUNet /
+# models.utility_models.ConditioningPyramidPaperUNet.
+_target_: models.translators.ControlNetTranslatorPaperUNet
+in_channels: ${thinker.vocab_size}
+painter_channels: [64, 128, 256, 512]
+painter_size: ${data.image_size}
+grid: 8             # image_size // grid_factor = 128 // 16
+bridge_mode: "normalized"
+with_timestep_emb: true

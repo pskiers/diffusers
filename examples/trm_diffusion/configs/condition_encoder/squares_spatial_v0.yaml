@@ -1,0 +1,14 @@
+# Thinker-side condition encoder: spatial image CNN (V0, no noisy input),
+# same pattern as Steiner/Polygon/Maze/Sudoku's spatial_v0 encoders — reads
+# the curve-outline condition image and keeps pixel-spatial correspondence.
+# Squares' condition is already a dense raster (the curve), not a sparse
+# point set like Steiner/Polygon's — but SpatialConditionEncoder only ever
+# reads `spatial_conditions` as an image and runs a CNN over it regardless,
+# so this is a direct reuse, not an adaptation.
+_target_: models.condition_encoders.SpatialConditionEncoder
+in_channels: 1
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.grid_factor}
+with_timestep_emb: true
