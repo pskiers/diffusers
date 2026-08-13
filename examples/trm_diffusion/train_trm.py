@@ -254,7 +254,15 @@ def main(cfg: DictConfig):
         log_dict = {f"train/{k}": v for k, v in metrics.items()}
         log_dict["train/lr"] = lr
 
-        step_size = getattr(unwrapped, "n_sup", 1)
+        # progress_step_size overrides n_sup for models where one train_step
+        # call advances global_step by something other than n_sup — e.g.
+        # ThinkerFrozenPainterACT, where a call is one persistent-carry
+        # reasoning step (global_step += 1), not n_sup deep-supervision
+        # iterations. Falls back to the existing n_sup-based sizing for
+        # every model that doesn't define it, so this is a no-op elsewhere.
+        step_size = getattr(unwrapped, "progress_step_size", None)
+        if step_size is None:
+            step_size = getattr(unwrapped, "n_sup", 1)
         progress_bar.update(step_size)
 
         if global_step >= next_log and accelerator.is_main_process:

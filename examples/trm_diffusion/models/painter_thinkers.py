@@ -718,6 +718,16 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             nn.init.constant_(self.thinker.halt_head.bias, continue_bias_init)
         self._act_carry: Optional[list[dict]] = None
 
+    @property
+    def progress_step_size(self) -> int:
+        """train_trm.py's progress bar reads this (falling back to n_sup
+        for every other model) — one train_step call here advances
+        global_step by 1, not by n_sup like the base class, so the bar
+        should tick by 1 too. n_sup itself is left alone: it still needs to
+        mean the real per-trajectory reasoning cap for train_step's own use
+        and for inherited inference methods (forward_with_carry)."""
+        return 1
+
     def train_step(
         self,
         micro_batches,
