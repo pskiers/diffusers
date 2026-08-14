@@ -37,3 +37,11 @@ mode: "thinker_base"
 
 run:
   output_dir: "runs/steiner_thinker_concat_controlnet"
+
+eval:
+  step_timeout: 7200  # best-of-10 sampling + extraction/scoring across 3-4 point ranges
+                       # measured up to ~60min total on the hardest range (41-50 pts) --
+                       # extraction cost is O(n^2)-ish in vertex/point count, CPU-bound,
+                       # independent of backbone size. Same fix as the painter-stage
+                       # experiments (missed here originally -- thinker-stage uses the
+                       # identical eval_callbacks, so the identical timeout risk applies).
