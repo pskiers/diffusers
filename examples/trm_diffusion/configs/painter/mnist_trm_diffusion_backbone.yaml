@@ -1,0 +1,50 @@
+# TRMDiffusionBackbone: the TRM itself as the diffusion backbone, instead of
+# a separate thinker steering a frozen UNet. The noisy image (channel-concat
+# with the puzzle condition) is patch-embedded into patch_size x patch_size
+# patches -- at patch_size=16=cell_size this gives exactly the 9x9=81 grid
+# the sudoku TRM already uses, so no new sequence-length/attention-cost
+# problem is introduced by the 144x144 resolution. See
+# models.trm_wrappers.TRMDiffusionBackbone.
+#
+# Pure diffusion loss only (train.sudoku_loss_weight must stay 0 -- there is
+# no separate thinker logits output to attach a CE loss to here).
+_target_: models.trm_wrappers.TRMDiffusionBackbone
+_recursive_: false
+
+patch_size: ${data.cell_size}
+out_channels: 1
+cond_channels: 1
+enc_channels: 128
+enc_hidden_channels: [128, 256, 256]
+image_size: ${data.painter_size}
+
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+num_puzzle_identifiers: 1
+halt_exploration_prob: 0.0
+batch_size: ${train.batch_size}
+
+eval_callbacks: ${eval_callbacks}
+
+# weight_decay=0.3 (not the original TRM default of 1.0) per the hyperparameter
+# search on the thinker side of the pipeline, which found 1.0 causes severe
+# training instability and 0.1-0.3 both resolve it -- applying that finding
+# here from the start rather than reproducing the known-bad default.
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 0.3
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

@@ -7,11 +7,17 @@ from adam_atan2 import AdamATan2
 import numpy as np
 from tqdm.auto import tqdm
 from accelerate import Accelerator
+from hydra.utils import instantiate
 from typing import Any, Optional
 
 from configs.schemas import ThinkerOptimConfig
+from datasets.data_sample import DataSample
 from datasets.sudoku_dataset import IGNORE_LABEL_ID
 from models.base import BaseModel
+from models.condition_encoders import _build_spatial_enc
+from models.interfaces import DiffusionPrediction
+from models.losses import build_loss
+from models.painter_base import PainterBase
 from models.utility_models import TimestepMLP
 from models.trm.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1_Inner,
@@ -464,3 +470,210 @@ class SpatialTRM(BaseModel):
                 accum[k].append(v.item())
         self.train()
         return {k: float(np.mean(v)) for k, v in accum.items()}
+
+
+class TRMDiffusionBackbone(PainterBase, SpatialTRM):
+    """SpatialTRM repurposed as the FULL pixel-space diffusion backbone,
+    instead of a reasoning module that steers a separate frozen painter.
+
+    The noisy image (channel-concatenated with the puzzle condition image) is
+    patch-embedded into seq_len tokens — one token per patch_size x patch_size
+    patch, via the same CNN patchifier NoisySpatialConditionEncoder already
+    uses (_build_spatial_enc). For MNIST-Sudoku, patch_size=cell_size=16
+    happens to give exactly the 9x9=81 grid the TRM already uses for one
+    token per sudoku cell, so no sequence-length/attention-cost problem
+    needs solving: attention stays over 81 tokens regardless of the 144x144
+    pixel resolution.
+
+    Reinterprets the vocab_size-sized "logits" SpatialTRM already produces as
+    flattened per-patch pixels (vocab_size = patch_size**2 * out_channels)
+    and folds them back into the full image — no separate frozen UNet, no
+    discrete classification head. Pure diffusion pixel-reconstruction loss
+    only (train_cfg.sudoku_loss_weight must be 0; there is no thinker logits
+    output to attach a CE loss to here).
+
+    Trains with the same deep-supervision scheme as the thinker side of the
+    two-stage pipeline: every one of the n_sup outer iterations gets its own
+    full forward + backward + optimizer step (see train_step), all against
+    the SAME (x_noisy, timesteps, target) sampled once per micro-batch —
+    only the recurrent carry (z_H, z_L) evolves across the n_sup loop.
+    """
+
+    condition_keys: list[str] = ["spatial_conditions"]
+    has_realsolution_eval: bool = False
+
+    def __init__(
+        self,
+        optim_cfg: ThinkerOptimConfig,
+        scheduler,
+        train_cfg,
+        eval_cfg,
+        patch_size: int = 16,
+        out_channels: int = 1,
+        cond_channels: int = 1,
+        enc_channels: int = 128,
+        enc_hidden_channels: tuple = (128, 256, 256),
+        image_size: int = 144,
+        eval_callbacks=None,
+        sampling_pipeline=None,
+        **trm_kwargs,
+    ):
+        patch_pixels = patch_size * patch_size * out_channels
+        grid = image_size // patch_size
+        SpatialTRM.__init__(
+            self,
+            optim_cfg=optim_cfg,
+            vocab_size=patch_pixels,
+            seq_len=grid * grid,
+            with_timestep_emb=True,
+            **trm_kwargs,
+        )
+        self.scheduler = scheduler
+        self.train_cfg = train_cfg
+        self.eval_cfg = eval_cfg
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.image_size = image_size
+        self.grid = grid
+
+        in_channels = out_channels + cond_channels
+        self.patch_enc, self.patch_proj = _build_spatial_enc(
+            in_channels, enc_channels, list(enc_hidden_channels), self.inner.config.hidden_size, patch_size
+        )
+        self.loss_fn = build_loss(train_cfg, scheduler)
+        self.eval_callbacks: list = [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
+        self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
+
+    @property
+    def noise_shape(self) -> tuple:
+        return (self.out_channels, self.image_size, self.image_size)
+
+    def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents.clamp(0.0, 1.0)
+
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        return images.clamp(0.0, 1.0)
+
+    # ── Patchify / unpatchify ────────────────────────────────────────────────
+
+    def _tokens_from_image(self, x_noisy: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        x = torch.cat([x_noisy, cond], dim=1) if cond is not None else x_noisy
+        feat = self.patch_proj(self.patch_enc(x))
+        return feat.flatten(2).transpose(1, 2)  # (B, seq_len, hidden_size)
+
+    def _image_from_patches(self, patches: torch.Tensor) -> torch.Tensor:
+        B = patches.shape[0]
+        p, g, c = self.patch_size, self.grid, self.out_channels
+        patches = patches.view(B, g, g, c, p, p)
+        patches = patches.permute(0, 3, 1, 4, 2, 5)  # (B, C, g, p, g, p)
+        return patches.reshape(B, c, g * p, g * p)
+
+    # ── Forward / sampling ───────────────────────────────────────────────────
+
+    def forward(self, sample: DataSample, **kwargs) -> DiffusionPrediction:
+        """Full inference: fresh carry, n_sup reasoning steps, fold back to
+        an image. No guidance is applied here (matches ThinkerFrozenPainterBase.forward);
+        use CFGPredictor from models.sampling during SamplingPipeline.sample()."""
+        bsz = sample.x_noisy.shape[0]
+        tokens = self._tokens_from_image(sample.x_noisy, sample.spatial_conditions)
+        z_H, z_L = self.get_initial_states(bsz)
+        z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
+
+        logits = None
+        for _ in range(self.n_sup):
+            logits, z_H, z_L = self.reasoning_step(tokens, z_H, z_L, timesteps=sample.timesteps)
+        noise_pred = self._image_from_patches(logits.float())
+
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+    # ── Training ─────────────────────────────────────────────────────────────
+
+    def _prepare_training_sample(self, mb: DataSample, device: torch.device) -> DataSample:
+        images = mb.images.to(device)
+        bsz = images.shape[0]
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
+        noisy = self.scheduler.add_noise(images, noise, timesteps)
+        target = noise if self.scheduler.config.prediction_type == "epsilon" else images
+        cond = mb.spatial_conditions.to(device) if mb.spatial_conditions is not None else None
+        return DataSample(
+            images=images,
+            spatial_conditions=cond,
+            x_noisy=noisy,
+            timesteps=timesteps,
+            target=target,
+            solution=mb.solution.to(device) if mb.solution is not None else None,
+            solution_mask=mb.solution_mask.to(device) if mb.solution_mask is not None else None,
+        )
+
+    def train_step(
+        self,
+        micro_batches,
+        accelerator,
+        optimizers,
+        ema,
+        global_batch_size: int,
+        global_step: int,
+        **kwargs,
+    ) -> tuple[dict, float, int]:
+        from models.optim_utils import apply_lr_and_step
+
+        K = len(micro_batches)
+        device = accelerator.device
+
+        mb_data = []
+        for mb in micro_batches:
+            sample = self._prepare_training_sample(mb, device)
+            bsz = sample.x_noisy.shape[0]
+            z_H, z_L = self.get_initial_states(bsz)
+            mb_data.append({"sample": sample, "z_H": z_H.to(device), "z_L": z_L.to(device)})
+
+        total_losses: dict[str, float] = {}
+        lr = 0.0
+        for _ in range(self.n_sup):
+            for d in mb_data:
+                tokens = self._tokens_from_image(d["sample"].x_noisy, d["sample"].spatial_conditions)
+                logits, d["z_H"], d["z_L"] = self.reasoning_step(
+                    tokens, d["z_H"], d["z_L"], timesteps=d["sample"].timesteps
+                )
+                noise_pred = self._image_from_patches(logits)
+                step_loss, loss_dict = self.loss_fn(noise_pred, None, d["sample"])
+                for k, v in loss_dict.items():
+                    total_losses[k] = total_losses.get(k, 0.0) + v
+                if step_loss.requires_grad:
+                    accelerator.backward(step_loss / (global_batch_size * K))
+
+            accelerator.clip_grad_norm_(self.parameters(), 1.0)
+            lr = apply_lr_and_step(optimizers, global_step)
+            global_step += 1
+            if ema is not None:
+                ema.update(self)
+
+        n = self.n_sup * K
+        losses = {k: v / n for k, v in total_losses.items()}
+        return losses, lr, global_step
+
+    @torch.no_grad()
+    def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:
+        max_batches = kwargs.get("max_batches", 100)
+
+        self.train()
+        metric_accum: dict[str, float] = {}
+        n_batches = 0
+        for i, batch in tqdm(enumerate(dataloader), desc="Eval", total=max_batches):
+            if i >= max_batches:
+                break
+            sample = self._prepare_training_sample(batch, accelerator.device)
+            result = self(sample)
+            _, loss_dict = self.loss_fn(result.pred, None, sample)
+            for k, v in loss_dict.items():
+                metric_accum[k] = metric_accum.get(k, 0.0) + v
+            n_batches += 1
+
+        result = {k: v / n_batches for k, v in metric_accum.items()} if n_batches > 0 else {}
+
+        self.eval()
+        for cb in self.eval_callbacks:
+            result.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
+        return result
