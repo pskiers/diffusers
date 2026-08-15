@@ -623,6 +623,31 @@ class ControlNetSteeredUNetPainter(UNetPainter):
                 p.requires_grad_(False)
 
 
+class JointControlNetUNetPainter(UNetPainter):
+    """Same architecture as ControlNetSteeredUNetPainter (UNet converted to
+    accept ControlNet-style steering residuals from the thinker), but
+    randomly initialized and left fully trainable instead of loaded from a
+    pretrained checkpoint and frozen.
+
+    Ablation: trains the painter and thinker jointly, end-to-end, from
+    scratch in one run — tests whether pretraining the painter unconditionally
+    first (the current two-stage pipeline) is actually load-bearing, or
+    whether ThinkerFrozenPainterBase.build_optimizers's existing support for
+    trainable painter params (already used for e.g. IP-Adapter variants) is
+    enough on its own.
+
+    **kwargs: forwarded verbatim to UNetPainter.__init__ — in particular
+    optim_cfg here is genuinely used (unlike ControlNetSteeredUNetPainter,
+    where it's a dead value since the painter is frozen), so pick real
+    from-scratch training hyperparameters, not the frozen config's
+    placeholder ones.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        _swap_to_controlnet_unet(self.unet)
+
+
 # ── Channel-concat conditioning (matches "Visual Diffusion Models are
 #    Geometric Solvers"'s actual architecture) ───────────────────────────────
 

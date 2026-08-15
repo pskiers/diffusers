@@ -1,0 +1,19 @@
+# Trainable UNetPainter for ControlNet thinker steering, trained jointly with
+# the thinker from scratch (no pretrained checkpoint, nothing frozen) -- see
+# models.painter_base.JointControlNetUNetPainter. Ablation companion to
+# mnist_unet_controlnet_frozen.yaml (the normal, pretrain-then-freeze setup).
+#
+# optim_cfg values match mnist_unet.yaml's (the standalone from-scratch
+# painter trainer), not mnist_unet_controlnet_frozen.yaml's -- those are a
+# dead/unused placeholder there since that painter is frozen, but they're
+# genuinely applied here.
+_target_: models.painter_base.JointControlNetUNetPainter
+_recursive_: false
+unet: ${backbone}
+painter_dtype: null
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
