@@ -1,0 +1,33 @@
+# @package _global_
+# Evaluate a frozen Polygon painter checkpoint through eval.py, with NO
+# thinker attached at all -- see steiner_unet_paper_baseline_eval.yaml for
+# the full rationale (same pattern, just Polygon's data/backbone/eval_callbacks).
+#
+# Usage:
+#   python eval.py experiment=polygon_unet_paper_baseline_eval \
+#     +painter.checkpoint_source=original_repo \
+#     painter.checkpoint=<path/to/checkpoints_max_polygon/checkpoint_100.pth>
+
+defaults:
+  - override /data: polygon
+  - override /backbone: polygon_unet_paper
+  - override /painter: polygon_unet_concat_controlnet_frozen
+  - override /train: polygon
+  - override /eval_callbacks: polygon
+  - override /diffusion: ddim_epsilon
+  - override /sampling: direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/polygon_unet_paper_baseline_eval"
+
+# see steiner_unet_paper_baseline_eval.yaml -- the shared frozen-painter
+# config doesn't set eval_callbacks itself, needed here since there's no
+# thinker wrapper to attach them to instead.
+painter:
+  eval_callbacks: ${eval_callbacks}
+
+eval:
+  step_timeout: 7200

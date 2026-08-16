@@ -101,18 +101,16 @@ def _save_metrics(metrics: dict, path: str, extra: dict | None = None) -> None:
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
+    # `checkpoint` here is eval.py's own top-level train_trm.py-format
+    # checkpoint (model_state/ema_state) — optional. Some models are fully
+    # weighted from Hydra construction alone (e.g. a frozen painter built
+    # with painter.checkpoint_source=original_repo, no thinker attached) and
+    # have no separate full-model checkpoint to layer on top; in that case
+    # just evaluate the model as constructed.
     checkpoint = cfg.get("checkpoint", None)
-    if checkpoint is None:
-        print(
-            "ERROR: No checkpoint specified.\n"
-            "  Usage: python eval.py experiment=<name> checkpoint=<path/to/checkpoint.pt>",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     use_ema: bool = cfg.get("use_ema", True)
 
-    default_metrics_path = str(Path(checkpoint).parent / "eval_metrics.json")
+    default_metrics_path = str(Path(checkpoint).parent / "eval_metrics.json") if checkpoint else "eval_metrics.json"
     metrics_path: str = cfg.get("metrics_path", default_metrics_path)
 
     torch.set_float32_matmul_precision("high")
@@ -159,7 +157,11 @@ def main(cfg: DictConfig):
     logger.info(f"Model parameters: {n_params:,}")
 
     # ── Load checkpoint ────────────────────────────────────────────────────────
-    step = _load_checkpoint(model, str(checkpoint), use_ema=use_ema, device="cpu")
+    if checkpoint is not None:
+        step = _load_checkpoint(model, str(checkpoint), use_ema=use_ema, device="cpu")
+    else:
+        logger.info("No top-level checkpoint given — evaluating model as constructed from Hydra config.")
+        step = None
 
     model = accelerator.prepare(model)
     unwrapped = accelerator.unwrap_model(model)
