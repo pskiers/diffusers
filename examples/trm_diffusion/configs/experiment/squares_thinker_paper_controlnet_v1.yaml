@@ -1,0 +1,29 @@
+# @package _global_
+# Same as squares_thinker_paper_controlnet.yaml, except the TRM's condition
+# encoder also sees the current noisy diffusion state (x_noisy) — see
+# steiner_thinker_paper_controlnet_v1.yaml for the full rationale (identical
+# pattern, just Squares' curve condition/painter/translator/thinker).
+#
+# Usage:
+#   python train_trm.py experiment=squares_thinker_paper_controlnet_v1 \
+#     painter.checkpoint=runs/squares_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: squares
+  - override /backbone: squares_unet_paper
+  - override /painter: squares_unet_concat_controlnet_frozen
+  - override /thinker: squares
+  - override /translator: controlnet_squares_paper
+  - override /condition_encoder: squares_spatial_v1
+  - override /train: squares_thinker
+  - override /eval: squares_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: squares_thinker
+  - override /diffusion: ddim_epsilon
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/squares_thinker_paper_controlnet_v1"

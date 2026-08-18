@@ -1,0 +1,12 @@
+# Thinker-side condition encoder: spatial image CNN concatenated with the
+# noisy diffusion image (V1) — see steiner_spatial_v1.yaml for the full
+# rationale (identical pattern, just Squares' curve condition image).
+_target_: models.condition_encoders.NoisySpatialConditionEncoder
+in_channels: 2          # 1 condition + 1 noisy
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.grid_factor}
+noisy_dropout_p_max: 0.7
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true
