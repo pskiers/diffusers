@@ -1,12 +1,99 @@
+import logging
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
+logger = logging.getLogger(__name__)
 
 
 def strip_compiled_prefix(state_dict: dict) -> dict:
     """Remove '_orig_mod.' prefix inserted by torch.compile on submodules."""
     return {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+
+
+def load_checkpoint(model, ckpt_path: str, use_ema: bool = True, device="cpu") -> int | None:
+    """Load weights from a checkpoint written by train_trm.py.
+
+    Format: {"step": int, "model_state": ..., "ema_state": {"shadow": ...}, ...}
+
+    Falls back to loading the file directly as a state_dict if no known keys
+    are found (plain torch.save(model.state_dict(), path)).
+
+    Returns the training step recorded in the checkpoint, or None.
+
+    Shared by eval.py and trajectory_viz.py — not named eval.<this> because
+    examples/trm_diffusion also has an eval/ package (eval/steiner_eval.py
+    etc.), and `from eval import ...` ambiguously resolves to that package
+    rather than the eval.py script.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        step = ckpt.get("step", None)
+
+        # Always load model_state first — covers frozen params and buffers
+        # (e.g. H_init, L_init) that EMA doesn't track.
+        sd = strip_compiled_prefix(ckpt["model_state"])
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        logger.info(f"Loaded model_state (step={step}): missing={len(missing)}, unexpected={len(unexpected)}")
+        if missing:
+            logger.info(f"  Missing (first 10): {missing[:10]}")
+        if unexpected:
+            logger.info(f"  Unexpected (first 10): {unexpected[:10]}")
+
+        if use_ema and ckpt.get("ema_state") is not None:
+            # EMAHelper.state_dict() returns self.shadow directly:
+            # {param_name: tensor} — no extra nesting.
+            ema_state = ckpt["ema_state"]
+            if isinstance(ema_state, dict) and ema_state:
+                ema_sd = strip_compiled_prefix(ema_state)
+                missing, unexpected = model.load_state_dict(ema_sd, strict=False)
+                logger.info(
+                    f"Loaded EMA weights on top of model_state "
+                    f"({len(ema_sd)} EMA params, missing={len(missing)})"
+                )
+                if missing:
+                    logger.info(f"  Missing (first 5): {missing[:5]}")
+                return step
+            logger.warning("EMA state is empty — using raw model_state")
+        return step
+
+    # Fallback: raw state_dict
+    sd = strip_compiled_prefix(ckpt)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    logger.info(f"Loaded raw state_dict (missing={len(missing)}, unexpected={len(unexpected)})")
+    return None
+
+
+@torch.no_grad()
+def recalibrate_batchnorm(model, dataloader, device, n_batches: int) -> int:
+    """Reset every BatchNorm's running_mean/running_var/num_batches_tracked
+    (nn.BatchNorm2d.reset_running_stats()) and re-accumulate them from
+    n_batches of real train()-mode forward passes — no gradients, no weight
+    updates, only the running-stat buffers change. Fixes (and was used to
+    empirically confirm) a checkpoint whose running stats drifted to
+    extreme values under training instability — see models/paper_unet.py.
+    Shared by eval.py and trajectory_viz.py.
+    """
+    bn_modules = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    for m in bn_modules:
+        m.reset_running_stats()
+
+    was_training = model.training
+    model.train()
+    dl_iter = iter(dataloader)
+    for _ in range(n_batches):
+        try:
+            batch = next(dl_iter)
+        except StopIteration:
+            dl_iter = iter(dataloader)
+            batch = next(dl_iter)
+        sample = model._prepare_training_sample(batch, device)
+        model(sample)
+    model.train(was_training)
+    return len(bn_modules)
 
 
 def load_frozen_custom_kl_vae(
@@ -341,6 +428,68 @@ class ConditioningPyramid1D(nn.Module):
 
         self.zero_convs = nn.ModuleList([nn.Conv1d(c, c, kernel_size=1) for c in block_out_channels])
         self.mid_zero_conv = nn.Conv1d(current_channels, current_channels, kernel_size=1)
+        for m in list(self.zero_convs) + [self.mid_zero_conv]:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, blueprint):
+        x = self.conv_in(blueprint)
+        residuals = []
+        for i, layer in enumerate(self.down_blocks):
+            x = layer["proj"](x)
+            x = x + layer["res"](x)
+            residuals.append(self.zero_convs[i](x))
+            x = layer["downsample"](x)
+
+        mid_res = x + self.mid_block(x)
+        return residuals, self.mid_zero_conv(mid_res)
+
+
+class ConditioningPyramidPaperUNet(nn.Module):
+    """2D ControlNet-style conditioning pyramid for PaperUNet (models/paper_unet.py),
+    used via ControlPainterPaperUNet.
+
+    Like ConditioningPyramid1D (not ConditioningPyramid): PaperUNet captures
+    exactly ONE skip per level, before downsampling — so this produces one
+    residual per entry in block_out_channels plus one mid-block residual.
+    Unlike ConditioningPyramid1D, every level downsamples (PaperUNet has no
+    "skip the last downsample" step — the bottleneck always operates on the
+    fully-downsampled result), so there is no is_last exception here.
+
+    Zero convolutions (1x1, weight+bias zero-init) on every output — at init
+    this injects exactly zero, same ControlNet trick as ConditioningPyramid.
+    """
+
+    def __init__(self, in_channels, block_out_channels=(64, 128, 256, 512), n_groups=32):
+        super().__init__()
+        self.conv_in = nn.Conv2d(in_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList()
+        current_channels = block_out_channels[0]
+        for out_channels in block_out_channels:
+            self.down_blocks.append(nn.ModuleDict({
+                "proj": (
+                    nn.Conv2d(current_channels, out_channels, kernel_size=1)
+                    if current_channels != out_channels else nn.Identity()
+                ),
+                "res": nn.Sequential(
+                    nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                    nn.GroupNorm(min(n_groups, out_channels), out_channels),
+                    nn.SiLU(),
+                ),
+                # Matches PaperUNet's own downsamples: stride-2 conv at every level.
+                "downsample": nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1),
+            }))
+            current_channels = out_channels
+
+        self.mid_block = nn.Sequential(
+            nn.Conv2d(current_channels, current_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(n_groups, current_channels), current_channels),
+            nn.SiLU(),
+        )
+
+        self.zero_convs = nn.ModuleList([nn.Conv2d(c, c, kernel_size=1) for c in block_out_channels])
+        self.mid_zero_conv = nn.Conv2d(current_channels, current_channels, kernel_size=1)
         for m in list(self.zero_convs) + [self.mid_zero_conv]:
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)

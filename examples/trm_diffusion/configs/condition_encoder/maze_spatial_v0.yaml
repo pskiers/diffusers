@@ -1,0 +1,8 @@
+# Thinker-side condition encoder: spatial image CNN (V0, no noisy input).
+_target_: models.condition_encoders.SpatialConditionEncoder
+in_channels: 3
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.cell_size}
+with_timestep_emb: true

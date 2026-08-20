@@ -1,0 +1,23 @@
+# ControlNet translator for CLEVR V1 thinker that reads only the noisy-latent
+# token slice (positionally registered to the output image) and discards the
+# object-reasoning tokens for the spatial residual path — mirrors sudoku's
+# controlnet_sliced.yaml.
+#
+# ObjectFeatureEncoderV1 orders tokens as [obj_tokens (max_objects),
+# img_tokens (grid_size²)] (models/condition_encoders.py:430), so
+# slice_start = max_objects, slice_len = grid_size².
+#
+# grid here must equal condition_encoder.grid_size, so slice_len == grid²
+# exactly — no seq_len is passed, so ControlNetTranslator's seq_proj (the
+# learned Linear that mixes all tokens down to grid²) is skipped entirely
+# (stays None) and the sliced tokens go straight to the spatial reshape.
+_target_: models.translators.SlicedControlNetTranslator
+in_channels: ${thinker.vocab_size}
+painter_channels: [128, 256, 256]
+layers_per_block: 2
+painter_size: 32
+grid: 16                    # must equal condition_encoder.grid_size
+bridge_mode: "normalized"
+with_timestep_emb: true
+slice_start: ${data.max_objects}  # object tokens come first
+slice_len: 256                    # grid² (16×16) — noisy-latent tokens

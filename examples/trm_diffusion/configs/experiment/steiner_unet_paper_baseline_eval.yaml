@@ -1,0 +1,45 @@
+# @package _global_
+# Evaluate a frozen Steiner painter checkpoint (this codebase's own, or the
+# paper's real checkpoints_steiner/checkpoint_100.pth via
+# +painter.checkpoint_source=original_repo) through eval.py, with NO thinker
+# attached at all. Uses the same ConcatConditionedControlNetSteeredUNetPainter
+# wrapper the TRM experiments use (steiner_unet_concat_controlnet_frozen) —
+# NOT because ControlNet steering is involved here, but because it's the
+# only painter class with checkpoint-loading support for the paper's raw
+# checkpoint format. With no thinker/translator ever attaching residuals,
+# ControlPainterPaperUNet.forward() with down_block_additional_residuals=None
+# is bit-for-bit identical to plain PaperUNet.forward() -- see
+# models/paper_unet.py's docstring -- so this is a pure baseline evaluation,
+# directly comparable (same eval.py, same eval_callbacks, same sample count
+# if overridden identically) to steiner_thinker_paper_controlnet's numbers.
+#
+# Usage:
+#   python eval.py experiment=steiner_unet_paper_baseline_eval \
+#     +painter.checkpoint_source=original_repo \
+#     painter.checkpoint=<path/to/checkpoints_steiner/checkpoint_100.pth>
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet_paper
+  - override /painter: steiner_unet_concat_controlnet_frozen
+  - override /train: steiner
+  - override /eval_callbacks: steiner
+  - override /diffusion: ddim_epsilon
+  - override /sampling: direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/steiner_unet_paper_baseline_eval"
+
+# steiner_unet_concat_controlnet_frozen.yaml doesn't set eval_callbacks
+# itself (it's normally only used inside a thinker-stage experiment, where
+# eval_callbacks attaches to the ThinkerFrozenPainterBase wrapper instead)
+# -- for a standalone painter_base-mode baseline eval, the painter itself
+# needs it.
+painter:
+  eval_callbacks: ${eval_callbacks}
+
+eval:
+  step_timeout: 7200

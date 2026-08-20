@@ -1,0 +1,26 @@
+# Steiner eval callback: best-of-10 DDIM sampling (matching the paper's own
+# evaluation protocol, arXiv 2510.21697 Table 2) + graph extraction/validity
+# checks (no learned classifier needed). Also breaks down by OOD point range
+# (21-30/31-40/41-50, on top of the in-distribution 10-20 primary set) to
+# test generalization, exactly as the paper does — same trained model, no
+# retraining needed. If a training run's periodic eval is too slow, lower
+# num_samples/num_candidates here (and/or each extra_eval_sets entry's own
+# num_samples) — see SteinerEvalCallback's docstring for the cost tradeoff.
+- _target_: models.eval_callbacks.SteinerEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 256
+  num_candidates: 10
+  num_log_images: 8
+  extra_eval_sets:
+    - name: 21-30
+      hf_filename: val_21_30.ndjson
+      max_points: 30
+      num_samples: 128
+    - name: 31-40
+      hf_filename: val_31_40.ndjson
+      max_points: 40
+      num_samples: 128
+    - name: 41-50
+      hf_filename: val_41_50.ndjson
+      max_points: 50
+      num_samples: 128

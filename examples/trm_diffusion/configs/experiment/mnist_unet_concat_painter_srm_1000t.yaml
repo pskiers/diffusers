@@ -1,0 +1,37 @@
+# @package _global_
+# Same as mnist_unet_concat_painter_srm.yaml, except num_train_timesteps=1000
+# instead of 100 (see configs/diffusion/ddpm_1000.yaml). Also rescales
+# train.noisy_swap.t_min/t_max (80/100 -> 800/1000, same relative 80%-of-
+# schedule position) -- those are absolute timestep-index comparisons
+# (see models/diffusion_utils.py's apply_noisy_swap), so they don't
+# auto-scale with num_train_timesteps. Currently a no-op either way
+# (noisy_swap.prob=0), kept consistent so enabling it later doesn't silently
+# apply the old 100-step window to a 1000-step schedule.
+#
+# Note: sampling.num_inference_steps (currently 20, via sampling/cfg.yaml)
+# is intentionally left unchanged -- DDIM sampling step count is independent
+# of num_train_timesteps by design, so this doesn't need to move in lockstep.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_unet_concat_painter_srm_1000t \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku_srm
+  - override /backbone: mnist_unet_concat_big
+  - override /painter: mnist_unet_concat_conditional
+  - override /train: mnist_unet_concat_big
+  - override /eval_callbacks: mnist
+  - override /diffusion: ddpm_1000
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_unet_concat_painter_srm_1000t"
+
+train:
+  noisy_swap:
+    t_min: 800
+    t_max: 1000

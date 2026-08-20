@@ -1,0 +1,22 @@
+# object_feature_v1_reveal.yaml wrapped in the x0-hint, matching your
+# current best setup (object_feature_v1_x0hint.yaml) as closely as possible
+# so this isolates just the one new variable (the reveal block) rather than
+# also reverting the anti-exposure-bias fix. Requires the
+# X0PredHintConditionEncoder spatial_conditions pass-through fix.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90  # match whatever you've settled on for object_feature_v1_x0hint
+inner:
+  _target_: models.condition_encoders.ObjectFeatureEncoderV1Reveal
+  in_dim: ${data.object_feat_dim}
+  hidden_dim: ${thinker.hidden_size}
+  out_dim: ${thinker.hidden_size}
+  latent_channels: 4
+  hidden_size: ${thinker.hidden_size}
+  grid_size: 16
+  reveal_channels: 3
+  reveal_enc_channels: 64
+  reveal_hidden_channels: [64, 128]
+  reveal_factor: 16
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true

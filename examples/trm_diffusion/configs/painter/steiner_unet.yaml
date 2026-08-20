@@ -1,0 +1,18 @@
+# Trainable Steiner UNetPainter (pixel-space, unconditional) — stage 1.
+# No condition_encoder: matches Sudoku/Maze's convention of an unconditional
+# painter; all actual conditioning on the terminal points happens in stage 2
+# via the TRM + ControlNet steering, not here.
+_target_: models.painter_base.UNetPainter
+_recursive_: false
+unet: ${backbone}
+painter_dtype: null
+# Steiner's 3-level background/vertex/edge render is in [-1,1], not the
+# [0,1] default this class otherwise assumes for pixel-space (no-VAE) painters.
+pixel_range: "[-1,1]"
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

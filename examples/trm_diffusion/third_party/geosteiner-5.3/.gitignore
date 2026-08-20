@@ -1,0 +1,16 @@
+# Build artifacts from build_without_libtool.sh — not checked in, rebuilt
+# on demand by the offline dataset-generation step. config.h/config.status/
+# Makefile ARE checked in (already configured, needed since this sandbox has
+# no autoconf to regenerate them).
+*.o
+*.lo
+*.a
+*.la
+.libs/
+config.log
+rand_points
+efst
+bb
+fst2graph
+docgen
+lp_solve_2.3/*.o

@@ -1,0 +1,22 @@
+# Trainable, conditional Steiner UNetPainter (channel-concat conditioning,
+# unscaled/paper-size backbone) — stage 1. Kept for a "faithful to the
+# paper" comparison point; see steiner_unet_concat_small.yaml for the
+# scaled-down variant used day to day. Trained with CFG dropout
+# (train.cfg_prob, see configs/train/steiner.yaml) so it can also be sampled
+# unconditionally.
+_target_: models.painter_base.ConcatConditionedUNetPainter
+_recursive_: false
+unet: ${backbone}
+image_channels: 1
+painter_dtype: "bfloat16"
+pixel_range: "[-1,1]"  # see steiner_unet.yaml
+mean_reduced_loss: true  # loss_fn is plain mean-reduced MSE — see UNetPainter.__init__
+min_train_timestep: 1  # paper samples t ~ randint(1, diffusion_steps), excludes t=0 — see UNetPainter.__init__
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 6e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  lr_min_ratio: 0.1
+  use_adam_atan2: false

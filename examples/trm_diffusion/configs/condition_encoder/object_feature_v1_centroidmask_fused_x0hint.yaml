@@ -1,0 +1,22 @@
+# Channel-concat variant: the centroid/attribute mask is concatenated
+# channel-wise with the noisy latent — already the same spatial resolution
+# by construction (mask_size = image_size // 8 matches the VAE's own
+# downsampling) — then run through ONE combined CNN (see
+# ObjectFeatureEncoderV1CentroidMaskFused). seq_len stays 266 (10 objects +
+# 256 combined tokens) — identical token layout to
+# object_feature_v1_x0hint.yaml, so translator=controlnet_clevr_v1_sliced
+# and thinker.seq_len=266 need no changes at all.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90  # match whatever you've settled on for object_feature_v1_x0hint
+inner:
+  _target_: models.condition_encoders.ObjectFeatureEncoderV1CentroidMaskFused
+  in_dim: ${data.object_feat_dim}
+  hidden_dim: ${thinker.hidden_size}
+  out_dim: ${thinker.hidden_size}
+  latent_channels: 4
+  hidden_size: ${thinker.hidden_size}
+  grid_size: 16
+  mask_channels: 16
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true

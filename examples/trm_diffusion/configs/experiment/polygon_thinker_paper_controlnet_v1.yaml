@@ -1,0 +1,32 @@
+# @package _global_
+# Same as polygon_thinker_paper_controlnet.yaml, except the TRM's condition
+# encoder also sees the current noisy diffusion state (x_noisy) — see
+# steiner_thinker_paper_controlnet_v1.yaml for the full rationale (identical
+# pattern, just Polygon's condition/painter/translator/thinker).
+#
+# Usage:
+#   python train_trm.py experiment=polygon_thinker_paper_controlnet_v1 \
+#     painter.checkpoint=runs/polygon_unet_concat_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: polygon
+  - override /backbone: polygon_unet_paper
+  - override /painter: polygon_unet_concat_controlnet_frozen
+  - override /thinker: polygon
+  - override /translator: controlnet_polygon_paper
+  - override /condition_encoder: polygon_spatial_v1
+  - override /train: polygon_thinker
+  - override /eval: polygon_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: polygon_thinker
+  - override /diffusion: ddim_epsilon
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/polygon_thinker_paper_controlnet_v1"
+
+eval:
+  step_timeout: 7200

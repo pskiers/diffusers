@@ -1,0 +1,18 @@
+# Same recipe as squares.yaml, except cfg_prob>0 — trains a null-condition
+# dropout so the model can be sampled with classifier-free guidance (paper's
+# released checkpoint uses cfg_prob=0 / guidance scale=1, see
+# squares_unet_concat_painter.yaml's docstring). Pairs with
+# configs/sampling/cfg_99.yaml. See squares.yaml for the batch_size/
+# gradient_accumulation_steps note (BatchNorm micro-batch-size caveat).
+seed: 42
+compile: true
+
+batch_size: 512
+num_steps: 24400
+gradient_accumulation_steps: 8  # 512*8=4096 effective batch -- see squares.yaml's note
+cfg_prob: 0.1
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

@@ -1,0 +1,21 @@
+# TRM stage: batch_size * gradient_accumulation_steps = 768 (single GPU) —
+# required for TRM training stability, per project convention (see
+# mnist_thinker.yaml / maze_thinker.yaml, same 384*2 split).
+seed: 42
+compile: true
+
+batch_size: 384
+num_steps: 200000
+gradient_accumulation_steps: 2
+cfg_prob: 0.0
+
+# Only used by mode=thinker_act (ThinkerFrozenPainterACT) -- see its
+# docstring in models/painter_thinkers.py. Ignored by thinker_base.
+act_halt_threshold: 0.0
+act_halt_exploration_prob: 0.1
+act_continue_bias_init: 1.0
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

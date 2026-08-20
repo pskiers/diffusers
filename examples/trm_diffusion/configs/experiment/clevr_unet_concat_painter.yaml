@@ -1,0 +1,35 @@
+# @package _global_
+# Stage 1 (no thinker/TRM/ControlNet at all): standalone CLEVR UNetPainter
+# with the centroid mask channel-concatenated onto x_noisy — the same
+# "concat with x_noisy" idea as
+# models.condition_encoders.ObjectFeatureEncoderV1CentroidMaskFused, but
+# applied directly to the painter's own UNet input instead of routed through
+# a thinker — while keeping per-object embeddings as cross-attention
+# conditioning (same condition_encoder as clevr_unet_painter.yaml).
+#
+# Usage: python train_trm.py experiment=clevr_unet_concat_painter
+#
+# For the full 16-channel (not presence-only) mask, override:
+#   data.centroid_mask_presence_only=false backbone.in_channels=20
+
+defaults:
+  - override /data: clevr
+  - override /train: clevr
+  - override /eval: clevr
+  - override /backbone: clevr_unet_concat
+  - override /vae: sdxl
+  - override /condition_encoder: clevr_object_unet
+  - override /painter: clevr_unet_concat_conditional
+  - override /eval_callbacks: clevr
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/clevr_unet_concat_painter"
+
+data:
+  mode: "reduced"
+  include_centroid_mask: true
+  centroid_mask_presence_only: true

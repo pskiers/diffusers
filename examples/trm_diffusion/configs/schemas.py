@@ -54,6 +54,11 @@ class TrainConfig:
     sudoku_loss_weight: float = 1.0
     mse_loss_weight: float = 1.0
     cfg_prob: float = 0.0
+    # Thinker-frozen-painter models only: always feed the frozen painter its
+    # own null_condition_sample() instead of the real sample (translator/steering
+    # still sees the real one). Forces the steering pathway to supply all
+    # conditioning itself, rather than nudging an already-conditional painter.
+    force_unconditional_painter: bool = False
     noisy_swap: Optional[NoisySwapConfig] = None
     classifier_loss: Optional[ClassifierLossConfig] = None
     two_stage: Optional[TwoStageConfig] = None
@@ -78,6 +83,12 @@ class EvalConfig:
     num_ddim_steps: int = 20
     num_log_images: int = 10
     classifier_path: Optional[str] = None
+    # Adaptive-halting head (see SpatialTRM.with_halt_head) — default source
+    # for ThinkerFrozenPainterBase.forward()'s use_halt_head/halt_threshold
+    # when a call site doesn't override them explicitly. No effect unless the
+    # thinker was built with with_halt_head=True.
+    use_halt_head: bool = False
+    halt_threshold: float = 0.0
 
 
 # ── Optimizer configs ──────────────────────────────────────────────────────────
@@ -109,6 +120,7 @@ class PainterOptimConfig:
     warmup_steps: int
     lr_min_ratio: float = 0.0
     betas: tuple[float, float] = (0.9, 0.999)
+    use_adam_atan2: bool = False  # AdamATan2 instead of AdamW — see trm_wrappers.py
 
 
 # ── Latent DiT configs ────────────────────────────────────────────────────────

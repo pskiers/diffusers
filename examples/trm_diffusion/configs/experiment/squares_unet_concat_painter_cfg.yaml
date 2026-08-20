@@ -1,0 +1,25 @@
+# @package _global_
+# Same paper-size Inscribed-Square UNetPainter as squares_unet_concat_painter.yaml
+# (architecture, epsilon prediction, optimizer/lr schedule all identical),
+# except trained with classifier-free guidance dropout (train.cfg_prob=0.1
+# via configs/train/squares_cfg.yaml) and sampled with CFG (scale 2.0) via
+# configs/sampling/cfg_99.yaml, instead of the paper's own cfg_prob=0 /
+# guidance-scale=1 recipe. Ablation: does CFG help beyond the paper's
+# reported numbers, holding everything else fixed. Mirrors
+# steiner_unet_concat_painter_cfg.yaml/polygon_unet_concat_painter_cfg.yaml.
+# Usage: python train_trm.py experiment=squares_unet_concat_painter_cfg
+
+defaults:
+  - override /data: squares
+  - override /backbone: squares_unet_paper
+  - override /painter: squares_unet_concat_conditional
+  - override /train: squares_cfg
+  - override /eval_callbacks: squares
+  - override /diffusion: ddim_epsilon
+  - override /sampling: cfg_99
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/squares_unet_concat_painter_cfg"

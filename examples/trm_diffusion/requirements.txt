@@ -29,7 +29,6 @@ wheel
 setuptools
 packaging
 ninja
-flash_attn
 einops
 timm
 sentencepiece
@@ -38,23 +37,26 @@ argdantic
 zarr<3
 h5py
 
-# ---------------------------------------------------------------------------
-# Optional: closed-loop eval simulators for dp_eval_callbacks.py
-# (PushT / BlockPush / ToolHang). NOT required for training — these callbacks
-# gracefully skip (log a warning, return {}) if their simulator isn't
-# installed. Only needed if you want the periodic/standalone closed-loop
-# coverage/success-rate metrics.
-# ---------------------------------------------------------------------------
-# PushT:
+# PushT
 gym-pusht
-pymunk
+pymunk<7
 shapely
-# ToolHang (robomimic==0.2.0 matches upstream diffusion_policy's pin; newer
-# robosuite releases have drifted API-wise from the version they used —
-# see examples/trm_diffusion/README.md for the exact pinned robosuite fork/commit
-# if you need closest fidelity to their reported numbers):
+# PushT — lowdim (keypoints) variant, for the vendored 9-keypoint
+gym==0.26.2
+pygame
+scikit-image
+# ToolHang
 robomimic==0.2.0
 robosuite
-# BlockPush's `block_pushing` package is NOT on PyPI — it lives inside
-# google-research/ibc and must be put on PYTHONPATH manually; see
-# examples/trm_diffusion/README.md.
+# robosuite/mujoco_py's EGL renderer shells out to the `patchelf` binary to
+# fix RPATHs on compiled .so files at env-creation time — the `patchelf`
+# PyPI package ships a prebuilt binary (no compiler/root needed), it just
+# needs to be pip-installed since most HPC clusters don't have it on PATH.
+patchelf
+# BlockPush — `gin-config`, `absl-py`, `six` are plain pip installs;
+# `pybullet-svl` needs special handling (conflicts with plain pybullet, old
+# sdist needs --no-build-isolation) and block_pushing itself is vendored, not
+# pip installable — see README.md for the full sequence.
+gin-config
+absl-py
+six

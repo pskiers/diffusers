@@ -3,6 +3,8 @@ import json
 import math
 import random
 import zipfile
+from typing import Optional
+
 import requests
 import numpy as np
 import torch
@@ -131,6 +133,243 @@ def make_mask_from_scene(scene_dict, mask_size=32, H_inv=None):
         mask[15] = mask[15].maximum(blob)
 
     return mask
+
+
+def make_presence_mask_from_scene(scene_dict, mask_size=32, sigma_frac=0.12):
+    """Single-channel spatial mask marking WHERE objects are — nothing else.
+
+    Unlike make_mask_from_scene, this has no per-attribute channels (no
+    color/shape/material/size), and every blob uses the SAME fixed sigma
+    (sigma_frac * mask_size) regardless of the object's own size — using the
+    object's true 3-D radius the way make_mask_from_scene does would let a
+    "large" object's blob leak its size via a bigger footprint. A clean
+    ablation for isolating pure positional information from identity.
+
+    Returns (1, mask_size, mask_size) float32 tensor.
+    """
+    objects = scene_dict["objects"]
+    mask = torch.zeros(1, mask_size, mask_size, dtype=torch.float32)
+
+    ys = torch.arange(mask_size, dtype=torch.float32)
+    xs = torch.arange(mask_size, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    sigma = max(sigma_frac * mask_size, 0.5)
+
+    for obj in objects:
+        cx = obj["pixel_coords"][0] / ORIG_W * mask_size
+        cy = obj["pixel_coords"][1] / ORIG_H * mask_size
+        blob = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma**2))
+        mask[0] = mask[0].maximum(blob)
+
+    return mask
+
+
+def make_reveal_from_scene(
+    image: torch.Tensor,
+    scene_dict: dict,
+    n_reveal: int,
+    radius_frac: float = 0.12,
+    rng: Optional[random.Random] = None,
+) -> torch.Tensor:
+    """Zero everywhere except circular patches around ``n_reveal`` randomly
+    chosen objects' true pixel positions, cropped directly from the real
+    (already-transformed) target image tensor.
+
+    An exact-pixel, exact-position anchor for a handful of objects — CLEVR's
+    analogue of MNIST-Sudoku's "given cells": a diagnostic to test whether a
+    few perfect anchors let the TRM place the rest via relations. Diagnostic
+    only, not a deployable mechanism — it requires the real target image,
+    which doesn't exist yet at actual generation time.
+
+    Args:
+        image: (C, H, W) already-transformed target image tensor.
+        scene_dict: raw scene dict (has "objects" with "pixel_coords").
+        n_reveal: number of objects to reveal (clamped to the scene's count).
+        radius_frac: reveal-circle radius as a fraction of image size.
+        rng: optional random.Random for reproducible object selection.
+    """
+    C, H, W = image.shape
+    revealed = torch.zeros_like(image)
+    objects = scene_dict["objects"]
+    if not objects or n_reveal <= 0:
+        return revealed
+
+    rng = rng or random
+    n = min(n_reveal, len(objects))
+    chosen = rng.sample(range(len(objects)), n)
+
+    radius = radius_frac * min(H, W)
+    ys = torch.arange(H, dtype=torch.float32).view(-1, 1)
+    xs = torch.arange(W, dtype=torch.float32).view(1, -1)
+
+    for idx in chosen:
+        obj = objects[idx]
+        cx = obj["pixel_coords"][0] / ORIG_W * W
+        cy = obj["pixel_coords"][1] / ORIG_H * H
+        keep = ((ys - cy) ** 2 + (xs - cx) ** 2 <= radius**2).unsqueeze(0)  # (1, H, W)
+        revealed = torch.where(keep, image, revealed)
+
+    return revealed
+
+
+def _crop_object_swatch(image: torch.Tensor, obj: dict, H_inv: np.ndarray, swatch_size: int, margin: float = 1.6) -> torch.Tensor:
+    """Crop a tight, perspective-correct square patch around one object's
+    true rendered position from its real, full-resolution source image
+    tensor, resized to (3, swatch_size, swatch_size). ``H_inv`` — see
+    calibrate_mask_projection — gives a perspective-correct pixel radius
+    from the object's known 3-D size, the same projection make_mask_from_scene
+    uses for its Gaussian blob sigma.
+
+    The crop WINDOW is sized from the "large" reference radius regardless of
+    this object's own size (``size_override="large"`` below), not from the
+    object's own radius: sizing the window to the object's own radius would
+    make every crop fill the tile after resizing, erasing the small/large
+    size cue entirely. With a fixed window, a "small" object naturally
+    occupies less of the tile than a "large" one, so the resized swatch
+    still visually encodes relative size."""
+    C, H, W = image.shape
+    cx, cy, _ = _object_pixel_circle(obj, W, H, H_inv)
+    _, _, r_pix = _object_pixel_circle(obj, W, H, H_inv, size_override="large")
+    r_pix = max(r_pix * margin, 4.0)
+
+    x0, x1 = int(round(cx - r_pix)), int(round(cx + r_pix))
+    y0, y1 = int(round(cy - r_pix)), int(round(cy + r_pix))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return torch.zeros(C, swatch_size, swatch_size, dtype=image.dtype)
+
+    crop = image[:, y0:y1, x0:x1].unsqueeze(0)
+    return F.interpolate(crop, size=(swatch_size, swatch_size), mode="bilinear", align_corners=False)[0]
+
+
+def _object_pixel_circle(obj: dict, image_w: int, image_h: int, H_inv: np.ndarray, size_override: Optional[str] = None):
+    """(cx, cy, r) — object's projected center and perspective-correct
+    radius, in pixel coordinates scaled to (image_w, image_h). Pass
+    ``size_override`` (e.g. "large") to compute r for a hypothetical object
+    of that size AT this object's position, instead of its own true size —
+    used by _crop_object_swatch to get a size-invariant crop window."""
+    cx = obj["pixel_coords"][0] / ORIG_W * image_w
+    cy = obj["pixel_coords"][1] / ORIG_H * image_h
+    r_3d = _CLEVR_RADIUS[size_override or obj["size"]]
+    x3, y3 = obj["3d_coords"][0], obj["3d_coords"][1]
+    uv_center = _project_3d_to_pixel(x3, y3, H_inv)
+    uv_edge = _project_3d_to_pixel(x3 + r_3d, y3, H_inv)
+    r = float(np.linalg.norm(uv_edge - uv_center)) / ORIG_W * image_w
+    return cx, cy, r
+
+
+def _is_isolated(
+    target_obj: dict,
+    scene_objects: list,
+    image_w: int,
+    image_h: int,
+    H_inv: np.ndarray,
+    margin: float = 1.6,
+    size_override: Optional[str] = None,
+) -> bool:
+    """True if no other object's real silhouette intrudes into target_obj's
+    CROP WINDOW — radius = size_override's reference radius * margin, i.e.
+    exactly the window _crop_object_swatch will actually use (pass the same
+    margin/size_override to both, as extract_clevr_swatch_table does).
+    Checking against target_obj's own true radius instead — the previous
+    behavior — under-margins whenever the actual crop window is bigger than
+    the object itself, which is always true here since the window is sized
+    to "large" regardless of the object's own size: a neighbor could sit
+    just outside a same-size isolation check yet still land inside the
+    size-invariant window used for the real crop. Objects can visually
+    overlap in 2-D even when spaced apart in 3-D, so this checks in
+    projected pixel space, not 3-D distance."""
+    tcx, tcy, tr = _object_pixel_circle(target_obj, image_w, image_h, H_inv, size_override=size_override)
+    tr *= margin
+    for other in scene_objects:
+        if other is target_obj:
+            continue
+        ocx, ocy, orad = _object_pixel_circle(other, image_w, image_h, H_inv)
+        if math.hypot(tcx - ocx, tcy - ocy) < tr + orad:
+            return False
+    return True
+
+
+def extract_clevr_swatch_table(
+    scenes: list,
+    image_dir: str,
+    H_inv: np.ndarray,
+    swatch_size: int = 32,
+    margin: float = 1.6,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Scan real CLEVR scenes once and, for each unique (color, shape,
+    material, size) combination, crop a tight square patch around one real,
+    unoccluded object instance's true position from its actual rendered
+    image — a real photorealistic anchor (same renderer/lighting engine as
+    the rest of the dataset), not a synthetic icon (a hand-drawn shape has
+    essentially no visual correspondence to a Blender render). Candidates
+    are preferred by: isolated (no overlapping neighbor) first, then fewest
+    total objects in the source scene, to avoid a crop contaminated by
+    clutter or occlusion. The result is a fixed lookup table reused at both
+    train and inference time: same attribute combination -> the same real
+    pixels, every time — CLEVR's analogue of MNISTSudokuDataset's
+    same_digit_images.
+
+    Returns:
+        table: (len(COLORS)*len(SHAPES)*len(MATERIALS)*len(SIZES), 3, S, S)
+            float32 tensor in [0, 1], ordered color->shape->material->size
+            (must match models.condition_encoders._clevr_swatch_indices).
+        isolated_mask: bool tensor, same length as table's first dim. False
+            means that combination had no isolated candidate anywhere in the
+            scanned scenes and fell back to a possibly-overlapping instance
+            (or is all-zero because the combination never appeared at all —
+            check the table for that separately). For inspection only, not
+            needed by ObjectFeatureEncoderV1Swatch.
+    """
+    rng = random.Random(seed)
+    candidates: dict = {}
+    for scene in scenes:
+        objects = scene["objects"]
+        n_objects = len(objects)
+        for obj in objects:
+            key = (obj["color"], obj["shape"], obj["material"], obj["size"])
+            isolated = _is_isolated(obj, objects, ORIG_W, ORIG_H, H_inv, margin=margin, size_override="large")
+            candidates.setdefault(key, []).append((scene["image_filename"], obj, n_objects, isolated))
+
+    def _pick(options):
+        isolated_opts = [o for o in options if o[3]]
+        pool = isolated_opts if isolated_opts else options
+        min_n = min(o[2] for o in pool)
+        best = [o for o in pool if o[2] == min_n]
+        return rng.choice(best)
+
+    to_tensor = T.ToTensor()
+    image_cache: dict = {}
+    table = []
+    isolated_mask = []
+    missing = []
+    n_occluded_fallback = 0
+    for color in COLORS:
+        for shape in SHAPES:
+            for material in MATERIALS:
+                for size in SIZES:
+                    key = (color, shape, material, size)
+                    options = candidates.get(key)
+                    if not options:
+                        missing.append(key)
+                        table.append(torch.zeros(3, swatch_size, swatch_size))
+                        isolated_mask.append(False)
+                        continue
+                    filename, obj, _n, isolated = _pick(options)
+                    if not isolated:
+                        n_occluded_fallback += 1
+                    isolated_mask.append(isolated)
+                    if filename not in image_cache:
+                        img = Image.open(os.path.join(image_dir, filename)).convert("RGB")
+                        image_cache[filename] = to_tensor(img)
+                    table.append(_crop_object_swatch(image_cache[filename], obj, H_inv, swatch_size, margin))
+    if missing:
+        print(f"extract_clevr_swatch_table: no example found for {len(missing)} combinations, filled with zeros: {missing}")
+    if n_occluded_fallback:
+        print(f"extract_clevr_swatch_table: {n_occluded_fallback} combinations had no isolated instance, fell back to a possibly-occluded one")
+    return torch.stack(table), torch.tensor(isolated_mask, dtype=torch.bool)
 
 
 def _adj_lists_to_matrix(adj_lists, n):
@@ -432,7 +671,19 @@ class CLEVRHybridDataset(Dataset):
     URL = "https://dl.fbaipublicfiles.com/clevr/CLEVR_v1.0.zip"
     collate_fn = staticmethod(collate_data_samples)
 
-    def __init__(self, root_dir, split="train", mode="absolute", image_size=256, download=True, n_reduced_samples=16):
+    def __init__(
+        self,
+        root_dir,
+        split="train",
+        mode="absolute",
+        image_size=256,
+        download=True,
+        n_reduced_samples=16,
+        reveal_n_objects: int = 0,
+        reveal_radius_frac: float = 0.12,
+        include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
+    ):
         """
         Args:
             mode (str): "absolute", "relative", "reduced", or "mask".
@@ -442,12 +693,39 @@ class CLEVRHybridDataset(Dataset):
                 pre-compute per scene when mode="reduced". One is chosen
                 randomly in each __getitem__ call, followed by an on-the-fly
                 left↔right / front↔behind coin flip per edge.
+            reveal_n_objects: if > 0, ALSO populate ``spatial_conditions`` with
+                a real-image reveal around this many randomly chosen objects'
+                true pixel positions (rest zeroed) — see
+                make_reveal_from_scene. Additive on top of whatever `mode`
+                already produces in `embedding_conditions`. Diagnostic only
+                (uses the real target image, unavailable at real inference).
+            reveal_radius_frac: reveal-circle radius, as a fraction of image
+                size, when reveal_n_objects > 0.
+            include_centroid_mask: if True, ALSO populate `spatial_conditions`
+                with a spatial map of every object's true position — additive
+                on top of `mode`'s own `embedding_conditions`, unlike
+                mode="mask" which replaces it entirely. Mutually exclusive
+                with reveal_n_objects (only one spatial_conditions source at
+                a time).
+            centroid_mask_presence_only: if True, the centroid mask is a
+                single presence channel (make_presence_mask_from_scene) —
+                WHERE objects are and nothing else, not even size (every
+                blob uses the same fixed sigma). If False (default), the
+                mask also carries per-object color/shape/material/size
+                (make_mask_from_scene). Only meaningful when
+                include_centroid_mask=True.
         """
         self.root_dir = root_dir
         self.mode = mode
         self.image_size = image_size
         self.mask_size = image_size // 8  # matches VAE 8× downsampling
         self.dataset_path = os.path.join(root_dir, "CLEVR_v1.0")
+        self.reveal_n_objects = reveal_n_objects
+        self.reveal_radius_frac = reveal_radius_frac
+        self.include_centroid_mask = include_centroid_mask
+        self.centroid_mask_presence_only = centroid_mask_presence_only
+        if reveal_n_objects > 0 and include_centroid_mask:
+            raise ValueError("reveal_n_objects and include_centroid_mask are mutually exclusive.")
 
         if download and not os.path.exists(self.dataset_path):
             self._download_and_extract()
@@ -464,7 +742,7 @@ class CLEVRHybridDataset(Dataset):
         # H_inv maps 3-D ground-plane coords → pixel coords so we can derive
         # perspective-correct Gaussian blob radii for each object.
         self.H_inv = None
-        if mode == "mask":
+        if mode == "mask" or (include_centroid_mask and not centroid_mask_presence_only):
             print("Calibrating perspective projection for mask generation...")
             self.H_inv = calibrate_mask_projection(self.scenes)
 
@@ -503,10 +781,11 @@ class CLEVRHybridDataset(Dataset):
     def __getitem__(self, idx):
         scene = self.scenes[idx]
         image = Image.open(os.path.join(self.image_dir, scene["image_filename"])).convert("RGB")
+        image_t = self.transform(image)
 
         if self.mode == "mask":
             spatial_mask = make_mask_from_scene(scene, self.mask_size, self.H_inv)
-            return DataSample(images=self.transform(image), spatial_conditions=spatial_mask)
+            return DataSample(images=image_t, spatial_conditions=spatial_mask)
 
         # Temporarily inject the mode so our shared function knows how to process it
         scene["mode"] = self.mode
@@ -514,8 +793,17 @@ class CLEVRHybridDataset(Dataset):
         # Get tensors. make_tensor_from_scene adds a batch dim of 1, so we strip it off here.
         cond_tensor, mask = make_tensor_from_scene(scene)
 
+        spatial_conditions = None
+        if self.reveal_n_objects > 0:
+            spatial_conditions = make_reveal_from_scene(image_t, scene, self.reveal_n_objects, self.reveal_radius_frac)
+        elif self.include_centroid_mask and self.centroid_mask_presence_only:
+            spatial_conditions = make_presence_mask_from_scene(scene, self.mask_size)
+        elif self.include_centroid_mask:
+            spatial_conditions = make_mask_from_scene(scene, self.mask_size, self.H_inv)
+
         return DataSample(
-            images=self.transform(image),
+            images=image_t,
             embedding_conditions=cond_tensor[0],
             embedding_mask=mask[0],
+            spatial_conditions=spatial_conditions,
         )

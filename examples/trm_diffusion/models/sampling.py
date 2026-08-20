@@ -94,6 +94,30 @@ class CFGPredictor(NoisePredictor):
         return pred_uncond + self.scale * (pred_cond - pred_uncond)
 
 
+class SteeringCFGPredictor(NoisePredictor):
+    """Classifier-free guidance over the thinker's steering only.
+
+    pred = pred_unsteered + scale * (pred_steered - pred_unsteered)
+
+    Unlike CFGPredictor (which zeros the *painter's own* conditioning too,
+    via null_condition_sample), this contrasts "with thinker steering" vs
+    "frozen painter's own conditioning untouched, zero steering" — calling
+    model(sample, null_steering=True) instead. See
+    ThinkerFrozenPainterBase.forward in models/painter_thinkers.py.
+
+    Requires the model to support forward(sample, null_steering=True) —
+    i.e. a ThinkerFrozenPainterBase (or subclass) model.
+    """
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    def predict(self, model, sample: DataSample, t: int, T: int) -> Tensor:
+        pred_steered = model(sample).pred
+        pred_unsteered = model(sample, null_steering=True).pred
+        return pred_unsteered + self.scale * (pred_steered - pred_unsteered)
+
+
 class NoisyGuidancePredictor(NoisePredictor):
     """Noisy-image guidance wrapping any inner predictor.
 
@@ -200,11 +224,11 @@ class SamplingPipeline:
 
     @property
     def cfg_scale(self) -> float:
-        """CFG scale if predictor is (or wraps) a CFGPredictor, else 1.0."""
+        """CFG scale if predictor is (or wraps) a CFGPredictor/SteeringCFGPredictor, else 1.0."""
         p = self.predictor
         if isinstance(p, NoisyGuidancePredictor):
             p = p.inner
-        return p.scale if isinstance(p, CFGPredictor) else 1.0
+        return p.scale if isinstance(p, (CFGPredictor, SteeringCFGPredictor)) else 1.0
 
     @torch.no_grad()
     def sample_one_batch(
@@ -243,6 +267,37 @@ class SamplingPipeline:
         return x
 
     @torch.no_grad()
+    def sample_best_of_n(
+        self,
+        model,
+        conditions: DataSample,
+        device: torch.device,
+        n: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tensor:
+        """Sample `n` independent candidates per instance (different noise
+        seeds), batched together in a single denoising pass.
+
+        Every condition field is repeated `n` times along the batch dim
+        (interleaved: instance 0's `n` candidates are contiguous, then
+        instance 1's, ...) and run through one `sample_one_batch` call of
+        size B*n — cheaper than n separate calls since the scheduler/model
+        overhead is shared, and torch.randn already draws independent noise
+        per row of the B*n batch.
+
+        Args:
+            conditions: DataSample with batch dim B.
+            n:          candidates per instance.
+
+        Returns:
+            (B, n, C, H, W) tensor.
+        """
+        B = _batch_size_of(conditions)
+        repeated = _repeat_interleave_sample(conditions, n)
+        flat = self.sample_one_batch(model, repeated, device, generator=generator)
+        return flat.view(B, n, *flat.shape[1:])
+
+    @torch.no_grad()
     def generate(
         self,
         model,
@@ -269,6 +324,18 @@ class SamplingPipeline:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _repeat_interleave_sample(sample: DataSample, n: int) -> DataSample:
+    """Repeat every set tensor field of `sample` n times along dim 0,
+    interleaved so each instance's n copies stay contiguous:
+    [inst0, inst0, ..., inst0, inst1, inst1, ...] (n copies each)."""
+    updates = {}
+    for f in dataclasses.fields(sample):
+        val = getattr(sample, f.name)
+        if val is not None and isinstance(val, Tensor):
+            updates[f.name] = val.repeat_interleave(n, dim=0)
+    return dataclasses.replace(sample, **updates)
 
 
 def _batch_size_of(sample: DataSample) -> int:

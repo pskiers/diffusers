@@ -1,0 +1,23 @@
+# GroupNorm+SiLU ablation variant of the paper's UNet, param-count-matched
+# to steiner_unet_concat.yaml/polygon_unet_concat.yaml (same config_curves.
+# yaml model: block values), just with this task's own in/out channel count.
+# The default backbone is now squares_unet_paper (models.paper_unet.
+# PaperUNet, verbatim BatchNorm+ReLU port) — use +backbone=squares_unet_
+# concat to ablate the norm/activation choice.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 2
+out_channels: 1
+block_out_channels: [64, 128, 256, 512]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 1  # matches steiner/polygon's fix — was 2 (~63M params vs paper's real ~20M)

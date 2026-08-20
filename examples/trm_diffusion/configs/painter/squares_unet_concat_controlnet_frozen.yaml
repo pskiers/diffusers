@@ -1,0 +1,29 @@
+# Frozen ConcatConditionedUNetPainter (unscaled/paper-size) for ControlNet
+# thinker steering — stage 2. The frozen painter keeps concatenating its own
+# condition (curve) exactly as trained; a TRM's ControlNet steering would be
+# a SEPARATE, additive signal on top (see
+# ConcatConditionedControlNetSteeredUNetPainter's docstring), not a
+# replacement of the painter's own conditioning. Mirrors
+# steiner_unet_concat_controlnet_frozen.yaml/
+# polygon_unet_concat_controlnet_frozen.yaml — no thinker/experiment config
+# wires this up yet (Squares has no TRM-steering path built), but the option
+# to load a frozen Squares painter (this codebase's own or the paper's real
+# checkpoints_curves/checkpoint_520.pth) exists now for whenever that's built.
+_target_: models.painter_base.ConcatConditionedControlNetSteeredUNetPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to squares_unet_concat_painter checkpoint
+# checkpoint_source: "original_repo"  # uncomment (+override checkpoint above) to load
+# the paper's own released weights directly instead of training our own painter --
+# e.g. checkpoints_curves/checkpoint_520.pth from nirgoren/geometric-solver on HF.
+# Verified: cross-loads with 0 missing/unexpected keys, reproduces paper's Table 1
+# "with snapping" numbers through this codebase's own sampling+eval pipeline (see memory).
+unet: ${backbone}
+image_channels: 1
+painter_dtype: "bfloat16"
+pixel_range: "[-1,1]"
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

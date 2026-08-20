@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.interfaces import ControlNetSteering, CrossAttnSteering, IPAdapterSteering, ThinkerSteering, TRMOutput
-from models.utility_models import ConditioningPyramid, ConditioningPyramid1D, TimestepMLP
+from models.utility_models import ConditioningPyramid, ConditioningPyramid1D, ConditioningPyramidPaperUNet, TimestepMLP
 
 
 class ThinkerPainterTranslatorBase(nn.Module):
@@ -213,6 +213,60 @@ class ControlNetTranslator(ThinkerPainterTranslatorBase):
             down_block_additional_residuals=down_res,
             mid_block_additional_residual=mid_res,
         )
+
+
+class ControlNetTranslatorPaperUNet(ControlNetTranslator):
+    """ControlNetTranslator variant for ControlPainterPaperUNet (models/paper_unet.py)
+    — same steps as ControlNetTranslator, just backed by a
+    ConditioningPyramidPaperUNet (one residual per level, no layers_per_block
+    concept) instead of ConditioningPyramid. Only __init__ differs; forward()
+    is inherited unchanged since it only calls self.control_pyramid(spatial)
+    generically.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        painter_channels: tuple[int, ...],
+        painter_size: int,
+        grid: int,
+        bridge_mode: str = "logits",
+        thinker_out_channels: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        with_timestep_emb: bool = False,
+    ):
+        if thinker_out_channels is not None and thinker_out_channels != in_channels:
+            ctrl_in = thinker_out_channels
+        else:
+            ctrl_in = in_channels
+
+        ThinkerPainterTranslatorBase.__init__(
+            self,
+            grid=grid,
+            bridge_mode=bridge_mode,
+            bridge_channels=ctrl_in if bridge_mode == "normalized" else None,
+        )
+        self.painter_size = painter_size
+
+        self.seq_proj = (
+            nn.Linear(seq_len, grid * grid, bias=False)
+            if seq_len is not None and seq_len != grid * grid
+            else None
+        )
+
+        self.logit_expand = (
+            nn.Linear(in_channels, thinker_out_channels, bias=False)
+            if thinker_out_channels is not None and thinker_out_channels != in_channels
+            else None
+        )
+
+        self.control_pyramid = ConditioningPyramidPaperUNet(
+            in_channels=ctrl_in,
+            block_out_channels=painter_channels,
+        )
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=painter_channels[-1])
 
 
 class SlicedControlNetTranslator(ControlNetTranslator):

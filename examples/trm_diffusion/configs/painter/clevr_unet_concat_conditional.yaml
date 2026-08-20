@@ -1,0 +1,16 @@
+# Trainable CLEVR UNetPainter with the centroid mask channel-concatenated
+# onto x_noisy, plus per-object cross-attention conditioning.
+_target_: models.painter_base.ConcatCrossAttnConditionedUNetPainter
+_recursive_: false
+unet: ${backbone}
+vae: ${vae}
+image_channels: 4
+condition_encoder: ${condition_encoder}
+painter_dtype: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

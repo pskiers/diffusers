@@ -1,0 +1,18 @@
+# @package _global_
+# Conditional (channel-concat) Ball Drop UNetPainter — stage 1. Trained with
+# CFG dropout so it can also be sampled unconditionally.
+# Usage: python train_trm.py experiment=ball_drop_unet_concat_painter
+
+defaults:
+  - override /data: ball_drop
+  - override /backbone: ball_drop_unet_concat
+  - override /painter: ball_drop_unet_concat
+  - override /train: ball_drop
+  - override /eval_callbacks: ball_drop
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/ball_drop_unet_concat_painter"

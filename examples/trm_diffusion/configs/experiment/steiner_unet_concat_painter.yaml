@@ -1,0 +1,36 @@
+# @package _global_
+# Conditional Steiner UNetPainter (channel-concat, unscaled/paper-size
+# backbone) — stage 1. See steiner_unet_concat_small_painter for the
+# scaled-down variant.
+# Usage: python train_trm.py experiment=steiner_unet_concat_painter
+#
+# Aligned to the paper's actual released training recipe
+# (github.com/kariander1/visual-geo-solver): epsilon prediction, no CFG,
+# lr=6e-4/warmup=100/lr_min_ratio=0.1, 99 sampling steps. Backbone is now
+# steiner_unet_paper (models.paper_unet.PaperUNet, BatchNorm+ReLU) — the
+# paper's actual architecture, not an approximation — see
+# configs/backbone/steiner_unet_paper.yaml. configs/backbone/
+# steiner_unet_concat.yaml (diffusers.UNet2DModel, GroupNorm+SiLU) remains
+# available as +backbone=steiner_unet_concat, kept as the norm/activation-
+# choice ablation point, not the default anymore.
+
+defaults:
+  - override /data: steiner
+  - override /backbone: steiner_unet_paper
+  - override /painter: steiner_unet_concat_conditional
+  - override /train: steiner
+  - override /eval_callbacks: steiner
+  - override /diffusion: ddim_epsilon
+  - override /sampling: direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/steiner_unet_concat_painter"
+
+eval:
+  step_timeout: 7200  # best-of-10 sampling + extraction/scoring across 3-4 point ranges
+                       # measured up to ~60min total on the hardest range (41-50 pts) --
+                       # extraction cost is O(n^2)-ish in vertex/point count, CPU-bound,
+                       # independent of backbone size. Default (3600s) was too tight.

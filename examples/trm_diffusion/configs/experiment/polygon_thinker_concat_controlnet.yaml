@@ -1,0 +1,43 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen conditional (channel-concat, unscaled/
+# paper-size) Polygon painter — ControlNet steering added as a SEPARATE,
+# additive signal on top of the painter's own (already-trained) conditioning,
+# not a replacement of it. Requires a trained polygon_unet_concat_painter
+# checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=polygon_thinker_concat_controlnet \
+#     painter.checkpoint=runs/polygon_unet_concat_painter/checkpoint_final.pt
+
+# 2026-08-03: diffusion overridden to ddpm_epsilon — see
+# steiner_thinker_concat_controlnet.yaml's comment for the full rationale
+# (must match polygon_unet_concat_painter's now-corrected epsilon-prediction
+# training). Sampling stays CFG deliberately (thinker's own steering
+# ablation, unrelated to the painter's original training-time CFG).
+defaults:
+  - override /data: polygon
+  - override /backbone: polygon_unet_concat
+  - override /painter: polygon_unet_concat_controlnet_frozen
+  - override /thinker: polygon
+  - override /translator: controlnet_polygon_concat
+  - override /condition_encoder: polygon_spatial_v0
+  - override /train: polygon_thinker
+  - override /eval: polygon_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: polygon_thinker
+  - override /diffusion: ddim_epsilon
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/polygon_thinker_concat_controlnet"
+
+eval:
+  step_timeout: 7200  # best-of-10 sampling + extraction/scoring across 3-4 point ranges
+                       # measured up to ~60min total on the hardest range (41-50 pts) --
+                       # extraction cost is O(n^2)-ish in vertex/point count, CPU-bound,
+                       # independent of backbone size. Same fix as the painter-stage
+                       # experiments (missed here originally -- thinker-stage uses the
+                       # identical eval_callbacks, so the identical timeout risk applies).

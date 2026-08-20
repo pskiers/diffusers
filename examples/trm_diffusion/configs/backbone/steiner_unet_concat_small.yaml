@@ -1,0 +1,21 @@
+# Scaled-down concat-conditioned backbone — same 3-level, no-attention shape
+# as steiner_unet.yaml (the scaled-down unconditional backbone), just a bit
+# wider at the deepest level since this one also has to learn to satisfy the
+# condition, not just match the target distribution. in_channels=2 (1 image
+# + 1 condition, concatenated — see ConcatConditionedUNetPainter). See
+# steiner_unet_concat.yaml for the unscaled/paper-size conditional variant.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 2
+out_channels: 1
+block_out_channels: [32, 64, 128]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

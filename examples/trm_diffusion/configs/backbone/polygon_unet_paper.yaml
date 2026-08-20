@@ -1,0 +1,17 @@
+# The paper's own UNet architecture (model/diffusion.py): BatchNorm+ReLU
+# residual blocks instead of diffusers.UNet2DModel's GroupNorm+SiLU — see
+# models/paper_unet.py. The paper explicitly states MaxAP "adopt[s] the
+# same visual diffusion architecture as in the previous two tasks, using an
+# identical U-Net backbone" — same channel/attention layout as
+# steiner_unet_paper.yaml (base_channels=64, 4 levels, attention at
+# bottleneck + deepest 2 encoder/decoder levels), matching
+# config_polygonalization_max.yaml's model: block exactly.
+_target_: models.paper_unet.PaperUNet
+sample_size: 128
+in_channels: 2
+out_channels: 1
+base_channels: 64
+num_levels: 4
+time_emb_dim: 128
+attention_heads: 8
+attention_locations: ["bottleneck", "enc2", "enc3", "dec2", "dec3"]

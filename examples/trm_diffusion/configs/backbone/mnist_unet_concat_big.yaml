@@ -1,0 +1,36 @@
+# Bigger conditional MNIST-Sudoku UNet (channel-concat conditioning, no
+# TRM/ControlNet involved — the puzzle's given-cells image is concatenated
+# onto the noisy input directly, same mechanism as
+# steiner_unet_concat_conditional.yaml/polygon's/squares').
+#
+# vs. the existing unconditional mnist_unet.yaml ([32,64,64], 3 levels, no
+# attention): 4 levels, [96,192,384,512] channels, attention at the 2
+# deepest levels (36x36=1296 and 18x18=324 tokens after 2/3 downsamples).
+# Measured at 81.7M params (vs. 25.3M for the single-attention-level, narrower
+# version tried first, vs. 1.5M for the existing unconditional baseline) --
+# ~3.6x the fwd+bwd compute of the 25.3M version, bs=16/fp32/uncompiled.
+# Channel growth is deliberately front-conservative/back-aggressive: FLOPs
+# for a conv layer scale with spatial size x channels, and spatial size
+# shrinks by 4x per downsample, so widening the deep (cheap, small-spatial)
+# levels buys much more capacity per unit of compute than widening the
+# shallow (expensive, large-spatial) ones. Sudoku's row/col/box constraints
+# are global (a cell 5 rows away can conflict), which a purely-convolutional
+# receptive field reaches only after many layers — attention gives the
+# model direct long-range access instead.
+_target_: diffusers.UNet2DModel
+sample_size: 144
+in_channels: 2   # 1 noisy image + 1 given-cells condition (channel-concat)
+out_channels: 1
+block_out_channels: [96, 192, 384, 512]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

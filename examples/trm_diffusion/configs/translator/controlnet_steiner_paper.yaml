@@ -1,0 +1,14 @@
+# ControlNet translator for the PaperUNet backbone (steiner_unet_paper) —
+# matches its channel progression exactly (base_channels=64, 4 levels).
+# See models.translators.ControlNetTranslatorPaperUNet /
+# models.utility_models.ConditioningPyramidPaperUNet for why this needs a
+# different pyramid shape than controlnet_steiner_concat.yaml's (no
+# layers_per_block concept — PaperUNet has one skip per level, not one per
+# resnet-sublayer).
+_target_: models.translators.ControlNetTranslatorPaperUNet
+in_channels: ${thinker.vocab_size}
+painter_channels: [64, 128, 256, 512]
+painter_size: ${data.image_size}
+grid: 8             # image_size // grid_factor = 128 // 16
+bridge_mode: "normalized"
+with_timestep_emb: true

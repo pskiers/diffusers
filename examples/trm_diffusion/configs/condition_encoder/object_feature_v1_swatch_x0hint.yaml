@@ -1,0 +1,22 @@
+# Same as object_feature_v1_x0hint.yaml, but the object tokens also get a
+# per-object real-image visual anchor (see ObjectFeatureEncoderV1Swatch).
+# Composes cleanly with your existing sliced-translator setup unchanged —
+# swatch only augments the object tokens in place, it doesn't add tokens or
+# change the latent/hint grid, so thinker.seq_len (266 for grid_size=16) and
+# translator=controlnet_clevr_v1_sliced (slice_start=max_objects,
+# slice_len=256) both stay exactly as they are.
+_target_: models.condition_encoders.X0PredHintConditionEncoder
+threshold: 90  # match whatever you've settled on for object_feature_v1_x0hint
+inner:
+  _target_: models.condition_encoders.ObjectFeatureEncoderV1Swatch
+  in_dim: ${data.object_feat_dim}
+  hidden_dim: ${thinker.hidden_size}
+  out_dim: ${thinker.hidden_size}
+  latent_channels: 4
+  hidden_size: ${thinker.hidden_size}
+  grid_size: 16
+  swatch_table_path: runs/clevr_swatch_table.pt
+  swatch_channels: 32
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: true

@@ -1,0 +1,35 @@
+# @package _global_
+# Conditional Inscribed-Square UNetPainter (channel-concat, unscaled/paper-
+# size backbone) — stage 1.
+# Usage: python train_trm.py experiment=squares_unet_concat_painter
+#
+# Aligned to the paper's actual released training recipe
+# (github.com/kariander1/visual-geo-solver, config_curves.yaml): epsilon
+# prediction, no CFG (p_null=0), lr=6e-4/warmup=100/lr_min_ratio=0.1. Backbone
+# is now squares_unet_paper (models.paper_unet.PaperUNet, BatchNorm+ReLU) —
+# the paper's actual architecture, shared identically across all three
+# tasks. configs/backbone/squares_unet_concat.yaml (diffusers.UNet2DModel,
+# GroupNorm+SiLU) remains available as +backbone=squares_unet_concat for the
+# norm/activation-choice ablation. See configs/train/squares.yaml and
+# configs/painter/squares_unet_concat_conditional.yaml for the actual values.
+#
+# diffusion: ddim_epsilon (not ddpm_epsilon) — the paper's real sampler
+# (schedulers/ddim.py, eta=0.0) is fully deterministic; DDPMScheduler.step()
+# silently injects noise at every reverse step. See configs/diffusion/
+# ddim_epsilon.yaml's comment (found/fixed for Steiner/Polygon first, this
+# experiment had the same bug — training is unaffected, only sampling/eval).
+
+defaults:
+  - override /data: squares
+  - override /backbone: squares_unet_paper
+  - override /painter: squares_unet_concat_conditional
+  - override /train: squares
+  - override /eval_callbacks: squares
+  - override /diffusion: ddim_epsilon
+  - override /sampling: direct
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/squares_unet_concat_painter"

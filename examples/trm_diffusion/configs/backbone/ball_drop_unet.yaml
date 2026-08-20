@@ -1,0 +1,20 @@
+# Unconditional Ball Drop backbone — RGB (3-channel, unlike Steiner/Polygon's
+# single-channel scheme; see datasets/ball_drop_dataset.py for why), same
+# no-attention 3-level shape as the MNIST-Sudoku/Steiner/Polygon unconditional
+# backbones (attention is the most expensive part at this resolution and
+# unconditional-painter quality doesn't need it here).
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 3
+out_channels: 3
+block_out_channels: [32, 64, 64]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

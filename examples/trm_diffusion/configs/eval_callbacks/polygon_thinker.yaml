@@ -1,0 +1,13 @@
+# Same best-of-10 + OOD-point-range protocol as configs/eval_callbacks/polygon.yaml
+# (see its comments) — run against the TRM+frozen-painter model, so the same
+# metrics are directly comparable against the plain conditional painter's.
+- _target_: models.eval_callbacks.PolygonEvalCallback
+  image_size: ${data.image_size}
+  num_samples: 256
+  num_candidates: 10
+  num_log_images: 8
+  extra_eval_sets:
+    - name: 13-15
+      hf_filename: val_13_15.ndjson
+      max_points: 15
+      num_samples: 128

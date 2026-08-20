@@ -6,6 +6,12 @@ num_steps: 150000
 gradient_accumulation_steps: 3
 cfg_prob: 0.0
 
+# Only used by mode=thinker_act (ThinkerFrozenPainterACT) -- see its
+# docstring in models/painter_thinkers.py. Ignored by thinker_base.
+act_halt_threshold: 0.0
+act_halt_exploration_prob: 0.1
+act_continue_bias_init: 1.0
+
 noisy_swap:
   prob: 0.0
   t_min: 80

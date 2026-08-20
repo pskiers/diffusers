@@ -1,0 +1,20 @@
+# Real published SketchVLM maze benchmark (200 examples, fixed 3x3 grids) —
+# eval-only, not for training (far too few examples). Override the `data`
+# group with this at eval time to score a MazeDataset-trained model against
+# the literal published benchmark instances:
+#   python eval.py experiment=maze_unet_painter data=maze_sketchvlm_benchmark \
+#     painter.checkpoint=runs/maze_unet_painter/checkpoint_final.pt
+grid_size: 8
+cell_size: 16
+painter_size: 128
+num_workers: 0
+
+train_dataset:
+  _target_: datasets.maze_dataset.SketchVLMMazeBenchmark
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"
+
+val_dataset:
+  _target_: datasets.maze_dataset.SketchVLMMazeBenchmark
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"

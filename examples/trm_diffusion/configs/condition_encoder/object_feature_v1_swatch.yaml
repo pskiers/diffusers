@@ -1,0 +1,17 @@
+# ObjectFeatureEncoderV1 + a real-image visual anchor per object (CLEVR's
+# analogue of MNIST-Sudoku's same_digit_images). Deployable — the swatch
+# table is built once from attributes, available at real inference too.
+# Requires runs/clevr_swatch_table.pt (see
+# experiments/build_clevr_swatch_table.py) to already exist.
+_target_: models.condition_encoders.ObjectFeatureEncoderV1Swatch
+in_dim: ${data.object_feat_dim}
+hidden_dim: ${thinker.hidden_size}
+out_dim: ${thinker.hidden_size}
+latent_channels: 4
+hidden_size: ${thinker.hidden_size}
+grid_size: 8          # G=8 → G²=64 latent tokens
+swatch_table_path: runs/clevr_swatch_table.pt
+swatch_channels: 32
+noisy_dropout_p_max: 0.7
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

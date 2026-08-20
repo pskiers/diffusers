@@ -1,0 +1,30 @@
+# @package _global_
+# Bigger conditional (channel-concat) MNIST-Sudoku UNetPainter, trained on
+# the SRM paper's real dataset (mnist_sudoku_srm: 1M sudokus, 990k train /
+# 10k test, real per-digit MNIST image pools) — painter only, no TRM.
+#
+# vs. the existing mnist_unet_painter (unconditional, [32,64,64], no
+# attention, trained on the smaller synthetic mnist_sudoku data): this is
+# conditional on the given-cells puzzle image via channel-concat (so the
+# model can be evaluated as an actual solver, not just an unconditional
+# generator), a bigger backbone ([64,128,256,256] + attention at the
+# deepest level — see backbone/mnist_unet_concat_big.yaml), and the SRM
+# dataset's real digit images/puzzle distribution.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_unet_concat_painter_srm \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku_srm
+  - override /backbone: mnist_unet_concat_big
+  - override /painter: mnist_unet_concat_conditional
+  - override /train: mnist_unet_concat_big
+  - override /eval_callbacks: mnist
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_unet_concat_painter_srm"

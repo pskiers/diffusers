@@ -12,6 +12,8 @@ vocab_size: 11   # 0=PAD, 1=blank, 2-10=digits 1-9
 num_givens: null  # if set, randomly keep only this many given cells per puzzle
 scale_min: 0.8
 scale_max: 0.9
+same_digit_images: false  # given cells render the literal same MNIST bitmap
+center_condition: false   # scale the condition by the same factor as the target, but paste it centered
 
 train_dataset:
   _target_: datasets.mnist_sudoku_dataset.MNISTSudokuScaledDataset
@@ -23,6 +25,8 @@ train_dataset:
   num_givens: "${data.num_givens}"
   scale_min: "${data.scale_min}"
   scale_max: "${data.scale_max}"
+  same_digit_images: "${data.same_digit_images}"
+  center_condition: "${data.center_condition}"
 
 val_dataset:
   _target_: datasets.mnist_sudoku_dataset.MNISTSudokuScaledDataset
@@ -34,3 +38,5 @@ val_dataset:
   num_givens: "${data.num_givens}"
   scale_min: "${data.scale_min}"
   scale_max: "${data.scale_max}"
+  same_digit_images: "${data.same_digit_images}"
+  center_condition: "${data.center_condition}"

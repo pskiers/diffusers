@@ -228,10 +228,7 @@ def main(cfg: DictConfig):
                 for k in ema_helper.shadow:
                     ema_helper.shadow[k] = ema_helper.shadow[k].to(accelerator.device)
             else:
-                unwrapped = accelerator.unwrap_model(model)
-                ema_helper.shadow = {
-                    name: param.data.clone() for name, param in unwrapped.named_parameters() if param.requires_grad
-                }
+                ema_helper.register(accelerator.unwrap_model(model))
         logger.info(
             f"Resumed from {resume_path} at step {global_step}" + ("" if load_opt else " (optimizer state NOT loaded)")
         )
@@ -285,7 +282,15 @@ def main(cfg: DictConfig):
         log_dict = {f"train/{k}": v for k, v in metrics.items()}
         log_dict["train/lr"] = lr
 
-        step_size = getattr(unwrapped, "n_sup", 1)
+        # progress_step_size overrides n_sup for models where one train_step
+        # call advances global_step by something other than n_sup — e.g.
+        # ThinkerFrozenPainterACT, where a call is one persistent-carry
+        # reasoning step (global_step += 1), not n_sup deep-supervision
+        # iterations. Falls back to the existing n_sup-based sizing for
+        # every model that doesn't define it, so this is a no-op elsewhere.
+        step_size = getattr(unwrapped, "progress_step_size", None)
+        if step_size is None:
+            step_size = getattr(unwrapped, "n_sup", 1)
         progress_bar.update(step_size)
 
         if global_step >= next_log and accelerator.is_main_process:
@@ -297,6 +302,7 @@ def main(cfg: DictConfig):
         if global_step >= next_eval:
             if ema_helper is not None:
                 live_params = [p.data.clone() for p in unwrapped.parameters() if p.requires_grad]
+                live_buffers = [b.data.clone() for b in unwrapped.buffers()]
                 ema_helper.ema(unwrapped)
 
             with _StepTimeout(eval_timeout):
@@ -306,6 +312,8 @@ def main(cfg: DictConfig):
             if ema_helper is not None:
                 for p, live in zip((p for p in unwrapped.parameters() if p.requires_grad), live_params):
                     p.data.copy_(live)
+                for b, live in zip(unwrapped.buffers(), live_buffers):
+                    b.data.copy_(live)
             unwrapped.train()
 
             if accelerator.is_main_process:

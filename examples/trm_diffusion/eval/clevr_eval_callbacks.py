@@ -16,11 +16,13 @@ ClevrMetricsCallback
 
 from __future__ import annotations
 
+import os
 import random
 from typing import Optional
 
 import numpy as np
 import torch
+import torchvision.transforms as T
 from PIL import Image
 from tqdm.auto import tqdm
 
@@ -31,7 +33,16 @@ except ImportError:
 
 from models.eval_callbacks import EvalCallbackBase
 from datasets.data_sample import DataSample, collate_data_samples
-from datasets.clevr_dataset import CLEVRHybridDataset, make_tensor_from_scene, ORIG_W, ORIG_H
+from datasets.clevr_dataset import (
+    CLEVRHybridDataset,
+    calibrate_mask_projection,
+    make_mask_from_scene,
+    make_presence_mask_from_scene,
+    make_reveal_from_scene,
+    make_tensor_from_scene,
+    ORIG_W,
+    ORIG_H,
+)
 
 
 def _load_scenes(root_dir: str, split: str, min_objects: int, max_objects: int):
@@ -40,12 +51,42 @@ def _load_scenes(root_dir: str, split: str, min_objects: int, max_objects: int):
     return [s for s in ds.scenes if min_objects <= len(s["objects"]) <= max_objects]
 
 
-def _scene_to_data_sample(scene: dict, mode: str) -> DataSample:
-    """Build a conditioning-only DataSample (no images) from a scene dict."""
+def _scene_to_data_sample(
+    scene: dict,
+    mode: str,
+    *,
+    image_dir: Optional[str] = None,
+    transform=None,
+    reveal_n_objects: int = 0,
+    reveal_radius_frac: float = 0.12,
+    include_centroid_mask: bool = False,
+    centroid_mask_presence_only: bool = False,
+    mask_size: int = 32,
+    H_inv=None,
+) -> DataSample:
+    """Build a conditioning-only DataSample (no generated image yet) from a
+    scene dict. Mirrors CLEVRHybridDataset.__getitem__'s spatial_conditions
+    logic: any condition encoder whose condition_keys include
+    "spatial_conditions" (the reveal/centroid-mask variants) needs it
+    populated here too, or sampling crashes with spatial_conditions=None —
+    reveal/centroid-mask are diagnostic (using the scene's ground truth), but
+    that ground truth is exactly this scene's known real image/attributes, so
+    it's available here the same way it is during training."""
     scene = dict(scene)
     scene["mode"] = mode
     cond_tensor, mask = make_tensor_from_scene(scene)
-    return DataSample(embedding_conditions=cond_tensor[0], embedding_mask=mask[0])
+
+    spatial_conditions = None
+    if reveal_n_objects > 0:
+        image = Image.open(os.path.join(image_dir, scene["image_filename"])).convert("RGB")
+        image_t = transform(image)
+        spatial_conditions = make_reveal_from_scene(image_t, scene, reveal_n_objects, reveal_radius_frac)
+    elif include_centroid_mask and centroid_mask_presence_only:
+        spatial_conditions = make_presence_mask_from_scene(scene, mask_size)
+    elif include_centroid_mask:
+        spatial_conditions = make_mask_from_scene(scene, mask_size, H_inv)
+
+    return DataSample(embedding_conditions=cond_tensor[0], embedding_mask=mask[0], spatial_conditions=spatial_conditions)
 
 
 def _generate_images(model, samples: list[DataSample], device: torch.device) -> torch.Tensor:
@@ -74,6 +115,11 @@ class ClevrImageLogCallback(EvalCallbackBase):
         min_objects:    Minimum number of objects per scene.
         max_objects:    Maximum number of objects per scene.
         split:          Dataset split to sample scenes from.
+        reveal_n_objects, reveal_radius_frac, include_centroid_mask,
+        centroid_mask_presence_only, image_size:
+            must match the same-named data.* config keys whenever the bound
+            condition encoder needs spatial_conditions (reveal/centroid-mask
+            variants) — otherwise generation crashes on spatial_conditions=None.
     """
 
     def __init__(
@@ -84,12 +130,40 @@ class ClevrImageLogCallback(EvalCallbackBase):
         min_objects: int = 3,
         max_objects: int = 10,
         split: str = "val",
+        reveal_n_objects: int = 0,
+        reveal_radius_frac: float = 0.12,
+        include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
+        image_size: int = 256,
     ):
         self._mode = mode
         scenes = _load_scenes(root_dir, split, min_objects, max_objects)
         selected = random.sample(scenes, min(n_scenes, len(scenes)))
 
-        self._base_samples = [_scene_to_data_sample(s, mode) for s in selected]
+        filename_split = "val" if split == "validation" else split
+        image_dir = os.path.join(root_dir, "CLEVR_v1.0", "images", filename_split)
+        transform = T.Compose([T.Resize((image_size, image_size)), T.ToTensor(), T.Normalize([0.5], [0.5])])
+        H_inv = (
+            calibrate_mask_projection(scenes)
+            if include_centroid_mask and not centroid_mask_presence_only
+            else None
+        )
+
+        self._base_samples = [
+            _scene_to_data_sample(
+                s,
+                mode,
+                image_dir=image_dir,
+                transform=transform,
+                reveal_n_objects=reveal_n_objects,
+                reveal_radius_frac=reveal_radius_frac,
+                include_centroid_mask=include_centroid_mask,
+                centroid_mask_presence_only=centroid_mask_presence_only,
+                mask_size=image_size // 8,
+                H_inv=H_inv,
+            )
+            for s in selected
+        ]
 
     @torch.no_grad()
     def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
@@ -129,6 +203,11 @@ class ClevrMetricsCallback(EvalCallbackBase):
         max_objects:    Maximum number of objects per scene.
         batch_size:     Generation batch size.
         split:          Dataset split to sample scenes from.
+        reveal_n_objects, reveal_radius_frac, include_centroid_mask,
+        centroid_mask_presence_only, image_size:
+            must match the same-named data.* config keys whenever the bound
+            condition encoder needs spatial_conditions (reveal/centroid-mask
+            variants) — otherwise generation crashes on spatial_conditions=None.
     """
 
     def __init__(
@@ -139,6 +218,11 @@ class ClevrMetricsCallback(EvalCallbackBase):
         min_objects: int = 3,
         max_objects: int = 10,
         split: str = "val",
+        reveal_n_objects: int = 0,
+        reveal_radius_frac: float = 0.12,
+        include_centroid_mask: bool = False,
+        centroid_mask_presence_only: bool = False,
+        image_size: int = 256,
     ):
         self._root_dir = root_dir
         self._mode = mode
@@ -146,11 +230,19 @@ class ClevrMetricsCallback(EvalCallbackBase):
         self._split = split
         self._min_objects = min_objects
         self._max_objects = max_objects
+        self._reveal_n_objects = reveal_n_objects
+        self._reveal_radius_frac = reveal_radius_frac
+        self._include_centroid_mask = include_centroid_mask
+        self._centroid_mask_presence_only = centroid_mask_presence_only
+        self._image_size = image_size
 
         # Lazy-loaded on first main-process call.
         self._scenes: Optional[list] = None
         self._calibration = None
         self._eval_models = None
+        self._image_dir = None
+        self._transform = None
+        self._H_inv = None
 
     def _load(self, device: torch.device):
         from eval.evaluate_clevr import calibrate_camera_and_size, JOINT_PROMPTS
@@ -159,6 +251,14 @@ class ClevrMetricsCallback(EvalCallbackBase):
 
         self._scenes = _load_scenes(self._root_dir, self._split, self._min_objects, self._max_objects)
         self._calibration = calibrate_camera_and_size(self._root_dir, split=self._split)
+
+        filename_split = "val" if self._split == "validation" else self._split
+        self._image_dir = os.path.join(self._root_dir, "CLEVR_v1.0", "images", filename_split)
+        self._transform = T.Compose(
+            [T.Resize((self._image_size, self._image_size)), T.ToTensor(), T.Normalize([0.5], [0.5])]
+        )
+        if self._include_centroid_mask and not self._centroid_mask_presence_only:
+            self._H_inv = calibrate_mask_projection(self._scenes)
 
         dino_proc = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
         dino_mod = AutoModelForZeroShotObjectDetection.from_pretrained(
@@ -194,7 +294,21 @@ class ClevrMetricsCallback(EvalCallbackBase):
         m = {k: 0 for k in ("t_req", "t_pred", "v_matches", "hallucinations",
                               "c_col", "c_sh", "c_mat", "c_sz", "perf", "t_rel", "c_rel")}
 
-        cond_samples = [_scene_to_data_sample(s, self._mode) for s in selected]
+        cond_samples = [
+            _scene_to_data_sample(
+                s,
+                self._mode,
+                image_dir=self._image_dir,
+                transform=self._transform,
+                reveal_n_objects=self._reveal_n_objects,
+                reveal_radius_frac=self._reveal_radius_frac,
+                include_centroid_mask=self._include_centroid_mask,
+                centroid_mask_presence_only=self._centroid_mask_presence_only,
+                mask_size=self._image_size // 8,
+                H_inv=self._H_inv,
+            )
+            for s in selected
+        ]
         imgs = _generate_images(model, cond_samples, device)
 
         for img_tensor, scene in tqdm(zip(imgs, selected), "CLEVR metrics eval", total=len(selected)):

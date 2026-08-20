@@ -48,6 +48,7 @@ from diffusers.models.unets.unet_2d import UNet2DOutput
 from hydra.utils import instantiate
 
 from configs.schemas import PainterOptimConfig, TrainConfig, EvalConfig
+from models.paper_unet import ControlPainterPaperUNet, PaperUNet
 from models.utility_models import strip_compiled_prefix
 from datasets.data_sample import DataSample
 from models.base import BaseModel
@@ -143,6 +144,9 @@ class UNetPainter(PainterBase, BaseModel):
         painter_dtype: Optional[str] = None,
         sampling_pipeline=None,
         vae_pixel_range: str = "[-1,1]",
+        pixel_range: str = "[0,1]",
+        mean_reduced_loss: bool = False,
+        min_train_timestep: int = 0,
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -156,6 +160,11 @@ class UNetPainter(PainterBase, BaseModel):
         # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
         # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
         self._vae_tanh = vae_pixel_range == "[-1,1]"
+        # Same idea as vae_pixel_range, but for pixel-space painters (no VAE),
+        # where the dataset's own native range may not be [0,1] — e.g. Steiner
+        # Tree's 3-level background/vertex/edge scheme is in [-1,1]. Unused
+        # when self.vae is set (vae_pixel_range governs that case instead).
+        self._pixel_tanh = pixel_range == "[-1,1]"
         self.condition_encoder: Optional[nn.Module] = (
             instantiate(condition_encoder) if condition_encoder is not None else None
         )
@@ -166,10 +175,40 @@ class UNetPainter(PainterBase, BaseModel):
             if painter_dtype is not None
             else None
         )
+        # loss_fn (models/losses.py) is already batch-mean-reduced, unlike the
+        # original TRM pretrain.py's sum-reduced CE loss that the
+        # `global_batch_size * K` divisor in train_step below was designed to
+        # match. Dividing a mean-reduced loss by global_batch_size again
+        # shrinks gradients by an extra ~global_batch_size, risking an AdamW
+        # eps-floor instability once per-parameter gradients get small (e.g.
+        # late in a well-converging run). mean_reduced_loss=True divides only
+        # by the micro-batch accumulation count K instead, matching the
+        # paper's own train_diffusion.py (`loss = loss / grad_accum_steps`).
+        # Default False preserves existing behavior for every other painter.
+        self._mean_reduced_loss = mean_reduced_loss
+        # Paper's train_diffusion.py samples t ~ randint(1, diffusion_steps) —
+        # excludes t=0 (an almost-noiseless input, which the paper's own
+        # scheduler.noise()/denoise_ddim() may not even handle meaningfully at
+        # index 0). Default 0 preserves existing behavior for every other
+        # painter; Steiner/Polygon/Squares set this to 1 to match exactly.
+        self._min_train_timestep = min_train_timestep
 
     @property
     def condition_keys(self) -> list[str]:
         return self.condition_encoder.condition_keys if self.condition_encoder is not None else []
+
+    def _unet_autocast(self, device_type: str):
+        """Scopes painter_dtype (if set) to just the UNet call — mirrors
+        ThinkerFrozenPainterBase.run_painter's scoping. Keeps
+        _prepare_training_sample's add_noise/target math and the loss
+        computation in fp32; only the UNet forward (the actual expensive
+        compute) runs under autocast. Deliberately narrower than an
+        Accelerate-level mixed_precision setting, which would autocast
+        everything indiscriminately — see train_trm.py's own comment on why
+        this codebase avoids that."""
+        if self.painter_dtype is not None:
+            return torch.autocast(device_type=device_type, dtype=self.painter_dtype)
+        return torch.autocast(device_type=device_type, enabled=False)
 
     # ── Latent helpers ───────────────────────────────────────────────────────
 
@@ -181,24 +220,37 @@ class UNetPainter(PainterBase, BaseModel):
         return (c, s, s)
 
     def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents → [0, 1] pixel images for logging."""
+        """Decode latents → pixel images for logging/eval, clamped to the
+        painter's own native range ([0, 1] by default; [-1, 1] pixel-space
+        painters like Steiner Tree pass pixel_range="[-1,1]"). Not rescaled
+        to [0, 1] in that case — callers that need a genuinely different
+        native range (rather than the usual [0, 1] display convention) are
+        expected to know it, e.g. eval/steiner_eval.py's thresholds are
+        defined directly in [-1, 1].
+        """
         if self.vae is not None:
             imgs = self.vae.decode(latents / self.scaling_factor).sample
             if self._vae_tanh:
                 return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             return imgs.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return latents.clamp(-1.0, 1.0)
         return latents.clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
-        """Convert dataset batch images → [0, 1] for display.
+        """Convert dataset batch images → the painter's native range for
+        display/eval (see decode_for_eval).
 
         Latent-space models receive dataset images in whatever range their VAE
-        was trained on (vae_pixel_range). Pixel-space models receive [0, 1] directly.
+        was trained on (vae_pixel_range). Pixel-space models receive [0, 1]
+        unless pixel_range="[-1,1]" was set (see decode_for_eval).
         """
         if self.vae is not None:
             if self._vae_tanh:
                 return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
             return images.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return images.clamp(-1.0, 1.0)
         return images.clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -221,7 +273,8 @@ class UNetPainter(PainterBase, BaseModel):
             kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
         if steering is not None:
             kwargs.update(steering.to_painter_kwargs())
-        noise_pred = self.unet(sample.x_noisy, sample.timesteps, **kwargs).sample
+        with self._unet_autocast(sample.x_noisy.device.type):
+            noise_pred = self.unet(sample.x_noisy, sample.timesteps, **kwargs).sample
         return DiffusionPrediction(
             pred=noise_pred,
             pred_type=self.scheduler.config.prediction_type,
@@ -243,7 +296,9 @@ class UNetPainter(PainterBase, BaseModel):
             images = self.encode(images)  # pixel → latent (no_grad inside encode)
 
         noise = torch.randn_like(images)
-        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
+        timesteps = torch.randint(
+            self._min_train_timestep, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long
+        )
         noisy = self.scheduler.add_noise(images, noise, timesteps)
         target = noise if self.scheduler.config.prediction_type == "epsilon" else images
 
@@ -291,7 +346,20 @@ class UNetPainter(PainterBase, BaseModel):
         return torch.autocast(device_type=device.type, dtype=self.painter_dtype)
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
-        optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
+        # optim_cfg is a raw DictConfig, not an instantiated PainterOptimConfig
+        # (painter configs set _recursive_: false) — dataclass defaults never
+        # apply, so optional fields need an explicit fallback via .get().
+        if self.optim_cfg.get("use_adam_atan2", False):
+            from adam_atan2 import AdamATan2
+
+            optim = AdamATan2(
+                self.parameters(),
+                lr=0,
+                weight_decay=self.optim_cfg.weight_decay,
+                betas=self.optim_cfg.get("betas", (0.9, 0.999)),
+            )
+        else:
+            optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
         return [
             ScheduledOptimizer(
                 optim,
@@ -301,6 +369,16 @@ class UNetPainter(PainterBase, BaseModel):
                 min_ratio=self.optim_cfg.lr_min_ratio,
             )
         ]
+
+    def _loss_backward_divisor(self, global_batch_size: int, K: int) -> float:
+        """Divisor applied to `loss_fn`'s (already batch-mean-reduced) output
+        before `accelerator.backward()`. Default matches original pretrain.py's
+        convention for sum-reduced losses (divide by global_batch_size once;
+        the K micro-batch accumulation cancels the extra K here). See
+        `mean_reduced_loss` in __init__ for the corrected divisor (K only),
+        opt-in per instance since most painters' loss_fn is mean-reduced but
+        haven't been verified against this double-normalization."""
+        return K if self._mean_reduced_loss else global_batch_size * K
 
     def train_step(
         self,
@@ -315,6 +393,8 @@ class UNetPainter(PainterBase, BaseModel):
         K = len(micro_batches)
         device = accelerator.device
         loss_sums: dict[str, float] = {}
+        loss_maxes: dict[str, float] = {}
+        divisor = self._loss_backward_divisor(global_batch_size, K)
 
         for mb in micro_batches:
             sample = self._prepare_training_sample(mb, device)
@@ -323,19 +403,31 @@ class UNetPainter(PainterBase, BaseModel):
                 drop = torch.rand(sample.x_noisy.shape[0], device=device) < self.train_cfg.cfg_prob
                 sample = self._apply_cfg_dropout(sample, drop)
 
-            with self._autocast(device):
-                result = self(sample)
-                total_loss, components = self.loss_fn(result.pred, result.logits, sample)
-            accelerator.backward(total_loss / (global_batch_size * K))
+            result = self(sample)
+            total_loss, components = self.loss_fn(result.pred, result.logits, sample)
+            accelerator.backward(total_loss / divisor)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
+                # Per-microbatch max, not just the K-averaged mean below — a
+                # single outlier microbatch within this accumulation window
+                # would otherwise be smoothed away by the averaging and
+                # invisible in logs right when it matters most.
+                loss_maxes[k] = max(loss_maxes.get(k, v), v)
 
-        accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        # clip_grad_norm_'s return value (pre-clip total norm, possibly
+        # inf/nan) was previously discarded — logging it is the cheapest way
+        # to tell a real gradient-explosion event (huge/nan norm right at the
+        # loss spike) apart from something else entirely (loss jumps with a
+        # perfectly normal grad norm) the next time this happens.
+        grad_norm = accelerator.clip_grad_norm_(self.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)
 
-        return {k: v / K for k, v in loss_sums.items()}, lr, global_step + 1
+        metrics = {k: v / K for k, v in loss_sums.items()}
+        metrics.update({f"{k}_max": v for k, v in loss_maxes.items()})
+        metrics["grad_norm"] = float(grad_norm)
+        return metrics, lr, global_step + 1
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
@@ -357,10 +449,15 @@ class UNetPainter(PainterBase, BaseModel):
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
         del dl_iter  # release workers before callbacks re-iterate the dataloader
-        self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
+        # eval_callbacks (sampling-based) must also see the model in eval()
+        # mode — they're supposed to reflect real inference-time behavior.
+        # self.train() only runs after them, so a mode-sensitive layer (e.g.
+        # BatchNorm, unlike GroupNorm) can't silently fall back to train-time
+        # statistics during what's meant to be an eval-mode callback.
         for cb in self.eval_callbacks:
             metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
         return metrics
 
     def compile_submodules(self):
@@ -516,6 +613,52 @@ class ControlPainterUNet(UNet2DModel):
 # ── Frozen UNet wrapper for TRM steering ─────────────────────────────────────
 
 
+def _swap_to_controlnet_unet(unet: nn.Module) -> None:
+    """Runtime __class__ swap to the ControlNet-residual-accepting variant
+    matching unet's actual architecture. UNet2DConditionModel already
+    accepts ControlNet residual kwargs natively, so it's left alone.
+    """
+    if isinstance(unet, PaperUNet):
+        unet.__class__ = ControlPainterPaperUNet
+    elif not isinstance(unet, UNet2DConditionModel):
+        unet.__class__ = ControlPainterUNet
+
+
+def _load_frozen_checkpoint(painter: nn.Module, checkpoint: str, checkpoint_source: str = "trm_diffusion") -> None:
+    """Load frozen-painter weights, from either this codebase's own
+    train_trm.py checkpoint format or the paper's original repo's raw
+    checkpoint format (e.g. nirgoren/geometric-solver's checkpoints_steiner/
+    checkpoint_100.pth on HF) — lets a *_controlnet_frozen painter config
+    point straight at the paper's own released weights for TRM steering,
+    skipping this codebase's own painter training entirely (its own
+    from-scratch training doesn't need to reproduce the paper's numbers for
+    the TRM's steering signal to be worth developing against a known-good
+    base — see memory: trm_diffusion_real_data_and_recipe_audit /
+    cross-loading tests already verified these checkpoints reproduce the
+    paper's Table 2/3 through this codebase's own sampling+eval pipeline).
+
+    "trm_diffusion" (default): checkpoint's "model_state" key is a full
+    painter state_dict (this codebase's own format).
+
+    "original_repo": checkpoint's "state_dict" key is a *bare UNet* state_dict
+    only (their model IS the UNet, no painter/condition_encoder wrapper) —
+    loaded into painter.unet directly, not the whole painter. Prefixes
+    ("module." from DDP, "_orig_mod." from torch.compile, wherever they
+    appear) are stripped the same way the cross-loading verification
+    scripts did.
+    """
+    if checkpoint_source == "trm_diffusion":
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        painter.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+    elif checkpoint_source == "original_repo":
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        raw = ckpt["state_dict"]
+        stripped = {k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in raw.items()}
+        painter.unet.load_state_dict(stripped, strict=True)
+    else:
+        raise ValueError(f"Unknown checkpoint_source: {checkpoint_source!r} (expected 'trm_diffusion' or 'original_repo')")
+
+
 class ControlNetSteeredUNetPainter(UNetPainter):
     """Frozen UNetPainter loaded from a checkpoint for ControlNet-style thinker steering.
 
@@ -526,23 +669,187 @@ class ControlNetSteeredUNetPainter(UNetPainter):
 
     Args:
         checkpoint: path to a checkpoint_*.pt file saved by train_trm.py
-                    (must contain a "model_state" key).
+                    (must contain a "model_state" key), or — when
+                    checkpoint_source="original_repo" — a raw checkpoint from
+                    the paper's own repo (must contain a "state_dict" key).
+        checkpoint_source: "trm_diffusion" (default) or "original_repo" — see
+                    _load_frozen_checkpoint.
         **kwargs:   forwarded verbatim to UNetPainter.__init__.
     """
 
-    def __init__(self, checkpoint: str, **kwargs):
+    def __init__(self, checkpoint: str, checkpoint_source: str = "trm_diffusion", **kwargs):
         super().__init__(**kwargs)
-        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
-        # UNet2DConditionModel already accepts ControlNet residual kwargs natively.
-        # Only swap to ControlPainterUNet for plain UNet2DModel (pixel-space UNets).
-        if not isinstance(self.unet, UNet2DConditionModel):
-            self.unet.__class__ = ControlPainterUNet
+        _load_frozen_checkpoint(self, checkpoint, checkpoint_source)
+        _swap_to_controlnet_unet(self.unet)
         for p in self.unet.parameters():
             p.requires_grad_(False)
         if self.condition_encoder is not None:
             for p in self.condition_encoder.parameters():
                 p.requires_grad_(False)
+
+
+class JointControlNetUNetPainter(UNetPainter):
+    """Same architecture as ControlNetSteeredUNetPainter (UNet converted to
+    accept ControlNet-style steering residuals from the thinker), but
+    randomly initialized and left fully trainable instead of loaded from a
+    pretrained checkpoint and frozen.
+
+    Ablation: trains the painter and thinker jointly, end-to-end, from
+    scratch in one run — tests whether pretraining the painter unconditionally
+    first (the current two-stage pipeline) is actually load-bearing, or
+    whether ThinkerFrozenPainterBase.build_optimizers's existing support for
+    trainable painter params (already used for e.g. IP-Adapter variants) is
+    enough on its own.
+
+    **kwargs: forwarded verbatim to UNetPainter.__init__ — in particular
+    optim_cfg here is genuinely used (unlike ControlNetSteeredUNetPainter,
+    where it's a dead value since the painter is frozen), so pick real
+    from-scratch training hyperparameters, not the frozen config's
+    placeholder ones.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        _swap_to_controlnet_unet(self.unet)
+
+
+# ── Channel-concat conditioning (matches "Visual Diffusion Models are
+#    Geometric Solvers"'s actual architecture) ───────────────────────────────
+
+
+class ConcatConditionedUNetPainter(UNetPainter):
+    """UNetPainter conditioned by channel-concatenating a spatial condition
+    image with the noisy input before the UNet call, rather than through a
+    condition_encoder producing extra UNet kwargs (cross-attention tokens,
+    ControlNet residuals, ...). Matches the paper's own conditioning
+    mechanism: `unet`'s in_channels must equal image_channels +
+    condition_channels; out_channels matches only the generated image, since
+    the condition channels are never noised (only sample.x_noisy is — the
+    condition is concatenated back on fresh, un-noised, at every timestep).
+
+    No condition_encoder is used at all here, so condition_keys is fixed to
+    ["spatial_conditions"] (rather than derived from one) — this is what
+    PainterBase.null_condition_sample / the training loop's CFG dropout read
+    to zero the condition for classifier-free guidance.
+
+    Args:
+        image_channels: channel count of the image being generated (and thus
+            of sample.x_noisy / the noise sampled at inference time) —
+            `unet`'s in_channels minus this is the condition's channel count.
+        **kwargs: forwarded to UNetPainter.__init__.
+    """
+
+    condition_keys = ["spatial_conditions"]
+
+    def __init__(self, *args, image_channels: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._image_channels = image_channels
+
+    @property
+    def noise_shape(self) -> tuple:
+        s = self.unet.config.sample_size
+        return (self._image_channels, s, s)
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        x = sample.x_noisy
+        if sample.spatial_conditions is not None:
+            x = torch.cat([x, sample.spatial_conditions], dim=1)
+        kwargs = steering.to_painter_kwargs() if steering is not None else {}
+        with self._unet_autocast(x.device.type):
+            noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+
+class ConcatCrossAttnConditionedUNetPainter(UNetPainter):
+    """UNetPainter conditioned BOTH ways at once: a spatial condition image
+    (e.g. CLEVR's centroid mask) is channel-concatenated onto x_noisy before
+    the UNet call (like ConcatConditionedUNetPainter), AND a condition_encoder
+    still runs to provide cross-attention kwargs (like the base UNetPainter) —
+    e.g. per-object embeddings via ObjectFeatureEncoder. Use this when the two
+    conditioning signals are independent (a spatial ground-truth mask plus a
+    per-object token sequence) rather than needing the mask routed through the
+    condition_encoder itself.
+
+    `unet`'s in_channels must equal image_channels + the spatial_conditions
+    channel count; out_channels matches only the generated image, since the
+    condition channels are never noised (only sample.x_noisy is — the
+    condition is concatenated back on fresh, un-noised, at every timestep).
+
+    condition_keys is the condition_encoder's own keys plus
+    "spatial_conditions", so both are zeroed for CFG dropout /
+    null_condition_sample.
+
+    Args:
+        image_channels: channel count of the image being generated (and thus
+            of sample.x_noisy / the noise sampled at inference time) —
+            `unet`'s in_channels minus this is the condition's channel count.
+        **kwargs: forwarded to UNetPainter.__init__.
+    """
+
+    def __init__(self, *args, image_channels: int = 4, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._image_channels = image_channels
+
+    @property
+    def noise_shape(self) -> tuple:
+        s = self.unet.config.sample_size
+        return (self._image_channels, s, s)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        keys = list(super().condition_keys)
+        if "spatial_conditions" not in keys:
+            keys.append("spatial_conditions")
+        return keys
+
+    def forward(
+        self,
+        sample: DataSample,
+        steering: Optional[ThinkerSteering] = None,
+    ) -> DiffusionPrediction:
+        x = sample.x_noisy
+        if sample.spatial_conditions is not None:
+            x = torch.cat([x, sample.spatial_conditions], dim=1)
+        kwargs: dict = {}
+        if self.condition_encoder is not None:
+            args = [getattr(sample, k) for k in self.condition_encoder.condition_keys]
+            kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
+        if steering is not None:
+            kwargs.update(steering.to_painter_kwargs())
+        with self._unet_autocast(x.device.type):
+            noise_pred = self.unet(x, sample.timesteps, **kwargs).sample
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+
+class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter):
+    """Frozen ConcatConditionedUNetPainter loaded from a checkpoint, with
+    ControlNet-style TRM steering added as a SEPARATE, additive signal — the
+    painter keeps concatenating its own (frozen) condition image exactly as
+    trained; the TRM's steering doesn't replace that, it's an independent
+    residual injection on top (mirrors ControlNetSteeredUNetPainter for the
+    unconditional case — see that class's docstring for why steering
+    "on top of" rather than "instead of" is the intended split).
+
+    Args:
+        checkpoint: path to a checkpoint_*.pt saved by train_trm.py for a
+                    ConcatConditionedUNetPainter run, or — when
+                    checkpoint_source="original_repo" — a raw checkpoint from
+                    the paper's own repo (must contain a "state_dict" key).
+        checkpoint_source: "trm_diffusion" (default) or "original_repo" — see
+                    _load_frozen_checkpoint.
+        **kwargs:   forwarded to ConcatConditionedUNetPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, checkpoint_source: str = "trm_diffusion", **kwargs):
+        super().__init__(**kwargs)
+        _load_frozen_checkpoint(self, checkpoint, checkpoint_source)
+        _swap_to_controlnet_unet(self.unet)
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
 
 
 # ── Generic trainable DiT painter ────────────────────────────────────────────
@@ -770,10 +1077,10 @@ class DiTPainter(PainterBase, BaseModel):
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
             n_batches += 1
         del dl_iter  # release workers before callbacks re-iterate the dataloader
-        self.train()
         metrics = {k: v / n_batches for k, v in loss_sums.items()} if n_batches else {}
         for cb in self.eval_callbacks:
             metrics.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
         return metrics
 
     def compile_submodules(self):

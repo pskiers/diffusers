@@ -1,0 +1,27 @@
+# @package _global_
+# TRM as the diffusion backbone itself (no separate frozen painter, no
+# thinker-steers-painter split) -- tests whether the TRM's own recursive
+# reasoning can directly denoise the puzzle image, patch-tokenized at
+# patch_size=cell_size so the 144x144 resolution never becomes a
+# sequence-length/attention-cost problem. Pure diffusion loss only.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_trm_diffusion_backbone \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /painter: mnist_trm_diffusion_backbone
+  - override /train: mnist
+  - override /eval_callbacks: mnist
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+train:
+  sudoku_loss_weight: 0.0  # pure diffusion -- no separate thinker logits to attach a CE loss to
+  cfg_prob: 0.0            # CFG training dropout isn't implemented in TRMDiffusionBackbone.train_step yet
+
+run:
+  output_dir: "runs/mnist_trm_diffusion_backbone"

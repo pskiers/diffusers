@@ -1,0 +1,17 @@
+# @package _global_
+# Unconditional Ball Drop UNetPainter.
+# Usage: python train_trm.py experiment=ball_drop_unet_painter
+
+defaults:
+  - override /data: ball_drop
+  - override /backbone: ball_drop_unet
+  - override /painter: ball_drop_unet
+  - override /train: ball_drop
+  - override /eval_callbacks: ball_drop
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/ball_drop_unet_painter"

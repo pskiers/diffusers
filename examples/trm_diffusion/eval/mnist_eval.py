@@ -189,9 +189,17 @@ def evaluate_grids(
     puzzle_acc          — fraction of puzzles where all 81 cells match ground truth.
     constraint_puzzle_acc — fraction of puzzles satisfying all sudoku constraints
                             (rows/cols/boxes each contain digits 1-9), regardless
-                            of whether the solution matches the ground truth.
+                            of whether the solution matches the ground truth. Does
+                            NOT check that given cells were respected — a model
+                            could hallucinate an unrelated valid grid and still
+                            score well here.
+    given_consistent_puzzle_acc — same validity check as constraint_puzzle_acc,
+                            but additionally requires every given cell to be
+                            predicted correctly. None when given_masks is not
+                            supplied (nothing to check).
 
-    Returns dict with keys: cell_acc, puzzle_acc, constraint_puzzle_acc, preds.
+    Returns dict with keys: cell_acc, puzzle_acc, constraint_puzzle_acc,
+    given_consistent_puzzle_acc, preds.
     """
     device    = next(classifier.parameters()).device
     images    = images.to(device)
@@ -211,21 +219,31 @@ def evaluate_grids(
     puzzle_acc = correct.all(dim=1).float().mean().item()
 
     # Constraint puzzle accuracy: does the predicted grid satisfy sudoku rules?
-    constraint_puzzle_acc = _check_sudoku_constraints(preds).float().mean().item()
+    valid_grid = _check_sudoku_constraints(preds)
+    constraint_puzzle_acc = valid_grid.float().mean().item()
 
     # Cell accuracy: blank cells only.
     if given_masks is not None:
-        blank   = ~given_masks.to(device)            # (B, 81) bool
+        given_masks = given_masks.to(device)
+        blank   = ~given_masks                        # (B, 81) bool
         n_blank = blank.sum()
         cell_acc = (correct[blank].float().mean().item()
                     if n_blank > 0 else correct.float().mean().item())
+
+        # Stricter than constraint_puzzle_acc: also require every given cell
+        # to be predicted correctly, so a valid-but-unrelated hallucinated
+        # grid doesn't count as solving the puzzle.
+        given_ok = (correct | blank).all(dim=1)        # (B,) — blank cells trivially pass
+        given_consistent_puzzle_acc = (valid_grid & given_ok).float().mean().item()
     else:
         cell_acc = correct.float().mean().item()
+        given_consistent_puzzle_acc = None
 
     return {
         "cell_acc": cell_acc,
         "puzzle_acc": puzzle_acc,
         "constraint_puzzle_acc": constraint_puzzle_acc,
+        "given_consistent_puzzle_acc": given_consistent_puzzle_acc,
         "preds": preds.cpu(),
     }
 

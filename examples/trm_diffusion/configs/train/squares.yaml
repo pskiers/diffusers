@@ -1,0 +1,23 @@
+seed: 42
+compile: true
+
+batch_size: 512
+num_steps: 24400
+gradient_accumulation_steps: 8  # 512*8=4096 effective batch.
+# NOTE: the paper's actual Curves recipe (config_curves.yaml) uses
+# batch_size=256/GPU * 4 GPUs * grad_accum_steps=4 -- a REAL micro-batch of
+# 1024, not the 512/8 split here (copied from Steiner/Polygon's DIFFERENT
+# 128/GPU*4GPUs*8accum recipe, which happens to land on the same *effective*
+# batch of 4096 by coincidence). This matters because PaperUNet uses
+# BatchNorm2d throughout, whose running stats are computed per-micro-batch,
+# not per-effective-batch -- 512 gives noisier/different BN statistics than
+# the paper's own 1024 would. Deliberately kept at 512/8 (single-GPU memory
+# limit); the exact-match fix would be batch_size=256 launched via
+# `accelerate launch --num_processes=4` (256/GPU * 4 GPUs * accum=4 = 4096,
+# with LESS memory per GPU than this), not available in this run's setup.
+cfg_prob: 0.0  # paper's released checkpoint is always-conditional, no CFG dropout (p_null=0)
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

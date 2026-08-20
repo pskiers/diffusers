@@ -1,0 +1,22 @@
+# Scaled down from the paper's reported architecture (4 levels,
+# base_channels=64, attention at 3 of 4 levels — 63M params, slow at 128px)
+# to the same size/shape as the MNIST-Sudoku backbone (mnist_unet.yaml):
+# 3 plain levels, no attention at all — attention is the most expensive part
+# at this resolution and unconditional-painter quality doesn't need it here.
+# See configs/backbone/steiner_unet_concat.yaml for the paper-size variant,
+# kept for the unscaled conditional-painter comparison.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 1
+out_channels: 1
+block_out_channels: [32, 64, 64]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

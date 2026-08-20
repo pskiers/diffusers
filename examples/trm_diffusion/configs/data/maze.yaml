@@ -1,0 +1,29 @@
+grid_size: 8
+cell_size: 16
+painter_size: 128  # cell_size(16) * grid_size(8) = 128
+min_active_size: 3  # matches the published SketchVLM maze benchmark's 3x3 scale
+max_active_size: 8
+wall_px: 2
+vocab_size: 2   # 0=off-path, 1=on-path (thinker output classes)
+seq_len: 64     # grid_size**2
+num_workers: 4
+
+train_dataset:
+  _target_: datasets.maze_dataset.MazeDataset
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"
+  min_active_size: "${data.min_active_size}"
+  max_active_size: "${data.max_active_size}"
+  wall_px: "${data.wall_px}"
+  length: 20000
+  seed: 0
+
+val_dataset:
+  _target_: datasets.maze_dataset.MazeDataset
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"
+  min_active_size: "${data.min_active_size}"
+  max_active_size: "${data.max_active_size}"
+  wall_px: "${data.wall_px}"
+  length: 2000
+  seed: 1

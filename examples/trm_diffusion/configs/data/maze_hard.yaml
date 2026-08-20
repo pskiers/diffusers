@@ -1,0 +1,36 @@
+# Eval-only: every maze at the hardest size trained on (min_active_size ==
+# max_active_size == grid_size, no padding, no easier sizes mixed in) — the
+# counterpart to maze_sketchvlm_benchmark.yaml's fixed-easy 3x3 real
+# benchmark. Override the `data` group with this at eval time to see a clean
+# hard-only number instead of it being averaged together with easy sizes:
+#   python eval.py experiment=maze_unet_painter data=maze_hard \
+#     painter.checkpoint=runs/maze_unet_painter/checkpoint_final.pt
+grid_size: 8
+cell_size: 16
+painter_size: 128
+min_active_size: 8
+max_active_size: 8
+wall_px: 2
+vocab_size: 2
+seq_len: 64
+num_workers: 4
+
+train_dataset:
+  _target_: datasets.maze_dataset.MazeDataset
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"
+  min_active_size: "${data.min_active_size}"
+  max_active_size: "${data.max_active_size}"
+  wall_px: "${data.wall_px}"
+  length: 2000
+  seed: 2
+
+val_dataset:
+  _target_: datasets.maze_dataset.MazeDataset
+  grid_size: "${data.grid_size}"
+  cell_size: "${data.cell_size}"
+  min_active_size: "${data.min_active_size}"
+  max_active_size: "${data.max_active_size}"
+  wall_px: "${data.wall_px}"
+  length: 2000
+  seed: 3

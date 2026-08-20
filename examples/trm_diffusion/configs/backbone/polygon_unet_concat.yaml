@@ -1,0 +1,34 @@
+# GroupNorm+SiLU ablation variant of the paper's UNet (diffusers.UNet2DModel,
+# param-count-matched, 4 levels, base_channels=64, condition channel-
+# concatenated before the UNet). The default backbone is now polygon_unet_
+# paper (models.paper_unet.PaperUNet, verbatim BatchNorm+ReLU port) — use
+# +backbone=polygon_unet_concat to ablate the norm/activation choice.
+#
+# Attention placement (2026-08-03 fix): the paper's own model/diffusion.py
+# only puts attention at the *deepest* 2 of 4 encoder levels (enc2, enc3) +
+# bottleneck + the mirrored 2 decoder levels — NOT 3 of 4 as this file
+# previously claimed/implemented (same fix as steiner_unet_concat.yaml).
+#
+# layers_per_block (2026-08-06 fix): the paper's UNet uses exactly 1 resnet
+# block per level; layers_per_block=2 was ~3x too many params (63M vs the
+# real 20M — see models/paper_unet.py for a verbatim, size-correct port).
+# layers_per_block=1 alone only gets to ~44M — diffusers' block/mid_block
+# internals (extra resnet at the bottleneck, heavier attention) account for
+# the rest and aren't exposed as a config knob; accepted as a known gap.
+_target_: diffusers.UNet2DModel
+sample_size: 128
+in_channels: 2
+out_channels: 1
+block_out_channels: [64, 128, 256, 512]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 1

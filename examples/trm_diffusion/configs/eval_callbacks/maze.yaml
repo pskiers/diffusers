@@ -1,0 +1,7 @@
+# Maze eval callback: DDIM sampling + nearest-color cell classification
+# (no learned classifier needed, unlike Sudoku's MNIST digit cells).
+- _target_: models.eval_callbacks.MazeEvalCallback
+  grid_size: ${data.grid_size}
+  cell_size: ${data.cell_size}
+  num_samples: 1024
+  num_log_images: 8

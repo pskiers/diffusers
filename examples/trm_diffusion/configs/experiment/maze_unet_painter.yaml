@@ -1,0 +1,17 @@
+# @package _global_
+# Unconditional Maze UNetPainter.
+# Usage: python train_trm.py experiment=maze_unet_painter
+
+defaults:
+  - override /data: maze
+  - override /backbone: maze_unet
+  - override /painter: maze_unet
+  - override /train: maze
+  - override /eval_callbacks: maze
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/maze_unet_painter"

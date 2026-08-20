@@ -1,0 +1,35 @@
+# Same as ddpm_epsilon.yaml (epsilon prediction, same noise schedule) except
+# DDIMScheduler instead of DDPMScheduler. Training is unaffected — add_noise()
+# is mathematically identical between the two (same forward process; DDPM vs
+# DDIM only differ in the *reverse*/sampling process) — this only changes
+# sampling/eval.
+#
+# Why this matters for Steiner/Polygon specifically: the paper's own real
+# sampler (schedulers/ddim.py) is fully deterministic — eta=0.0, so its
+# denoise_ddim() has no noise term anywhere in the reverse formula. Our
+# SamplingPipeline calls model.scheduler.step(noise_pred, t, x) — with
+# DDPMScheduler this silently does standard ancestral/stochastic sampling
+# (injects fresh Gaussian noise at every step except the last, see
+# diffusers/schedulers/scheduling_ddpm.py's `if t > 0: variance_noise = ...`),
+# never matching the paper's deterministic process despite "DDIM" appearing
+# in several comments/docstrings (models/sampling.py, configs/sampling/*.yaml)
+# — those were aspirational, not actually wired to a DDIM scheduler.
+# DDIMScheduler.step() defaults eta=0.0 (deterministic, matching the paper
+# exactly) and has the identical (model_output, timestep, sample) call
+# signature, so this is a drop-in swap — no code changes needed. Diversity
+# across best-of-N samples is unaffected: it comes from each candidate's
+# independently-sampled initial x_T, not from per-step noise injection.
+# clip_sample: false — the paper's own denoise_ddim() never clips x_0_pred
+# anywhere (verified directly against schedulers/ddim.py); clip_sample=true
+# (copied over unchanged from ddpm_epsilon.yaml, an oversight) diverges
+# substantially whenever a real x0 prediction exceeds [-1,1] mid-trajectory
+# (common, especially at high-noise steps) — verified numerically: with
+# clip_sample=true, a single step's output differed from the paper's exact
+# (unclipped) formula by up to 2.55 in a synthetic test where the true
+# x0_pred sat outside [-1,1]; with clip_sample=false the two implementations
+# matched to ~1e-6 (fp32 rounding only).
+_target_: diffusers.DDIMScheduler
+num_train_timesteps: 100
+beta_schedule: "squaredcos_cap_v2"
+prediction_type: "epsilon"
+clip_sample: false
