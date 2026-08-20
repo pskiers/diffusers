@@ -1,0 +1,7 @@
+# Same as ddpm.yaml, except num_train_timesteps=1000 (the original DDPM
+# paper's convention) instead of 100 -- a finer noise schedule for
+# experiments that want more denoising steps to reason across.
+_target_: diffusers.DDPMScheduler
+num_train_timesteps: 1000
+beta_schedule: "squaredcos_cap_v2"
+prediction_type: "sample"
