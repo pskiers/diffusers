@@ -1,0 +1,20 @@
+# batch_size=384 * grad_accum=2 = 768 effective batch, matching the existing
+# (unconditional) mnist.yaml painter recipe. num_steps=100000 is also that
+# same recipe's value, carried over deliberately: at 768 effective batch,
+# 100,000 steps = 76,800,000 sample-views -- against this dataset's actual
+# 990,000-puzzle training pool (1,000,000 total minus the 10,000-puzzle test
+# split, see MNISTSudokuSRMDataset), that's ~77.6 epochs, a reasonable target
+# and a fair comparison point against the existing unconditional baseline
+# trained on the same step budget.
+seed: 42
+compile: true
+
+batch_size: 384
+num_steps: 100000
+gradient_accumulation_steps: 2
+cfg_prob: 0.0  # always-conditional; set >0 for a classifier-free-guidance variant
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

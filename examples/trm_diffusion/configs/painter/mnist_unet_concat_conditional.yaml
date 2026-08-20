@@ -1,0 +1,25 @@
+# Trainable, conditional MNIST-Sudoku UNetPainter (channel-concat
+# conditioning on the given-cells puzzle image) — same mechanism as
+# steiner_unet_concat_conditional.yaml/polygon's/squares' (spatial_conditions
+# concatenated onto the noisy input before the UNet call), just for the SRM
+# Sudoku dataset instead. Pairs with backbone/mnist_unet_concat_big.yaml.
+#
+# Deliberately does NOT copy pixel_range/mean_reduced_loss/min_train_timestep
+# from the Steiner/Polygon/Squares configs -- those were fixes specific to
+# matching that paper's own recipe exactly (images in [-1,1], a particular
+# loss-reduction convention, t=0 excluded from training). MNIST-Sudoku has no
+# such external reference: images here are natively [0,1] (see
+# MNISTSudokuSRMDataset), matching this class's own defaults, so nothing
+# needs overriding.
+_target_: models.painter_base.ConcatConditionedUNetPainter
+_recursive_: false
+unet: ${backbone}
+image_channels: 1
+painter_dtype: "bfloat16"
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4          # matches the existing (unconditional) mnist_unet.yaml painter's lr
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
