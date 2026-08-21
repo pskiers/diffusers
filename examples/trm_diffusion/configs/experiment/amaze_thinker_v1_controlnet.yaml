@@ -1,5 +1,5 @@
 # @package _global_
-# Stage 2: TRM thinker (V1, ControlNet) with frozen Amaze UNet painter.
+# TRM thinker (V1, ControlNet) with frozen Amaze UNet painter.
 # Usage:
 #   python train_trm.py experiment=amaze_thinker_v1_controlnet \
 #     painter.checkpoint=runs/amaze_unet_painter/checkpoint_final.pt
@@ -8,7 +8,7 @@ defaults:
   - override /data: amaze
   - override /backbone: amaze_unet
   - override /painter: amaze_unet_controlnet_frozen
-  - override /thinker: mnist
+  - override /thinker: amaze
   - override /translator: controlnet
   - override /condition_encoder: amaze_spatial_v1
   - override /train: mnist_thinker

@@ -37,10 +37,13 @@ def _nproc(env_var: str) -> int:
 
 # ── Paper test spec ──────────────────────────────────────────────────────────
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
-MAZE_SCALES = [3, 5, 7, 9, 11, 13, 16]          # 7 scales, 3×3 … 16×16 (circle: layers)
-MAZE_TEST_PER_SCALE = int(os.environ.get("MAZE_TEST_PER_SCALE", "100"))  # DFS-only → 100 keeps 700/geom, 2800 total
-QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]            # 7 scales
-QUEEN_TEST_PER_SCALE = int(os.environ.get("QUEEN_TEST_PER_SCALE", "50")) # 7 × 50 = 350
+MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
+MAZE_OOD_SCALES = [3]
+MAZE_TEST_PER_SCALE = int(os.environ.get("MAZE_TEST_PER_SCALE", "100"))
+QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
+QUEEN_OOD_SCALES = [12]
+QUEEN_TEST_PER_SCALE = int(os.environ.get("QUEEN_TEST_PER_SCALE", "50"))
+QUEEN_OOD_TEST_PER_SCALE = int(os.environ.get("QUEEN_OOD_TEST_PER_SCALE", "100"))
 
 # ── Train sizes ────────────
 MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
@@ -278,14 +281,12 @@ def ensure_maze_test_combo(shape: str, scale: int) -> None:
 
 
 def ensure_maze_test_shape_all(shape: str) -> Path:
-    """Ensure every scale combo for ``shape`` exists, then merge them into
-    test_maze/{shape}/all_{shape}_test.parquet (skip existing)."""
-    test_scales = MAZE_SCALES + [8]
-    for scale in test_scales:
+    """Generate in-dist + OOD combos for ``shape``; merge only in-dist into all_{shape}_test."""
+    for scale in MAZE_SCALES + MAZE_OOD_SCALES:
         ensure_maze_test_combo(shape, scale)
     all_pq = test_maze_shape_all_file(shape)
     if not all_pq.exists():
-        _merge_parquets([test_maze_combo_file(shape, s) for s in test_scales], all_pq)
+        _merge_parquets([test_maze_combo_file(shape, s) for s in MAZE_SCALES], all_pq)
     return all_pq
 
 
@@ -418,14 +419,14 @@ def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
         raise
 
 
-def ensure_queens_test_scale(scale: int) -> None:
+def ensure_queens_test_scale(scale: int, count: int = QUEEN_TEST_PER_SCALE) -> None:
     """Generate one paper-spec queen test scale file (skip if already present)."""
     target = test_queens_scale_file(scale)
     if target.exists():
         print(f"   test_queens/{target.name} already exists — skip")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    produced, work = _gen_queens_pool(scale, QUEEN_TEST_PER_SCALE, QUEEN_TEST_SEED + scale)
+    produced, work = _gen_queens_pool(scale, count, QUEEN_TEST_SEED + scale)
     try:
         shutil.move(str(produced), str(target))
     finally:
@@ -478,9 +479,11 @@ def ensure_maze_test_all() -> Path:
 
 
 def ensure_queens_test_all() -> Path:
-    """Ensure the full queen test set: per-scale n{n}_test + merged all_test."""
+    """Ensure the full queen test set: in-dist n{n}_test + OOD; merge only in-dist into all_test."""
     for scale in QUEEN_SCALES:
         ensure_queens_test_scale(scale)
+    for scale in QUEEN_OOD_SCALES:
+        ensure_queens_test_scale(scale, QUEEN_OOD_TEST_PER_SCALE)
     all_pq = test_queens_all_file()
     if not all_pq.exists():
         _merge_parquets([test_queens_scale_file(s) for s in QUEEN_SCALES], all_pq)

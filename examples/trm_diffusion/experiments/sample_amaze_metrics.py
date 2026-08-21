@@ -24,9 +24,11 @@ from omegaconf import DictConfig, OmegaConf
 logger = get_logger(__name__, log_level="INFO")
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
-MAZE_SCALES = [3, 5, 7, 8, 9, 11, 13, 16]
+MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
+MAZE_OOD_SCALES = [3]
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]  # circle uses layers, not width/height
 QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
+QUEEN_OOD_SCALES = [12]
 
 
 def _require_test_parquet(parquet: Path, task: str) -> None:
@@ -197,16 +199,15 @@ def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict, sample
 
     try:
         prefix = f"amaze_eval/{task}"
-        overall = result["overall"]
-        for key, val in overall.items():
+        for key, val in result["overall"].items():
             run.summary[f"{prefix}/overall/{key}"] = val
+        for key, val in result.get("overall_ood", {}).items():
+            run.summary[f"{prefix}/overall_ood/{key}"] = val
 
-        # Per-shape tables (with a [generated | condition] image per row) go to
-        # BOTH the JSON (result["per_shape"]) and wandb. maze -> one table per
-        # shape under a distinct key; queens -> a single per-scale table.
         samples = samples or {}
         img_cols = ["group", "generated", "condition",
                     "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
+        metric_cols = ["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
 
         def _img_table(named_pairs):
             t = wandb.Table(columns=img_cols)
@@ -218,26 +219,37 @@ def _log_wandb(cfg: DictConfig, checkpoint: str, task: str, result: dict, sample
                            agg["mse_outside"], agg["pass1"], agg["pass5"])
             return t
 
+        def _metric_table(named_aggs):
+            t = wandb.Table(columns=metric_cols)
+            for name, agg in named_aggs:
+                t.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
+                           agg["mse_outside"], agg["pass1"], agg["pass5"])
+            return t
+
         per_shape = result.get("per_shape")
         per_scale = result.get("per_scale")
         if per_shape:
-            # One table PER SHAPE under a distinct key -> square/hexagon/triangle/circle
-            # never overwrite each other. Each row is a scale with its images.
             for g, by_scale in per_shape.items():
                 rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(f"{g}_{s}")) for s in MAZE_SCALES]
                 run.log({f"{prefix}/{g}_table": _img_table(rows)})
-            # Per-geometry aggregation (scalars + one metrics-only table).
+            for g, by_scale in (result.get("per_shape_ood") or {}).items():
+                rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(f"{g}_{s}")) for s in MAZE_OOD_SCALES]
+                run.log({f"{prefix}/{g}_ood_table": _img_table(rows)})
+
             per_geometry = result.get("per_geometry") or {}
-            gtable = wandb.Table(columns=["geometry", "violation", "coverage",
-                                          "mse_inside", "mse_outside", "pass1", "pass5"])
             for g, agg in per_geometry.items():
                 for key, val in agg.items():
                     run.summary[f"{prefix}/per_geometry/{g}/{key}"] = val
-                gtable.add_data(g, agg["violation"], agg["coverage"], agg["mse_inside"],
-                                agg["mse_outside"], agg["pass1"], agg["pass5"])
-            run.log({f"{prefix}/per_geometry_table": gtable})
+            run.log({f"{prefix}/per_geometry_table": _metric_table([(g, per_geometry[g]) for g in per_geometry])})
+
+            per_geometry_ood = result.get("per_geometry_ood") or {}
+            for g, agg in per_geometry_ood.items():
+                for key, val in agg.items():
+                    run.summary[f"{prefix}/per_geometry_ood/{g}/{key}"] = val
+            run.log({f"{prefix}/per_geometry_ood_table": _metric_table([(g, per_geometry_ood[g]) for g in per_geometry_ood])})
         elif per_scale:
-            rows = [(f"{s}x{s}", per_scale[s], samples.get(s)) for s in per_scale]
+            combined = {**per_scale, **(result.get("per_scale_ood") or {})}
+            rows = [(f"{s}x{s}", combined[s], samples.get(s)) for s in combined]
             run.log({f"{prefix}/per_scale_table": _img_table(rows)})
 
         logger.info(f"wandb: logged {task} metrics into run {run_id} (project {project}).")
@@ -283,19 +295,20 @@ def main(cfg: DictConfig):
     logger.info(f"Sampling with batch_size={sample_batch_size} (K={samples_per_puzzle} attempts/puzzle).")
 
     if task == "maze":
-        per_combo, combo_samples = {}, {}
-        for geometry in MAZE_GEOMETRIES:
-            for scale in MAZE_SCALES:
-                combo = data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
-                _require_test_parquet(combo, "maze")
-                ds = _build_amaze_dataset(cfg, str(combo))
+        def _score_maze(scales):
+            per_combo, combo_samples = {}, {}
+            for geometry in MAZE_GEOMETRIES:
+                for scale in scales:
+                    combo = data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
+                    _require_test_parquet(combo, "maze")
+                    ds = _build_amaze_dataset(cfg, str(combo))
+                    logger.info(f"[maze/{geometry}/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
+                    rows, sample_pair = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
+                    per_combo[f"{geometry}_{scale}"] = rows
+                    combo_samples[f"{geometry}_{scale}"] = sample_pair
+            return per_combo, combo_samples
 
-                logger.info(f"[maze/{geometry}/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
-
-                rows, sample_pair = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
-                per_combo[f"{geometry}_{scale}"] = rows
-                combo_samples[f"{geometry}_{scale}"] = sample_pair
-
+        per_combo, combo_samples = _score_maze(MAZE_SCALES)
         all_rows = [r for rows in per_combo.values() for r in rows]
         per_combo_agg = {k: _aggregate(v) for k, v in per_combo.items()}
         per_geometry = {
@@ -304,52 +317,73 @@ def main(cfg: DictConfig):
         }
         overall = _aggregate(all_rows)
 
-        # Per-shape breakdown: one table per geometry, one row per scale.
+        ood_combo, ood_samples = _score_maze(MAZE_OOD_SCALES)
+        ood_combo_agg = {k: _aggregate(v) for k, v in ood_combo.items()}
+        per_geometry_ood = {
+            g: _aggregate([r for s in MAZE_OOD_SCALES for r in ood_combo[f"{g}_{s}"]])
+            for g in MAZE_GEOMETRIES
+        }
+        overall_ood = _aggregate([r for rows in ood_combo.values() for r in rows])
+
         for g in MAZE_GEOMETRIES:
             _print_metrics_table(
                 f"Maze — {g} (per scale)",
                 [(f"{s}x{s}", per_combo_agg[f"{g}_{s}"]) for s in MAZE_SCALES],
             )
-        # Per-geometry aggregation (over all scales).
-        _print_metrics_table("Maze — per geometry", [(g, per_geometry[g]) for g in MAZE_GEOMETRIES])
-        # Overall.
-        _print_metrics_row("Maze (Continuous) — overall, 4 geometries x 7 scales", overall)
+        _print_metrics_table("Maze — per geometry (general)", [(g, per_geometry[g]) for g in MAZE_GEOMETRIES])
+        _print_metrics_row("Maze — overall general (7 scales)", overall)
+        _print_metrics_table("Maze — per geometry OOD (3x3)", [(g, per_geometry_ood[g]) for g in MAZE_GEOMETRIES])
+        _print_metrics_row("Maze — overall OOD (3x3)", overall_ood)
 
-        # Nested per-shape tables (shape -> scale -> metrics): stored as distinct
-        # tables in the JSON and, later, as distinct wandb tables per shape.
         per_shape = {
             g: {str(s): per_combo_agg[f"{g}_{s}"] for s in MAZE_SCALES}
             for g in MAZE_GEOMETRIES
         }
+        per_shape_ood = {
+            g: {str(s): ood_combo_agg[f"{g}_{s}"] for s in MAZE_OOD_SCALES}
+            for g in MAZE_GEOMETRIES
+        }
         result = {
-            "task": "maze", "overall": overall,
-            "per_shape": per_shape, "per_geometry": per_geometry,
+            "task": "maze", "overall": overall, "overall_ood": overall_ood,
+            "per_shape": per_shape, "per_shape_ood": per_shape_ood,
+            "per_geometry": per_geometry, "per_geometry_ood": per_geometry_ood,
             "n_puzzles": len(all_rows),
         }
-        samples = combo_samples
+        samples = {**combo_samples, **ood_samples}
 
     else:
-        per_scale, scale_samples = {}, {}
-        for scale in QUEEN_SCALES:
-            combo = data_root / "test_queens" / f"n{scale}_test.parquet"
-            _require_test_parquet(combo, "queens")
-            ds = _build_amaze_dataset(cfg, str(combo))
+        def _score_queens(scales):
+            per_scale, scale_samples = {}, {}
+            for scale in scales:
+                combo = data_root / "test_queens" / f"n{scale}_test.parquet"
+                _require_test_parquet(combo, "queens")
+                ds = _build_amaze_dataset(cfg, str(combo))
+                logger.info(f"[queens/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
+                rows, sample_pair = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
+                per_scale[str(scale)] = rows
+                scale_samples[str(scale)] = sample_pair
+            return per_scale, scale_samples
 
-            logger.info(f"[queens/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
-
-            rows, sample_pair = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
-            per_scale[str(scale)] = rows
-            scale_samples[str(scale)] = sample_pair
-
+        per_scale, scale_samples = _score_queens(QUEEN_SCALES)
         all_rows = [r for rows in per_scale.values() for r in rows]
         overall = _aggregate(all_rows)
         per_scale_agg = {s: _aggregate(rows) for s, rows in per_scale.items()}
 
-        _print_metrics_table("Queen — per scale", [(f"{s}x{s}", per_scale_agg[s]) for s in per_scale_agg])
-        _print_metrics_row("Queen (Discrete) — overall, 7 scales (4..10)", overall)
+        ood_scale, ood_samples = _score_queens(QUEEN_OOD_SCALES)
+        overall_ood = _aggregate([r for rows in ood_scale.values() for r in rows])
+        ood_scale_agg = {s: _aggregate(rows) for s, rows in ood_scale.items()}
 
-        result = {"task": "queens", "overall": overall, "per_scale": per_scale_agg, "n_puzzles": len(all_rows)}
-        samples = scale_samples
+        _print_metrics_table("Queen — per scale", [(f"{s}x{s}", per_scale_agg[s]) for s in per_scale_agg])
+        _print_metrics_row("Queen — overall general (4..10)", overall)
+        _print_metrics_table("Queen — OOD per scale", [(f"{s}x{s}", ood_scale_agg[s]) for s in ood_scale_agg])
+        _print_metrics_row("Queen — overall OOD (12x12)", overall_ood)
+
+        result = {
+            "task": "queens", "overall": overall, "overall_ood": overall_ood,
+            "per_scale": per_scale_agg, "per_scale_ood": ood_scale_agg,
+            "n_puzzles": len(all_rows),
+        }
+        samples = {**scale_samples, **ood_samples}
 
     result["checkpoint"] = str(checkpoint)
     result["step"] = step

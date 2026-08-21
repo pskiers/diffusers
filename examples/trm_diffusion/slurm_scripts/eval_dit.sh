@@ -25,8 +25,8 @@ DIT_CKPT="${2:?need the DiT checkpoint path as arg 2}"
 WANDB_PROJECT="${WANDB_PROJECT:-${3:-amaze}}"
 
 case "${TASK}" in
-  queens) EXP=amaze_dit_queens_v3 ;;
-  maze)   EXP=amaze_dit_maze_v3 ;;
+  queens) EXP=amaze_dit_queens ;;
+  maze)   EXP=amaze_dit_maze ;;
   *) echo "TASK must be 'queens' or 'maze', got '${TASK}'" >&2; exit 1 ;;
 esac
 

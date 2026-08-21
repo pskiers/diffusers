@@ -1,9 +1,9 @@
 # @package _global_
-# Standalone (no-TRM) diffusion baseline for MAZE — "V3" data regime: ALL shapes
+# Standalone (no-TRM) diffusion baseline for MAZE: ALL shapes
 # (square, hexagon, triangle, circle) x ALL sizes. Pixel-space pure DiT
 # conditioned on the puzzle image by channel concat (Palette/SR3 style), CFG off.
 # Usage:
-#   python train_trm.py experiment=amaze_dit_maze_v3 \
+#   python train_trm.py experiment=amaze_dit_maze \
 #     data.amaze_root=data/amaze/train_maze/all_train_size144
 defaults:
   - override /data: amaze
@@ -26,4 +26,4 @@ eval:
   batch_size: 128
 
 run:
-  output_dir: "runs/amaze_dit_maze_v3"
+  output_dir: "runs/amaze_dit_maze"

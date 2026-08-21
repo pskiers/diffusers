@@ -1,8 +1,8 @@
 # @package _global_
-# Standalone (no-TRM) diffusion baseline for QUEENS — "V3".
+# Standalone (no-TRM) diffusion baseline for QUEENS.
 # Pixel-space pure DiT conditioned on the puzzle image by channel concat, trained on the multi-scale queens mix (n=4..10).
 # Usage:
-#   python train_trm.py experiment=amaze_dit_queens_v3 \
+#   python train_trm.py experiment=amaze_dit_queens \
 #     data.amaze_root=data/amaze/train_queens/all_train_size144
 defaults:
   - override /data: amaze
@@ -25,4 +25,4 @@ eval:
   batch_size: 128
 
 run:
-  output_dir: "runs/amaze_dit_queens_v3"
+  output_dir: "runs/amaze_dit_queens"

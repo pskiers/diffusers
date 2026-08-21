@@ -1,8 +1,5 @@
 # @package _global_
-# Stage 2: TRM thinker (V2, ControlNet) with a frozen Amaze UNet painter.
-# V2 = multi-scale queens (n=4..10): the TRM reasons on a 12x12 = 144-token grid
-# (cell_size=12 -> condition encoder pools 144/12 = 12 per side) instead of V1's
-# 7x7 = 49. Pair with a painter trained on the same multi-scale mix (Painter V2).
+# TRM thinker (V2, ControlNet) with a frozen Amaze UNet painter.
 # Usage:
 #   python train_trm.py experiment=amaze_thinker_v2_controlnet \
 #     data.amaze_root=data/amaze/train_queens/all_train_size144 \
@@ -12,7 +9,7 @@ defaults:
   - override /data: amaze
   - override /backbone: amaze_unet
   - override /painter: amaze_unet_controlnet_frozen
-  - override /thinker: mnist
+  - override /thinker: amaze
   - override /translator: controlnet
   - override /condition_encoder: amaze_spatial_v1
   - override /train: mnist_thinker
