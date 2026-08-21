@@ -2,42 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Metrics Functions for Maze Generation
+Metrics Functions for Maze Generation 
 
 This module implements three types of metrics functions for evaluating maze generation:
 
 """
 
 import os
-from typing import Dict, List, Tuple, Union
-
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from typing import List, Dict, Union, Tuple
+import skimage.metrics
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
-
 # 由 infer_bagel 根据 config.is_circle 设置（config/maze.py 或 infer_auto.sh 传入）
 IS_CIRCLE = False
-
-# ── Local modifications (TRM-diffusion vendoring) ────────────────────────────
-# Vendored from the AMAZE benchmark repo (infer/maze_metrics.py). Two changes vs upstream:
-#   1. Info/debug prints are gated behind AMAZE_METRICS_VERBOSE=1 (upstream
-#      prints per-sample debug for every image, unusable in a training eval
-#      loop); error prints remain unconditional.
-#   2. Per-sample debug image dumps written to the CWD (sing_img.jpg,
-#      gener.jpg, reference.jpg, mask.jpg, sl_.jpg, bg_.jpg, pt_*.jpg)
-#      were removed.
-VERBOSE = os.environ.get("AMAZE_METRICS_VERBOSE", "0") == "1"
-
-
-def _vprint(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
-
 
 def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     """
@@ -513,16 +496,19 @@ class MazeRewardFunction:
                 #print(reference_maze.shape)
                 # target_h, target_w = reference_maze.shape[0], reference_maze.shape[1]
                 generated_image = torch.tensor(np.array(generated_image))
+                Image.fromarray(generated_image.numpy().transpose(1, 2, 0).astype(np.uint8)).save("gener.jpg") 
                 #generated_image = generated_image.resize(target_h, target_w)
                 # print("generated_image shape: ", generated_image.shape)
                 # 1. 转换reference_maze为tensor
                 reference_tensor =torch.tensor(np.array(reference_solution).transpose(2, 0, 1)) # self._convert_to_tensor(reference_maze, target_size=(target_h, target_w))
+                Image.fromarray(reference_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)).save("reference.jpg") 
                 # print("reference_tensor shape: ", reference_tensor.shape)
                 #if generated_image.device != reference_tensor.device:
                  #   reference_tensor = reference_tensor.to(generated_image.device)
                 #print(mask_tensor.shape)
                 # 2. 处理mask HWC
                 mask_tensor = torch.tensor(np.array(solution_mask).transpose(2,0,1))#self._convert_to_tensor(solution_mask, target_size=(target_h, target_w))
+                Image.fromarray(mask_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)).save("mask.jpg") 
                 # print("mask_tensor shape: ", mask_tensor.shape)
                 #if generated_image.device != mask_tensor.device:
                 #    mask_tensor = mask_tensor.to(generated_image.device)
@@ -641,7 +627,7 @@ class MazeRewardFunction:
             GT cell coverage (0-1, higher is better)
         """
         if solution_mask is None:
-            _vprint("  错误: solution_mask必须提供")
+            print("  错误: solution_mask必须提供")
             return 0.0
 
         try:
@@ -654,13 +640,13 @@ class MazeRewardFunction:
                 metadata = metadata_json
 
             if 'path_cell_ids' not in metadata or len(metadata['path_cell_ids']) == 0:
-                _vprint("  警告: metadata中没有path_cell_ids")
+                print("  警告: metadata中没有path_cell_ids")
                 return 0.0
 
             gt_cell_ids = set(metadata['path_cell_ids'])
             gt_cell_count = len(gt_cell_ids)
-            _vprint(f"  GT路径经过的cell数量: {gt_cell_count}")
-            _vprint(f"  GT cell IDs: {sorted(gt_cell_ids)}")  # 只显示前10个
+            print(f"  GT路径经过的cell数量: {gt_cell_count}")
+            print(f"  GT cell IDs: {sorted(gt_cell_ids)}")  # 只显示前10个
 
             # 2. 解码cell_map
             # cell_ids_array = cell_map_tensor = self._convert_to_tensor(cell_map)
@@ -673,11 +659,13 @@ class MazeRewardFunction:
             
             solution_mask = torch.tensor(np.array(solution_mask).transpose(2, 0, 1)) #HWC-CHW
             
+            Image.fromarray(solution_mask.numpy().transpose(1,2, 0).astype(np.uint8)).save("sl_.jpg")  #CHW-HWC
             
             result_img_tensor = (generated_image * ((solution_mask > 0).float())) # CHW
             # Image.fromarray(generated_image.numpy().transpose(2,1, 0).astype(np.uint8)).save("gener.jpg") 
             result_img = result_img_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)
 
+            Image.fromarray(result_img_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)).save("bg_.jpg")
 
             
             # 5. 使用extract_blue_path提取蓝色路径
@@ -685,6 +673,7 @@ class MazeRewardFunction:
             generated_tensor_resized = result_img_tensor.numpy().transpose(1, 2, 0).astype(np.uint8) # HWC
             blue_path_mask = extract_blue_path(generated_tensor_resized)
 
+            Image.fromarray(np.stack([blue_path_mask * 255] * 3, axis=2).astype(np.uint8)).save("pt_.jpg")
 
             kernel = np.ones((3, 3), dtype=np.uint8)
             image = cv2.erode((blue_path_mask * 255).astype(np.uint8), kernel, iterations=1)
@@ -693,6 +682,7 @@ class MazeRewardFunction:
             # Image.fromarray(np.stack([image] * 3, axis=2).astype(np.uint8)).save("pt_erode.jpg")
 
             image = cv2.dilate(image, kernel, iterations=1)
+            Image.fromarray(np.stack([image] * 3, axis=2).astype(np.uint8)).save("pt_restore.jpg")
 
             path_binary = mask_binary = blue_path_mask = (image > 0).astype(np.uint8)
 
@@ -715,7 +705,7 @@ class MazeRewardFunction:
 #            # #print(f"  路径像素总数: {np.sum(path_binary)}")
 
             if np.sum(path_binary) == 0:
-                _vprint("  警告: 没有检测到路径像素")
+                print("  警告: 没有检测到路径像素")
                 return 0.0
 
             # 获取路径尺寸和所有路径点（在try外面定义，以便fallback使用）
@@ -723,7 +713,7 @@ class MazeRewardFunction:
             path_points = np.where(path_binary > 0)
 
             if len(path_points[0]) == 0:
-                _vprint("  警告: 没有路径点")
+                print("  警告: 没有路径点")
                 return 0.0
 
             all_path_coords = set(zip(path_points[0], path_points[1]))
@@ -733,7 +723,7 @@ class MazeRewardFunction:
 
             # 5. 提取BFS遍历路径经过的cell IDs
             if len(visited) == 0:
-                _vprint("  警告: BFS未找到路径像素")
+                print("  警告: BFS未找到路径像素")
                 return 0.0
 
             # 从visited中提取所有坐标
@@ -750,8 +740,8 @@ class MazeRewardFunction:
             # 移除0（背景ID）
             path_cell_ids.discard(0)
 
-            _vprint(f"  生成路径经过的cell数量: {len(path_cell_ids)}")
-            _vprint(f"  生成路径cell IDs前10个: {sorted(path_cell_ids)}")
+            print(f"  生成路径经过的cell数量: {len(path_cell_ids)}")
+            print(f"  生成路径cell IDs前10个: {sorted(path_cell_ids)}")
 
             # 6. 计算与GT cell IDs的交集
             covered_gt_cells = gt_cell_ids.intersection(path_cell_ids)
@@ -883,7 +873,7 @@ class MazeRewardFunction:
             Background violation ratio (0-1, lower is better, so will use -1 weight)
         """
         if solution_mask is None or original_img is None:
-            _vprint("  错误: solution_mask和original_img都必须提供")
+            print("  错误: solution_mask和original_img都必须提供")
             return 1.0
 
         try:
@@ -897,7 +887,7 @@ class MazeRewardFunction:
                 metadata = metadata_json
 
             if 'path_cell_ids' not in metadata or len(metadata['path_cell_ids']) == 0:
-                _vprint("  警告: metadata中没有path_cell_ids")
+                print("  警告: metadata中没有path_cell_ids")
                 return 1.0
 
             gt_cell_ids = set(metadata['path_cell_ids'])
@@ -968,7 +958,7 @@ class MazeRewardFunction:
      #       print(f"  非解空间区域的路径像素数: {violation_pixels}")
             
             if violation_pixels == 0:
-                _vprint("  没有违规路径，返回0.0")
+                print("  没有违规路径，返回0.0")
                 return 0.0
             
             # 7. 使用BFS遍历违规路径，统计经过的格子
@@ -1029,7 +1019,7 @@ class MazeRewardFunction:
             #print(f"  总背景格子数: {total_background_cells}")
             
             if total_background_cells == 0:
-                _vprint("  警告: 没有背景格子")
+                print("  警告: 没有背景格子")
                 return 0.0
             
             # 10. 计算违规比例
@@ -1097,12 +1087,12 @@ class MazeRewardFunction:
                     img_height = image_size.get('height', None)
                     if img_width is not None and img_height is not None:
                         target_size = (img_height, img_width)  # (H, W)
-                        _vprint(f"[Sample {i}] Using image_size from metadata: {target_size} (H, W)")
+                        print(f"[Sample {i}] Using image_size from metadata: {target_size} (H, W)")
                 
                 # 如果没有image_size，使用默认值（保持向后兼容）
                 if target_size is None:
                     target_size = (1024, 1024)
-                    _vprint(f"[Sample {i}] Warning: No image_size in metadata, using default: {target_size}")
+                    print(f"[Sample {i}] Warning: No image_size in metadata, using default: {target_size}")
                 
                 
                 # Get reference images (can be PIL Images, tensors, or file paths)
@@ -1151,6 +1141,7 @@ class MazeRewardFunction:
                 sing_img = cv2.resize(sing_img.numpy().transpose(1, 2, 0), (target_size[1], target_size[0]), interpolation=cv2.INTER_CUBIC)
                 sing_img = torch.tensor(sing_img.transpose(2, 0,1))  # HWC -> CHW
                 # print("1.", sing_img.shape)
+                Image.fromarray(sing_img.numpy().transpose(1, 2, 0).astype(np.uint8)).save("sing_img.jpg")
 
                 mse_in, mse_out = self.compute_solution_space_reward(
                     sing_img, ori_image_tensor, solution_ref_tensor, solution_mask
@@ -1169,11 +1160,11 @@ class MazeRewardFunction:
                     cell_coverage_reward = self.compute_gt_cell_coverage_reward(
                         sing_img, cell_map, metadata_json, solution_mask, solution_ref_tensor, sample_index=i
                     )
-                    _vprint(f"格子内reward：{cell_coverage_reward}")
+                    print(f"格子内reward：{cell_coverage_reward}")
                     if cell_coverage_reward < 0:
-                       _vprint("生成乱码图像，格子内reward返回-1")
+                       print("生成乱码图像，格子内reward返回-1")
                 else:
-                    _vprint(f"  样本 {i}: 缺少cell_map，跳过第三个reward")
+                    print(f"  样本 {i}: 缺少cell_map，跳过第三个reward")
 
                 # 第四个reward：计算背景违规比例
                 background_violation_reward = 0.0
@@ -1187,9 +1178,9 @@ class MazeRewardFunction:
                         sing_img, cell_map, metadata_json, solution_mask, 
                         sol_img=solution_ref, original_img=ori_image, sample_index=i
                     )
-                    _vprint(f"格子外reward：{background_violation_reward}")
+                    print(f"格子外reward：{background_violation_reward}")
                 else:
-                    _vprint(f"  样本 {i}: 缺少cell_map，跳过第四个reward")
+                    print(f"  样本 {i}: 缺少cell_map，跳过第四个reward")
 
                 # --- 修改：存储 MSE ---
                 mse_inside_scores[i] = mse_in

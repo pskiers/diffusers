@@ -11,3 +11,8 @@ third_party/amaze/mazes-generator/node_modules/
 !third_party/amaze/mazes-generator/maze-config.json
 !third_party/amaze/mazes-generator/js/lib/
 !third_party/amaze/mazes-generator/js/lib/*.js
+
+# Vendored base model repos (cloned by setup_ft_code.sh). The AMAZE fine-tuning
+# glue (sft/, infer/, data/) IS committed; these huge base repos are not.
+third_party/amaze/sft/bagel/Bagel/
+third_party/amaze/sft/janus/Janus/
