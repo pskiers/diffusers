@@ -1,0 +1,21 @@
+# Conditional MNIST-Sudoku UNet, ~20M params -- a smaller sibling of
+# mnist_unet_concat_big.yaml (81.7M), for parameter-count ablations. Same
+# 4-level/channel-concat/2-attention-level shape, just narrower channels.
+# Measured: 19.2M params.
+_target_: diffusers.UNet2DModel
+sample_size: 144
+in_channels: 2   # 1 noisy image + 1 given-cells condition (channel-concat)
+out_channels: 1
+block_out_channels: [64, 128, 192, 224]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2
