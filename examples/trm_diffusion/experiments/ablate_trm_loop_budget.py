@@ -45,6 +45,22 @@ is untouched):
              regression quality in isolation (no sampling required), and
              experiments/eval_halt_step_profile.py for the real per-sample
              step distribution broken out per denoising step.
+  t_n      — sweep H_cycles (T) and L_cycles (n) independently at sampling
+             only, holding n_sup at the trained default (or
+             ablation.t_n_n_sup if set). Works uniformly on any model
+             exposing forward_with_carry with H_cycles/L_cycles overrides —
+             both ThinkerFrozenPainterBase (reasoner = model.thinker) and
+             TRMDiffusionBackbone (reasoner = model itself). This is
+             experiment D1's "sweep N_sup (and separately T, n)" axis; run
+             "static" for the N_sup half and this axis for the T/n half,
+             then plot both against total reasoner L-level calls
+             (n_sup * H_cycles * L_cycles, x2 under CFG) on one shared
+             x-axis, together with the same sweep run against the other
+             checkpoint (Painter-Thinker vs. TRM-alone), for direct
+             comparison. ablation.t_values sweeps H_cycles (L_cycles held
+             at the reasoner's trained default); ablation.n_values sweeps
+             L_cycles (H_cycles held at the trained default).
+
   skip_reuse — goes further than "halt": below ablation.skip_t_cutoffs
              (an actual diffusion timestep t, not a step index), a
              denoising step may skip reasoning ENTIRELY and reuse the
@@ -127,6 +143,13 @@ Usage:
       checkpoint=runs/mnist_thinker_x0hint_v1_80/checkpoint_with_halt_head.pt \\
       +ablation.axes=[skip_reuse] +ablation.skip_t_cutoffs=[0,20,35,50] \\
       +ablation.skip_halt_threshold=0.0002
+
+    # D1's T/n sweep, on either checkpoint type (Painter-Thinker shown here;
+    # for TRM-alone just swap experiment=/checkpoint= to the
+    # TRMDiffusionBackbone run — the axis works identically on both):
+    python experiments/ablate_trm_loop_budget.py \\
+      experiment=mnist_thinker_v1_controlnet ... checkpoint=... \\
+      +ablation.axes=[t_n] +ablation.t_values=[1,2,3,4,6] +ablation.n_values=[2,4,6,8,12]
 
 Config overrides work exactly like train_trm.py / eval.py.
 """
@@ -271,7 +294,12 @@ def _run_ablation_sampling(
     cfg_scale: float,
     n_sup_fn: Callable[[int, int, int], int],
     reset_fn: Callable[[int], bool],
+    H_cycles: Optional[int] = None,
+    L_cycles: Optional[int] = None,
 ) -> torch.Tensor:
+    """H_cycles/L_cycles: constant override for the whole trajectory (used
+    by the "t_n" axis); None (the default) leaves the reasoner's trained
+    config values in place, matching every other axis's behavior."""
     device = x_init.device
     model.scheduler.set_timesteps(num_inference_steps, device=device)
     x = x_init.clone()
@@ -289,12 +317,16 @@ def _run_ablation_sampling(
             z_H_c = z_L_c = None
             z_H_u = z_L_u = None
 
-        pred_c, z_H_c, z_L_c = model.forward_with_carry(step_sample, z_H_c, z_L_c, n_sup=n_sup)
+        pred_c, z_H_c, z_L_c = model.forward_with_carry(
+            step_sample, z_H_c, z_L_c, n_sup=n_sup, H_cycles=H_cycles, L_cycles=L_cycles
+        )
         noise_pred = pred_c.pred
 
         if cfg_scale != 1.0:
             null_sample = model.null_condition_sample(step_sample)
-            pred_u, z_H_u, z_L_u = model.forward_with_carry(null_sample, z_H_u, z_L_u, n_sup=n_sup)
+            pred_u, z_H_u, z_L_u = model.forward_with_carry(
+                null_sample, z_H_u, z_L_u, n_sup=n_sup, H_cycles=H_cycles, L_cycles=L_cycles
+            )
             noise_pred = pred_u.pred + cfg_scale * (noise_pred - pred_u.pred)
 
         x = model.scheduler.step(noise_pred, t, x).prev_sample
@@ -305,6 +337,17 @@ def _run_ablation_sampling(
 def _total_sup_calls(n_sup_fn: Callable[[int, int, int], int], num_steps: int, cfg_scale: float) -> int:
     total = sum(n_sup_fn(i, 0, 0) for i in range(num_steps))
     return total * (2 if cfg_scale != 1.0 else 1)
+
+
+def _total_reasoner_calls(n_sup: int, H_cycles: int, L_cycles: int, num_steps: int, cfg_scale: float) -> int:
+    """Total L-level calls across the whole sampling trajectory: each of the
+    n_sup outer iterations runs H_cycles*L_cycles L-level steps (see
+    SpatialTRM.reasoning_step's H_cycles-1 no-grad + 1 graded-cycle split),
+    repeated at every denoising step, x2 under CFG (both branches reason).
+    Used by the "t_n" axis, where H_cycles/L_cycles vary — total_sup_calls
+    alone (a plain n_sup count) would silently under-report compute there."""
+    per_denoise_step = n_sup * H_cycles * L_cycles
+    return per_denoise_step * num_steps * (2 if cfg_scale != 1.0 else 1)
 
 
 @torch.no_grad()
@@ -377,13 +420,16 @@ def _run_config(
     cfg_scale: float,
     n_sup_fn: Callable[[int, int, int], int],
     reset_fn: Callable[[int], bool],
+    H_cycles: Optional[int] = None,
+    L_cycles: Optional[int] = None,
 ) -> dict:
     all_cell, all_puzzle, all_constraint, all_given_consistent = [], [], [], []
     t0 = time.time()
 
     for cb in cached_batches:
         x = _run_ablation_sampling(
-            model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale, n_sup_fn, reset_fn
+            model, cb["conditions"], cb["x_init"], num_inference_steps, cfg_scale, n_sup_fn, reset_fn,
+            H_cycles=H_cycles, L_cycles=L_cycles,
         )
         generated = model.decode_for_eval(x)
         acc = evaluate_grids(generated, cb["solutions"], classifier, cell_size, given_masks=cb["given_masks"])
@@ -532,7 +578,8 @@ def _run_skip_reuse_sampling(
             and prev_logits_c is not None
         )
         if can_skip and use_head_gate:
-            can_skip = bool((model.thinker.predict_halt_value(z_H_c).mean() <= pred_skip_threshold).item())
+            reasoner = getattr(model, "thinker", model)
+            can_skip = bool((reasoner.predict_halt_value(z_H_c).mean() <= pred_skip_threshold).item())
 
         if can_skip:
             noise_pred = model.run_painter(step_sample, prev_logits_c)
@@ -671,6 +718,9 @@ def main(cfg: DictConfig):
     skip_halt_threshold: float = ab.get("skip_halt_threshold", 0.0002)
     skip_use_head_gate: bool = ab.get("skip_use_head_gate", False)
     skip_pred_skip_threshold: float = ab.get("skip_pred_skip_threshold", 0.0)
+    t_values: Optional[list] = list(ab["t_values"]) if "t_values" in ab else None
+    n_values: Optional[list] = list(ab["n_values"]) if "n_values" in ab else None
+    t_n_n_sup: Optional[int] = ab.get("t_n_n_sup", None)
     out_path: str = ab.get("out", str(Path(checkpoint).parent / "loop_budget_ablation.json"))
 
     if "schedule" in axes and schedule_flat_n is None:
@@ -718,10 +768,17 @@ def main(cfg: DictConfig):
     classifier = sudoku_cb.eval_clf
     cell_size = sudoku_cb.cell_size
 
+    # reasoner: the TRM whose config/halt-head we inspect below.
+    # ThinkerFrozenPainterBase nests it at model.thinker; TRMDiffusionBackbone
+    # IS the reasoner (it subclasses SpatialTRM directly), so model itself
+    # exposes inner.config/with_halt_head/predict_halt_value.
+    reasoner = getattr(model, "thinker", model)
+    trained_H_cycles = reasoner.inner.config.H_cycles
+    trained_L_cycles = reasoner.inner.config.L_cycles
+
     logger.info(
         f"cfg_scale={cfg_scale}  num_inference_steps={num_inference_steps}  "
-        f"trained n_sup={model.n_sup}  H_cycles={model.thinker.inner.config.H_cycles}  "
-        f"L_cycles={model.thinker.inner.config.L_cycles}"
+        f"trained n_sup={model.n_sup}  H_cycles={trained_H_cycles}  L_cycles={trained_L_cycles}"
     )
 
     cached_batches = _build_cached_batches(model, eval_dl, device, num_samples, seed)
@@ -776,8 +833,40 @@ def main(cfg: DictConfig):
             results[key]["schedule"] = sched
             logger.info(f"  → {results[key]}")
 
+    if "t_n" in axes:
+        flat_n_sup = t_n_n_sup if t_n_n_sup is not None else model.n_sup
+
+        def _default_spread(v: int) -> list[int]:
+            return sorted({max(1, v // 2), v, v * 2, v * 3})
+
+        for H in t_values if t_values is not None else _default_spread(trained_H_cycles):
+            key = f"t_n/H_cycles={H}/L_cycles={trained_L_cycles}(default)/n_sup={flat_n_sup}"
+            logger.info(f"Running {key} ...")
+            results[key] = _run_config(
+                model, classifier, cell_size, cached_batches, num_inference_steps, cfg_scale,
+                _make_n_sup_fn([flat_n_sup] * num_inference_steps), _make_reset_fn(1),
+                H_cycles=H, L_cycles=trained_L_cycles,
+            )
+            results[key]["total_reasoner_calls"] = _total_reasoner_calls(
+                flat_n_sup, H, trained_L_cycles, num_inference_steps, cfg_scale
+            )
+            logger.info(f"  → {results[key]}")
+
+        for L in n_values if n_values is not None else _default_spread(trained_L_cycles):
+            key = f"t_n/H_cycles={trained_H_cycles}(default)/L_cycles={L}/n_sup={flat_n_sup}"
+            logger.info(f"Running {key} ...")
+            results[key] = _run_config(
+                model, classifier, cell_size, cached_batches, num_inference_steps, cfg_scale,
+                _make_n_sup_fn([flat_n_sup] * num_inference_steps), _make_reset_fn(1),
+                H_cycles=trained_H_cycles, L_cycles=L,
+            )
+            results[key]["total_reasoner_calls"] = _total_reasoner_calls(
+                flat_n_sup, trained_H_cycles, L, num_inference_steps, cfg_scale
+            )
+            logger.info(f"  → {results[key]}")
+
     if "halt" in axes:
-        if not getattr(model.thinker, "with_halt_head", False):
+        if not getattr(reasoner, "with_halt_head", False):
             raise SystemExit(
                 "ablation.axes includes 'halt' but the model was built without a halt head — "
                 "add thinker.with_halt_head=true and point checkpoint= at a checkpoint produced "
@@ -794,7 +883,7 @@ def main(cfg: DictConfig):
                 logger.info(f"  → {results[key]}")
 
     if "skip_reuse" in axes:
-        if not getattr(model.thinker, "with_halt_head", False):
+        if not getattr(reasoner, "with_halt_head", False):
             raise SystemExit(
                 "ablation.axes includes 'skip_reuse' but the model was built without a halt head — "
                 "add thinker.with_halt_head=true and point checkpoint= at a checkpoint produced "
