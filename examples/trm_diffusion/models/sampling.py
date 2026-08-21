@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
@@ -181,6 +181,28 @@ class LinearSchedule:
         return self.noisy_end + (self.clean_end - self.noisy_end) * (1.0 - t / T)
 
 
+# ── Trajectory capture ────────────────────────────────────────────
+
+
+@dataclass
+class TrajectoryRecorder:
+    """Opt-in capture of intermediate denoising states during sampling.
+
+    steps:      inference-step indices (0-based, in scheduler order) to record;
+                None records every step.
+    capture_xt: also store the noisy latent x_t (prev_sample), not just the
+                running x0 estimate (pred_original_sample).
+    records:    filled during sampling — one dict per captured step with keys
+                {"step", "t", "x0_pred"[, "x_t"]}; tensors are (B, C, H, W) on CPU.
+    """
+    steps: Optional[set] = None
+    capture_xt: bool = False
+    records: list = field(default_factory=list)
+
+    def wants(self, i: int) -> bool:
+        return self.steps is None or i in self.steps
+
+
 # ── SamplingPipeline ──────────────────────────────────────────────────────────
 
 
@@ -237,6 +259,7 @@ class SamplingPipeline:
         conditions: DataSample,
         device: torch.device,
         generator: Optional[torch.Generator] = None,
+        recorder: Optional[TrajectoryRecorder] = None,
     ) -> Tensor:
         """Denoise one pre-batched DataSample using the model's scheduler.
 
@@ -247,6 +270,8 @@ class SamplingPipeline:
                         set per step by this method.
             device:     target device.
             generator:  optional RNG for reproducible initial noise.
+            recorder:   optional TrajectoryRecorder; when given, intermediate
+                        denoising states are appended to recorder.records.
 
         Returns:
             (B, C, H, W) denoised output tensor on device.
@@ -258,11 +283,20 @@ class SamplingPipeline:
         model.scheduler.set_timesteps(self.num_inference_steps, device=device)
         x = torch.randn(shape, device=device, generator=generator)
 
-        for t in model.scheduler.timesteps:
+        for i, t in enumerate(model.scheduler.timesteps):
             t_batch = t.expand(B).to(device)
             step_sample = dataclasses.replace(conditions, x_noisy=x, timesteps=t_batch)
             noise_pred = self.predictor.predict(model, step_sample, int(t.item()), T)
-            x = model.scheduler.step(noise_pred, t, x).prev_sample
+            step_out = model.scheduler.step(noise_pred, t, x)
+            x = step_out.prev_sample
+            if recorder is not None and recorder.wants(i):
+                x0_pred = getattr(step_out, "pred_original_sample", None)
+                recorder.records.append({
+                    "step": i,
+                    "t": int(t.item()),
+                    "x0_pred": (x0_pred if x0_pred is not None else x).detach().cpu(),
+                    **({"x_t": x.detach().cpu()} if recorder.capture_xt else {}),
+                })
 
         return x
 
