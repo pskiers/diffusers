@@ -376,7 +376,7 @@ class LatentSpatialDiT(nn.Module):
         ]
 
     def compile_submodules(self):
-        self.dit = torch.compile(self.dit)
+        self.dit = torch.compile(self.dit, dynamic=False)
 
     @torch.no_grad()
     def _encode(self, images: torch.Tensor) -> torch.Tensor:

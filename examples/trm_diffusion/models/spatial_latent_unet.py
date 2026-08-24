@@ -229,7 +229,7 @@ class SpatialLatentUNet(nn.Module):
         ]
 
     def compile_submodules(self):
-        self.unet = torch.compile(self.unet)
+        self.unet = torch.compile(self.unet, dynamic=False)
 
     def _trainable_params(self):
         return list(self.unet.parameters()) + list(self.cond_encoder.parameters())
