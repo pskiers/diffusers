@@ -42,6 +42,10 @@ if [[ "${BACKEND}" != "dummy" ]]; then
   : "${CHECKPOINT:?set CHECKPOINT to the FT model dir for backend ${BACKEND}}"
   GEN_ARGS+=( --checkpoint "${CHECKPOINT}" )
 fi
+if [[ "${BACKEND}" == "bagel" ]]; then
+  : "${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to the base BAGEL-7B-MoT snapshot dir}"
+  GEN_ARGS+=( --bagel-model-path "${BAGEL_MODEL_PATH}" )
+fi
 
 module load CUDA/12.4.0
 module load GCCcore/14.3.0 nodejs/22.17.1

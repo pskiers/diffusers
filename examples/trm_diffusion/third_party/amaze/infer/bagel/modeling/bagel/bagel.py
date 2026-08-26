@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from turtle import position
 from typing import List, Tuple, Optional
 import math
 import random
