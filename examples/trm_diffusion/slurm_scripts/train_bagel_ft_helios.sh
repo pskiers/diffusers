@@ -81,9 +81,14 @@ def tolerate(src, fn):
             depth -= 1
         i += 1
     close = i - 1  # index of the signature's closing ")"
-    if "**" in src[m.end():close]:
+    sig = src[m.end():close]
+    if "**" in sig:
         return src  # already accepts **kwargs
-    return src[:close] + ", **_lora_kwargs" + src[close:]
+    # insert after the last real char; respect a trailing comma to avoid ", , **kwargs"
+    stripped = sig.rstrip()
+    sep = " **_lora_kwargs" if stripped.endswith(",") else ", **_lora_kwargs"
+    insert_at = m.end() + len(stripped)
+    return src[:insert_at] + sep + src[insert_at:]
 for fn in ("fsdp_save_ckpt", "try_load_ckpt"):
     s = tolerate(s, fn)
 open(p, "w").write(s)
