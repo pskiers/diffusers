@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=240G
+#SBATCH --mem=0
 #SBATCH --time=48:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
@@ -55,6 +55,11 @@ cp "${BAGEL_SFT}/sft.py" "${BAGEL_BASE}/sft.py"
 for f in maze_dataset.py maze_packed_dataset.py; do
   [[ -f "${AMAZE_DIR}/infer/bagel/data/${f}" ]] && cp "${AMAZE_DIR}/infer/bagel/data/${f}" "${BAGEL_BASE}/data/${f}"
 done
+
+# AMAZE sft.py calls try_load_ckpt(..., use_lora=, use_lora_checkpoint=); upstream
+# Bagel's fsdp_utils.py signature lacks those. We don't use LoRA, so make it tolerate them.
+FSDP_UTILS="${BAGEL_BASE}/train/fsdp_utils.py"
+sed -i 's/def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False):/def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False, use_lora=False, use_lora_checkpoint=False):/' "${FSDP_UTILS}"
 
 cd "${BAGEL_BASE}"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"

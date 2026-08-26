@@ -257,8 +257,147 @@ class BagelBackend:
         return imgs[:k]
 
 
+# ── Janus-Pro FT inference backend ─────────────────────────────────────────️
+_JANUS_ROOT = TRM_ROOT / "third_party" / "amaze" / "sft" / "janus" / "Janus"
+
+
+def _prepare_janus_imports() -> None:
+    """Put the vendored Janus repo (holding the ``janus`` package) on sys.path."""
+    import sys
+
+    if _JANUS_ROOT.is_dir() and str(_JANUS_ROOT) not in sys.path:
+        sys.path.insert(0, str(_JANUS_ROOT))
+
+
+class JanusBackend:
+    """Fine-tuned Janus-Pro two-stage (VQ-conditioned autoregressive) generation;
+    mirrors third_party/amaze/infer/infer_janus.py's generate_image_batch (the
+    always-has-input-image path used for maze/queens image->image)."""
+
+    def __init__(self, checkpoint: str, img_size: int = 384, patch_size: int = 16,
+                 temperature: float = 1.0):
+        _prepare_janus_imports()
+
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        from janus.models import VLChatProcessor
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.bfloat16
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.temperature = temperature
+
+        self.processor = VLChatProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+        self.model = (
+            AutoModelForCausalLM.from_pretrained(
+                checkpoint, trust_remote_code=True, torch_dtype=self.dtype,
+            )
+            .to(self.device)
+            .eval()
+        )
+
+    def generate(self, image: Image.Image, prompt: str, k: int):
+        import numpy as np
+        import torch
+
+        model, processor, device = self.model, self.processor, self.device
+        n_tokens = processor.num_image_tokens
+
+        class _ProcOut:
+            def __init__(self, sft_format, input_ids):
+                self.sft_format = sft_format
+                self.input_ids = input_ids
+                self.pixel_values = None
+                self.num_image_tokens = torch.IntTensor([])
+
+            def __len__(self):
+                return len(self.input_ids)
+
+        with torch.inference_mode():
+            input_images = [image.convert("RGB")] * k
+            prompts = [prompt] * k
+
+            # 1) input image -> VQ embeddings (the image->image condition)
+            pixel_values = processor.image_processor(input_images, return_tensors="pt")["pixel_values"]
+            pixel_values = pixel_values.to(device=device, dtype=self.dtype)
+            _, _, info = model.gen_vision_model.encode(pixel_values)
+            in_tokens = info[2].detach().reshape(pixel_values.shape[0], -1)
+            in_embeds = model.prepare_gen_img_embeds(in_tokens)  # (k, n_tokens, dim)
+
+            # 2) build prompts (aligned with the trainer's collate_fn)
+            image_token_str = (
+                processor.image_start_tag
+                + processor.pad_tag * n_tokens
+                + processor.image_end_tag
+            )
+            pre_data = []
+            for p in prompts:
+                conversation = [
+                    {"role": "<|User|>", "content": image_token_str + "\n" + p},
+                    {"role": "<|Assistant|>", "content": ""},
+                ]
+                sft_format = processor.apply_sft_template_for_multi_turn_prompts(
+                    conversations=conversation, sft_format=processor.sft_format, system_prompt="",
+                )
+                sft_format = sft_format + processor.image_start_tag
+                input_ids = torch.LongTensor(processor.tokenizer.encode(sft_format))
+                pre_data.append(_ProcOut(sft_format, input_ids))
+
+            prepare_inputs = processor.batchify(pre_data)
+            input_ids = prepare_inputs.input_ids.to(device)
+            attention_mask = prepare_inputs.attention_mask.to(device)
+            inputs_embeds = model.language_model.get_input_embeddings()(input_ids)
+
+            # inject the input-image VQ embeddings at each <image_start>
+            image_start_id = processor.image_start_id
+            for i in range(k):
+                starts = (input_ids[i] == image_start_id).nonzero(as_tuple=True)[0]
+                if len(starts) >= 1:
+                    s = starts[0].item() + 1
+                    e = s + n_tokens
+                    if e <= inputs_embeds.shape[1]:
+                        inputs_embeds[i, s:e, :] = in_embeds[i]
+
+            # 3) autoregressive image-token generation (KV-cached)
+            generated = torch.zeros((k, n_tokens), dtype=torch.int, device=device)
+            outputs, img_embeds = None, None
+            for step in range(n_tokens):
+                if step == 0:
+                    step_embeds, step_mask = inputs_embeds, attention_mask
+                else:
+                    step_embeds = img_embeds
+                    step_mask = torch.ones((k, 1), device=device, dtype=attention_mask.dtype)
+                outputs = model.language_model.model(
+                    inputs_embeds=step_embeds, use_cache=True, attention_mask=step_mask,
+                    past_key_values=outputs.past_key_values if step > 0 else None,
+                )
+                logits = model.gen_head(outputs.last_hidden_state[:, -1, :])
+                probs = torch.softmax(logits / self.temperature, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                generated[:, step] = next_tokens
+                img_embeds = model.prepare_gen_img_embeds(next_tokens).unsqueeze(1)
+
+            # 4) decode image tokens -> RGB
+            dec = model.gen_vision_model.decode_code(
+                generated.to(dtype=torch.int),
+                shape=[k, 8, self.img_size // self.patch_size, self.img_size // self.patch_size],
+            )
+            dec = dec.to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
+            dec = np.clip((dec + 1) / 2 * 255, 0, 255).astype(np.uint8)
+
+        imgs = [Image.fromarray(d).convert("RGB") for d in dec]
+        if not imgs:
+            imgs = [image.convert("RGB")]
+        while len(imgs) < k:
+            imgs.append(imgs[-1])
+        return imgs[:k]
+
+
 def build_backend(name: str, checkpoint: str | None, model_path: str | None = None,
-                  num_timesteps: int = 50):
+                  num_timesteps: int = 50, janus_img_size: int = 384,
+                  janus_patch_size: int = 16, temperature: float = 1.0):
     if name == "dummy":
         return DummyBackend()
     if name == "bagel":
@@ -266,10 +405,10 @@ def build_backend(name: str, checkpoint: str | None, model_path: str | None = No
             raise ValueError("bagel backend needs --checkpoint (the FT checkpoint dir).")
         return BagelBackend(checkpoint, model_path or "", num_timesteps=num_timesteps)
     if name == "janus":
-        raise NotImplementedError(
-            "janus backend: load Janus-Pro FT weights and reproduce the two-stage image generation "
-            "from third_party/amaze/infer/infer_janus.py. Wire during the cluster smoke-test."
-        )
+        if not checkpoint:
+            raise ValueError("janus backend needs --checkpoint (the FT Janus 'tfmr' dir).")
+        return JanusBackend(checkpoint, img_size=janus_img_size,
+                            patch_size=janus_patch_size, temperature=temperature)
     raise ValueError(f"unknown backend '{name}'")
 
 
@@ -283,12 +422,20 @@ def main():
     ap.add_argument("--num-timesteps", type=int,
                     default=int(os.environ.get("BAGEL_NUM_TIMESTEPS", "50")),
                     help="Denoising steps for the bagel backend.")
+    ap.add_argument("--janus-img-size", type=int, default=int(os.environ.get("JANUS_IMG_SIZE", "384")),
+                    help="Janus generation image size (must match its VQ decoder; default 384).")
+    ap.add_argument("--janus-patch-size", type=int, default=int(os.environ.get("JANUS_PATCH_SIZE", "16")),
+                    help="Janus VQ patch size (default 16 -> 384/16=24, 576 tokens).")
+    ap.add_argument("--temperature", type=float, default=float(os.environ.get("JANUS_TEMPERATURE", "1.0")),
+                    help="Sampling temperature for the janus backend.")
     ap.add_argument("--data-root", type=Path, default=TRM_ROOT / "data" / "amaze")
     ap.add_argument("--gen-dir", type=Path, required=True)
     ap.add_argument("--samples-per-puzzle", type=int, default=5)
     args = ap.parse_args()
 
-    backend = build_backend(args.backend, args.checkpoint, args.bagel_model_path, args.num_timesteps)
+    backend = build_backend(args.backend, args.checkpoint, args.bagel_model_path, args.num_timesteps,
+                            janus_img_size=args.janus_img_size, janus_patch_size=args.janus_patch_size,
+                            temperature=args.temperature)
     fallback_prompt = MAZE_PROMPT if args.task == "maze" else QUEEN_PROMPT
     k = args.samples_per_puzzle
     total = 0
