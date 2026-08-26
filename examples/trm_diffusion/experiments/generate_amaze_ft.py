@@ -211,8 +211,32 @@ class BagelBackend:
             dtype=self.dtype, offload_folder="/tmp/bagel_offload",
         )
         ft_ckpt = _find_weights(Path(checkpoint))
-        msg = model.load_state_dict(load_file(str(ft_ckpt)), strict=False)
-        print(f">> Bagel FT load ({ft_ckpt}): missing={len(msg.missing_keys)} "
+        ft_state = load_file(str(ft_ckpt))
+
+        # A LoRA checkpoint (save_lora_only training) carries peft ``lora_`` keys under the
+        # language model; rebuild the same PEFT wrapping so the keys match, load, then merge.
+        lora_keys = [k for k in ft_state if ".lora_" in k or k.endswith(".lora_A.weight")
+                     or ".lora_A." in k or ".lora_B." in k]
+        is_lora = len(lora_keys) > 0
+        if is_lora:
+            from peft import LoraConfig, get_peft_model
+            # infer rank from a lora_A weight ([r, in_features]); alpha from env (AMAZE default 32).
+            r = next((ft_state[k].shape[0] for k in lora_keys if ".lora_A" in k), None) or \
+                int(os.environ.get("LORA_R", "16"))
+            alpha = int(os.environ.get("LORA_ALPHA", "32"))
+            target_modules = [
+                "self_attn.q_proj_moe_gen", "self_attn.k_proj_moe_gen",
+                "self_attn.v_proj_moe_gen", "self_attn.o_proj_moe_gen",
+                "mlp_moe_gen.gate_proj", "mlp_moe_gen.up_proj", "mlp_moe_gen.down_proj",
+            ]
+            model.language_model = get_peft_model(
+                model.language_model,
+                LoraConfig(r=r, lora_alpha=alpha, init_lora_weights=False,
+                           target_modules=target_modules),
+            )
+
+        msg = model.load_state_dict(ft_state, strict=False)
+        print(f">> Bagel FT load ({ft_ckpt}, lora={is_lora}): missing={len(msg.missing_keys)} "
               f"unexpected={len(msg.unexpected_keys)}", flush=True)
 
         # Any params still on meta (missing from both) -> base values or zeros.
@@ -225,6 +249,10 @@ class BagelBackend:
                 if val is None:
                     val = torch.zeros(p.shape, dtype=self.dtype)
                 set_module_tensor_to_device(model, name, "cpu", value=val)
+
+        if is_lora:
+            # Fold the adapter into the base so inference uses a plain Bagel model.
+            model.language_model = model.language_model.merge_and_unload()
 
         model = model.eval()
         model.requires_grad_(False)

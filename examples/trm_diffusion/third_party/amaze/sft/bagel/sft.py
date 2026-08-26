@@ -839,6 +839,12 @@ def main():
 
 
     
+    # LoRA on a single GPU: cast the (frozen) base to bf16 before wrapping so FSDP keeps a
+    # bf16 master instead of fp32. Halves resident model memory so the 14.6B checkpoint
+    # gather fits on one 96GB GPU. Safe for LoRA: the base is frozen (never updated).
+    if training_args.use_lora:
+        model = model.to(torch.bfloat16)
+
     fsdp_model = fsdp_wrapper(model, fsdp_config)
     apply_activation_checkpointing(
         fsdp_model, 
