@@ -98,8 +98,13 @@ def tolerate(src, fn):
     return src[:insert_at] + sep + src[insert_at:]
 for fn in ("fsdp_save_ckpt", "try_load_ckpt"):
     s = tolerate(s, fn)
+# FSDP + LoRA: a layer mixes frozen base and trainable adapter params, so FSDP needs
+# use_orig_params=True (else "uniform requires_grad" error). Harmless for full FT.
+if "use_orig_params" not in s:
+    s = re.sub(r"(return FSDP\(\s*\n\s*original_model,)",
+               r"\1\n        use_orig_params=True,", s, count=1)
 open(p, "w").write(s)
-print("patched fsdp_utils.py (fsdp_save_ckpt, try_load_ckpt tolerate LoRA kwargs)")
+print("patched fsdp_utils.py (tolerate LoRA kwargs + use_orig_params)")
 PY
 
 cd "${BAGEL_BASE}"
