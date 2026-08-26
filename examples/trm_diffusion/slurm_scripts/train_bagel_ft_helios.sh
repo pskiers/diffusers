@@ -33,6 +33,10 @@ BAGEL_SFT="${AMAZE_DIR}/sft/bagel"
 BAGEL_BASE="${BAGEL_SFT}/Bagel"
 DATA_DIR="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 
+# Reference AMAZE config (run_sft.sh): 5000 opt-steps. At ~35 s/step on one GH200
+# (cpu_offload) that is ~48.6 h > the 48 h wall, so a single job lands ~4900 steps;
+# resubmit the same RUN_NAME to finish (auto_resume=true + save_every=100 chain from
+# the last checkpoint, losing <=100 steps).
 TOTAL_STEPS="${TOTAL_STEPS:-5000}"
 LR="${LR:-1e-5}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
@@ -56,10 +60,35 @@ for f in maze_dataset.py maze_packed_dataset.py; do
   [[ -f "${AMAZE_DIR}/infer/bagel/data/${f}" ]] && cp "${AMAZE_DIR}/infer/bagel/data/${f}" "${BAGEL_BASE}/data/${f}"
 done
 
-# AMAZE sft.py calls try_load_ckpt(..., use_lora=, use_lora_checkpoint=); upstream
-# Bagel's fsdp_utils.py signature lacks those. We don't use LoRA, so make it tolerate them.
+# AMAZE sft.py calls try_load_ckpt(..., use_lora=, use_lora_checkpoint=) and
+# fsdp_save_ckpt(..., use_lora=, save_lora_only=); upstream Bagel's fsdp_utils.py
+# signatures lack those. We don't use LoRA, so make both tolerate (ignore) extra kwargs.
 FSDP_UTILS="${BAGEL_BASE}/train/fsdp_utils.py"
-sed -i 's/def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False):/def try_load_ckpt(resume_from, logger, model, ema_model=None, resume_from_ema=False, use_lora=False, use_lora_checkpoint=False):/' "${FSDP_UTILS}"
+python - "${FSDP_UTILS}" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+def tolerate(src, fn):
+    m = re.search(r"def %s\(" % fn, src)
+    if not m:
+        return src
+    i, depth = m.end(), 1
+    while depth:
+        c = src[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    close = i - 1  # index of the signature's closing ")"
+    if "**" in src[m.end():close]:
+        return src  # already accepts **kwargs
+    return src[:close] + ", **_lora_kwargs" + src[close:]
+for fn in ("fsdp_save_ckpt", "try_load_ckpt"):
+    s = tolerate(s, fn)
+open(p, "w").write(s)
+print("patched fsdp_utils.py (fsdp_save_ckpt, try_load_ckpt tolerate LoRA kwargs)")
+PY
 
 cd "${BAGEL_BASE}"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"

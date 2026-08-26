@@ -34,6 +34,11 @@ JANUS_SFT="${AMAZE_DIR}/sft/janus"
 JANUS_BASE="${JANUS_SFT}/Janus"
 DATA_DIR="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 
+# Reference AMAZE config (sft.py): 8 epochs, lr 5e-6, grad_accum 16. Effective batch =
+# 1 gpu x train_bsz(1) x grad_accum(16) = 16 samples/opt-step -> 1 epoch ~= 1875 steps,
+# 8 epochs ~= 15000. The trainer checkpoints once per epoch (checkpoint-<epoch>-<step>/
+# tfmr) with gradient checkpointing on; 8 epochs overruns one 48 h job, so resubmit with
+# --resume_from_checkpoint runs/<RUN_NAME>/checkpoint-<epoch>-<step> to finish.
 N_EPOCHS="${N_EPOCHS:-8}"
 LR="${LR:-5e-6}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
@@ -56,6 +61,9 @@ export PYTHONPATH="${PROJECT_ROOT}/${JANUS_BASE}:${PROJECT_ROOT}/${AMAZE_DIR}:${
 export WANDB_PROJECT="${WANDB_PROJECT}"
 
 # Single GH200 -> one training process.
+RESUME_ARGS=()
+[[ -n "${RESUME_FROM:-}" ]] && RESUME_ARGS=( --resume_from_checkpoint "${RESUME_FROM}" )
+
 srun accelerate launch --num_processes 1 --mixed_precision bf16 \
   "${JANUS_SFT}/sft.py" \
   --model_path "${JANUS_MODEL_PATH}" \
@@ -73,6 +81,7 @@ srun accelerate launch --num_processes 1 --mixed_precision bf16 \
   --weight_decay 0.1 \
   --max_ckpts 10 \
   --log_dir "${PROJECT_ROOT}/runs/${RUN_NAME}/logs" \
-  --seed 42
+  --seed 42 \
+  "${RESUME_ARGS[@]}"
 
 echo "Janus FT (${TASK}) complete -> runs/${RUN_NAME}"
