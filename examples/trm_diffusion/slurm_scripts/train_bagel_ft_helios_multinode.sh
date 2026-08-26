@@ -1,8 +1,8 @@
 #!/bin/bash -l
-#SBATCH --job-name=amaze_bagel_ft
+#SBATCH --job-name=amaze_bagel_ft_mn
 #SBATCH --account=plgdiffusion3-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
@@ -11,21 +11,23 @@
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
-# Helios (GH200 / aarch64) variant of train_bagel_ft.sh. A single GH200 (120GB HBM +
-# large Grace host RAM) fits the 14.6B model with FSDP NO_SHARD + cpu_offload (optimizer
-# states offloaded to host). Only account/partition/modules/venv/sharding differ from
-# the Athena (4x A100) script.
+# Multi-node (N x GH200, 1 GPU/node) variant of train_bagel_ft_helios.sh. Needed
+# because a SINGLE GH200 cannot save the 14.6B checkpoint: FSDP downgrades FULL_SHARD
+# to NO_SHARD at world_size=1, so the full model stays resident (~93/95GB) and the
+# save-time state_dict gather OOMs. With world_size>=2 FULL_SHARD really shards the
+# params/optimizer across ranks -> per-GPU footprint drops and the save fits.
 #
-# Usage: sbatch slurm_scripts/train_bagel_ft_helios.sh <maze|queens>
-# Env: BAGEL_MODEL_PATH (local BAGEL-7B-MoT snapshot, REQUIRED), TOTAL_STEPS (5000),
-#      LR (1e-5), WANDB_PROJECT (amaze_final), RUN_NAME, VENV (default $SCRATCH/trm_helios_venv).
+# Override node count with:  sbatch --nodes=3 slurm_scripts/train_bagel_ft_helios_multinode.sh maze
+# Usage: sbatch slurm_scripts/train_bagel_ft_helios_multinode.sh <maze|queens>
+# Env: BAGEL_MODEL_PATH (REQUIRED), TOTAL_STEPS (5000), LR (1e-5), WANDB_PROJECT
+#      (amaze_final), RUN_NAME, VENV (default $SCRATCH/trm_helios_venv).
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
-TASK="${1:?usage: sbatch train_bagel_ft_helios.sh <maze|queens>}"
+TASK="${1:?usage: sbatch train_bagel_ft_helios_multinode.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
 
 AMAZE_DIR="third_party/amaze"
@@ -33,10 +35,6 @@ BAGEL_SFT="${AMAZE_DIR}/sft/bagel"
 BAGEL_BASE="${BAGEL_SFT}/Bagel"
 DATA_DIR="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 
-# Reference AMAZE config (run_sft.sh): 5000 opt-steps. At ~35 s/step on one GH200
-# (cpu_offload) that is ~48.6 h > the 48 h wall, so a single job lands ~4900 steps;
-# resubmit the same RUN_NAME to finish (auto_resume=true + save_every=100 chain from
-# the last checkpoint, losing <=100 steps).
 TOTAL_STEPS="${TOTAL_STEPS:-5000}"
 LR="${LR:-1e-5}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
@@ -48,23 +46,16 @@ source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs
 export PYTHONUNBUFFERED=1
-# reduce allocator fragmentation so the checkpoint full_state_dict gather has headroom
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# newer libstdc++ for compiled extensions (insurance; harmless if unused)
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
 [[ -d "${BAGEL_BASE}" ]] || { echo "ERROR: ${BAGEL_BASE} missing. Run: bash ${AMAZE_DIR}/setup_ft_code.sh" >&2; exit 1; }
 [[ -f "${DATA_DIR}/maze_dataset_train.parquet" ]] || { echo "ERROR: ${DATA_DIR}/maze_dataset_train.parquet missing. Run: python scripts/export_amaze_for_ft.py ${TASK}." >&2; exit 1; }
 
-# ── Assemble: overlay AMAZE sft.py + maze data files into the base Bagel repo ──
+# ── Assemble: overlay AMAZE sft.py + maze data + tolerate LoRA kwargs in fsdp_utils ──
 cp "${BAGEL_SFT}/sft.py" "${BAGEL_BASE}/sft.py"
 for f in maze_dataset.py maze_packed_dataset.py; do
   [[ -f "${AMAZE_DIR}/infer/bagel/data/${f}" ]] && cp "${AMAZE_DIR}/infer/bagel/data/${f}" "${BAGEL_BASE}/data/${f}"
 done
-
-# AMAZE sft.py calls try_load_ckpt(..., use_lora=, use_lora_checkpoint=) and
-# fsdp_save_ckpt(..., use_lora=, save_lora_only=); upstream Bagel's fsdp_utils.py
-# signatures lack those. We don't use LoRA, so make both tolerate (ignore) extra kwargs.
 FSDP_UTILS="${BAGEL_BASE}/train/fsdp_utils.py"
 python - "${FSDP_UTILS}" <<'PY'
 import re, sys
@@ -82,11 +73,10 @@ def tolerate(src, fn):
         elif c == ")":
             depth -= 1
         i += 1
-    close = i - 1  # index of the signature's closing ")"
+    close = i - 1
     sig = src[m.end():close]
     if "**" in sig:
-        return src  # already accepts **kwargs
-    # insert after the last real char; respect a trailing comma to avoid ", , **kwargs"
+        return src
     stripped = sig.rstrip()
     sep = " **_lora_kwargs" if stripped.endswith(",") else ", **_lora_kwargs"
     insert_at = m.end() + len(stripped)
@@ -94,17 +84,26 @@ def tolerate(src, fn):
 for fn in ("fsdp_save_ckpt", "try_load_ckpt"):
     s = tolerate(s, fn)
 open(p, "w").write(s)
-print("patched fsdp_utils.py (fsdp_save_ckpt, try_load_ckpt tolerate LoRA kwargs)")
+print("patched fsdp_utils.py (tolerate LoRA kwargs)")
 PY
 
 cd "${BAGEL_BASE}"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export WANDB_PROJECT="${WANDB_PROJECT}"
 
-# Single 96GB GH200: FULL_SHARD + cpu_offload keeps only the active layer's params on
-# GPU (rest on host RAM), so the 14.6B model AND the checkpoint full_state_dict gather
-# fit. (NO_SHARD keeps the whole fp32 master + bf16 copy resident ~93/95GB -> save OOMs.)
-srun torchrun --standalone --nproc_per_node=1 sft.py \
+# ── Multi-node rendezvous ──
+export MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)"
+export MASTER_PORT="${MASTER_PORT:-29500}"
+NUM_SHARD="${SLURM_NNODES:-2}"
+# If NCCL fails to find the fabric, set the HSN interface explicitly, e.g.:
+#   export NCCL_SOCKET_IFNAME=hsn0
+
+# FULL_SHARD across ${NUM_SHARD} ranks (ZeRO-3): params/optimizer sharded so each GPU
+# holds ~1/N of the model and the checkpoint gather fits. num_shard must equal world size.
+srun torchrun \
+  --nnodes="${SLURM_NNODES}" --nproc_per_node=1 \
+  --rdzv_id="${SLURM_JOB_ID}" --rdzv_backend=c10d --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  sft.py \
   --maze_dataset_path "${DATA_DIR}" \
   --model_path "${BAGEL_MODEL_PATH}" \
   --resume_from "${BAGEL_MODEL_PATH}" \
@@ -127,6 +126,6 @@ srun torchrun --standalone --nproc_per_node=1 sft.py \
   --llm_qk_norm true --tie_word_embeddings false --layer_module Qwen2MoTDecoderLayer \
   --copy_init_moe true --use_flex false --global_seed 4396 \
   --sharding_strategy FULL_SHARD --backward_prefetch BACKWARD_PRE \
-  --num_replicate 1 --num_shard 1 --cpu_offload true --use_lora false
+  --num_replicate 1 --num_shard "${NUM_SHARD}" --cpu_offload true --use_lora false
 
-echo "Bagel FT (${TASK}) complete -> runs/${RUN_NAME}"
+echo "Bagel FT multi-node (${TASK}, ${SLURM_NNODES} nodes) complete -> runs/${RUN_NAME}"

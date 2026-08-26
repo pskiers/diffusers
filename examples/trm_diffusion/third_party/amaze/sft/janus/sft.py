@@ -92,7 +92,7 @@ class TrainingMetrics:
         self.total = torch.Tensor([0]).to(device=device)
         self.total_loss = torch.Tensor([0]).to(device=device)
         self.total_mse = torch.Tensor([0]).to(device=device)
-        self.world_size = dist.get_world_size()
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     def __call__(self, logits, labels, loss, mse=None):
         return self.update(logits, labels, loss, mse)
@@ -109,10 +109,11 @@ class TrainingMetrics:
                 self.total_mse += mse.item()
 
     def get_metric(self, reset=True):
-        dist.all_reduce(self.right, op=torch.distributed.ReduceOp.SUM)
-        dist.all_reduce(self.total, op=torch.distributed.ReduceOp.SUM)
-        dist.all_reduce(self.total_loss, op=torch.distributed.ReduceOp.SUM)
-        dist.all_reduce(self.total_mse, op=torch.distributed.ReduceOp.SUM)
+        if dist.is_initialized():
+            dist.all_reduce(self.right, op=torch.distributed.ReduceOp.SUM)
+            dist.all_reduce(self.total, op=torch.distributed.ReduceOp.SUM)
+            dist.all_reduce(self.total_loss, op=torch.distributed.ReduceOp.SUM)
+            dist.all_reduce(self.total_mse, op=torch.distributed.ReduceOp.SUM)
 
         acc = (self.right / self.total).item()
         loss = self.total_loss.item() / (self.world_size * self.n_step)
@@ -362,13 +363,14 @@ def train(args: argparse.Namespace) -> None:
             mode="offline"
         )
 
-    # Set batch size
-    accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.train_bsz_per_gpu
-    accelerator.state.deepspeed_plugin.deepspeed_config['train_batch_size'] = (
-        args.train_bsz_per_gpu * 
-        dist.get_world_size() * 
-        accelerator.gradient_accumulation_steps
-    )
+    # Set batch size (only when launched under DeepSpeed; plain accelerate/FSDP has no plugin)
+    if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.train_bsz_per_gpu
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_batch_size'] = (
+            args.train_bsz_per_gpu * 
+            dist.get_world_size() * 
+            accelerator.gradient_accumulation_steps
+        )
 
     # Determine model path (from checkpoint or original)
     resume_from_checkpoint = getattr(args, 'resume_from_checkpoint', None)
@@ -432,7 +434,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # Set learning rate scheduler
-    num_training_steps = int(len(train_dataloader) * args.n_epochs) // accelerator.gradient_accumulation_steps // dist.get_world_size()
+    num_training_steps = int(len(train_dataloader) * args.n_epochs) // accelerator.gradient_accumulation_steps // (dist.get_world_size() if dist.is_initialized() else 1)
 
     # Use custom scheduler instead of original call
     lr_scheduler = get_custom_cosine_schedule_with_warmup(
