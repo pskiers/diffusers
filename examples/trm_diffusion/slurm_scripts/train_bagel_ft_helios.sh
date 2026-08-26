@@ -40,6 +40,11 @@ DATA_DIR="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 TOTAL_STEPS="${TOTAL_STEPS:-5000}"
 LR="${LR:-1e-5}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
+# LoRA is the practical single-GPU path for 14.6B (full FT can't save on one GH200 and
+# is network-bound on multi-node). USE_LORA=true -> tiny trainable set, fits+saves on
+# one GPU, saves only the adapter. cpu_offload not needed for LoRA.
+USE_LORA="${USE_LORA:-false}"
+if [[ "${USE_LORA}" == "true" ]]; then CPU_OFFLOAD="${CPU_OFFLOAD:-false}"; else CPU_OFFLOAD="${CPU_OFFLOAD:-true}"; fi
 RUN_NAME="${RUN_NAME:-ft_bagel_${TASK}}"
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
 
@@ -127,6 +132,6 @@ srun torchrun --standalone --nproc_per_node=1 sft.py \
   --llm_qk_norm true --tie_word_embeddings false --layer_module Qwen2MoTDecoderLayer \
   --copy_init_moe true --use_flex false --global_seed 4396 \
   --sharding_strategy FULL_SHARD --backward_prefetch BACKWARD_PRE \
-  --num_replicate 1 --num_shard 1 --cpu_offload true --use_lora false
+  --num_replicate 1 --num_shard 1 --cpu_offload "${CPU_OFFLOAD}" --use_lora "${USE_LORA}" --save_lora_only "${USE_LORA}"
 
 echo "Bagel FT (${TASK}) complete -> runs/${RUN_NAME}"
