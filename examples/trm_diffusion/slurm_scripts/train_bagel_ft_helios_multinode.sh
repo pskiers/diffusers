@@ -39,6 +39,10 @@ TOTAL_STEPS="${TOTAL_STEPS:-5000}"
 LR="${LR:-1e-5}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 RUN_NAME="${RUN_NAME:-ft_bagel_${TASK}}"
+# cpu_offload murders throughput (CPU<->GPU per layer). With >=3 nodes the sharded
+# model fits on GPU (~76GB/GPU at 3), so default it OFF; on 2 nodes it must be true
+# (~114GB/GPU) but the run is then ~8x slower. Override: CPU_OFFLOAD=true.
+CPU_OFFLOAD="${CPU_OFFLOAD:-false}"
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
@@ -126,6 +130,6 @@ srun torchrun \
   --llm_qk_norm true --tie_word_embeddings false --layer_module Qwen2MoTDecoderLayer \
   --copy_init_moe true --use_flex false --global_seed 4396 \
   --sharding_strategy FULL_SHARD --backward_prefetch BACKWARD_PRE \
-  --num_replicate 1 --num_shard "${NUM_SHARD}" --cpu_offload true --use_lora false
+  --num_replicate 1 --num_shard "${NUM_SHARD}" --cpu_offload "${CPU_OFFLOAD}" --use_lora false
 
 echo "Bagel FT multi-node (${TASK}, ${SLURM_NNODES} nodes) complete -> runs/${RUN_NAME}"
