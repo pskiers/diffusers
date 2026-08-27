@@ -38,10 +38,14 @@ TASK="${1:?usage: sbatch eval_ft_helios.sh <maze|queens>}"
 BACKEND="${BACKEND:-dummy}"
 SAMPLES="${SAMPLES:-5}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
-RUN_NAME="${RUN_NAME:-ft_${BACKEND}_${TASK}}"
+# THINK=1 -> chain-of-thought sampling (bagel only), scored as a separate _cot run.
+THINK="${THINK:-0}"
+RUN_SUFFIX=""; [[ "${THINK}" == "1" ]] && RUN_SUFFIX="_cot"
+RUN_NAME="${RUN_NAME:-ft_${BACKEND}_${TASK}}${RUN_SUFFIX}"
 GEN_DIR="${GEN_DIR:-runs/${RUN_NAME}/generated}"
 
 GEN_ARGS=( "${TASK}" --backend "${BACKEND}" --gen-dir "${GEN_DIR}" --samples-per-puzzle "${SAMPLES}" )
+[[ "${THINK}" == "1" ]] && GEN_ARGS+=( --think )
 if [[ "${BACKEND}" != "dummy" ]]; then
   : "${CHECKPOINT:?set CHECKPOINT to the FT model dir for backend ${BACKEND}}"
   GEN_ARGS+=( --checkpoint "${CHECKPOINT}" )

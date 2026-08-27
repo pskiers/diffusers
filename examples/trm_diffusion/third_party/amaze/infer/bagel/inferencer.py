@@ -760,7 +760,7 @@ class InterleaveInferencer:
 
             # 2. 处理图像输入 (Image Input)
             # 预处理图像
-            from flow_grpo.bagel.data.data_utils import pil_img2rgb
+            # pil_img2rgb already imported at module top (from bagel.data.data_utils)
             processed_images = []
             image_shapes = []
             for img in images:

@@ -141,7 +141,8 @@ class BagelBackend:
     """Fine-tuned BAGEL-7B-MoT inference via the vendored InterleaveInferencer;
     mirrors third_party/amaze/infer/infer_bagel.py's model assembly."""
 
-    def __init__(self, checkpoint: str, model_path: str, num_timesteps: int = 50):
+    def __init__(self, checkpoint: str, model_path: str, num_timesteps: int = 50,
+                 think: bool = False, max_think_tokens: int = 1024):
         _prepare_bagel_imports()
 
         import torch
@@ -168,6 +169,8 @@ class BagelBackend:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16
         self.num_timesteps = num_timesteps
+        self.think = think
+        self.max_think_tokens = max_think_tokens
 
         llm_config = Qwen2Config.from_json_file(str(model_dir / "llm_config.json"))
         llm_config.qk_norm = True
@@ -267,6 +270,8 @@ class BagelBackend:
 
     def generate(self, image: Image.Image, prompt: str, k: int):
         # One batched call draws k independent noise seeds -> k Pass@K candidates.
+        # think=True reproduces the paper's CoT setup: the model emits a <think> planning
+        # text (inference-time only, no CoT training) before generating the image.
         out = self.inferencer(
             image=[image.convert("RGB")] * k,
             text=[prompt] * k,
@@ -275,6 +280,8 @@ class BagelBackend:
             cfg_img_scale=1.0,
             cfg_interval=[0.0, 1.0],
             cfg_renorm_min=0.0,
+            think=self.think,
+            max_think_tokens=self.max_think_tokens,
         )
         imgs = out.get("images") or ([out["image"]] if out.get("image") is not None else [])
         imgs = [im.convert("RGB") for im in imgs if im is not None]
@@ -425,16 +432,20 @@ class JanusBackend:
 
 def build_backend(name: str, checkpoint: str | None, model_path: str | None = None,
                   num_timesteps: int = 50, janus_img_size: int = 384,
-                  janus_patch_size: int = 16, temperature: float = 1.0):
+                  janus_patch_size: int = 16, temperature: float = 1.0, think: bool = False):
     if name == "dummy":
         return DummyBackend()
     if name == "bagel":
         if not checkpoint:
             raise ValueError("bagel backend needs --checkpoint (the FT checkpoint dir).")
-        return BagelBackend(checkpoint, model_path or "", num_timesteps=num_timesteps)
+        return BagelBackend(checkpoint, model_path or "", num_timesteps=num_timesteps, think=think)
     if name == "janus":
         if not checkpoint:
             raise ValueError("janus backend needs --checkpoint (the FT Janus 'tfmr' dir).")
+        if think:
+            raise NotImplementedError(
+                "janus CoT (two-stage text->image) is not wired yet; run janus without --think."
+            )
         return JanusBackend(checkpoint, img_size=janus_img_size,
                             patch_size=janus_patch_size, temperature=temperature)
     raise ValueError(f"unknown backend '{name}'")
@@ -456,6 +467,9 @@ def main():
                     help="Janus VQ patch size (default 16 -> 384/16=24, 576 tokens).")
     ap.add_argument("--temperature", type=float, default=float(os.environ.get("JANUS_TEMPERATURE", "1.0")),
                     help="Sampling temperature for the janus backend.")
+    ap.add_argument("--think", action="store_true", default=os.environ.get("THINK", "") == "1",
+                    help="Chain-of-thought: emit a <think> planning step before the image (bagel only; "
+                         "inference-time, matches the paper's w/ CoT rows).")
     ap.add_argument("--data-root", type=Path, default=TRM_ROOT / "data" / "amaze")
     ap.add_argument("--gen-dir", type=Path, required=True)
     ap.add_argument("--samples-per-puzzle", type=int, default=5)
@@ -463,7 +477,7 @@ def main():
 
     backend = build_backend(args.backend, args.checkpoint, args.bagel_model_path, args.num_timesteps,
                             janus_img_size=args.janus_img_size, janus_patch_size=args.janus_patch_size,
-                            temperature=args.temperature)
+                            temperature=args.temperature, think=args.think)
     fallback_prompt = MAZE_PROMPT if args.task == "maze" else QUEEN_PROMPT
     k = args.samples_per_puzzle
     total = 0
