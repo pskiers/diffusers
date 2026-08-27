@@ -310,7 +310,7 @@ class JanusBackend:
     always-has-input-image path used for maze/queens image->image)."""
 
     def __init__(self, checkpoint: str, img_size: int = 384, patch_size: int = 16,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, think: bool = False, max_think_tokens: int = 512):
         _prepare_janus_imports()
 
         import torch
@@ -323,6 +323,8 @@ class JanusBackend:
         self.img_size = img_size
         self.patch_size = patch_size
         self.temperature = temperature
+        self.think = think
+        self.max_think_tokens = max_think_tokens
 
         self.processor = VLChatProcessor.from_pretrained(checkpoint, trust_remote_code=True)
         self.model = (
@@ -333,9 +335,46 @@ class JanusBackend:
             .eval()
         )
 
+    def _gen_cot(self, image: Image.Image, prompt: str) -> str:
+        """Stage 1 of the paper's Janus CoT: understanding-mode text generation of the
+        <think> planning </think> given the puzzle image + CoT-augmented instruction."""
+        import torch
+
+        model, processor, device = self.model, self.processor, self.device
+        question = (prompt + " You should first think about the planning process in the mind. "
+                    "The planning process is enclosed within <think> </think> tags.")
+        conversation = [
+            {"role": "<|User|>", "content": f"<image_placeholder>\n{question}",
+             "images": [image.convert("RGB")]},
+            {"role": "<|Assistant|>", "content": ""},
+        ]
+        with torch.inference_mode():
+            prepare_inputs = processor(
+                conversations=conversation, images=[image.convert("RGB")], force_batchify=True,
+            ).to(device)
+            inputs_embeds = model.prepare_inputs_embeds(**prepare_inputs)
+            outputs = model.language_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=prepare_inputs.attention_mask,
+                pad_token_id=processor.tokenizer.eos_token_id,
+                bos_token_id=processor.tokenizer.bos_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
+                max_new_tokens=self.max_think_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
+        return processor.tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
+
     def generate(self, image: Image.Image, prompt: str, k: int):
         import numpy as np
         import torch
+
+        # Stage 1 (CoT): generate the <think> plan once per puzzle, fold it into the
+        # stage-2 image prompt, matching the paper's two-stage Janus w/ CoT setup.
+        if self.think:
+            cot = self._gen_cot(image, prompt)
+            prompt = (prompt + f" <think> {cot} </think> "
+                      "According to your thinking process, output the image only.")
 
         model, processor, device = self.model, self.processor, self.device
         n_tokens = processor.num_image_tokens
@@ -442,12 +481,8 @@ def build_backend(name: str, checkpoint: str | None, model_path: str | None = No
     if name == "janus":
         if not checkpoint:
             raise ValueError("janus backend needs --checkpoint (the FT Janus 'tfmr' dir).")
-        if think:
-            raise NotImplementedError(
-                "janus CoT (two-stage text->image) is not wired yet; run janus without --think."
-            )
         return JanusBackend(checkpoint, img_size=janus_img_size,
-                            patch_size=janus_patch_size, temperature=temperature)
+                            patch_size=janus_patch_size, temperature=temperature, think=think)
     raise ValueError(f"unknown backend '{name}'")
 
 
