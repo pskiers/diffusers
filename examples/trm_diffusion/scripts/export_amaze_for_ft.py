@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""Export the amaze parquet into the directory layout the vendored AMAZE
-fine-tuning loaders expect (Bagel / Janus):
-
-    <out>/{maze,queens}/maze_dataset_train.parquet
-    <out>/{maze,queens}/maze_dataset_test.parquet
-
-Train comes from ``train.orig.parquet`` (native resolution, full columns, base64
-images) — the same 30k puzzles as PT/DDPM, but NOT the 144px ``train.parquet``.
-Images stay base64 PNG and the ``instruction`` column is ensured (paper prompt).
-"""
+"""Export the amaze parquet into the Bagel/Janus FT layout: data/amaze/ft/{task}/maze_dataset_{train,test}.parquet.
+Train comes from train.orig.parquet (native-res) so fine-tuning isn't stuck at the 144px training resolution."""
 from __future__ import annotations
 
 import argparse

@@ -1,32 +1,28 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_trajectory
-#SBATCH --account=plgdyplomancipw3tt-gpu-a100
-#SBATCH --partition=plgrid-gpu-a100
+#SBATCH --account=plgdiffusion3-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=0
 #SBATCH --time=02:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
-# Capture the denoising trajectory (per-timestep x0 images) for a TRM or DiT
-# checkpoint, to juxtapose how the two models sample. Saves per-step PNGs +
-# a labelled filmstrip under <ckpt_dir>/trajectory/<task>/<combo>/ and logs a
-# wandb table into the checkpoint's training run.
+# Capture the denoising trajectory (per-timestep x0 images + a labelled filmstrip)
+# for a TRM or DiT checkpoint, on Helios (GH200).
 #
 # Usage:
 #   sbatch slurm_scripts/trajectory_amaze.sh dit <maze|queens> <dit.pt>
 #   sbatch slurm_scripts/trajectory_amaze.sh trm <maze|queens> <thinker.pt> <painter.pt>
-# Env:
-#   COMBO (square_n9 / n8), PUZZLES (4), STEPS (8), CAPTURE_XT (false), SEED (0),
-#   WANDB_PROJECT (amaze), DATA_ROOT (<root>/data/amaze)
+# Env: COMBO PUZZLES(4) STEPS(8) CAPTURE_XT(false) SEED(0) WANDB_PROJECT(amaze) DATA_ROOT
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/venv"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 usage() {
   echo "usage: sbatch slurm_scripts/trajectory_amaze.sh <trm|dit> <maze|queens> <checkpoint> [painter.pt]" >&2
@@ -47,15 +43,14 @@ SEED="${SEED:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze}"
 DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/amaze}"
 
-module load CUDA/12.4.0
-module load GCCcore/14.3.0 nodejs/22.17.1
-module load Miniconda3/23.3.1-0
+module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
 
 export PYTHONUNBUFFERED=1
+export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
 ARGS=(
   +checkpoint="${CKPT}"

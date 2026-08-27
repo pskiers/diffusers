@@ -10,32 +10,29 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Cap per-worker native thread pools BEFORE importing numpy/pandas/pyarrow. This
+
+# Cap native thread pools before importing pandas.
 for _thr_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                  "NUMEXPR_NUM_THREADS", "ARROW_NUM_THREADS", "RAYON_NUM_THREADS",
                  "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_thr_var, "1")
 
-import pandas as pd
+import pandas as pd  # noqa: E402
 
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
 MAZE_GEN = TRM_ROOT / "third_party" / "amaze" / "mazes-generator"
 QUEEN_GEN = TRM_ROOT / "third_party" / "amaze" / "queen-generator"
 
-# Output root — always data/amaze
 OUT_ROOT = Path(os.environ.get("AMAZE_OUT_ROOT", str(TRM_ROOT / "data" / "amaze")))
 
 
 def _nproc(env_var: str) -> int:
-    """Worker-process count: ``env_var`` override, else the SLURM CPU allocation,
-    else the machine's cpu count (min 1)."""
     return max(1, int(os.environ.get(env_var)
                       or os.environ.get("SLURM_CPUS_PER_TASK")
                       or (os.cpu_count() or 1)))
 
 
-# ── Paper test spec ──────────────────────────────────────────────────────────
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
 MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
 MAZE_OOD_SCALES = [3]
@@ -45,7 +42,6 @@ QUEEN_OOD_SCALES = [12]
 QUEEN_TEST_PER_SCALE = int(os.environ.get("QUEEN_TEST_PER_SCALE", "50"))
 QUEEN_OOD_TEST_PER_SCALE = int(os.environ.get("QUEEN_OOD_TEST_PER_SCALE", "100"))
 
-# ── Train sizes ────────────
 MAZE_TRAIN = int(os.environ.get("MAZE_TRAIN", "30000"))
 QUEEN_TRAIN = int(os.environ.get("QUEEN_TRAIN", "30000"))
 QUEEN_TRAIN_SCALE_CAPS = {
@@ -56,7 +52,6 @@ QUEEN_TRAIN_SCALE_CAPS = {
 }
 QUEEN_CELL_SIZE = os.environ.get("QUEEN_CELL_SIZE", "64")
 QUEEN_RADIUS = os.environ.get("QUEEN_RADIUS", "16")
-# Parallel worker processes, split the batch across processes
 QUEEN_NPROC = _nproc("QUEEN_NPROC")
 MAZE_NPROC = _nproc("MAZE_NPROC")
 
@@ -71,23 +66,13 @@ TRAIN_ALGOS = {
 }
 TEST_ALGORITHM = "recursiveBacktrack"
 
-# ── Seed bases (disjoint ranges so train never overlaps test) ────────────────
+# Disjoint seed ranges so train never overlaps test.
 MAZE_TRAIN_SEED = 1_000_000
-MAZE_TEST_SEED = 7_000_000       # per-combo: MAZE_TEST_SEED + scale*10_000 + i
+MAZE_TEST_SEED = 7_000_000
 QUEEN_TRAIN_SEED = 5_000_000
-QUEEN_TEST_SEED = 8_000_000      # per-scale: QUEEN_TEST_SEED + scale
+QUEEN_TEST_SEED = 8_000_000
 
 
-# ── Path helpers ─────────────────────────────────────────────────────────────
-# Test files (native resolution, one parquet each):
-#   test_queens/all_test.parquet, test_queens/n{n}_test.parquet
-#   test_maze/all_test.parquet
-#   test_maze/{shape}/all_{shape}_test.parquet
-#   test_maze/{shape}/n{n}_{shape}_test.parquet
-# Train leaves (train.parquet + validate.parquet; image_size in the leaf name):
-#   train_queens/{all|n{n}}_train_size{S}/
-#   train_maze/all_train_size{S}/                       (all shapes, all sizes)
-#   train_maze/{shape}/{all_{shape}|n{n}_{shape}}_train_size{S}/
 def test_maze_dir() -> Path:
     return OUT_ROOT / "test_maze"
 
@@ -137,7 +122,6 @@ def train_maze_dir(shape: str, size, image_size: int = TRAIN_IMAGE_SIZE) -> Path
     return root / shape / leaf
 
 
-# ── Subprocess helper ────────────────────────────────────────────────────────
 def _run(cmd, cwd=None) -> subprocess.CompletedProcess:
     cmd = [str(c) for c in cmd]
     print(">>", " ".join(cmd), flush=True)
@@ -151,8 +135,6 @@ def _run(cmd, cwd=None) -> subprocess.CompletedProcess:
 
 
 def _run_parallel(cmds: list) -> None:
-    """Launch every command concurrently, wait for all, raise on any failure.
-    Each item is either an argv list, or an ``(argv, cwd)`` tuple."""
     procs = []
     for item in cmds:
         cmd, cwd = item if isinstance(item, tuple) else (item, None)
@@ -177,14 +159,12 @@ def _run_parallel(cmds: list) -> None:
 
 
 def _split_count(count: int, nproc: int) -> list[int]:
-    """Split ``count`` into as-even-as-possible positive chunks (<= nproc of them)."""
     nproc = max(1, min(nproc, count))
     base, rem = divmod(count, nproc)
     return [base + (1 if i < rem else 0) for i in range(nproc)]
 
 
 def _split_list(items: list, nproc: int) -> list[list]:
-    """Split a list into <= nproc as-even-as-possible non-empty sublists."""
     chunks, start = [], 0
     for size in _split_count(len(items), nproc):
         chunks.append(items[start:start + size])
@@ -193,14 +173,12 @@ def _split_list(items: list, nproc: int) -> list[list]:
 
 
 def _ensure_node_deps() -> None:
-    """One-time `npm install` for the maze generator (needs internet)."""
     if (MAZE_GEN / "node_modules").is_dir():
         return
     print(f"Installing node deps in {MAZE_GEN} (needs internet — run on a login node)…", flush=True)
     _run(["npm", "install"], cwd=MAZE_GEN)
 
 
-# ── Maze generation ──────────────────────────────────────────────────────────
 def _maze_entries(geometry: str, scale: int, count: int, algorithms: list[str], seed_base: int) -> list[dict]:
     entries = []
     for i in range(count):
@@ -212,20 +190,15 @@ def _maze_entries(geometry: str, scale: int, count: int, algorithms: list[str], 
             "filename": f"{geometry}_{scale}_{i:06d}.png",
         }
         if geometry == "circle":
-            entry["layers"] = scale          # circle scale = number of layers
+            entry["layers"] = scale
         else:
             entry["width"] = scale
-            entry["height"] = scale          # paper-spec square dims (n×n)
+            entry["height"] = scale
         entries.append(entry)
     return entries
 
 
 def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_ratio: float) -> None:
-    """Render ``entries`` with the node generator, convert to parquet, and move
-    the requested split file (train_ratio=1.0 → *_train, 0.0 → *_test) to
-    ``out_dir/out_name``. Work is split across MAZE_NPROC parallel node workers
-    (each rendering a chunk in its own dir), then the parquets are merged. Cleans
-    up the (large) intermediate render dirs."""
     _ensure_node_deps()
     out_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="amaze_maze_"))
@@ -239,7 +212,6 @@ def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_rat
             wk = work / f"w{i}"
             wk.mkdir()
             (wk / "cfg.json").write_text(json.dumps({"mazes": chunk}))
-            # node writes generated_* relative to its cwd → give each worker its own.
             node_cmds.append((["node", MAZE_GEN / "batch-maze-generator.js", "config", wk / "cfg.json"], wk))
             proc_cmds.append([
                 sys.executable, MAZE_GEN / "process_maze_into_parquet.py",
@@ -253,7 +225,7 @@ def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_rat
             ])
             parts.append(wk / want)
 
-        _run_parallel(node_cmds)     # the slow, CPU-bound render step — now on all cores
+        _run_parallel(node_cmds)
         _run_parallel(proc_cmds)
         for part in parts:
             if not part.exists():
@@ -268,7 +240,6 @@ def _gen_maze_split(entries: list[dict], out_dir: Path, out_name: str, train_rat
 
 
 def ensure_maze_test_combo(shape: str, scale: int) -> None:
-    """Generate one paper-spec test combo file (skip if already present)."""
     target = test_maze_combo_file(shape, scale)
     if target.exists():
         print(f"   {target.parent.name}/{target.name} already exists — skip")
@@ -281,7 +252,6 @@ def ensure_maze_test_combo(shape: str, scale: int) -> None:
 
 
 def ensure_maze_test_shape_all(shape: str) -> Path:
-    """Generate in-dist + OOD combos for ``shape``; merge only in-dist into all_{shape}_test."""
     for scale in MAZE_SCALES + MAZE_OOD_SCALES:
         ensure_maze_test_combo(shape, scale)
     all_pq = test_maze_shape_all_file(shape)
@@ -291,9 +261,6 @@ def ensure_maze_test_shape_all(shape: str) -> Path:
 
 
 def _maze_train_entries(shapes: list[str], scales: list[int]) -> list[dict]:
-    """Build MAZE_TRAIN maze entries distributed uniformly across the shape×scale
-    combos. Each combo gets a disjoint, position-stable seed range so the same
-    (shape, scale) yields identical puzzles whether generated alone or mixed."""
     combos = [(g, s) for g in shapes for s in scales]
     per_combo = _split_count(MAZE_TRAIN, len(combos))
     entries: list[dict] = []
@@ -307,12 +274,6 @@ def _maze_train_entries(shapes: list[str], scales: list[int]) -> list[dict]:
 
 
 def gen_maze_train(shape: str, size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
-    """Generate a maze train leaf (train.parquet, skip if present).
-
-    shape=all         → all shapes, all sizes.
-    shape, size=all   → one shape, all sizes.
-    shape, size=n     → one shape, one size.
-    """
     target_dir = train_maze_dir(shape, size, image_size)
     target = target_dir / "train.parquet"
     if target.exists():
@@ -331,12 +292,7 @@ def gen_maze_train(shape: str, size, image_size: int = TRAIN_IMAGE_SIZE) -> None
     _gen_maze_split(entries, target_dir, "train.parquet", train_ratio=1.0)
 
 
-# ── Queen generation ─────────────────────────────────────────────────────────
 def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
-    """Render ``count`` queen puzzles at n=scale and convert to a single parquet.
-    The work is split across QUEEN_NPROC parallel worker processes (each with a
-    distinct seed), then the per-worker parquets are merged. Returns
-    (parquet_path, work_dir); the caller must rmtree work_dir."""
     work = Path(tempfile.mkdtemp(prefix="amaze_queen_"))
     try:
         chunks = _split_count(count, QUEEN_NPROC)
@@ -359,7 +315,7 @@ def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
             ])
             parts.append(pq_i / "maze_dataset_train.parquet")
 
-        _run_parallel(gen_cmds)     # the slow, CPU-bound step — now on all cores
+        _run_parallel(gen_cmds)
         _run_parallel(conv_cmds)
         for part in parts:
             if not part.exists():
@@ -377,9 +333,6 @@ def _gen_queens_pool(scale: int, count: int, seed: int) -> tuple[Path, Path]:
 
 
 def _queen_mixed_counts(count: int) -> dict[int, int]:
-    """Distribute ``count`` puzzles over QUEEN_SCALES: scales listed in
-    QUEEN_TRAIN_SCALE_CAPS are pinned to their (richness-limited) cap, and the
-    remaining budget is split evenly across the uncapped scales."""
     capped = {s: min(QUEEN_TRAIN_SCALE_CAPS[s], count)
               for s in QUEEN_SCALES if s in QUEEN_TRAIN_SCALE_CAPS}
     free = [s for s in QUEEN_SCALES if s not in capped]
@@ -389,13 +342,7 @@ def _queen_mixed_counts(count: int) -> dict[int, int]:
 
 
 def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
-    """Render ``count`` queen puzzles across QUEEN_SCALES and merge them into a
-    single mixed-size parquet. Small boards have a tiny distinct-puzzle space, so
-    they are capped by QUEEN_TRAIN_SCALE_CAPS (S < M / QUEEN_TEST_PER_SCALE) to
-    keep the training draw well below the space size — otherwise training covers
-    the whole space and the disjoint-seed test set leaks. The remaining budget is
-    split evenly across the uncapped (large) scales. Each puzzle keeps its own
-    ``n`` in ``sample_json``. Returns (parquet_path, work_dir)."""
+    # Small boards are capped (QUEEN_TRAIN_SCALE_CAPS) so the disjoint-seed test set can't leak.
     work = Path(tempfile.mkdtemp(prefix="amaze_queen_mixed_"))
     try:
         per_scale = _queen_mixed_counts(count)
@@ -405,7 +352,6 @@ def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
             c = per_scale.get(scale, 0)
             if c <= 0:
                 continue
-            # Disjoint seed ranges per scale (>> per-worker offsets inside the pool).
             sub_produced, sub_work = _gen_queens_pool(scale, c, seed_base + scale * 100_000)
             dst = work / f"pool_n{scale}.parquet"
             shutil.move(str(sub_produced), str(dst))
@@ -420,7 +366,6 @@ def _gen_queens_mixed_pool(count: int, seed_base: int) -> tuple[Path, Path]:
 
 
 def ensure_queens_test_scale(scale: int, count: int = QUEEN_TEST_PER_SCALE) -> None:
-    """Generate one paper-spec queen test scale file (skip if already present)."""
     target = test_queens_scale_file(scale)
     if target.exists():
         print(f"   test_queens/{target.name} already exists — skip")
@@ -434,11 +379,6 @@ def ensure_queens_test_scale(scale: int, count: int = QUEEN_TEST_PER_SCALE) -> N
 
 
 def gen_queens_train(size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
-    """Generate a queen train leaf (train.parquet, skip if present).
-
-    ``size`` is an int (single ``n=size`` board) or the string ``"ALL"`` (30k
-    puzzles of mixed sizes across QUEEN_SCALES, distributed by
-    QUEEN_TRAIN_SCALE_CAPS — small scales capped, large scales split evenly)."""
     target_dir = train_queens_dir(size, image_size)
     target = target_dir / "train.parquet"
     if target.exists():
@@ -457,7 +397,6 @@ def gen_queens_train(size, image_size: int = TRAIN_IMAGE_SIZE) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
-# ── Merge + val copy ─────────────────────────────────────────────────────────
 def _merge_parquets(parts: list[Path], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     frames = [pd.read_parquet(p) for p in parts if p.exists()]
@@ -469,8 +408,6 @@ def _merge_parquets(parts: list[Path], out_path: Path) -> None:
 
 
 def ensure_maze_test_all() -> Path:
-    """Ensure the full maze test tree: per-shape combos, per-shape all_{shape}_test,
-    and the top-level all_test (all shapes × all sizes). Skips existing files."""
     shape_all = [ensure_maze_test_shape_all(shape) for shape in MAZE_GEOMETRIES]
     all_pq = test_maze_all_file()
     if not all_pq.exists():
@@ -479,7 +416,6 @@ def ensure_maze_test_all() -> Path:
 
 
 def ensure_queens_test_all() -> Path:
-    """Ensure the full queen test set: in-dist n{n}_test + OOD; merge only in-dist into all_test."""
     for scale in QUEEN_SCALES:
         ensure_queens_test_scale(scale)
     for scale in QUEEN_OOD_SCALES:
@@ -491,7 +427,6 @@ def ensure_queens_test_all() -> Path:
 
 
 def copy_val(train_dir: Path, test_parquet: Path) -> None:
-    """Copy the matching test set into the train leaf as validate.parquet."""
     dst = train_dir / "validate.parquet"
     if dst.exists():
         print(f">> {train_dir.name}/validate.parquet already exists — skip")
@@ -500,23 +435,13 @@ def copy_val(train_dir: Path, test_parquet: Path) -> None:
     print(f">> validate ← copy of {test_parquet.name} → {dst}")
 
 
-# Train split reads only these two image columns (resized); the rest are eval-only.
 _RESIZE_COLS = ("m_original_img", "sol_img")
 _DROP_COLS = ("original_img", "mask_img", "cell_map")
 
 
 def _resize_train_parquet(train_dir: Path, image_size: int | None = None) -> None:
-    """Downsize the train split's images to ``image_size`` (default TRAIN_IMAGE_SIZE) in place (idempotent).
-
-    The maze generator renders at ~102 px/cell (~830-1300px images); AmazeDataset
-    would otherwise BICUBIC-antialias-resize each to the model input size on the CPU
-    every epoch, making training data-loading-bound (hexagon ~8x slower than queens
-    on identical model params). Precomputing that resize once -- byte-identical to
-    AmazeDataset's transform -- turns per-step loading into a near no-op and shrinks
-    the parquet. Only the train split is touched; val/test stay at native resolution
-    for eval scoring, and the original is kept as *.orig.parquet. torch/PIL are
-    imported lazily so plain test generation stays torch-free.
-    """
+    # Precompute the train-split resize once (byte-identical to AmazeDataset's transform)
+    # so training isn't data-loading-bound; keep the native-res original as *.orig.parquet.
     if image_size is None:
         image_size = TRAIN_IMAGE_SIZE
     if image_size <= 0:
@@ -582,9 +507,7 @@ def _resize_train_parquet(train_dir: Path, image_size: int | None = None) -> Non
     print(f">> resized train → {image_size}px, dropped {dropped or '[]'}, backup {os.path.basename(backup)}")
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 def _norm_size(value):
-    """Return 'all' or an int for a --size token; None stays None."""
     if value is None:
         return None
     if str(value).upper() == "ALL":
@@ -611,13 +534,11 @@ def main(argv: list[str]) -> None:
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # ── TEST: always (re)generate the full tree, skipping what already exists. ──
     if args.mode == "test":
         all_pq = ensure_maze_test_all() if task == "maze" else ensure_queens_test_all()
         print(f"Done → {all_pq.parent}")
         return
 
-    # ── TRAIN: only the requested --shape/--size combo. ───────────────────────
     size = _norm_size(args.size)
     if size is None:
         raise SystemExit("train requires --size <all|int>")
