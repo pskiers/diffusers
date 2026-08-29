@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the dataset-coverage tables from the report (# Dataset section).
-
-S (training samples per size) is recomputed from gen_amaze.py so it stays exact.
-M is exact for maze (spanning trees of the n×n grid) and an estimate for queens
-(layouts × region colourings with a unique solution — no closed form).
-"""
+"""Check data coverage for amaze benchmark"""
 from __future__ import annotations
 
 import math
@@ -82,12 +77,12 @@ def main() -> None:
     q = queens_rows()
     m = maze_rows()
     print(f"MAZE_TRAIN={MAZE_TRAIN:,}  QUEEN_TRAIN={QUEEN_TRAIN:,}")
-    _table("Queens (M is an ESTIMATE — see docstring)", q)
+    _table("Queens", q)
     print(f"  sum S (queens) = {sum(s for _, _, s in q):,}  (should be {QUEEN_TRAIN:,})")
-    _table("Maze — S is per (shape, size); M = spanning trees of the n×n grid", m)
+    _table("Maze: S is per (shape, size), M = spanning trees of the nxn grid", m)
     print(
         f"  sum S (maze) = {sum(_maze_per_combo().values()):,}"
-        f"  (over all {len(MAZE_GEOMETRIES)}×{len(MAZE_SCALES)} shape×size combos;"
+        f"  (over all {len(MAZE_GEOMETRIES)}×{len(MAZE_SCALES)} shapexsize combos;"
         f" should be {MAZE_TRAIN:,})"
     )
 

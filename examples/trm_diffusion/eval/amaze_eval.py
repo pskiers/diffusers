@@ -324,3 +324,171 @@ class AmazeMetrics:
         arr = arr.astype(np.uint32)
         r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
         return (r | (g << 8) | (b << 16)).astype(np.int64)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared metric aggregation + wandb-table logging, used by every AMAZE eval path:
+# experiments/sample_amaze_metrics.py (TRM/DiT) and experiments/score_amaze_images.py
+# (BAGEL/Janus). ``AmazeMetrics`` above scores one image; the helpers below reduce the
+# per-puzzle rows into the canonical ``result`` dict and push the SAME general / OOD /
+# per-geometry / per-size tables to wandb. Only the way images are produced differs.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# In-distribution vs held-out (OOD) test scales — shared by every AMAZE eval path.
+MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
+MAZE_OOD_SCALES = [3]
+MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
+QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
+QUEEN_OOD_SCALES = [12]
+
+# The six aggregated per-puzzle row keys (distinct from ``_METRIC_KEYS`` above, which
+# are the raw per-image scorer keys).
+METRIC_KEYS = ("violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5")
+
+
+def aggregate(rows: list[dict]) -> dict:
+    """Reduce per-puzzle rows to the mean of each metric (0.0 for every key if empty)."""
+    if not rows:
+        return {k: 0.0 for k in METRIC_KEYS}
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+    return {k: float(df[k].mean()) for k in METRIC_KEYS}
+
+
+def maze_sample_key(geometry: str, scale) -> str:
+    """Key for the representative image pair of a maze (shape, size) combo.
+
+    Matches the FT PNG-directory name ``{geometry}_n{scale}`` so the sample dict is
+    keyed identically across the from-scratch and fine-tuned paths.
+    """
+    return f"{geometry}_n{scale}"
+
+
+def queens_sample_key(scale) -> str:
+    """Key for the representative image pair of a queens size (``n{scale}``)."""
+    return f"n{scale}"
+
+
+def build_maze_result(per_combo: dict, ood_combo: dict) -> dict:
+    """Canonical maze ``result`` dict from per-(shape,size) rows.
+
+    ``per_combo`` / ``ood_combo`` map ``f"{geometry}_{scale}"`` -> list of per-puzzle rows
+    (in-distribution scales and OOD scales respectively).
+    """
+    all_rows = [r for rows in per_combo.values() for r in rows]
+    return {
+        "task": "maze",
+        "overall": aggregate(all_rows),
+        "overall_ood": aggregate([r for rows in ood_combo.values() for r in rows]),
+        "per_shape": {
+            g: {str(s): aggregate(per_combo[f"{g}_{s}"]) for s in MAZE_SCALES}
+            for g in MAZE_GEOMETRIES
+        },
+        "per_shape_ood": {
+            g: {str(s): aggregate(ood_combo[f"{g}_{s}"]) for s in MAZE_OOD_SCALES}
+            for g in MAZE_GEOMETRIES
+        },
+        "per_geometry": {
+            g: aggregate([r for s in MAZE_SCALES for r in per_combo[f"{g}_{s}"]])
+            for g in MAZE_GEOMETRIES
+        },
+        "per_geometry_ood": {
+            g: aggregate([r for s in MAZE_OOD_SCALES for r in ood_combo[f"{g}_{s}"]])
+            for g in MAZE_GEOMETRIES
+        },
+        "n_puzzles": len(all_rows),
+    }
+
+
+def build_queens_result(per_scale_rows: dict, ood_scale_rows: dict) -> dict:
+    """Canonical queens ``result`` dict from per-size rows.
+
+    ``per_scale_rows`` / ``ood_scale_rows`` map ``str(scale)`` -> list of per-puzzle rows.
+    """
+    all_rows = [r for rows in per_scale_rows.values() for r in rows]
+    return {
+        "task": "queens",
+        "overall": aggregate(all_rows),
+        "overall_ood": aggregate([r for rows in ood_scale_rows.values() for r in rows]),
+        "per_scale": {s: aggregate(rows) for s, rows in per_scale_rows.items()},
+        "per_scale_ood": {s: aggregate(rows) for s, rows in ood_scale_rows.items()},
+        "n_puzzles": len(all_rows),
+    }
+
+
+def make_wandb_image(tensor):
+    """Convert a (C,H,W) [0,1] tensor to a wandb.Image (HWC uint8); None -> None."""
+    if tensor is None:
+        return None
+    import numpy as np
+    import wandb
+
+    arr = tensor.detach().float().clamp(0, 1).cpu().numpy()
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    return wandb.Image((arr * 255).astype("uint8"))
+
+
+def log_tables(run, task: str, result: dict, samples: dict | None = None) -> None:
+    """Log the general / OOD / per-geometry / per-size AMAZE tables to an open wandb run.
+
+    ``run`` is an already-initialised wandb run (the caller owns init/finish).
+    ``samples`` maps ``maze_sample_key`` / ``queens_sample_key`` -> a
+    ``{"generated", "condition"}`` image pair for the per-combo image tables.
+    """
+    import wandb
+
+    samples = samples or {}
+    prefix = f"amaze_eval/{task}"
+    for key, val in result["overall"].items():
+        run.summary[f"{prefix}/overall/{key}"] = val
+    for key, val in result.get("overall_ood", {}).items():
+        run.summary[f"{prefix}/overall_ood/{key}"] = val
+
+    img_cols = ["group", "generated", "condition",
+                "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
+    metric_cols = ["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
+
+    def _img_table(named_pairs):
+        t = wandb.Table(columns=img_cols)
+        for name, agg, pair in named_pairs:
+            pair = pair or {}
+            t.add_data(name, make_wandb_image(pair.get("generated")),
+                       make_wandb_image(pair.get("condition")),
+                       agg["violation"], agg["coverage"], agg["mse_inside"],
+                       agg["mse_outside"], agg["pass1"], agg["pass5"])
+        return t
+
+    def _metric_table(named_aggs):
+        t = wandb.Table(columns=metric_cols)
+        for name, agg in named_aggs:
+            t.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
+                       agg["mse_outside"], agg["pass1"], agg["pass5"])
+        return t
+
+    if task == "maze":
+        for g, by_scale in result["per_shape"].items():
+            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s))) for s in MAZE_SCALES]
+            run.log({f"{prefix}/{g}_table": _img_table(rows)})
+        for g, by_scale in result["per_shape_ood"].items():
+            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s))) for s in MAZE_OOD_SCALES]
+            run.log({f"{prefix}/{g}_ood_table": _img_table(rows)})
+
+        per_geometry = result["per_geometry"]
+        for g, agg in per_geometry.items():
+            for key, val in agg.items():
+                run.summary[f"{prefix}/per_geometry/{g}/{key}"] = val
+        run.log({f"{prefix}/per_geometry_table": _metric_table([(g, per_geometry[g]) for g in MAZE_GEOMETRIES])})
+
+        per_geometry_ood = result["per_geometry_ood"]
+        for g, agg in per_geometry_ood.items():
+            for key, val in agg.items():
+                run.summary[f"{prefix}/per_geometry_ood/{g}/{key}"] = val
+        run.log({f"{prefix}/per_geometry_ood_table": _metric_table([(g, per_geometry_ood[g]) for g in MAZE_GEOMETRIES])})
+    else:
+        combined = {**result["per_scale"], **result["per_scale_ood"]}
+        rows = [(f"{s}x{s}", combined[s], samples.get(queens_sample_key(s))) for s in combined]
+        run.log({f"{prefix}/per_scale_table": _img_table(rows)})

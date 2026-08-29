@@ -16,10 +16,10 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from models.sampling import TrajectoryRecorder
+from eval.amaze_eval import make_wandb_image as _make_wandb_image
 from experiments.sample_amaze_metrics import (
     TRM_ROOT,
     _build_amaze_dataset,
-    _make_wandb_image,
     _require_test_parquet,
 )
 

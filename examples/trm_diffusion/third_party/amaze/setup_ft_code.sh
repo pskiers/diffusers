@@ -17,11 +17,19 @@ trap 'rm -rf "$TMP"' EXIT
 echo ">> cloning ${AMAZE_REPO}"
 git clone --depth 1 "${AMAZE_REPO}" "${TMP}/amaze"
 
-echo ">> copying sft/, data/maze_dataset.py and infer/ glue into ${HERE}"
-mkdir -p "${HERE}/sft" "${HERE}/data" "${HERE}/infer"
-cp -r "${TMP}/amaze/sft/." "${HERE}/sft/"
-cp    "${TMP}/amaze/data/maze_dataset.py" "${HERE}/data/"
-cp -r "${TMP}/amaze/infer/." "${HERE}/infer/"
+# The sft/, data/ and infer/ glue is COMMITTED to this repo and locally modified
+# (e.g. sft/janus/sft.py + sft/bagel/sft.py carry our validation / wandb changes).
+# Do NOT clobber it on re-runs. Set FORCE_VENDOR=1 to re-copy upstream (overwrites edits).
+if [[ "${FORCE_VENDOR:-0}" == "1" || ! -f "${HERE}/sft/janus/sft.py" ]]; then
+  echo ">> copying sft/, data/maze_dataset.py and infer/ glue into ${HERE}"
+  mkdir -p "${HERE}/sft" "${HERE}/data" "${HERE}/infer"
+  cp -r "${TMP}/amaze/sft/." "${HERE}/sft/"
+  cp    "${TMP}/amaze/data/maze_dataset.py" "${HERE}/data/"
+  cp -r "${TMP}/amaze/infer/." "${HERE}/infer/"
+else
+  echo ">> glue already present (committed + locally modified) -> keeping it."
+  echo "   (set FORCE_VENDOR=1 to overwrite with upstream)"
+fi
 
 if [[ "${SKIP_BASE:-0}" != "1" ]]; then
   echo ">> cloning base model repos (large)"
@@ -34,4 +42,3 @@ fi
 echo "Done."
 echo "  glue code : ${HERE}/{sft,infer,data}"
 echo "  base repos: ${HERE}/sft/bagel/Bagel , ${HERE}/sft/janus/Janus"
-echo "Next: python scripts/export_amaze_for_ft.py both   # builds data/amaze/ft/{maze,queens}"

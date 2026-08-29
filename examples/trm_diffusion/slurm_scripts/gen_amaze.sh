@@ -11,7 +11,7 @@
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
-# Usage: sbatch slurm_scripts/gen_amaze.sh <test|train> <maze|queens|both> [--shape all --size all --image-size 256]
+# Usage: sbatch slurm_scripts/gen_amaze.sh <test|train|ft> <maze|queens|both> [--shape all --size all --image-size 256]
 
 set -euo pipefail
 
@@ -22,7 +22,7 @@ MODE="${1:-test}"
 TASK="${2:-both}"
 EXTRA="${*:3}"
 
-[[ "${MODE}" != "test" && "${MODE}" != "train" ]] && { echo "MODE must be test|train" >&2; exit 1; }
+[[ "${MODE}" != "test" && "${MODE}" != "train" && "${MODE}" != "ft" ]] && { echo "MODE must be test|train|ft" >&2; exit 1; }
 [[ "${TASK}" != "maze" && "${TASK}" != "queens" && "${TASK}" != "both" ]] && { echo "TASK must be maze|queens|both" >&2; exit 1; }
 
 module load CUDA/12.4.0
@@ -33,7 +33,7 @@ source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
 
-if [[ "${TASK}" == "maze" || "${TASK}" == "both" ]]; then
+if [[ "${MODE}" != "ft" && ( "${TASK}" == "maze" || "${TASK}" == "both" ) ]]; then
   if [[ ! -d third_party/amaze/mazes-generator/node_modules ]]; then
     echo "ERROR: third_party/amaze/mazes-generator/node_modules is missing." >&2
     echo "Run ONCE on the LOGIN node (needs internet):" >&2

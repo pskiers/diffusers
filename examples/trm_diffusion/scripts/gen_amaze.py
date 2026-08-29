@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import shutil
@@ -18,6 +20,7 @@ for _thr_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_thr_var, "1")
 
 import pandas as pd  # noqa: E402
+from PIL import Image  # noqa: E402
 
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
@@ -450,10 +453,6 @@ def _resize_train_parquet(train_dir: Path, image_size: int | None = None) -> Non
     if not train_pq.is_file():
         return
 
-    import base64
-    import io
-
-    from PIL import Image
     from torchvision import transforms
 
     def _decode(raw):
@@ -507,6 +506,67 @@ def _resize_train_parquet(train_dir: Path, image_size: int | None = None) -> Non
     print(f">> resized train → {image_size}px, dropped {dropped or '[]'}, backup {os.path.basename(backup)}")
 
 
+MAZE_PROMPT = (
+    "Add the blue solution path for the maze, connect start point (solid red circle) "
+    "to end point (red 'X' mark). Ensure all original maze elements (walls, points, "
+    "etc.) remain unchanged—only add the path."
+)
+QUEEN_PROMPT = (
+    "Given the puzzle image, generate the solved board by placing one queen "
+    "(represented by a solid black circle in the center of a grid cell) in each row, "
+    "column, and colored region while ensuring queens do not touch in 8-neighborhood."
+)
+_FT_IMAGE_COLS = ("original_img", "m_original_img", "sol_img", "mask_img", "cell_map")
+
+
+def export_ft(task: str) -> None:
+    def to_b64(cell):
+        if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+            return cell
+        if isinstance(cell, str):
+            return cell
+        if isinstance(cell, (bytes, bytearray)):
+            return base64.b64encode(bytes(cell)).decode("utf-8")
+        if isinstance(cell, Image.Image):
+            buf = io.BytesIO()
+            cell.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+        return cell
+
+    def prepare(df, prompt):
+        df = df.copy()
+        if "instruction" not in df.columns or df["instruction"].isna().all():
+            df["instruction"] = prompt
+        else:
+            df["instruction"] = df["instruction"].fillna(prompt)
+        for col in _FT_IMAGE_COLS:
+            if col in df.columns:
+                df[col] = df[col].map(to_b64)
+        return df
+
+    if task == "maze":
+        train_dir, test_src, prompt = train_maze_dir("all", "all"), test_maze_all_file(), MAZE_PROMPT
+    else:
+        train_dir, test_src, prompt = train_queens_dir("all"), test_queens_all_file(), QUEEN_PROMPT
+
+    orig = train_dir / "train.orig.parquet"
+    train_src = orig if orig.exists() else train_dir / "train.parquet"
+    if not train_src.exists():
+        raise SystemExit(f"train parquet not found: {train_src} (run gen_amaze.py train {task} --size all)")
+    if not test_src.exists():
+        raise SystemExit(f"test parquet not found: {test_src} (run gen_amaze.py test {task})")
+    if train_src.name == "train.parquet":
+        print(f"WARN [{task}]: train.orig.parquet missing — exporting 144px train.parquet (low-res FT).")
+
+    out_dir = OUT_ROOT / "ft" / task
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train = prepare(pd.read_parquet(train_src), prompt)
+    test = prepare(pd.read_parquet(test_src), prompt)
+    train.to_parquet(out_dir / "maze_dataset_train.parquet", index=False)
+    test.to_parquet(out_dir / "maze_dataset_test.parquet", index=False)
+    print(f">> ft {task}: train {len(train)} rows, test {len(test)} rows → {out_dir}")
+
+
 def _norm_size(value):
     if value is None:
         return None
@@ -520,8 +580,8 @@ def _norm_size(value):
 
 def main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(add_help=True, description="Amaze dataset generator")
-    parser.add_argument("mode", choices=["train", "test"])
-    parser.add_argument("task", help="maze | queens (amaze == maze)")
+    parser.add_argument("mode", choices=["train", "test", "ft"])
+    parser.add_argument("task", help="maze | queens | both (both only for ft; amaze == maze)")
     parser.add_argument("--shape", default=None,
                         help="maze train: all|" + "|".join(MAZE_GEOMETRIES))
     parser.add_argument("--size", default=None, help="train: all | <int>")
@@ -529,6 +589,17 @@ def main(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     task = "maze" if args.task in ("maze", "amaze") else args.task
+
+    if args.mode == "ft":
+        OUT_ROOT.mkdir(parents=True, exist_ok=True)
+        tasks = ["maze", "queens"] if args.task == "both" else [task]
+        for t in tasks:
+            if t not in ("maze", "queens"):
+                raise SystemExit(f"Unknown task '{args.task}' (use maze|queens|both)")
+            export_ft(t)
+        print(f"Done → {OUT_ROOT / 'ft'}")
+        return
+
     if task not in ("maze", "queens"):
         raise SystemExit(f"Unknown task '{args.task}' (use maze|queens)")
 

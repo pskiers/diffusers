@@ -11,9 +11,9 @@
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
-# Score any model on the AMAZE tables (Helios / GH200).
-#   bagel|janus|dummy : generate_amaze_ft.py -> score_amaze_images.py  (wandb amaze_final)
-#   dit|trm           : sample_amaze_metrics.py                        (logs into the training run)
+# Score any model on the AMAZE tables
+#   bagel|janus|dummy : score_amaze_images.py
+#   dit|trm           : sample_amaze_metrics.py
 #
 # Usage: sbatch slurm_scripts/eval_amaze.sh <dummy|bagel|janus|dit|trm> <maze|queens> [CKPT] [PAINTER_CKPT]
 # Env: SAMPLES(5) WANDB_PROJECT RUN_NAME THINK(0);  bagel: BAGEL_MODEL_PATH;  trm: CELL_SIZE SEQ_LEN GRID

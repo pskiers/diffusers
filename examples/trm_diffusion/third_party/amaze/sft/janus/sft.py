@@ -61,10 +61,10 @@ class VLChatProcessorOutput():
         return len(self.input_ids)
 
 def get_custom_cosine_schedule_with_warmup(
-    optimizer, 
-    num_warmup_steps, 
-    num_training_steps, 
-    min_lr_ratio=0.0, 
+    optimizer,
+    num_warmup_steps,
+    num_training_steps,
+    min_lr_ratio=0.0,
     num_cycles=0.5
 ):
     def lr_lambda(current_step):
@@ -133,7 +133,7 @@ class SftDataset(Dataset):
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.accelerator = accelerator
-        
+
         # 使用 MazeDataset 加载数据
         # data_path 应该是包含 maze_dataset_train.parquet 的目录路径
         dataset_path = config.data_path
@@ -143,7 +143,7 @@ class SftDataset(Dataset):
         split = getattr(config, 'split', 'train')
         self.maze_dataset = MazeDataset(dataset_path, split=split)
         accelerator.print(f'Total data amount: {len(self.maze_dataset)}')
-        
+
         # 动态检测真实的图像token数量（只在主进程执行，避免分布式环境下的问题）
         self.image_len = 576  # 默认值
         # if len(self.maze_dataset) > 0 and accelerator.is_main_process:
@@ -165,7 +165,7 @@ class SftDataset(Dataset):
         #                 accelerator.print(f'Detected image token count: {self.image_len}')
         #     except Exception as e:
         #         accelerator.print(f'Warning: Failed to detect image token count, using default 576. Error: {e}')
-        
+
         # 在分布式环境中同步image_len（所有进程使用相同的值）
         # if dist.is_initialized() and dist.get_world_size() > 1:
         #     try:
@@ -179,14 +179,14 @@ class SftDataset(Dataset):
         #     except Exception as e:
         #         accelerator.print(f'Warning: Failed to broadcast image token count, using local value {self.image_len}. Error: {e}')
 
-  
+
     def __len__(self) -> int:
         return len(self.maze_dataset)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         # 从 MazeDataset 获取数据
         maze_item = self.maze_dataset[index]
-        
+
         # 转换为 SFT 训练需要的格式
         # sol_img 作为 output_image（目标生成的图像）
         # m_original_img 或 original_img 作为 input_image（输入图像）
@@ -195,19 +195,19 @@ class SftDataset(Dataset):
             'output_image': maze_item['sol_img'],  # 解答图像作为输出目标
             'input_prompt': maze_item['prompt'],
         }
-        
+
         # 如果有输入图像，使用 m_original_img（带标记的迷宫）或 original_img
         input_images = []
         if maze_item['m_original_img'] is not None:
             input_images.append(maze_item['m_original_img'])
         # elif maze_item['original_img'] is not None:
         #     input_images.append(maze_item['original_img'])
-        
+
         if len(input_images) > 0:
             item['input_image'] = input_images
-        
+
         return item
-    
+
     def get_code_book(self, images):
         # images 现在是 PIL Image 对象列表，不是路径列表
         if images and isinstance(images[0], str):
@@ -216,7 +216,7 @@ class SftDataset(Dataset):
             images = [PIL.Image.fromarray(img).convert("RGB") if hasattr(img, 'shape') else img for img in images]
         images_outputs = self.processor.image_processor(images, return_tensors="pt")
         return images_outputs['pixel_values'].to(torch.bfloat16)
-    
+
     def process_image(self, images):
         # images 可以是 PIL Image 对象列表或路径列表
         if not images:
@@ -234,21 +234,21 @@ class SftDataset(Dataset):
         # 1. 准备图片数据
         gen_images = [x['output_image'] for x in batch]
         input_images = [x['input_image'][0] for x in batch] # 假设每个样本只有一张输入图
-        
+
         # 2. 处理 Pixel Values (都要转成 bfloat16 给 VQ Model 用)
         # 输出图（Target）
         pixel_values_output = self.process_image(gen_images).to(torch.bfloat16)
         # 输入图（Condition），注意这里也用 process_image，而不是 encoder 的处理逻辑
         pixel_values_input = self.process_image(input_images).to(torch.bfloat16)
-        
+
         # 3. 构造 Prompt 字符串
         # 我们需要手动构造： <vision_start><pad>*576<vision_end> + Prompt + <vision_start><pad>*576
-        
+
         # 定义 Token 字符串
         image_token_str = self.processor.image_start_tag + \
                           self.processor.pad_tag * self.processor.num_image_tokens + \
                           self.processor.image_end_tag
-                          
+
         # 仅用于输出的开头（生成部分通常不需要 end tag，看具体训练习惯，Janus通常只要 start）
         output_image_start = self.processor.image_start_tag + \
                              self.processor.pad_tag * self.processor.num_image_tokens
@@ -258,37 +258,37 @@ class SftDataset(Dataset):
             # 构造输入部分：Input Image Tokens + Text Prompt
             # 注意：这里把输入图片当成了文本的一部分塞进去
             user_content = image_token_str + "\n" + x['input_prompt']
-            
+
             conversation = [
                 {"role": "<|User|>", "content": user_content},
                 {"role": "<|Assistant|>", "content": ""}
             ]
-            
+
             # 应用模板
             sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
                 conversations=conversation,
                 sft_format=self.processor.sft_format,
                 system_prompt="",
             )
-            
+
             # 拼接输出部分的占位符
             sft_format = sft_format + output_image_start
-            
+
             input_ids = torch.LongTensor(self.processor.tokenizer.encode(sft_format))
-            
+
             # 此时 input_ids 里有两段 pad_tokens：
             # 第一段是输入图，第二段是输出图。我们在 train 里通过位置来区分。
-            
+
             pre_data.append(VLChatProcessorOutput(
                 sft_format=sft_format,
                 pixel_values=None, # 这里不再需要 encoder_pixel_values
                 input_ids=input_ids,
                 num_image_tokens=[] # 这里的逻辑可以忽略，因为我们手动处理了
             ))
-            
+
         if len(pre_data) > 0:
             prepare_inputs = self.processor.batchify(pre_data)
-            
+
         return {
             "input_ids": prepare_inputs.input_ids,
             "attention_mask": prepare_inputs.attention_mask,
@@ -314,11 +314,13 @@ def save_checkpoint(
     epoch: int,
     step: int,
     global_step: int,
-    is_last: bool = False
+    is_last: bool = False,
+    val_loss=None,
+    val_mse=None,
 ) -> None:
 
     save_dir = os.path.join(args.output_dir, f"checkpoint-{epoch}-{global_step}")
-    
+
     if accelerator.is_main_process:
         # Manage checkpoint numbers
         checkpoint_files = [f for f in os.listdir(args.output_dir) if f.startswith("checkpoint-")]
@@ -331,7 +333,7 @@ def save_checkpoint(
 
         model.save_pretrained(output_dir, state_dict=accelerator.get_state_dict(model))
         processor.save_pretrained(output_dir)
-        
+
         # Save training metadata
         training_state = {
             'epoch': epoch,
@@ -339,6 +341,8 @@ def save_checkpoint(
             'global_step': global_step,
             'n_epochs': args.n_epochs,
             'learning_rate': args.learning_rate,
+            'val_loss': val_loss,
+            'val_mse': val_mse,
         }
         training_state_path = os.path.join(save_dir, 'training_state.json')
         with open(training_state_path, 'w') as f:
@@ -346,6 +350,75 @@ def save_checkpoint(
 
     accelerator.wait_for_everyone()
     logger.info(f'Checkpoint {epoch}-{global_step} saved successfully')
+
+
+@torch.no_grad()
+def run_validation(model, processor, val_dataloader, accelerator, max_batches: int = 0):
+    """Mean CE loss + MSE over the validation split (up to ``max_batches`` batches).
+
+    Mirrors the training forward (VQ-encode input+output images, inject their embeds at
+    the two <vision_start> spans, predict the output image tokens) but without backward.
+    Returns (val_loss, val_mse) on every process; (None, None) if the loader is empty.
+    """
+    was_training = model.training
+    model.eval()
+    image_start_id = processor.image_start_id
+    image_token_len = 576
+    image_embeds_shape = 576
+
+    total_loss = torch.zeros([], device=accelerator.device)
+    total_mse = torch.zeros([], device=accelerator.device)
+    n = 0
+    for bi, batch in enumerate(val_dataloader):
+        if max_batches and bi >= max_batches:
+            break
+        quant, emb_loss, info = model.gen_vision_model.encode(batch['pixel_values'])
+        target_image_tokens = info[2].detach().reshape(batch['pixel_values'].shape[0], -1)
+        target_image_embeds = model.prepare_gen_img_embeds(target_image_tokens)
+        del quant, emb_loss, info
+
+        quant_in, emb_loss_in, info_in = model.gen_vision_model.encode(batch['input_pixel_values'])
+        input_image_tokens = info_in[2].detach().reshape(batch['input_pixel_values'].shape[0], -1)
+        input_image_embeds = model.prepare_gen_img_embeds(input_image_tokens)
+        del quant_in, emb_loss_in, info_in
+
+        inputs_embeds = model.language_model.get_input_embeddings()(batch['input_ids'])
+        for i in range(inputs_embeds.shape[0]):
+            start_indices = (batch['input_ids'][i] == image_start_id).nonzero(as_tuple=True)[0]
+            if len(start_indices) >= 2:
+                input_start = start_indices[0] + 1
+                inputs_embeds[i, input_start:input_start + image_token_len, :] = input_image_embeds[i]
+                output_start = start_indices[-1] + 1
+                inputs_embeds[i, output_start:output_start + image_token_len - 1, :] = target_image_embeds[i, :-1, :]
+
+        outputs = model.language_model.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch['attention_mask'],
+            return_dict=True,
+            use_cache=False,
+        )
+        full_len = inputs_embeds.shape[1]
+        start_pos = full_len - image_embeds_shape
+        logits = model.gen_head(outputs.last_hidden_state[:, start_pos - 1:full_len - 1, :])
+        pred_image_embeds = model.prepare_gen_img_embeds(logits.argmax(dim=-1))
+        total_mse += F.mse_loss(pred_image_embeds, target_image_embeds, reduction='mean')
+        total_loss += F.cross_entropy(logits.view(-1, logits.size(-1)), target_image_tokens.view(-1))
+        n += 1
+        del inputs_embeds, outputs, logits, pred_image_embeds, target_image_embeds, target_image_tokens
+        torch.cuda.empty_cache()
+
+    if was_training:
+        model.train()
+    if n == 0:
+        return None, None
+    if dist.is_initialized():
+        dist.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
+        dist.all_reduce(total_mse, op=torch.distributed.ReduceOp.SUM)
+        world = dist.get_world_size()
+    else:
+        world = 1
+    return total_loss.item() / (n * world), total_mse.item() / (n * world)
+
 
 def train(args: argparse.Namespace) -> None:
 
@@ -356,19 +429,19 @@ def train(args: argparse.Namespace) -> None:
 
     if accelerator.is_main_process:
         wandb.init(
-            project=args.experiment_name,
+            project=args.wandb_project,
             name=args.run_name,
             config=args,
             dir=args.log_dir,
-            mode="offline"
+            mode=args.wandb_mode,
         )
 
     # Set batch size (only when launched under DeepSpeed; plain accelerate/FSDP has no plugin)
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:
         accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.train_bsz_per_gpu
         accelerator.state.deepspeed_plugin.deepspeed_config['train_batch_size'] = (
-            args.train_bsz_per_gpu * 
-            dist.get_world_size() * 
+            args.train_bsz_per_gpu *
+            dist.get_world_size() *
             accelerator.gradient_accumulation_steps
         )
 
@@ -398,7 +471,7 @@ def train(args: argparse.Namespace) -> None:
         torch_dtype=torch.bfloat16
     )
     model_config = model.config
-    
+
     # Enable gradient checkpointing to save memory (critical for OOM)
     if hasattr(model.language_model.model, 'gradient_checkpointing_enable'):
         model.language_model.model.gradient_checkpointing_enable()
@@ -433,6 +506,22 @@ def train(args: argparse.Namespace) -> None:
         num_workers=1
     )
 
+    # Validation loader (val split = maze_dataset_test.parquet); only when enabled.
+    val_dataloader = None
+    if args.val_every_steps > 0:
+        import copy as _copy
+        val_args = _copy.copy(args)
+        val_args.split = 'test'
+        val_dataset = SftDataset(val_args, processor, accelerator, model)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.train_bsz_per_gpu,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=val_dataset.collate_fn,
+            num_workers=1
+        )
+
     # Set learning rate scheduler
     num_training_steps = int(len(train_dataloader) * args.n_epochs) // accelerator.gradient_accumulation_steps // (dist.get_world_size() if dist.is_initialized() else 1)
 
@@ -445,23 +534,28 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # Prepare training
-    model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
+    if val_dataloader is not None:
+        model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+            model, optimizer, train_dataloader, val_dataloader
+        )
+    else:
+        model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
 
     # Load checkpoint state if resuming
     resume_from_checkpoint = getattr(args, 'resume_from_checkpoint', None)
     start_epoch = 0
     global_step = 0
     training_state = None
-    
+
     if resume_from_checkpoint:
         if not os.path.exists(resume_from_checkpoint):
             raise ValueError(f'Checkpoint directory does not exist: {resume_from_checkpoint}')
-        
+
         # Verify checkpoint structure
         tfmr_dir = os.path.join(resume_from_checkpoint, 'tfmr')
         if not os.path.exists(tfmr_dir):
             raise ValueError(f'Checkpoint directory missing tfmr subdirectory: {resume_from_checkpoint}')
-        
+
         if accelerator.is_main_process:
             logger.info(f'Loading training state from {resume_from_checkpoint}')
         training_state = load_training_state(resume_from_checkpoint)
@@ -477,24 +571,27 @@ def train(args: argparse.Namespace) -> None:
 
     metric = TrainingMetrics(device=torch.cuda.current_device())
     model.train()
-    
+
     # Early stopping variables
     best_loss = None  # Will be initialized when early stopping starts
     patience_counter = 0
     should_stop = False
     early_stopping_initialized = False
+    # Most recent validation metrics -> recorded into each saved checkpoint (min-val selection).
+    last_val_loss = None
+    last_val_mse = None
 
     for epoch in range(start_epoch, args.n_epochs):
         if should_stop:
             if accelerator.is_main_process:
                 logger.info(f'Early stopping triggered at epoch {epoch}, step {global_step}')
             break
-        
+
         # Initialize early stopping when reaching the specified epoch
         if epoch == args.early_stopping_start_epoch and not early_stopping_initialized:
             if accelerator.is_main_process:
                 logger.info(f'Early stopping will be enabled starting from epoch {epoch}')
-        
+
         train_iter = tqdm(train_dataloader, total=len(train_dataloader)) if accelerator.is_main_process else train_dataloader
 
         for batch in train_iter:
@@ -503,7 +600,7 @@ def train(args: argparse.Namespace) -> None:
                 quant, emb_loss, info = model.gen_vision_model.encode(batch['pixel_values'])
                 target_image_tokens = info[2].detach().reshape(batch['pixel_values'].shape[0], -1)
             del quant, emb_loss, info
-            
+
             # 生成 Target 的 Embeddings (用于 Teacher Forcing)
             target_image_embeds = model.prepare_gen_img_embeds(target_image_tokens)
 
@@ -535,10 +632,10 @@ def train(args: argparse.Namespace) -> None:
             # =================================================================
             # 4. 注入 Embeddings (关键步骤！)
             # =================================================================
-            
+
             # 这里的逻辑假设：每个样本的结构都是 [Input_Img] ... [Output_Img]
             # 我们需要找到 input_ids 中 <vision_start> 的位置
-            
+
             image_start_id = processor.image_start_id # 确保你有这个 ID，通常在 processor.tokenizer 里
             image_token_len = 576
             # 遍历 Batch 中的每一个样本
@@ -547,7 +644,7 @@ def train(args: argparse.Namespace) -> None:
                 # 找到所有 <vision_start> 的索引
                 # (seq_len,) -> indices
                 start_indices = (batch['input_ids'][i] == image_start_id).nonzero(as_tuple=True)[0]
-                
+
                 # 理论上应该有两个 start tag (一个输入，一个输出)
                 # 如果有时候只有输出（比如有的样本没输入），要做判断。
                 # 假设都有：
@@ -562,14 +659,14 @@ def train(args: argparse.Namespace) -> None:
                     # 保持你原本正确的 Teacher Forcing 逻辑 (Shift)
                     output_start = start_indices[-1] + 1
                     output_end = output_start + image_token_len
-                    
+
                     # 目标区间：inputs_embeds[output_start : output_end]
                     # 我们填入：target_image_embeds[:-1] (前575个) 到前 575 个位置
                     # 最后一个位置保持原样（或者是 pad，无所谓，因为不预测它之后的东西）
-                    
+
                     # 你的旧逻辑复用：
                     # inputs_embeds[i, output_start : output_end-1, :] = target_image_embeds[i, :-1, :]
-                    
+
                     # 更稳健的写法：
                     inputs_embeds[i, output_start : output_end-1, :] = target_image_embeds[i, :-1, :]
 
@@ -585,7 +682,7 @@ def train(args: argparse.Namespace) -> None:
             image_embeds_shape = 576
             full_len = inputs_embeds.shape[1]
             start_pos = full_len - image_embeds_shape # 假设输出图在最末尾
-            
+
             # 提取 logits: [start_pos-1 : full_len-1]
             # start_pos-1 是 <vision_start>，预测 Token_0
             # full_len-1 是 Token_574，预测 Token_575
@@ -603,7 +700,7 @@ def train(args: argparse.Namespace) -> None:
             logits_flat = logits.view(-1, logits.size(-1)) # [B*576, 16384]
             labels_flat = target_image_tokens.view(-1)            # [B*576]
             loss = F.cross_entropy(logits_flat, labels_flat)
-            
+
             # Calculate MSE: predicted embeddings vs true embeddings
             # with torch.no_grad():
             #     # Get predicted tokens from logits (argmax)
@@ -613,7 +710,7 @@ def train(args: argparse.Namespace) -> None:
             #     pred_image_embeds = model.prepare_gen_img_embeds(pred_tokens)
             #     # Calculate MSE between predicted and true embeddings
             #     mse = F.mse_loss(pred_image_embeds, target_image_tokens, reduction='mean')
-            
+
             # Calculate metrics before backward (use detached copies to save memory)
             metric(logits.detach(), target_image_tokens.detach(), loss.detach(), mse.detach())
             # Free computed tensors
@@ -627,7 +724,7 @@ def train(args: argparse.Namespace) -> None:
             # Free loss and logits after backward (gradients are computed)
             del loss, logits
             # torch.cuda.empty_cache()
-            
+
             # Free inputs_embeds after backward (no longer needed)
             del inputs_embeds
             # torch.cuda.empty_cache()
@@ -646,13 +743,13 @@ def train(args: argparse.Namespace) -> None:
                 # Clear cache during gradient accumulation
                 torch.cuda.empty_cache()
 
-            
+
             global_step += 1
 
             if (global_step + 1) % accelerator.gradient_accumulation_steps == 0:
                 # Calculate metrics
                 acc, train_loss, train_mse = metric.get_metric()
-                
+
                 # Early stopping check (only after reaching the specified epoch)
                 if epoch >= args.early_stopping_start_epoch:
                     # Initialize best_loss on first check
@@ -662,7 +759,7 @@ def train(args: argparse.Namespace) -> None:
                         early_stopping_initialized = True
                         if accelerator.is_main_process:
                             logger.info(f'Early stopping enabled at epoch {epoch}, step {global_step}. Initial loss: {train_loss:.4f}')
-                    
+
                     if train_loss < best_loss:
                         best_loss = train_loss
                         patience_counter = 0
@@ -672,7 +769,7 @@ def train(args: argparse.Namespace) -> None:
                             should_stop = True
                             if accelerator.is_main_process:
                                 logger.info(f'Early stopping: loss has not improved for {args.early_stopping_patience} steps. Best loss: {best_loss:.4f}, Current loss: {train_loss:.4f}')
-                
+
                 if accelerator.is_main_process:
                     postfix_dict = {
                         'epoch': epoch,
@@ -687,9 +784,9 @@ def train(args: argparse.Namespace) -> None:
                     }
                     if early_stopping_initialized:
                         postfix_dict['patience'] = f"{patience_counter}/{args.early_stopping_patience}"
-                    
+
                     train_iter.set_postfix(**postfix_dict)
-                    
+
                     log_dict = {
                         'loss': train_loss,
                         'acc': acc,
@@ -699,9 +796,22 @@ def train(args: argparse.Namespace) -> None:
                     if early_stopping_initialized:
                         log_dict['best_loss'] = best_loss
                         log_dict['patience_counter'] = patience_counter
-                    
+
                     wandb.log(log_dict, step=global_step)
-                
+
+                # Periodic validation (all processes run the forward; main logs to wandb).
+                if args.val_every_steps > 0 and val_dataloader is not None:
+                    opt_step = (global_step + 1) // accelerator.gradient_accumulation_steps
+                    if opt_step % args.val_every_steps == 0:
+                        val_loss, val_mse = run_validation(
+                            model, processor, val_dataloader, accelerator, args.val_max_batches
+                        )
+                        if val_loss is not None:
+                            last_val_loss, last_val_mse = val_loss, val_mse
+                        if accelerator.is_main_process and val_loss is not None:
+                            wandb.log({'val/loss': val_loss, 'val/mse': val_mse}, step=global_step)
+                            logger.info(f'[val] step {global_step}: loss={val_loss:.4f} mse={val_mse:.4f}')
+
                 if should_stop:
                     # 早停时保存最新的权重
                     accelerator.wait_for_everyone()
@@ -709,38 +819,42 @@ def train(args: argparse.Namespace) -> None:
                         logger.info(f'Saving checkpoint before early stopping at epoch {epoch}, step {global_step}')
                     save_checkpoint(
                         model=model,
-                        processor=processor, 
+                        processor=processor,
                         accelerator=accelerator,
                         args=args,
                         epoch=epoch,
                         step=global_step-1,
                         global_step=global_step,
-                        is_last=True
+                        is_last=True,
+                        val_loss=last_val_loss,
+                        val_mse=last_val_mse,
                     )
                     break
 
         if should_stop:
             break
-            
+
         accelerator.wait_for_everyone()
         save_checkpoint(
             model=model,
-            processor=processor, 
+            processor=processor,
             accelerator=accelerator,
             args=args,
             epoch=epoch,
             step=global_step-1,
             global_step=global_step,
-            is_last=True
+            is_last=True,
+            val_loss=last_val_loss,
+            val_mse=last_val_mse,
         )
-    
+
     if should_stop and accelerator.is_main_process:
         best_loss_str = f"{best_loss:.4f}" if best_loss is not None else "N/A"
         logger.info(f'Training stopped early. Total epochs completed: {epoch}, Total steps: {global_step}, Best loss: {best_loss_str}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Pre-training parameter configuration')
-    
+
     # Experiment settings
     parser.add_argument('--experiment_name', type=str, default='janus_train', help='Experiment name')
     parser.add_argument('--run_name', type=str, default='run_1', help='Run name')
@@ -766,11 +880,17 @@ if __name__ == '__main__':
     parser.add_argument('--early_stopping_start_epoch', type=int, default=200, help='Start early stopping check after this many epochs')
     parser.add_argument('--early_stopping_patience', type=int, default=5, help='Early stopping patience: stop training if loss does not improve for this many steps')
 
+    # Validation + wandb (AMAZE: log train/val loss to a configurable wandb project)
+    parser.add_argument('--wandb_project', type=str, default=os.environ.get('WANDB_PROJECT', 'amaze'), help='wandb project (defaults to $WANDB_PROJECT).')
+    parser.add_argument('--wandb_mode', type=str, default=os.environ.get('WANDB_MODE', 'online'), help='wandb mode: online|offline|disabled (defaults to $WANDB_MODE).')
+    parser.add_argument('--val_every_steps', type=int, default=0, help='Run validation every N optimizer steps (0 disables).')
+    parser.add_argument('--val_max_batches', type=int, default=0, help='Max val batches per validation pass (0 = full val split).')
+
     # Others
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     args = parser.parse_args()
-    
+
     # Set paths
     args.log_dir = os.path.join(args.log_dir, args.experiment_name)
     args.output_dir = os.path.join(args.output_dir, args.experiment_name)
@@ -784,4 +904,4 @@ if __name__ == '__main__':
     set_seed(args.seed)
 
     # Start training
-    train(args)     
+    train(args)

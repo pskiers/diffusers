@@ -371,7 +371,7 @@ class TrainingArguments:
         metadata={"help": "W&B resume mode: 'allow', 'must', or 'never'."}
     )
     wandb_offline: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Run W&B in offline mode (logs locally, sync later)."}
     )
 
@@ -578,14 +578,12 @@ def main():
         os.makedirs(training_args.results_dir, exist_ok=True)
         os.makedirs(training_args.checkpoint_dir, exist_ok=True)
         logger = create_logger(training_args.results_dir, dist.get_rank())
-        wandb.login(key="b3753b33042543939282f6152e5ef1c8c21c1d07")
         wandb.init(
-            project=training_args.wandb_project, 
-            entity="1476093501",
-            id=f"{training_args.wandb_name}-run{training_args.wandb_runid}", 
-            name=training_args.wandb_name, 
+            project=training_args.wandb_project,
+            id=f"{training_args.wandb_name}-run{training_args.wandb_runid}",
+            name=training_args.wandb_name,
             resume=training_args.wandb_resume,
-            mode="offline", #if training_args.wandb_offline else "online",
+            mode="offline" if training_args.wandb_offline else "online",
             settings=wandb.Settings(init_timeout=120, start_method="fork")
         )
         wandb.config.update(training_args)
@@ -631,14 +629,14 @@ def main():
         language_model = Qwen2ForCausalLM(llm_config)
     else:
         language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
-    
+
     if training_args.copy_init_moe:
         language_model.init_moe()
 
     inference_dtype = torch.float32
 
 
-    if training_args.visual_und:  
+    if training_args.visual_und:
         if training_args.finetune_from_hf:
             vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
         else:
@@ -652,14 +650,14 @@ def main():
 
     if training_args.visual_gen:
         vae_model, vae_config = load_ae(
-            local_path=os.path.join(model_args.model_path, "ae.safetensors") 
+            local_path=os.path.join(model_args.model_path, "ae.safetensors")
             if training_args.finetune_from_hf else model_args.vae_path
         )
 
     config = BagelConfig(
         visual_gen=training_args.visual_gen,
         visual_und=training_args.visual_und,
-        llm_config=llm_config, 
+        llm_config=llm_config,
         vit_config=vit_config if training_args.visual_und else None,
         vae_config=vae_config if training_args.visual_gen else None,
         latent_patch_size=model_args.latent_patch_size,
@@ -670,8 +668,8 @@ def main():
         timestep_shift=training_args.timestep_shift,
     )
     model = Bagel(
-        language_model, 
-        vit_model if training_args.visual_und else None, 
+        language_model,
+        vit_model if training_args.visual_und else None,
         config
     )
 
@@ -712,19 +710,19 @@ def main():
         num_replicate=training_args.num_replicate,
         num_shard=training_args.num_shard,
     )
-    
+
     # 如果使用 LoRA checkpoint resume，需要先初始化 LoRA，然后再加载 checkpoint
     # 这样 try_load_ckpt 才能正确加载 LoRA 权重
     should_init_lora_before_load = (
-        training_args.use_lora_checkpoint and 
-        resume_from is not None and 
+        training_args.use_lora_checkpoint and
+        resume_from is not None and
         os.path.exists(resume_from)
     )
-    
+
     if should_init_lora_before_load:
         # 检查 checkpoint 中是否有 LoRA 权重
         model_state_dict_path = os.path.join(
-            resume_from, 
+            resume_from,
             "ema.safetensors" if training_args.finetune_from_ema else "model.safetensors"
         )
         has_lora_weights = False
@@ -736,7 +734,7 @@ def main():
                 del state_dict
             except Exception as e:
                 logger.warning(f"Failed to check LoRA weights in checkpoint: {e}")
-        
+
         if has_lora_weights:
             logger.info("Detected LoRA weights in checkpoint, initializing LoRA before loading checkpoint...")
             # 确保基础模型参数被冻结（PEFT 会自动处理，但显式设置更安全）
@@ -782,9 +780,9 @@ def main():
 
     # Load pretrained model weights
     model, _ = FSDPCheckpoint.try_load_ckpt(
-        resume_from, logger, model, 
+        resume_from, logger, model,
         resume_from_ema=training_args.finetune_from_ema,
-        use_lora=training_args.use_lora, 
+        use_lora=training_args.use_lora,
         use_lora_checkpoint=training_args.use_lora_checkpoint
     )
 
@@ -821,7 +819,7 @@ def main():
                 param.requires_grad = False
 
         model.language_model = language_model
-    
+
     # 如果使用 LoRA，确保只有 LoRA 参数可训练，其他参数都被冻结
     if training_args.use_lora:
         # PEFT 会自动冻结基础模型参数，但为了确保，我们显式设置
@@ -835,10 +833,10 @@ def main():
         for name, param in model.language_model.named_parameters():
             if 'moe_gen' in name:
                 param.requires_grad = True
-        
 
 
-    
+
+
     # LoRA on a single GPU: cast the (frozen) base to bf16 before wrapping so FSDP keeps a
     # bf16 master instead of fp32. Halves resident model memory so the 14.6B checkpoint
     # gather fits on one 96GB GPU. Safe for LoRA: the base is frozen (never updated).
@@ -847,10 +845,10 @@ def main():
 
     fsdp_model = fsdp_wrapper(model, fsdp_config)
     apply_activation_checkpointing(
-        fsdp_model, 
+        fsdp_model,
         checkpoint_wrapper_fn=functools.partial(
             checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-        ), 
+        ),
         check_fn=grad_checkpoint_check_fn
     )
 
@@ -861,10 +859,10 @@ def main():
 
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(
-        fsdp_model.parameters(), 
-        lr=training_args.lr, 
-        betas=(training_args.beta1, training_args.beta2), 
-        eps=training_args.eps, 
+        fsdp_model.parameters(),
+        lr=training_args.lr,
+        betas=(training_args.beta1, training_args.beta2),
+        eps=training_args.eps,
         weight_decay=0.01
     )
     if training_args.lr_scheduler == 'cosine':
@@ -887,7 +885,7 @@ def main():
         data_status = None
     else:
         optimizer, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
-            resume_from, optimizer, scheduler, fsdp_config, 
+            resume_from, optimizer, scheduler, fsdp_config,
         )
 
     # Setup maze packed dataloader with transforms
@@ -1001,7 +999,7 @@ def main():
       #  for layer in fsdp_model.language_model.module.model.model.layers:
        #     layer.module.training = False
         #    layer.module.self_attn.training = False
-    
+
     # Calculate and print trainable parameter ratio (after FSDP wrapping)
     if dist.get_rank() == 0:
         total_params = 0
@@ -1010,9 +1008,9 @@ def main():
             total_params += param.numel()
             if param.requires_grad:
                 trainable_params += param.numel()
-        
+
         trainable_ratio = (trainable_params / total_params * 100) if total_params > 0 else 0.0
-        
+
         logger.info("="*80)
         logger.info("📊 Trainable Parameters Statistics:")
         logger.info(f"   Total parameters: {total_params / 1e9:.4f}B ({total_params:,})")
@@ -1030,6 +1028,22 @@ def main():
     token_window = 0.0
     seqlen_square_window = 0.0
     dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
+    # Track the most recent validation metrics and record them next to each checkpoint so the
+    # post-training selection can pick the min-val step directly from local files (no wandb needed).
+    last_val = {"mse": None, "ce": None}
+    def _write_val_json(step):
+        if dist.get_rank() != 0 or last_val["mse"] is None:
+            return
+        import json
+        # async_checkpoint_save defaults True -> the checkpoint dir may not exist yet when we run,
+        # so create it (harmless: the async saver uses exist_ok=True for the same path).
+        d = os.path.join(training_args.checkpoint_dir, f"{step:07d}")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "val.json"), "w") as f:
+                json.dump({"step": step, "val_mse": last_val["mse"], "val_ce": last_val["ce"]}, f)
+        except OSError as e:
+            logger.warning(f"could not write val.json in {d}: {e}")
     for micro_step, data in enumerate(train_loader):
         curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
         if curr_step >= training_args.total_steps:
@@ -1037,7 +1051,7 @@ def main():
             break
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
-        ce_loss_weights = data.pop('ce_loss_weights', None)       
+        ce_loss_weights = data.pop('ce_loss_weights', None)
         tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
         dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
         token_window += tokens_tensor.item()
@@ -1060,7 +1074,7 @@ def main():
             #         # 获取当前 embedding 层的最大允许索引  152064
             #         current_vocab_limit = fsdp_model.module.language_model.config.vocab_size if hasattr(fsdp_model, "module") else model.language_model.config.vocab_size
             #         max_token_id = data['packed_text_ids'].max()
-                    
+
             #         if max_token_id >= current_vocab_limit:
             #             error_msg = f"FATAL ERROR: Found token ID {max_token_id} which exceeds vocab size {current_vocab_limit}!"
             #             logger.error(error_msg)
@@ -1069,7 +1083,7 @@ def main():
             #             raise ValueError(error_msg)
 
 
-            #         llm_pos_limit = 32768 
+            #         llm_pos_limit = 32768
             #         if hasattr(model.language_model.config, "max_position_embeddings"):
             #             llm_pos_limit = model.language_model.config.max_position_embeddings
 
@@ -1101,7 +1115,7 @@ def main():
             #         if 'packed_vit_tokens' in data:
             #             if dist.get_rank() == 0:
             #                 print(f"ℹ️ ViT Tokens Shape: {data['packed_vit_tokens'].shape}")
-                    
+
             #         # ================= [全方位越界检测 END] =================
             #     # ============================================
                 loss_dict = fsdp_model(**data)
@@ -1110,7 +1124,7 @@ def main():
                     logger.error(f"CUDA OOM at step {curr_step}: {e}")
                     torch.cuda.empty_cache()
                 raise e
-        
+
         loss = 0
         ce = loss_dict["ce"]
         #print(loss_dict)
@@ -1152,7 +1166,7 @@ def main():
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-        
+
         # Log loss values:
         if curr_step % training_args.log_every == 0:
             total_samples = torch.tensor(len(data['sample_lens']), device=device)
@@ -1236,6 +1250,8 @@ def main():
             )
             if dist.get_rank() == 0 and val_metrics:
                 wandb.log(val_metrics, step=curr_step)
+                last_val["mse"] = val_metrics.get('val_mse', last_val["mse"])
+                last_val["ce"] = val_metrics.get('val_ce', last_val["ce"])
 
             # Clear CUDA cache after validation
             torch.cuda.empty_cache()
@@ -1272,6 +1288,7 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            _write_val_json(curr_step)
 
     # Save final checkpoint if not already saved
     if curr_step > 0:
@@ -1288,7 +1305,7 @@ def main():
         except RuntimeError as e:
             logger.error(f"Error during final gather_object: {e}")
             gather_list = None if dist.get_rank() != 0 else [data_status] * dist.get_world_size()
-        
+
         FSDPCheckpoint.fsdp_save_ckpt(
             ckpt_dir=training_args.checkpoint_dir,
             train_steps=curr_step,
@@ -1315,8 +1332,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        _write_val_json(curr_step)
         logger.info(f"Final checkpoint saved at step {curr_step}")
-    
+
     logger.info("Done!")
     if dist.get_rank() == 0:
         wandb.finish()
