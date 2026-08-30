@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_bagel_ft
-#SBATCH --account=plgdiffusion3-gpu-a100
-#SBATCH --partition=plgrid-gpu-a100
+#SBATCH --account=plgdiffusion3-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
@@ -18,7 +18,7 @@
 #
 # Usage: sbatch slurm_scripts/train_bagel_ft.sh <maze|queens>
 # Env: BAGEL_MODEL_PATH (REQUIRED), TOTAL_STEPS (5000), SAVE_EVERY (500), LR (1e-5),
-#      WANDB_PROJECT (amaze_final), RUN_NAME, CPU_OFFLOAD (false), VENV (default $SCRATCH/trm_sokoban/venv).
+#      WANDB_PROJECT (amaze_final), RUN_NAME, CPU_OFFLOAD (false), VENV (default $SCRATCH/trm_helios_venv).
 # NB: each checkpoint = full model (~29GB) + optimizer state (~100GB+), and fsdp_save_ckpt does NOT
 #     rotate/prune. SAVE_EVERY 500 over 5000 steps = 10 ckpts (~1.5TB). eval_every=50 keeps the wandb
 #     val curve fine-grained so you can locate + pick the best checkpoint by val loss / Pass@K.
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="${VENV:-${SCRATCH}/trm_sokoban/venv}"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 TASK="${1:?usage: sbatch train_bagel_ft.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
@@ -48,9 +48,7 @@ SAMPLES="${SAMPLES:-5}"
 SELECT="${SELECT:-val}"   # val: score only the lowest-val-MSE checkpoint; all: score every checkpoint
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
 
-# Athena: the venv (torch 2.4.1+cu124) bundles CUDA/cuDNN -> no Python/CUDA module needed.
-# Set MODULES only if you actually need extra modules (e.g. MODULES="CUDA/12.4.0").
-if [[ -n "${MODULES:-}" ]]; then module load ${MODULES}; fi
+module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs

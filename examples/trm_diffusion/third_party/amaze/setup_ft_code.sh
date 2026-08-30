@@ -35,6 +35,37 @@ if [[ "${SKIP_BASE:-0}" != "1" ]]; then
   echo ">> cloning base model repos (large)"
   [[ -d "${HERE}/sft/bagel/Bagel" ]] || git clone --depth 1 https://github.com/ByteDance-Seed/Bagel.git "${HERE}/sft/bagel/Bagel"
   [[ -d "${HERE}/sft/janus/Janus" ]] || git clone --depth 1 https://github.com/deepseek-ai/Janus.git "${HERE}/sft/janus/Janus"
+
+  # torch < 2.5 has no torch.nn.attention.flex_attention; Bagel imports it unconditionally, but we
+  # train with --use_flex false, so guard those imports to let Bagel load on torch 2.4.x (idempotent).
+  if [[ -d "${HERE}/sft/bagel/Bagel" ]]; then
+    ( cd "${HERE}/sft/bagel/Bagel" && python - <<'PY'
+import glob, re
+MARK = "# flex-guarded"
+for f in glob.glob("**/*.py", recursive=True):
+    try:
+        s = open(f).read()
+    except Exception:
+        continue
+    if "flex_attention import" not in s or MARK in s:
+        continue
+    out = []
+    for ln in s.split("\n"):
+        m = re.match(r"^(\s*)from torch\.nn\.attention\.flex_attention import (.+)$", ln)
+        if m:
+            ind = m.group(1)
+            names = [x.strip().split(" as ")[-1] for x in m.group(2).split(",")]
+            out.append(ind + "try:  " + MARK)
+            out.append(ind + "    " + ln.strip())
+            out.append(ind + "except (ImportError, ModuleNotFoundError):")
+            out.extend(ind + "    " + nm + " = None" for nm in names)
+        else:
+            out.append(ln)
+    open(f, "w").write("\n".join(out))
+    print("guarded flex_attention:", f)
+PY
+    )
+  fi
 else
   echo ">> SKIP_BASE=1 -> not cloning Bagel/Janus base repos"
 fi

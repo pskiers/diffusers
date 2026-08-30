@@ -34,6 +34,7 @@ source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
 export PYTHONUNBUFFERED=1
+export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="${PROJECT_ROOT}/third_party/amaze/sft/janus/Janus:${PROJECT_ROOT}/third_party/amaze:${PYTHONPATH:-}"
 export WANDB_PROJECT="${WANDB_PROJECT}"
 

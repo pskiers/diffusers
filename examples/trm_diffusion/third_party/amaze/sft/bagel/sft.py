@@ -568,6 +568,14 @@ def main():
     torch.cuda.set_device(device)
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # TEMP (remove after the reused save_every=100 Bagel jobs finish): the frozen pending jobs pass
+    # --save_every 100 -> ~50 ckpts x ~150GB = ~7TB each, and two blow the 12TB Helios scratch. Bump
+    # exactly 100 -> 500 at runtime (sft.py is copied per-run) so they keep 10 ckpts (~1.5TB). Any
+    # other value (e.g. our train_bagel_ft.sh's 500, or a smoke's 50) is left untouched.
+    if training_args.save_every == 100:
+        training_args.save_every = 500
+
     if training_args.peak_device_tflops <= 0:
         auto_tflops = detect_peak_tflops(training_args.peak_device_tflops)
         if auto_tflops > 0:

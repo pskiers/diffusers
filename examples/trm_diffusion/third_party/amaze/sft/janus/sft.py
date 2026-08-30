@@ -883,8 +883,8 @@ if __name__ == '__main__':
     # Validation + wandb (AMAZE: log train/val loss to a configurable wandb project)
     parser.add_argument('--wandb_project', type=str, default=os.environ.get('WANDB_PROJECT', 'amaze'), help='wandb project (defaults to $WANDB_PROJECT).')
     parser.add_argument('--wandb_mode', type=str, default=os.environ.get('WANDB_MODE', 'online'), help='wandb mode: online|offline|disabled (defaults to $WANDB_MODE).')
-    parser.add_argument('--val_every_steps', type=int, default=0, help='Run validation every N optimizer steps (0 disables).')
-    parser.add_argument('--val_max_batches', type=int, default=0, help='Max val batches per validation pass (0 = full val split).')
+    parser.add_argument('--val_every_steps', type=int, default=200, help='Run validation every N optimizer steps (0 disables).')
+    parser.add_argument('--val_max_batches', type=int, default=16, help='Max val batches per validation pass (0 = full val split).')
 
     # Others
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

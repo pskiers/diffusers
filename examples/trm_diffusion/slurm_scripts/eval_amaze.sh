@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_eval
-#SBATCH --account=plgdiffusion3-gpu-a100
-#SBATCH --partition=plgrid-gpu-a100
+#SBATCH --account=plgdiffusion3-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
@@ -21,16 +21,14 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="${VENV:-${SCRATCH}/trm_sokoban/venv}"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 MODEL="${1:?usage: sbatch eval_amaze.sh <dummy|bagel|janus|dit|trm> <maze|queens> [CKPT] [PAINTER_CKPT]}"
 TASK="${2:?need task: maze|queens}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
 SAMPLES="${SAMPLES:-5}"
 
-# Athena: the venv (torch 2.4.1+cu124) bundles CUDA/cuDNN -> no Python/CUDA module needed.
-# Set MODULES only if you actually need extra modules (e.g. MODULES="CUDA/12.4.0").
-if [[ -n "${MODULES:-}" ]]; then module load ${MODULES}; fi
+module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
