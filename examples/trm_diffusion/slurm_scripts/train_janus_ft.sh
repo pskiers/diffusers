@@ -1,27 +1,27 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_janus_ft
-#SBATCH --account=plgdiffusion3-gpu-a100
-#SBATCH --partition=plgrid-gpu-a100
+#SBATCH --account=plgdiffusion3-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=0
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
 # Usage (from trm_diffusion):  sbatch slurm_scripts/train_janus_ft.sh <maze|queens>
-# Athena: full FT of Janus-Pro-7B sharded across NPROC(4) A100-40GB via accelerate FSDP
-# (config slurm_scripts/fsdp_janus.yaml) -- 7B + AdamW don't fit one 40GB card.
-# Env: JANUS_MODEL_PATH (REQUIRED), N_EPOCHS (8), LR (5e-6), GRAD_ACCUM (16), NPROC (4),
+# Helios: full FT of Janus-Pro-7B on ONE GH200-120GB (fits without sharding). Training ~20h;
+# with SAMPLE=true the post-train scoring adds a few h -> either bump --time or set SAMPLE=false.
+# Env: JANUS_MODEL_PATH (REQUIRED), N_EPOCHS (8), LR (5e-6), GRAD_ACCUM (16),
 #      WANDB_PROJECT (amaze_final), WANDB_MODE (online), SELECT (val|all), SAMPLES (5),
-#      RUN_NAME, VENV (default $SCRATCH/trm_sokoban/venv).
+#      RUN_NAME, VENV (default $SCRATCH/trm_helios_venv).
 
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="${VENV:-${SCRATCH}/trm_sokoban/venv}"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 TASK="${1:?usage: sbatch train_janus_ft_helios.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
@@ -34,7 +34,6 @@ DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 N_EPOCHS="${N_EPOCHS:-8}"
 LR="${LR:-5e-6}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
-NPROC="${NPROC:-4}"                 # GPUs to shard the 7B model across (FSDP FULL_SHARD)
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 WANDB_MODE="${WANDB_MODE:-online}"
 VAL_EVERY_STEPS="${VAL_EVERY_STEPS:-200}"
@@ -45,9 +44,7 @@ SELECT="${SELECT:-$([[ "${TASK}" == "queens" ]] && echo all || echo val)}"  # qu
 RUN_NAME="${RUN_NAME:-ft_janus_${TASK}}"
 JANUS_MODEL_PATH="${JANUS_MODEL_PATH:?set JANUS_MODEL_PATH to a local Janus-Pro-7B snapshot (huggingface-cli download deepseek-ai/Janus-Pro-7B)}"
 
-# Athena: the venv (torch 2.4.1+cu124) bundles CUDA/cuDNN -> no Python/CUDA module needed.
-# Set MODULES only if you actually need extra modules (e.g. MODULES="CUDA/12.4.0").
-if [[ -n "${MODULES:-}" ]]; then module load ${MODULES}; fi
+module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs
@@ -62,13 +59,11 @@ export PYTHONPATH="${PROJECT_ROOT}/${JANUS_BASE}:${PROJECT_ROOT}/${AMAZE_DIR}:${
 export WANDB_PROJECT="${WANDB_PROJECT}"
 export WANDB_MODE="${WANDB_MODE}"
 
-# ${NPROC}x A100-40GB via FSDP FULL_SHARD (7B + AdamW don't fit one 40GB card).
+# Single GH200-120GB -> one training process (7B + AdamW fit without sharding).
 RESUME_ARGS=()
 [[ -n "${RESUME_FROM:-}" ]] && RESUME_ARGS=( --resume_from_checkpoint "${RESUME_FROM}" )
 
-srun accelerate launch \
-  --config_file "${PROJECT_ROOT}/slurm_scripts/fsdp_janus.yaml" \
-  --num_processes "${NPROC}" \
+srun accelerate launch --num_processes 1 --mixed_precision bf16 \
   "${JANUS_SFT}/sft.py" \
   --model_path "${JANUS_MODEL_PATH}" \
   --data_path "${DATA_DIR}" \

@@ -18,7 +18,7 @@
 #
 # Usage: sbatch slurm_scripts/train_bagel_ft.sh <maze|queens>
 # Env: BAGEL_MODEL_PATH (REQUIRED), TOTAL_STEPS (5000), SAVE_EVERY (500), LR (1e-5),
-#      WANDB_PROJECT (amaze_final), RUN_NAME, CPU_OFFLOAD (false), VENV (default $SCRATCH/trm_helios_venv).
+#      WANDB_PROJECT (amaze_final), RUN_NAME, CPU_OFFLOAD (false), VENV (default $SCRATCH/trm_sokoban/venv).
 # NB: each checkpoint = full model (~29GB) + optimizer state (~100GB+), and fsdp_save_ckpt does NOT
 #     rotate/prune. SAVE_EVERY 500 over 5000 steps = 10 ckpts (~1.5TB). eval_every=50 keeps the wandb
 #     val curve fine-grained so you can locate + pick the best checkpoint by val loss / Pass@K.
