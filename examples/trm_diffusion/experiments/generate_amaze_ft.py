@@ -525,6 +525,9 @@ def main():
         out = args.gen_dir / combo
         out.mkdir(parents=True, exist_ok=True)
         for idx, row in df.iterrows():
+            # resume: skip puzzles whose k sample images already exist
+            if all((out / f"{idx}_{a}.png").exists() for a in range(k)):
+                continue
             image = _decode(row["m_original_img"])
             prompt = row.get("instruction") or row.get("text") or fallback_prompt
             for a, im in enumerate(backend.generate(image, prompt, k)):
