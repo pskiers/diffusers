@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_bagel_ft
-#SBATCH --account=plgdiffusion3-gpu-gh200
-#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --account=plgdiffusion3-gpu-a100
+#SBATCH --partition=plgrid-gpu-a100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
+VENV="${VENV:-${SCRATCH}/trm_sokoban/venv}"
 
 TASK="${1:?usage: sbatch train_bagel_ft.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
@@ -34,7 +34,7 @@ TASK="${1:?usage: sbatch train_bagel_ft.sh <maze|queens>}"
 AMAZE_DIR="third_party/amaze"
 BAGEL_SFT="${AMAZE_DIR}/sft/bagel"
 BAGEL_BASE="${BAGEL_SFT}/Bagel"
-DATA_DIR="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
+DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 
 TOTAL_STEPS="${TOTAL_STEPS:-5000}"   # authors' run_sft.sh recipe (optimizer updates; dataset-size-independent)
 SAVE_EVERY="${SAVE_EVERY:-500}"      # ckpt cadence only (no effect on trained model). 5000/500=10 ckpts ~1.5TB; each ~150GB, NOT rotated -> lower only if scratch allows
@@ -48,7 +48,9 @@ SAMPLES="${SAMPLES:-5}"
 SELECT="${SELECT:-val}"   # val: score only the lowest-val-MSE checkpoint; all: score every checkpoint
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+# Athena: the venv (torch 2.4.1+cu124) bundles CUDA/cuDNN -> no Python/CUDA module needed.
+# Set MODULES only if you actually need extra modules (e.g. MODULES="CUDA/12.4.0").
+if [[ -n "${MODULES:-}" ]]; then module load ${MODULES}; fi
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs
