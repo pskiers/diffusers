@@ -37,8 +37,8 @@ def _nproc(env_var: str) -> int:
 
 
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
-MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
-MAZE_OOD_SCALES = [3]
+MAZE_SCALES = [int(x) for x in os.environ.get("MAZE_SCALES", "5,7,8,9,11,13,16").split(",") if x.strip()]
+MAZE_OOD_SCALES = [int(x) for x in os.environ.get("MAZE_OOD_SCALES", "3").split(",") if x.strip()]
 MAZE_TEST_PER_SCALE = int(os.environ.get("MAZE_TEST_PER_SCALE", "100"))
 QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
 QUEEN_OOD_SCALES = [12]
