@@ -1,0 +1,22 @@
+# @package _global_
+# Same as mnist_unet_concat_painter_srm.yaml, except the ~19.2M-param
+# backbone (mnist_unet_concat_20m.yaml) instead of the 81.7M one -- a
+# smaller sibling for parameter-count ablations.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_unet_concat_painter_srm_20m \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku_srm
+  - override /backbone: mnist_unet_concat_20m
+  - override /painter: mnist_unet_concat_conditional
+  - override /train: mnist_unet_concat_big
+  - override /eval_callbacks: mnist
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_unet_concat_painter_srm_20m"

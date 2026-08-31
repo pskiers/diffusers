@@ -209,15 +209,22 @@ class ThinkerFrozenPainterBase(BaseModel):
         z_H: Optional[torch.Tensor] = None,
         z_L: Optional[torch.Tensor] = None,
         n_sup: Optional[int] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
         null_steering: bool = False,
         use_halt_head: bool = False,
         halt_threshold: float = 0.0,
         steps_used: Optional[list] = None,
         halt_preds_out: Optional[list] = None,
         halt_steps_out: Optional[list] = None,
+        logits_out: Optional[list] = None,
+        zH_out: Optional[list] = None,
     ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
-        instead of always resetting it, and allows overriding n_sup.
+        instead of always resetting it, and allows overriding n_sup/
+        H_cycles/L_cycles (see experiments/ablate_trm_loop_budget.py's
+        "t_n" axis) for inference-time ablation only — training always uses
+        the thinker's configured H_cycles/L_cycles.
 
         z_H/z_L=None (the default) reproduces forward()'s behavior exactly:
         a fresh get_initial_states() reset. Passing in a previous call's
@@ -267,6 +274,31 @@ class ThinkerFrozenPainterBase(BaseModel):
         experiments/eval_halt_step_profile.py. None by default, so existing
         call sites are unaffected.
 
+        logits_out: optional list; if given and use_halt_head=False, the
+        raw thinker logits (detached, pre-CFG, pre-painter) after every
+        reasoning iteration are appended to it in order — the "candidate
+        trajectory" experiment D2 needs (decode each iteration's logits via
+        run_painter + the caller's own CFG combine to score task accuracy
+        vs. reasoning step k). See
+        experiments/candidate_trajectory_probe.py. None by default, so
+        existing call sites are unaffected. Not populated under
+        use_halt_head=True (its own per-sample early-exit already changes
+        which iterations exist per sample) or null_steering (no reasoning
+        happens).
+
+        zH_out: optional list; if given, z_H (detached) after every
+        reasoning iteration is appended to it — the raw recurrent state a
+        post-hoc digit probe reads (see experiments/train_digit_probe.py),
+        as opposed to logits_out's already-decoded-to-vocab values. Unlike
+        logits_out, THIS one is populated under use_halt_head=True too: at
+        each iteration the appended (bsz, ...) snapshot holds every
+        still-active sample's just-computed z_H, with already-halted
+        samples' slots frozen at their own last computed state — a
+        consistent full-batch-shaped "current best known z_H per sample"
+        at every iteration, suitable for experiments/
+        probe_reasoning_dynamics.py's halt-threshold ablation. Not
+        populated under null_steering (no reasoning happens).
+
         Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
         null_steering, the carry is passed through unchanged so callers can
         thread state uniformly regardless of null_steering. z_H_next/
@@ -298,11 +330,16 @@ class ThinkerFrozenPainterBase(BaseModel):
                 step_count = 0
                 for _ in range(n_sup):
                     logits, z_H, z_L = self.thinker.reasoning_step(
-                        enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps
+                        enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps,
+                        H_cycles=H_cycles, L_cycles=L_cycles,
                     )
                     step_count += 1
                     if halt_preds_out is not None:
                         halt_preds_out.append(self.thinker.predict_halt_value(z_H).detach())
+                    if logits_out is not None:
+                        logits_out.append(logits.detach())
+                    if zH_out is not None:
+                        zH_out.append(z_H.detach())
                 if steps_used is not None:
                     steps_used.append(step_count)
             else:
@@ -313,6 +350,12 @@ class ThinkerFrozenPainterBase(BaseModel):
                 active_idx = torch.arange(bsz, device=device)
                 cur_enc_emb, cur_puzzle_ids, cur_timesteps = enc_emb, puzzle_ids, sample.timesteps
                 cur_z_H, cur_z_L, cur_logits = z_H, z_L, None
+                # running_z_H: (bsz, ...) "current best known z_H per sample"
+                # snapshot for zH_out, accounting for early halting — a
+                # halted sample's slot stops updating (frozen at its last
+                # computed state) while still-active samples' slots keep
+                # tracking their latest z_H every iteration.
+                running_z_H = z_H.clone() if zH_out is not None else None
 
                 final_logits = None
                 final_z_H = torch.empty_like(z_H)
@@ -322,13 +365,17 @@ class ThinkerFrozenPainterBase(BaseModel):
                 step_count = 0
                 for _ in range(n_sup):
                     new_logits, new_z_H, new_z_L = self.thinker.reasoning_step(
-                        cur_enc_emb, cur_z_H, cur_z_L, cur_puzzle_ids, timesteps=cur_timesteps
+                        cur_enc_emb, cur_z_H, cur_z_L, cur_puzzle_ids, timesteps=cur_timesteps,
+                        H_cycles=H_cycles, L_cycles=L_cycles,
                     )
                     step_count += 1
                     if final_logits is None:
                         final_logits = torch.empty(
                             bsz, *new_logits.shape[1:], dtype=new_logits.dtype, device=device
                         )
+                    if running_z_H is not None:
+                        running_z_H[active_idx] = new_z_H
+                        zH_out.append(running_z_H.detach().clone())
 
                     pred = self.thinker.predict_halt_value(new_z_H)
                     if halt_preds_out is not None:
@@ -606,17 +653,19 @@ class ThinkerFrozenPainterBase(BaseModel):
     # ── Compilation ───────────────────────────────────────────────────────────
 
     def compile_submodules(self):
-        self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False)
+        self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False, dynamic=False)
         if hasattr(self.painter, "compile_submodules"):
             self.painter.compile_submodules()
         if hasattr(self.condition_encoder, "compile_submodules"):
             self.condition_encoder.compile_submodules()
         else:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=False)
         if hasattr(self.thinker_painter_translator, "compile_submodules"):
             self.thinker_painter_translator.compile_submodules()
         else:
-            self.thinker_painter_translator = torch.compile(self.thinker_painter_translator, fullgraph=False)
+            self.thinker_painter_translator = torch.compile(
+                self.thinker_painter_translator, fullgraph=False, dynamic=False
+            )
 
 
 # ── Persistent-carry ACT training (separate from ThinkerFrozenPainterBase —

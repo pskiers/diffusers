@@ -290,9 +290,9 @@ class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
         return metrics
 
     def compile_submodules(self):
-        self.backbone = torch.compile(self.backbone, fullgraph=False)
+        self.backbone = torch.compile(self.backbone, fullgraph=False, dynamic=False)
         if self.condition_encoder is not None:
-            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False)
+            self.condition_encoder = torch.compile(self.condition_encoder, fullgraph=False, dynamic=False)
 
 
 class ActionUNet1DPainter(ActionPainterBase):

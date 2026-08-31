@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,8 +21,10 @@ from models.interfaces import DiffusionPrediction
 from models.losses import build_loss
 from models.painter_base import PainterBase
 from models.utility_models import TimestepMLP
+from models.trm.layers import CastedEmbedding, CastedLinear, RotaryEmbedding
 from models.trm.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1_Inner,
+    TinyRecursiveReasoningModel_ACTV1Block,
     TinyRecursiveReasoningModel_ACTV1Config,
     TinyRecursiveReasoningModel_ACTV1InnerCarry,
 )
@@ -446,10 +450,10 @@ class SpatialTRM(BaseModel):
         return {"loss": avg_loss}, lr, global_step
 
     def compile_submodules(self):
-        self.inner.L_level = torch.compile(self.inner.L_level, fullgraph=False)
+        self.inner.L_level = torch.compile(self.inner.L_level, fullgraph=False, dynamic=False)
         if self.with_timestep_emb:
-            self.timestep_mlp = torch.compile(self.timestep_mlp, fullgraph=False)
-            self.thinker_temb_proj = torch.compile(self.thinker_temb_proj, fullgraph=False)
+            self.timestep_mlp = torch.compile(self.timestep_mlp, fullgraph=False, dynamic=False)
+            self.thinker_temb_proj = torch.compile(self.thinker_temb_proj, fullgraph=False, dynamic=False)
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:
@@ -570,21 +574,177 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
 
     # ── Forward / sampling ───────────────────────────────────────────────────
 
-    def forward(self, sample: DataSample, **kwargs) -> DiffusionPrediction:
-        """Full inference: fresh carry, n_sup reasoning steps, fold back to
-        an image. No guidance is applied here (matches ThinkerFrozenPainterBase.forward);
-        use CFGPredictor from models.sampling during SamplingPipeline.sample()."""
+    def run_painter(self, sample: DataSample, logits: torch.Tensor) -> torch.Tensor:
+        """Fold TRM logits (raw per-patch pixels) back into an image.
+
+        Named to match ThinkerFrozenPainterBase.run_painter's interface, not
+        because there's a separate painter here — this IS the unpatchify
+        step — so inference-time ablation scripts (e.g.
+        experiments/ablate_trm_loop_budget.py) can call it uniformly across
+        both model types.
+        """
+        return self._image_from_patches(logits.float())
+
+    def forward_with_carry(
+        self,
+        sample: DataSample,
+        z_H: Optional[torch.Tensor] = None,
+        z_L: Optional[torch.Tensor] = None,
+        n_sup: Optional[int] = None,
+        H_cycles: Optional[int] = None,
+        L_cycles: Optional[int] = None,
+        shuffle_state: bool = False,
+        use_halt_head: bool = False,
+        halt_threshold: float = 0.0,
+        steps_used: Optional[list] = None,
+        halt_preds_out: Optional[list] = None,
+        halt_steps_out: Optional[list] = None,
+        logits_out: Optional[list] = None,
+        zH_out: Optional[list] = None,
+    ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
+        instead of always resetting it, and allows overriding n_sup/
+        H_cycles/L_cycles for inference-time ablation only (training always
+        uses the configured values via a fresh reset — see train_step).
+
+        z_H/z_L=None (the default) reproduces forward()'s behavior exactly:
+        a fresh get_initial_states() reset. Passing in a previous call's
+        returned carry instead lets a caller thread reasoning state across
+        denoising timesteps (see experiments/ablate_trm_loop_budget.py's
+        "static"/"carry"/"t_n" axes) — out of the training distribution, so
+        a regression under carrying is a real, expected possible outcome.
+
+        shuffle_state: experiment-C state-shuffling probe (see
+        experiments/state_shuffle_probe.py) — after every reasoning step
+        (including under use_halt_head, before any sample is checked for
+        halting), apply the SAME random permutation to z_H/z_L across the
+        batch. tokens are never shuffled.
+
+        use_halt_head/halt_threshold/steps_used/halt_preds_out/
+        halt_steps_out/logits_out/zH_out mirror ThinkerFrozenPainterBase.
+        forward_with_carry's semantics exactly (per-sample dynamic
+        re-batching early exit, real not nominal compute savings;
+        logits_out — only populated under use_halt_head=False — records
+        every reasoning iteration's raw logits for experiment D2's
+        candidate-trajectory scoring; zH_out records z_H at every
+        iteration UNDER EITHER use_halt_head setting — a consistent
+        full-batch "current best known z_H per sample" snapshot each
+        iteration, already-halted samples frozen at their own last state —
+        for the post-hoc digit probe, see
+        experiments/candidate_trajectory_probe.py /
+        experiments/train_digit_probe.py /
+        experiments/probe_reasoning_dynamics.py) — see that method's
+        docstring for the full contract; this is the same logic, operating
+        on `tokens` instead of an encoded condition and self.reasoning_step
+        instead of self.thinker.reasoning_step.
+
+        Returns: (DiffusionPrediction, z_H_next, z_L_next).
+        """
         bsz = sample.x_noisy.shape[0]
         tokens = self._tokens_from_image(sample.x_noisy, sample.spatial_conditions)
-        z_H, z_L = self.get_initial_states(bsz)
-        z_H, z_L = z_H.to(sample.x_noisy.device), z_L.to(sample.x_noisy.device)
+        device = sample.x_noisy.device
 
-        logits = None
-        for _ in range(self.n_sup):
-            logits, z_H, z_L = self.reasoning_step(tokens, z_H, z_L, timesteps=sample.timesteps)
-        noise_pred = self._image_from_patches(logits.float())
+        if z_H is None or z_L is None:
+            z_H, z_L = self.get_initial_states(bsz)
+            z_H, z_L = z_H.to(device), z_L.to(device)
 
-        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+        n_sup = n_sup if n_sup is not None else self.n_sup
+
+        if not use_halt_head:
+            logits = None
+            step_count = 0
+            for _ in range(n_sup):
+                logits, z_H, z_L = self.reasoning_step(
+                    tokens, z_H, z_L, timesteps=sample.timesteps, H_cycles=H_cycles, L_cycles=L_cycles
+                )
+                step_count += 1
+                if logits_out is not None:
+                    logits_out.append(logits.detach())
+                if zH_out is not None:
+                    zH_out.append(z_H.detach())
+                if shuffle_state:
+                    perm = torch.randperm(bsz, device=device)
+                    z_H, z_L = z_H[perm], z_L[perm]
+                if halt_preds_out is not None:
+                    halt_preds_out.append(self.predict_halt_value(z_H).detach())
+            if steps_used is not None:
+                steps_used.append(step_count)
+        else:
+            # active_idx: original-batch positions of samples still being
+            # reasoned about — see ThinkerFrozenPainterBase.forward_with_carry.
+            active_idx = torch.arange(bsz, device=device)
+            cur_tokens, cur_timesteps = tokens, sample.timesteps
+            cur_z_H, cur_z_L, cur_logits = z_H, z_L, None
+            # running_z_H: (bsz, ...) "current best known z_H per sample"
+            # snapshot for zH_out, accounting for early halting — see
+            # ThinkerFrozenPainterBase.forward_with_carry's identical logic.
+            running_z_H = z_H.clone() if zH_out is not None else None
+
+            final_logits = None
+            final_z_H = torch.empty_like(z_H)
+            final_z_L = torch.empty_like(z_L)
+            halt_step = torch.full((bsz,), -1, dtype=torch.long, device=device)
+
+            step_count = 0
+            for _ in range(n_sup):
+                new_logits, new_z_H, new_z_L = self.reasoning_step(
+                    cur_tokens, cur_z_H, cur_z_L, timesteps=cur_timesteps, H_cycles=H_cycles, L_cycles=L_cycles
+                )
+                step_count += 1
+                if final_logits is None:
+                    final_logits = torch.empty(bsz, *new_logits.shape[1:], dtype=new_logits.dtype, device=device)
+                if running_z_H is not None:
+                    running_z_H[active_idx] = new_z_H
+                    zH_out.append(running_z_H.detach().clone())
+
+                pred = self.predict_halt_value(new_z_H)
+                if halt_preds_out is not None:
+                    halt_preds_out.append(pred.detach())
+                halt_now = pred <= halt_threshold
+
+                halted_orig = active_idx[halt_now]
+                final_logits[halted_orig] = new_logits[halt_now]
+                final_z_H[halted_orig] = new_z_H[halt_now]
+                final_z_L[halted_orig] = new_z_L[halt_now]
+                halt_step[halted_orig] = step_count
+
+                keep = ~halt_now
+                active_idx = active_idx[keep]
+                if active_idx.numel() == 0:
+                    break
+                cur_tokens = cur_tokens[keep]
+                cur_timesteps = cur_timesteps[keep] if cur_timesteps is not None else None
+                cur_z_H, cur_z_L, cur_logits = new_z_H[keep], new_z_L[keep], new_logits[keep]
+
+            if active_idx.numel() > 0:
+                # n_sup exhausted with some samples never individually
+                # crossing the threshold — freeze them at their last state.
+                final_logits[active_idx] = cur_logits
+                final_z_H[active_idx] = cur_z_H
+                final_z_L[active_idx] = cur_z_L
+                halt_step[active_idx] = step_count
+
+            logits, z_H, z_L = final_logits, final_z_H, final_z_L
+            if steps_used is not None:
+                steps_used.append(float(halt_step.float().mean().item()))
+            if halt_steps_out is not None:
+                halt_steps_out.append(halt_step.detach())
+
+        noise_pred = self.run_painter(sample, logits)
+        pred = DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type, logits=logits)
+        return pred, z_H, z_L
+
+    def forward(self, sample: DataSample, shuffle_state: bool = False, **kwargs) -> DiffusionPrediction:
+        """Full inference: fresh carry, n_sup reasoning steps, fold back to
+        an image. No guidance is applied here (matches ThinkerFrozenPainterBase.forward);
+        use CFGPredictor from models.sampling during SamplingPipeline.sample().
+
+        shuffle_state=True runs the experiment-C state-shuffling probe (see
+        forward_with_carry) — off by default so normal training/eval/
+        sampling is unaffected.
+        """
+        pred, _, _ = self.forward_with_carry(sample, shuffle_state=shuffle_state)
+        return pred
 
     # ── Training ─────────────────────────────────────────────────────────────
 
@@ -652,6 +812,265 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         n = self.n_sup * K
         losses = {k: v / n for k, v in total_losses.items()}
         return losses, lr, global_step
+
+    @torch.no_grad()
+    def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:
+        max_batches = kwargs.get("max_batches", 100)
+
+        self.train()
+        metric_accum: dict[str, float] = {}
+        n_batches = 0
+        for i, batch in tqdm(enumerate(dataloader), desc="Eval", total=max_batches):
+            if i >= max_batches:
+                break
+            sample = self._prepare_training_sample(batch, accelerator.device)
+            result = self(sample)
+            _, loss_dict = self.loss_fn(result.pred, None, sample)
+            for k, v in loss_dict.items():
+                metric_accum[k] = metric_accum.get(k, 0.0) + v
+            n_batches += 1
+
+        result = {k: v / n_batches for k, v in metric_accum.items()} if n_batches > 0 else {}
+
+        self.eval()
+        for cb in self.eval_callbacks:
+            result.update(cb(self, dataloader, accelerator, **kwargs))
+        self.train()
+        return result
+
+
+def compute_depth_matched_layers(n_sup: int, H_cycles: int, L_cycles: int, L_layers: int) -> int:
+    """Total transformer-block-layer applications in ONE full TRM reasoning
+    trajectory (n_sup outer iterations) at a single denoising step: each
+    reasoning_step call runs H_cycles cycles, each cycle running L_cycles
+    L-level updates plus one H-level update through the SAME shared
+    L_level module (L_cycles + 1 calls per cycle, L_layers actual
+    transformer layers per call — see
+    TinyRecursiveReasoningModel_ACTV1_Inner.forward's H_cycles-1 no-grad +
+    1 graded-cycle split). Used to size DepthMatchedFeedforwardBackbone's
+    `depth` for experiment B so a comparable total compute budget can't
+    explain any accuracy gap by itself.
+    """
+    return n_sup * H_cycles * (L_cycles + 1) * L_layers
+
+
+class DepthMatchedFeedforwardBackbone(PainterBase, BaseModel):
+    """Plain, non-recursive feedforward diffusion backbone for experiment
+    B ("is the TRM's gain from genuine iterative refinement, or just from
+    having that much sequential compute available at all?").
+
+    NO weight sharing: each of `depth` transformer blocks below has its
+    own independent weights, unlike SpatialTRM's single L_level module
+    reused n_sup*H_cycles*(L_cycles+1) times. NO carried state: one single
+    straight forward pass per denoising step — there is no n_sup loop, so
+    nothing is threaded across "reasoning iterations" because there are
+    none. `depth` should be set via compute_depth_matched_layers(...) of
+    the TRM checkpoint being compared against, so the two models spend the
+    same total number of transformer-block-layer applications per
+    denoising step.
+
+    Reuses TinyRecursiveReasoningModel_ACTV1Block (the exact same
+    self-attention + SwiGLU transformer block SpatialTRM's L_level is built
+    from) as the per-layer compute unit, so the comparison is apples-to-
+    apples at the layer level — only the recursion/weight-sharing is
+    removed, not the underlying block architecture. Same patchify/
+    unpatchify scheme as TRMDiffusionBackbone (patch_size x patch_size
+    patches, channel-concat with the puzzle condition).
+    """
+
+    condition_keys: list[str] = ["spatial_conditions"]
+    has_realsolution_eval: bool = False
+
+    def __init__(
+        self,
+        optim_cfg: ThinkerOptimConfig,
+        scheduler,
+        train_cfg,
+        eval_cfg,
+        depth: int,
+        patch_size: int = 16,
+        out_channels: int = 1,
+        cond_channels: int = 1,
+        enc_channels: int = 128,
+        enc_hidden_channels: tuple = (128, 256, 256),
+        image_size: int = 144,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        expansion: float = 4.0,
+        forward_dtype: str = "bfloat16",
+        pos_encodings: str = "rope",
+        eval_callbacks=None,
+        sampling_pipeline=None,
+    ):
+        super().__init__()
+        self.depth = depth
+        self.optim_cfg = optim_cfg
+        self.scheduler = scheduler
+        self.train_cfg = train_cfg
+        self.eval_cfg = eval_cfg
+
+        patch_pixels = patch_size * patch_size * out_channels
+        grid = image_size // patch_size
+        seq_len = grid * grid
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.image_size = image_size
+        self.grid = grid
+        self.hidden_size = hidden_size
+        self.forward_dtype = getattr(torch, forward_dtype)
+
+        block_config = TinyRecursiveReasoningModel_ACTV1Config(
+            batch_size=1, seq_len=seq_len, puzzle_emb_ndim=0, num_puzzle_identifiers=1,
+            vocab_size=patch_pixels, H_cycles=1, L_cycles=1, H_layers=0, L_layers=1,
+            hidden_size=hidden_size, expansion=expansion, num_heads=n_heads,
+            pos_encodings=pos_encodings, halt_max_steps=1, halt_exploration_prob=0.0,
+            forward_dtype=forward_dtype, mlp_t=False, puzzle_emb_len=0, no_ACT_continue=True,
+        )
+        # depth INDEPENDENT blocks, each with its own weights — the direct
+        # opposite of SpatialTRM's single shared, recurrently-applied L_level.
+        self.blocks = nn.ModuleList([TinyRecursiveReasoningModel_ACTV1Block(block_config) for _ in range(depth)])
+
+        self.embed_scale = math.sqrt(hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+        if pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=hidden_size // n_heads, max_position_embeddings=seq_len, base=10000.0)
+        elif pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(seq_len, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+
+        self.lm_head = CastedLinear(hidden_size, patch_pixels, bias=False)
+
+        # Timestep conditioning, matching SpatialTRM's with_timestep_emb=True path.
+        self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=256)
+        self.temb_proj = nn.Linear(256, hidden_size)
+        nn.init.zeros_(self.temb_proj.weight)
+        nn.init.zeros_(self.temb_proj.bias)
+
+        in_channels = out_channels + cond_channels
+        self.patch_enc, self.patch_proj = _build_spatial_enc(
+            in_channels, enc_channels, list(enc_hidden_channels), hidden_size, patch_size
+        )
+        self.loss_fn = build_loss(train_cfg, scheduler)
+        self.eval_callbacks: list = [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
+        self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    @property
+    def noise_shape(self) -> tuple:
+        return (self.out_channels, self.image_size, self.image_size)
+
+    def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents.clamp(0.0, 1.0)
+
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        return images.clamp(0.0, 1.0)
+
+    def build_optimizers(self, world_size: int, num_steps) -> list[ScheduledOptimizer]:
+        optim = AdamATan2(
+            self.parameters(),
+            lr=0,  # set per-step by scheduler
+            weight_decay=self.optim_cfg.weight_decay,
+            betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+        )
+        return [
+            ScheduledOptimizer(
+                optim,
+                base_lr=self.optim_cfg.lr,
+                warmup_steps=self.optim_cfg.warmup_steps,
+                num_steps=num_steps,
+                min_ratio=self.optim_cfg.lr_min_ratio,
+            )
+        ]
+
+    # ── Patchify / unpatchify (identical scheme to TRMDiffusionBackbone) ─────
+
+    def _tokens_from_image(self, x_noisy: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        x = torch.cat([x_noisy, cond], dim=1) if cond is not None else x_noisy
+        feat = self.patch_proj(self.patch_enc(x))
+        return feat.flatten(2).transpose(1, 2)  # (B, seq_len, hidden_size)
+
+    def _image_from_patches(self, patches: torch.Tensor) -> torch.Tensor:
+        B = patches.shape[0]
+        p, g, c = self.patch_size, self.grid, self.out_channels
+        patches = patches.view(B, g, g, c, p, p)
+        patches = patches.permute(0, 3, 1, 4, 2, 5)  # (B, C, g, p, g, p)
+        return patches.reshape(B, c, g * p, g * p)
+
+    # ── Forward: ONE straight pass through `depth` independent blocks —
+    #    no recursion, no carried state ───────────────────────────────────────
+
+    def forward(self, sample: DataSample, **kwargs) -> DiffusionPrediction:
+        tokens = self._tokens_from_image(sample.x_noisy, sample.spatial_conditions)
+        emb = tokens.to(self.forward_dtype)
+        if hasattr(self, "embed_pos"):
+            emb = 0.707106781 * (emb + self.embed_pos.embedding_weight.to(self.forward_dtype))
+        h = self.embed_scale * emb
+
+        t_bias = self.temb_proj(self.timestep_mlp(sample.timesteps)).unsqueeze(1)
+        h = h + t_bias.to(h.dtype)
+
+        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+        for block in self.blocks:
+            h = block(cos_sin=cos_sin, hidden_states=h)
+
+        logits = self.lm_head(h)
+        noise_pred = self._image_from_patches(logits.float())
+        return DiffusionPrediction(pred=noise_pred, pred_type=self.scheduler.config.prediction_type)
+
+    # ── Training: single pass, single backward + optimizer step per
+    #    micro-batch — no n_sup loop, unlike TRMDiffusionBackbone/SpatialTRM ──
+
+    def _prepare_training_sample(self, mb: DataSample, device: torch.device) -> DataSample:
+        images = mb.images.to(device)
+        bsz = images.shape[0]
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
+        noisy = self.scheduler.add_noise(images, noise, timesteps)
+        target = noise if self.scheduler.config.prediction_type == "epsilon" else images
+        cond = mb.spatial_conditions.to(device) if mb.spatial_conditions is not None else None
+        return DataSample(
+            images=images,
+            spatial_conditions=cond,
+            x_noisy=noisy,
+            timesteps=timesteps,
+            target=target,
+            solution=mb.solution.to(device) if mb.solution is not None else None,
+            solution_mask=mb.solution_mask.to(device) if mb.solution_mask is not None else None,
+        )
+
+    def train_step(
+        self,
+        micro_batches,
+        accelerator,
+        optimizers,
+        ema,
+        global_batch_size: int,
+        global_step: int,
+        **kwargs,
+    ) -> tuple[dict, float, int]:
+        from models.optim_utils import apply_lr_and_step
+
+        K = len(micro_batches)
+        device = accelerator.device
+        total_losses: dict[str, float] = {}
+
+        for mb in micro_batches:
+            sample = self._prepare_training_sample(mb, device)
+            result = self(sample)
+            step_loss, loss_dict = self.loss_fn(result.pred, None, sample)
+            for k, v in loss_dict.items():
+                total_losses[k] = total_losses.get(k, 0.0) + v
+            if step_loss.requires_grad:
+                accelerator.backward(step_loss / (global_batch_size * K))
+
+        accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        lr = apply_lr_and_step(optimizers, global_step)
+        if ema is not None:
+            ema.update(self)
+
+        losses = {k: v / K for k, v in total_losses.items()}
+        return losses, lr, global_step + 1
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator: Any, **kwargs) -> dict:
