@@ -29,8 +29,10 @@ from PIL import Image
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
 
-MAZE_SCALES = [5, 7, 8, 9, 11, 13, 16]
-MAZE_OOD_SCALES = [3]
+# In-domain vs held-out (OOD) maze test scales — env-overridable (comma lists) so a
+# 3×3-trained model can score with e.g. MAZE_SCALES=3,5,7,9,11,13,16 MAZE_OOD_SCALES=8.
+MAZE_SCALES = [int(x) for x in os.environ.get("MAZE_SCALES", "5,7,8,9,11,13,16").split(",") if x.strip()]
+MAZE_OOD_SCALES = [int(x) for x in os.environ.get("MAZE_OOD_SCALES", "3").split(",") if x.strip()]
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
 QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
 QUEEN_OOD_SCALES = [12]
