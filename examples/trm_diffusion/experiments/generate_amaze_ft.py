@@ -471,18 +471,21 @@ class JanusBackend:
 
 def build_backend(name: str, checkpoint: str | None, model_path: str | None = None,
                   num_timesteps: int = 40, janus_img_size: int = 384,
-                  janus_patch_size: int = 16, temperature: float = 1.0, think: bool = False):
+                  janus_patch_size: int = 16, temperature: float = 1.0, think: bool = False,
+                  max_think_tokens: int | None = None):
     if name == "dummy":
         return DummyBackend()
+    think_kw = {} if max_think_tokens is None else {"max_think_tokens": max_think_tokens}
     if name == "bagel":
         if not checkpoint:
             raise ValueError("bagel backend needs --checkpoint (the FT checkpoint dir).")
-        return BagelBackend(checkpoint, model_path or "", num_timesteps=num_timesteps, think=think)
+        return BagelBackend(checkpoint, model_path or "", num_timesteps=num_timesteps,
+                            think=think, **think_kw)
     if name == "janus":
         if not checkpoint:
             raise ValueError("janus backend needs --checkpoint (the FT Janus 'tfmr' dir).")
-        return JanusBackend(checkpoint, img_size=janus_img_size,
-                            patch_size=janus_patch_size, temperature=temperature, think=think)
+        return JanusBackend(checkpoint, img_size=janus_img_size, patch_size=janus_patch_size,
+                            temperature=temperature, think=think, **think_kw)
     raise ValueError(f"unknown backend '{name}'")
 
 
@@ -503,8 +506,12 @@ def main():
     ap.add_argument("--temperature", type=float, default=float(os.environ.get("JANUS_TEMPERATURE", "1.0")),
                     help="Sampling temperature for the janus backend.")
     ap.add_argument("--think", action="store_true", default=os.environ.get("THINK", "") == "1",
-                    help="Chain-of-thought: emit a <think> planning step before the image (bagel only; "
+                    help="Chain-of-thought: emit a <think> planning step before the image (bagel & janus; "
                          "inference-time, matches the paper's w/ CoT rows).")
+    ap.add_argument("--max-think-tokens", type=int,
+                    default=int(os.environ["MAX_THINK_TOKENS"]) if os.environ.get("MAX_THINK_TOKENS") else None,
+                    help="Cap the CoT <think> length when --think (lower, e.g. 256, cuts KV-cache memory "
+                         "so k=5 fits a 24GB GPU). Default: backend's own (janus 512, bagel 1024).")
     ap.add_argument("--data-root", type=Path, default=TRM_ROOT / "data" / "amaze")
     ap.add_argument("--gen-dir", type=Path, required=True)
     ap.add_argument("--samples-per-puzzle", type=int, default=5)
@@ -512,7 +519,8 @@ def main():
 
     backend = build_backend(args.backend, args.checkpoint, args.bagel_model_path, args.num_timesteps,
                             janus_img_size=args.janus_img_size, janus_patch_size=args.janus_patch_size,
-                            temperature=args.temperature, think=args.think)
+                            temperature=args.temperature, think=args.think,
+                            max_think_tokens=args.max_think_tokens)
     fallback_prompt = MAZE_PROMPT if args.task == "maze" else QUEEN_PROMPT
     k = args.samples_per_puzzle
     total = 0
