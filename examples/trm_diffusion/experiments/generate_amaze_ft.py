@@ -141,7 +141,7 @@ class BagelBackend:
     """Fine-tuned BAGEL-7B-MoT inference via the vendored InterleaveInferencer;
     mirrors third_party/amaze/infer/infer_bagel.py's model assembly."""
 
-    def __init__(self, checkpoint: str, model_path: str, num_timesteps: int = 50,
+    def __init__(self, checkpoint: str, model_path: str, num_timesteps: int = 40,
                  think: bool = False, max_think_tokens: int = 1024):
         _prepare_bagel_imports()
 
@@ -470,7 +470,7 @@ class JanusBackend:
 
 
 def build_backend(name: str, checkpoint: str | None, model_path: str | None = None,
-                  num_timesteps: int = 50, janus_img_size: int = 384,
+                  num_timesteps: int = 40, janus_img_size: int = 384,
                   janus_patch_size: int = 16, temperature: float = 1.0, think: bool = False):
     if name == "dummy":
         return DummyBackend()
@@ -494,8 +494,8 @@ def main():
     ap.add_argument("--bagel-model-path", default=os.environ.get("BAGEL_MODEL_PATH"),
                     help="Base BAGEL-7B-MoT snapshot dir (bagel backend); defaults to $BAGEL_MODEL_PATH.")
     ap.add_argument("--num-timesteps", type=int,
-                    default=int(os.environ.get("BAGEL_NUM_TIMESTEPS", "50")),
-                    help="Denoising steps for the bagel backend.")
+                    default=int(os.environ.get("BAGEL_NUM_TIMESTEPS", "40")),
+                    help="Denoising steps for the bagel backend (40 = authors' config.sample.eval_num_steps).")
     ap.add_argument("--janus-img-size", type=int, default=int(os.environ.get("JANUS_IMG_SIZE", "384")),
                     help="Janus generation image size (must match its VQ decoder; default 384).")
     ap.add_argument("--janus-patch-size", type=int, default=int(os.environ.get("JANUS_PATCH_SIZE", "16")),
