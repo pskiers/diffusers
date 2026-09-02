@@ -15,7 +15,7 @@
 # Helios: full FT of Janus-Pro-7B on ONE GH200-120GB (fits without sharding). Training ~20h;
 # with SAMPLE=true the post-train scoring adds a few h -> either bump --time or set SAMPLE=false.
 # Env: JANUS_MODEL_PATH (REQUIRED), N_EPOCHS (8), LR (5e-6), GRAD_ACCUM (16),
-#      WANDB_PROJECT (amaze_final), WANDB_MODE (online), SELECT (val|all), SAMPLES (5),
+#      WANDB_PROJECT (amaze_final), WANDB_MODE (online), SELECT (val|all|last), SAMPLES (5),
 #      RUN_NAME, VENV (default $SCRATCH/trm_helios_venv).
 
 set -euo pipefail
@@ -63,6 +63,9 @@ export WANDB_MODE="${WANDB_MODE}"
 RESUME_ARGS=()
 [[ -n "${RESUME_FROM:-}" ]] && RESUME_ARGS=( --resume_from_checkpoint "${RESUME_FROM}" )
 
+if [[ "${SKIP_TRAIN:-0}" == "1" ]]; then
+  echo ">> SKIP_TRAIN=1 -> skipping training; scoring existing checkpoints under runs/${RUN_NAME}."
+else
 srun accelerate launch --num_processes 1 --mixed_precision bf16 \
   "${JANUS_SFT}/sft.py" \
   --model_path "${JANUS_MODEL_PATH}" \
@@ -86,12 +89,14 @@ srun accelerate launch --num_processes 1 --mixed_precision bf16 \
   "${RESUME_ARGS[@]}"
 
 echo "Janus FT (${TASK}) complete -> runs/${RUN_NAME}"
+fi
 
 # ── Checkpoint selection + scoring on the AMAZE metrics (one wandb run per scored checkpoint) ──
 # SELECT=val  -> pick the checkpoint with the lowest validation MSE (recorded in each checkpoint's
 #                training_state.json) and score ONLY that one on the full test set. (default for maze)
 # SELECT=all  -> score EVERY epoch-checkpoint (trajectory; also the fallback for a run with no recorded
 #                validation, e.g. the pre-val Janus-queens run). (default for queens)
+# SELECT=last -> score ONLY the last epoch-checkpoint (max-memorization view; 1 run).
 # COST of ONE checkpoint = N_test_puzzles x SAMPLES image-gens (queens ~450 puzzles, maze ~3200).
 # Resumable: already-scored checkpoints are skipped (.scored marker).
 if [[ "${SAMPLE}" != "false" ]]; then
@@ -108,6 +113,9 @@ if [[ "${SAMPLE}" != "false" ]]; then
         echo "WARN: SELECT=val but no validation metrics recorded -> scoring the LAST checkpoint only." >&2
         CKPTS=("${CKPTS[-1]}")
       fi
+    elif [[ "${SELECT}" == "last" ]]; then
+      echo ">> SELECT=last -> scoring only the last checkpoint: ${CKPTS[-1]}"
+      CKPTS=("${CKPTS[-1]}")
     fi
     AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py test "${TASK}"   # build the test set ONCE
     echo ">> scoring ${#CKPTS[@]} Janus checkpoint(s) x ${SAMPLES} samples (SELECT=${SELECT})."
