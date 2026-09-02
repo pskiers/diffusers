@@ -34,8 +34,8 @@ TRM_ROOT = Path(__file__).resolve().parent.parent
 MAZE_SCALES = [int(x) for x in os.environ.get("MAZE_SCALES", "5,7,8,9,11,13,16").split(",") if x.strip()]
 MAZE_OOD_SCALES = [int(x) for x in os.environ.get("MAZE_OOD_SCALES", "3").split(",") if x.strip()]
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
-QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
-QUEEN_OOD_SCALES = [12]
+QUEEN_SCALES = [int(x) for x in os.environ.get("QUEEN_SCALES", "4,5,6,7,8,9,10").split(",") if x.strip()]
+QUEEN_OOD_SCALES = [int(x) for x in os.environ.get("QUEEN_OOD_SCALES", "12").split(",") if x.strip()]
 
 MAZE_PROMPT = (
     "Add the blue solution path for the maze, connect start point (solid red circle) "
@@ -312,7 +312,8 @@ class JanusBackend:
     always-has-input-image path used for maze/queens image->image)."""
 
     def __init__(self, checkpoint: str, img_size: int = 384, patch_size: int = 16,
-                 temperature: float = 1.0, think: bool = False, max_think_tokens: int = 512):
+                 temperature: float = 1.0, cfg_weight: float = 1.0, think: bool = False,
+                 max_think_tokens: int = 512):
         _prepare_janus_imports()
 
         import torch
@@ -325,6 +326,7 @@ class JanusBackend:
         self.img_size = img_size
         self.patch_size = patch_size
         self.temperature = temperature
+        self.cfg_weight = cfg_weight
         self.think = think
         self.max_think_tokens = max_think_tokens
 
@@ -424,10 +426,29 @@ class JanusBackend:
             prepare_inputs = processor.batchify(pre_data)
             input_ids = prepare_inputs.input_ids.to(device)
             attention_mask = prepare_inputs.attention_mask.to(device)
-            inputs_embeds = model.language_model.get_input_embeddings()(input_ids)
-
-            # inject the input-image VQ embeddings at each <image_start>
             image_start_id = processor.image_start_id
+
+            # Optional classifier-free guidance (CFG). Default cfg_weight=1.0 -> DISABLED,
+            # i.e. the authors' plain-conditional sampling (single k-row batch). When
+            # cfg_weight != 1.0 we run a 2k batch: rows [0:k] conditional (input image
+            # injected); rows [k:2k] unconditional (every token but BOS and the trailing
+            # <image_start> replaced by pad_id, no image injected). logits = uncond +
+            # cfg*(cond-uncond) -> amplifies the input-conditioned signal.
+            use_cfg = abs(self.cfg_weight - 1.0) > 1e-6
+            if use_cfg:
+                pad_id = getattr(processor, "pad_id", None)
+                if pad_id is None:
+                    pad_id = processor.tokenizer.pad_token_id
+                uncond_ids = input_ids.clone()
+                uncond_ids[:, 1:-1] = pad_id
+                batch_ids = torch.cat([input_ids, uncond_ids], dim=0)
+                base_mask = torch.cat([attention_mask, attention_mask], dim=0)
+            else:
+                batch_ids = input_ids
+                base_mask = attention_mask
+            inputs_embeds = model.language_model.get_input_embeddings()(batch_ids)
+
+            # inject the input-image VQ embeddings at each <image_start> (conditional rows)
             for i in range(k):
                 starts = (input_ids[i] == image_start_id).nonzero(as_tuple=True)[0]
                 if len(starts) >= 1:
@@ -436,24 +457,33 @@ class JanusBackend:
                     if e <= inputs_embeds.shape[1]:
                         inputs_embeds[i, s:e, :] = in_embeds[i]
 
-            # 3) autoregressive image-token generation (KV-cached)
+            # 3) autoregressive image-token generation (KV-cached).
+            # temperature <= 1e-4 -> greedy (argmax); otherwise temperature-scaled sampling.
+            greedy = self.temperature <= 1e-4
             generated = torch.zeros((k, n_tokens), dtype=torch.int, device=device)
             outputs, img_embeds = None, None
             for step in range(n_tokens):
                 if step == 0:
-                    step_embeds, step_mask = inputs_embeds, attention_mask
+                    step_embeds, step_mask = inputs_embeds, base_mask
                 else:
                     step_embeds = img_embeds
-                    step_mask = torch.ones((k, 1), device=device, dtype=attention_mask.dtype)
+                    step_mask = None if use_cfg else torch.ones((k, 1), device=device, dtype=attention_mask.dtype)
                 outputs = model.language_model.model(
                     inputs_embeds=step_embeds, use_cache=True, attention_mask=step_mask,
                     past_key_values=outputs.past_key_values if step > 0 else None,
                 )
                 logits = model.gen_head(outputs.last_hidden_state[:, -1, :])
-                probs = torch.softmax(logits / self.temperature, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                if use_cfg:
+                    logit_cond, logit_uncond = logits[:k], logits[k:]
+                    logits = logit_uncond + self.cfg_weight * (logit_cond - logit_uncond)
+                if greedy:
+                    next_tokens = logits.argmax(dim=-1)
+                else:
+                    probs = torch.softmax(logits / self.temperature, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 generated[:, step] = next_tokens
-                img_embeds = model.prepare_gen_img_embeds(next_tokens).unsqueeze(1)
+                fed = torch.cat([next_tokens, next_tokens], dim=0) if use_cfg else next_tokens
+                img_embeds = model.prepare_gen_img_embeds(fed).unsqueeze(1)
 
             # 4) decode image tokens -> RGB
             dec = model.gen_vision_model.decode_code(
@@ -473,8 +503,8 @@ class JanusBackend:
 
 def build_backend(name: str, checkpoint: str | None, model_path: str | None = None,
                   num_timesteps: int = 40, janus_img_size: int = 384,
-                  janus_patch_size: int = 16, temperature: float = 1.0, think: bool = False,
-                  max_think_tokens: int | None = None):
+                  janus_patch_size: int = 16, temperature: float = 1.0, cfg_weight: float = 1.0,
+                  think: bool = False, max_think_tokens: int | None = None):
     if name == "dummy":
         return DummyBackend()
     think_kw = {} if max_think_tokens is None else {"max_think_tokens": max_think_tokens}
@@ -487,7 +517,7 @@ def build_backend(name: str, checkpoint: str | None, model_path: str | None = No
         if not checkpoint:
             raise ValueError("janus backend needs --checkpoint (the FT Janus 'tfmr' dir).")
         return JanusBackend(checkpoint, img_size=janus_img_size, patch_size=janus_patch_size,
-                            temperature=temperature, think=think, **think_kw)
+                            temperature=temperature, cfg_weight=cfg_weight, think=think, **think_kw)
     raise ValueError(f"unknown backend '{name}'")
 
 
@@ -506,7 +536,10 @@ def main():
     ap.add_argument("--janus-patch-size", type=int, default=int(os.environ.get("JANUS_PATCH_SIZE", "16")),
                     help="Janus VQ patch size (default 16 -> 384/16=24, 576 tokens).")
     ap.add_argument("--temperature", type=float, default=float(os.environ.get("JANUS_TEMPERATURE", "1.0")),
-                    help="Sampling temperature for the janus backend.")
+                    help="Sampling temperature for the janus backend (<=1e-4 -> greedy/argmax).")
+    ap.add_argument("--cfg-weight", type=float, default=float(os.environ.get("JANUS_CFG", "1.0")),
+                    help="Classifier-free guidance weight (janus). 1.0 (default) = disabled = the authors' "
+                         "plain-conditional sampling; >1 amplifies the input-image-conditioned signal.")
     ap.add_argument("--think", action="store_true", default=os.environ.get("THINK", "") == "1",
                     help="Chain-of-thought: emit a <think> planning step before the image (bagel & janus; "
                          "inference-time, matches the paper's w/ CoT rows).")
@@ -521,7 +554,7 @@ def main():
 
     backend = build_backend(args.backend, args.checkpoint, args.bagel_model_path, args.num_timesteps,
                             janus_img_size=args.janus_img_size, janus_patch_size=args.janus_patch_size,
-                            temperature=args.temperature, think=args.think,
+                            temperature=args.temperature, cfg_weight=args.cfg_weight, think=args.think,
                             max_think_tokens=args.max_think_tokens)
     fallback_prompt = MAZE_PROMPT if args.task == "maze" else QUEEN_PROMPT
     k = args.samples_per_puzzle
