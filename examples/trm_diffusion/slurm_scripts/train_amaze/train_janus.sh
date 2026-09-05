@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=20:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
@@ -27,7 +27,7 @@ MODEL_PATH="deepseek-ai/Janus-Pro-7B"
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 mkdir -p "${HF_HOME}" "${PROJECT_ROOT}/slurm_outputs"
 
-export PYTHONPATH="${SFT_DIR}/Janus:${PWD}:${PYTHONPATH:-}"
+export PYTHONPATH="${SFT_DIR}/Janus:${EAR_AMAZE_ROOT}:${PWD}:${PYTHONPATH:-}"
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
@@ -52,7 +52,7 @@ echo "Output: $OUTPUT_DIR"
 echo "Default sft.py arguments"
 echo "============================================="
 
-srun accelerate launch -m sft.py \
+srun accelerate launch sft.py \
     --model_path "${MODEL_PATH}" \
     --data_path "${MAZE_DATASET_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
