@@ -13,12 +13,14 @@
 
 # Wrong-path recovery probe on 13x13 square mazes, ablated over TRM
 # (Painter-Thinker) and the DiT baseline.
-#   ADD  0/20/50%      wrong branch grafted onto the drawn prefix, run to a dead end
+#   ADD  0/20/50%      wrong path walked off the prefix's frontier to a dead end
 #   WALL 10/30/50/75%  straight shortcut to the target, through walls
 #   GAP  10/30/50/75%  contiguous slice of the full GT path erased
 # each re-noised to every t_start in T_STARTS and denoised back down.
 #
+# Usage:  sbatch slurm_scripts/sample_amaze/maze_corruption_recovery.sh
 # Env: NUM_SAMPLES T_STARTS BATCH STEPS DATA OUT_DIR GEN_DATA DUMP_N
+#      TRM_CKPT PAINTER_CKPT DIT_CKPT
 
 set -euo pipefail
 
@@ -50,6 +52,9 @@ DUMP_N="${DUMP_N:-5}"
 # The test split is already generated on the cluster; set GEN_DATA=1 only to
 # rebuild it (e.g. after changing MAZE_TEST_PER_SCALE).
 GEN_DATA="${GEN_DATA:-0}"
+TRM_CKPT="${TRM_CKPT:-runs/pt_maze_final_thinker/checkpoint_final.pt}"
+PAINTER_CKPT="${PAINTER_CKPT:-runs/pt_maze_final_painter/checkpoint_final.pt}"
+DIT_CKPT="${DIT_CKPT:-runs/dit_maze_final/checkpoint_final.pt}"
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
@@ -63,6 +68,9 @@ if [[ "${GEN_DATA}" == "1" ]]; then
   AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py test maze
 fi
 [[ -s "${DATA}" ]] || { echo "missing ${DATA} — run with GEN_DATA=1" >&2; exit 1; }
+for ck in "${TRM_CKPT}" "${PAINTER_CKPT}" "${DIT_CKPT}"; do
+  [[ -s "${ck}" ]] || { echo "missing checkpoint ${ck}" >&2; exit 1; }
+done
 python - "${DATA}" "${NUM_SAMPLES}" <<'PY'
 import sys, pandas as pd
 path, want = sys.argv[1], int(sys.argv[2])
@@ -79,15 +87,15 @@ COMMON=( +probe.t_starts="${T_STARTS}" +probe.batch_size="${BATCH}"
 echo "=== [maze corruption] TRM  (t_starts=${T_STARTS} n=${NUM_SAMPLES} steps=${STEPS}) ==="
 srun python experiments/maze_corruption_recovery_probe.py \
   experiment=amaze_thinker_v2_controlnet \
-  painter.checkpoint=runs/pt_maze_final_painter/checkpoint_final.pt \
-  +checkpoint=runs/pt_maze_final_thinker/checkpoint_final.pt \
+  painter.checkpoint="${PAINTER_CKPT}" \
+  +checkpoint="${TRM_CKPT}" \
   +probe.model_name=trm "${COMMON[@]}" \
   +probe.out="${OUT_DIR}/trm.json"
 
 echo "=== [maze corruption] DiT  (t_starts=${T_STARTS} n=${NUM_SAMPLES} steps=${STEPS}) ==="
 srun python experiments/maze_corruption_recovery_probe.py \
   experiment=amaze_dit_maze \
-  +checkpoint=runs/dit_maze_final/checkpoint_final.pt \
+  +checkpoint="${DIT_CKPT}" \
   +probe.model_name=dit "${COMMON[@]}" \
   +probe.out="${OUT_DIR}/dit.json"
 
