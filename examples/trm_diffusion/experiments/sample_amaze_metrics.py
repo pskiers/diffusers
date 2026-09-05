@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import hydra
 import torch
+import torchvision.utils as vutils
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets.amaze_dataset import AmazeDataset
@@ -61,7 +62,8 @@ def _build_amaze_dataset(cfg: DictConfig, dataset_path: str) -> AmazeDataset:
 
 @torch.no_grad()
 def sample_and_score(
-    model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int
+    model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int,
+    combo_name: str, samples_dir: Path, saved_counter: list[int], is_main_process: bool = True
 ) -> tuple[list[dict], dict | None]:
     """Sample `samples_per_puzzle` attempts per puzzle and score them with the AmazeMetrics evaluator.
 
@@ -94,6 +96,19 @@ def sample_and_score(
 
         P = len(puzzles)
         inputs = decoded.reshape(P, K, *decoded.shape[1:])               # (P, K, C, H, W)
+
+        # Save eval images on disc
+        if is_main_process:
+            for pi, p_idx in enumerate(range(start, start + P)):
+                if saved_counter[0] < 25:
+                    cond = puzzles[pi].spatial_conditions
+                    if cond is not None:
+                        gen = inputs[pi, 0] # pass@1
+                        combined_img = torch.cat([cond.cpu(), gen.cpu()], dim=2)
+                        out_img_path = samples_dir / f"{saved_counter[0]:02d}_{combo_name}_idx{p_idx}.png"
+                        vutils.save_image(combined_img, out_img_path)
+                        saved_counter[0] += 1
+
         if sample_pair is None and P > 0:
             cond = puzzles[0].spatial_conditions
             sample_pair = {
@@ -213,6 +228,12 @@ def main(cfg: DictConfig):
     model = accelerator.unwrap_model(model)
     model.eval()
 
+    # Init saving imags
+    samples_dir = Path(checkpoint).parent / "samples"
+    if accelerator.is_main_process:
+        samples_dir.mkdir(parents=True, exist_ok=True)
+    saved_counter = [0]
+
     # Pack whole puzzles + their K attempts into denoising batches of this size (defaults to the
     # sampling pipeline's own batch_size) instead of sampling one puzzle at a time.
     sample_batch_size = int(cfg.get("sample_batch_size", model.sampling_pipeline.batch_size))
@@ -227,8 +248,15 @@ def main(cfg: DictConfig):
                     _require_test_parquet(combo, "maze")
                     ds = _build_amaze_dataset(cfg, str(combo))
                     logger.info(f"[maze/{geometry}/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
-                    rows, sample_pair = sample_and_score(model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size)
-                    per_combo[f"{geometry}_{scale}"] = rows
+
+                    combo_name = f"{geometry}_{scale}"
+                    rows, sample_pair = sample_and_score(
+                        model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size,
+                        combo_name=combo_name, samples_dir=samples_dir, saved_counter=saved_counter,
+                        is_main_process=accelerator.is_main_process
+                    )
+
+                    per_combo[combo_name] = rows
                     combo_samples[maze_sample_key(geometry, scale)] = sample_pair
             return per_combo, combo_samples
 
@@ -256,7 +284,14 @@ def main(cfg: DictConfig):
                 _require_test_parquet(combo, "queens")
                 ds = _build_amaze_dataset(cfg, str(combo))
                 logger.info(f"[queens/{scale}] scoring {len(ds)} puzzles x{samples_per_puzzle} samples")
-                rows, sample_pair = sample_and_score(model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size)
+
+                combo_name = f"n{scale}"
+                rows, sample_pair = sample_and_score(
+                    model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size,
+                    combo_name=combo_name, samples_dir=samples_dir, saved_counter=saved_counter,
+                    is_main_process=accelerator.is_main_process
+                )
+
                 per_scale_rows[str(scale)] = rows
                 scale_samples[queens_sample_key(scale)] = sample_pair
             return per_scale_rows, scale_samples
@@ -275,11 +310,13 @@ def main(cfg: DictConfig):
     result["checkpoint"] = str(checkpoint)
     result["step"] = step
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(result, f, indent=2)
-    logger.info(f"Results saved -> {out_path}")
 
     if accelerator.is_main_process:
+        with open(out_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logger.info(f"Results saved -> {out_path}")
+        logger.info(f"Sample images saved -> {samples_dir}")
+
         _log_wandb(cfg, str(checkpoint), task, result, samples)
 
 

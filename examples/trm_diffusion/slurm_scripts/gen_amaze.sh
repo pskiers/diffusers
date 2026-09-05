@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=amaze_gen
-#SBATCH --account=plgdyplomancipw3tt-gpu-a100
-#SBATCH --partition=plgrid-gpu-a100
+#SBATCH --account=plgdiffusion3-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="/net/tscratch/people/plgmgrzanka/trm_sokoban/venv"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 MODE="${1:-test}"
 TASK="${2:-both}"
@@ -25,9 +25,7 @@ EXTRA="${*:3}"
 [[ "${MODE}" != "test" && "${MODE}" != "train" && "${MODE}" != "ft" ]] && { echo "MODE must be test|train|ft" >&2; exit 1; }
 [[ "${TASK}" != "maze" && "${TASK}" != "queens" && "${TASK}" != "both" ]] && { echo "TASK must be maze|queens|both" >&2; exit 1; }
 
-module load CUDA/12.4.0
-module load GCCcore/14.3.0 nodejs/22.17.1
-module load Miniconda3/23.3.1-0
+module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0 GCCcore/14.3.0 nodejs/22.17.1
 
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"

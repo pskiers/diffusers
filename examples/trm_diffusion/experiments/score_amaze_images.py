@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 from torchvision import transforms
+import torchvision.utils as vutils
 
 TRM_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(TRM_ROOT))
@@ -68,7 +69,7 @@ def _queen_parquet(data_root: Path, scale: int) -> Path:
     return data_root / "test_queens" / f"n{scale}_test.parquet"
 
 
-def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: int):
+def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: int, samples_dir: Path, saved_counter: list[int]):
     if not parquet.exists():
         raise FileNotFoundError(f"test parquet not found: {parquet} (run gen_amaze.py test {task})")
     ds = AmazeDataset(str(parquet), split="test", image_size=IMAGE_SIZE,
@@ -84,11 +85,25 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
         for pi, gi in enumerate(range(start, start + n)):
             for a in range(k):
                 inputs[pi, a] = _load_img(gen_dir / combo / f"{gi}_{a}.png")
+
+            if saved_counter[0] < 25:
+                cond = puzzles[pi].spatial_conditions
+                if cond is not None:
+                    gen = inputs[pi, 0]
+                    combined_img = torch.cat([cond.cpu(), gen.cpu()], dim=2)
+
+                    out_img_path = samples_dir / f"{saved_counter[0]:02d}_{combo}_idx{gi}.png"
+                    vutils.save_image(combined_img, out_img_path)
+
+                    saved_counter[0] += 1
+
         if sample_pair is None and n > 0:
             cond = puzzles[0].spatial_conditions
             sample_pair = {"generated": inputs[0, 0].clone(),
                            "condition": cond.detach().cpu() if cond is not None else None}
+
         metadata = [p.metadata if p.metadata is not None else {} for p in puzzles]
+
         for rec in scorer.compute_and_accumulate_metrics(inputs, metadata):
             pass_at_k = rec[f"pass_at_{k}"] if k > 1 else rec["pass"]
             rows.append({
@@ -96,6 +111,7 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
                 "mse_inside": rec["mse_inside"], "mse_outside": rec["mse_outside"],
                 "pass1": rec["pass"], "pass5": pass_at_k,
             })
+
     return rows, sample_pair
 
 
@@ -106,30 +122,30 @@ def _print_row(label, agg):
           f"P@1 {agg['pass1']*100:.2f}%  P@5 {agg['pass5']*100:.2f}%")
 
 
-def _score_maze(gen_dir, data_root, device, k):
+def _score_maze(gen_dir, data_root, device, k, samples_dir, saved_counter):
     per_combo, ood_combo, samples = {}, {}, {}
     for g in MAZE_GEOMETRIES:
         for s in MAZE_SCALES:
             combo = _maze_combo(g, s)
-            rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, g, s), "maze", device, k)
+            rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, g, s), "maze", device, k, samples_dir, saved_counter)
             per_combo[f"{g}_{s}"] = rows
             samples[combo] = pair
         for s in MAZE_OOD_SCALES:
             combo = _maze_combo(g, s)
-            rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, g, s), "maze", device, k)
+            rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, g, s), "maze", device, k, samples_dir, saved_counter)
             ood_combo[f"{g}_{s}"] = rows
             samples[combo] = pair
     return build_maze_result(per_combo, ood_combo), samples
 
 
-def _score_queens(gen_dir, data_root, device, k):
+def _score_queens(gen_dir, data_root, device, k, samples_dir, saved_counter):
     per_scale_rows, ood_scale_rows, samples = {}, {}, {}
     for s in QUEEN_SCALES:
-        rows, pair = score_combo(gen_dir, f"n{s}", _queen_parquet(data_root, s), "queens", device, k)
+        rows, pair = score_combo(gen_dir, f"n{s}", _queen_parquet(data_root, s), "queens", device, k, samples_dir, saved_counter)
         per_scale_rows[str(s)] = rows
         samples[f"n{s}"] = pair
     for s in QUEEN_OOD_SCALES:
-        rows, pair = score_combo(gen_dir, f"n{s}", _queen_parquet(data_root, s), "queens", device, k)
+        rows, pair = score_combo(gen_dir, f"n{s}", _queen_parquet(data_root, s), "queens", device, k, samples_dir, saved_counter)
         ood_scale_rows[str(s)] = rows
         samples[f"n{s}"] = pair
     return build_queens_result(per_scale_rows, ood_scale_rows), samples
@@ -149,10 +165,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     k = args.samples_per_puzzle
 
+    samples_dir = args.gen_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    saved_counter = [0]
+
     if args.task == "maze":
-        result, samples = _score_maze(args.gen_dir, args.data_root, device, k)
+        result, samples = _score_maze(args.gen_dir, args.data_root, device, k, samples_dir, saved_counter)
     else:
-        result, samples = _score_queens(args.gen_dir, args.data_root, device, k)
+        result, samples = _score_queens(args.gen_dir, args.data_root, device, k, samples_dir, saved_counter)
 
     _print_row(f"{args.task} overall (general)", result["overall"])
     _print_row(f"{args.task} overall (OOD)", result["overall_ood"])
@@ -162,6 +182,7 @@ def main():
     with open(out_json, "w") as f:
         json.dump(result, f, indent=2)
     print(f"\nResults saved -> {out_json}")
+    print(f"Sample images saved -> {samples_dir}")
 
     if args.wandb_project:
         import wandb
