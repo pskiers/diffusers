@@ -52,7 +52,7 @@ echo "Output: $OUTPUT_DIR"
 echo "Default sft.py arguments"
 echo "============================================="
 
-srun accelerate launch sft.py \
+srun accelerate launch -m sft.py \
     --model_path "${MODEL_PATH}" \
     --data_path "${MAZE_DATASET_PATH}" \
     --output_dir "${OUTPUT_DIR}" \

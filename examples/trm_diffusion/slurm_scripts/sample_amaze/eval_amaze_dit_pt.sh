@@ -42,9 +42,8 @@ if [[ "${MODEL}" == "dit" ]]; then
   ARGS+=( experiment="amaze_dit_${TASK}" )
 else
   PAINTER_CKPT="${PAINTER_CKPT:-${4:?trm needs the painter checkpoint as arg 4}}"
-  if [[ "${TASK}" == "queens" ]]; then CELL_SIZE="${CELL_SIZE:-20}"; SEQ_LEN="${SEQ_LEN:-49}"; GRID="${GRID:-7}"
-  else CELL_SIZE="${CELL_SIZE:-18}"; SEQ_LEN="${SEQ_LEN:-64}"; GRID="${GRID:-8}"; fi
-  ARGS+=( experiment=amaze_thinker_v1_controlnet painter.checkpoint="${PAINTER_CKPT}"
+  CELL_SIZE="${CELL_SIZE:-12}"; SEQ_LEN="${SEQ_LEN:-144}"; GRID="${GRID:-12}"
+  ARGS+=( experiment=amaze_thinker_v2_controlnet painter.checkpoint="${PAINTER_CKPT}"
           data.cell_size="${CELL_SIZE}" thinker.seq_len="${SEQ_LEN}" translator.grid="${GRID}" )
 fi
 srun python experiments/sample_amaze_metrics.py "${ARGS[@]}"
