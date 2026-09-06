@@ -379,26 +379,40 @@ def build_maze_result(per_combo: dict, ood_combo: dict) -> dict:
     ``per_combo`` / ``ood_combo`` map ``f"{geometry}_{scale}"`` -> list of per-puzzle rows
     (in-distribution scales and OOD scales respectively).
     """
+    # score_amaze_images.py scores one geometry per invocation, so per_combo may
+    # cover a subset of MAZE_GEOMETRIES. Report only what was actually scored -
+    # defaulting a missing geometry to aggregate([]) would silently publish zeros
+    # as if that shape had been evaluated.
+    geometries = [
+        g for g in MAZE_GEOMETRIES
+        if any(f"{g}_{s}" in per_combo for s in MAZE_SCALES)
+        or any(f"{g}_{s}" in ood_combo for s in MAZE_OOD_SCALES)
+    ]
     all_rows = [r for rows in per_combo.values() for r in rows]
     return {
         "task": "maze",
+        # NOTE: "overall" spans exactly the geometries in "geometries", not
+        # necessarily all four.
+        "geometries": geometries,
         "overall": aggregate(all_rows),
         "overall_ood": aggregate([r for rows in ood_combo.values() for r in rows]),
         "per_shape": {
-            g: {str(s): aggregate(per_combo[f"{g}_{s}"]) for s in MAZE_SCALES}
-            for g in MAZE_GEOMETRIES
+            g: {str(s): aggregate(per_combo[f"{g}_{s}"])
+                for s in MAZE_SCALES if f"{g}_{s}" in per_combo}
+            for g in geometries
         },
         "per_shape_ood": {
-            g: {str(s): aggregate(ood_combo[f"{g}_{s}"]) for s in MAZE_OOD_SCALES}
-            for g in MAZE_GEOMETRIES
+            g: {str(s): aggregate(ood_combo[f"{g}_{s}"])
+                for s in MAZE_OOD_SCALES if f"{g}_{s}" in ood_combo}
+            for g in geometries
         },
         "per_geometry": {
-            g: aggregate([r for s in MAZE_SCALES for r in per_combo[f"{g}_{s}"]])
-            for g in MAZE_GEOMETRIES
+            g: aggregate([r for s in MAZE_SCALES for r in per_combo.get(f"{g}_{s}", [])])
+            for g in geometries
         },
         "per_geometry_ood": {
-            g: aggregate([r for s in MAZE_OOD_SCALES for r in ood_combo[f"{g}_{s}"]])
-            for g in MAZE_GEOMETRIES
+            g: aggregate([r for s in MAZE_OOD_SCALES for r in ood_combo.get(f"{g}_{s}", [])])
+            for g in geometries
         },
         "n_puzzles": len(all_rows),
     }
@@ -473,24 +487,34 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
         return t
 
     if task == "maze":
+        # A single-geometry invocation carries a subset of MAZE_GEOMETRIES; drive
+        # the tables off what was scored and record it, so a square-only
+        # "overall" is not read as an all-shapes number.
+        geometries = result.get("geometries", MAZE_GEOMETRIES)
+        run.summary[f"{prefix}/geometries"] = ",".join(geometries)
+
         for g, by_scale in result["per_shape"].items():
-            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s))) for s in MAZE_SCALES]
+            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s)))
+                    for s in MAZE_SCALES if str(s) in by_scale]
             run.log({f"{prefix}/{g}_table": _img_table(rows)})
         for g, by_scale in result["per_shape_ood"].items():
-            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s))) for s in MAZE_OOD_SCALES]
+            rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s)))
+                    for s in MAZE_OOD_SCALES if str(s) in by_scale]
             run.log({f"{prefix}/{g}_ood_table": _img_table(rows)})
 
         per_geometry = result["per_geometry"]
         for g, agg in per_geometry.items():
             for key, val in agg.items():
                 run.summary[f"{prefix}/per_geometry/{g}/{key}"] = val
-        run.log({f"{prefix}/per_geometry_table": _metric_table([(g, per_geometry[g]) for g in MAZE_GEOMETRIES])})
+        run.log({f"{prefix}/per_geometry_table":
+                 _metric_table([(g, per_geometry[g]) for g in geometries if g in per_geometry])})
 
         per_geometry_ood = result["per_geometry_ood"]
         for g, agg in per_geometry_ood.items():
             for key, val in agg.items():
                 run.summary[f"{prefix}/per_geometry_ood/{g}/{key}"] = val
-        run.log({f"{prefix}/per_geometry_ood_table": _metric_table([(g, per_geometry_ood[g]) for g in MAZE_GEOMETRIES])})
+        run.log({f"{prefix}/per_geometry_ood_table":
+                 _metric_table([(g, per_geometry_ood[g]) for g in geometries if g in per_geometry_ood])})
     else:
         combined = {**result["per_scale"], **result["per_scale_ood"]}
         rows = [(f"{s}x{s}", combined[s], samples.get(queens_sample_key(s))) for s in combined]
