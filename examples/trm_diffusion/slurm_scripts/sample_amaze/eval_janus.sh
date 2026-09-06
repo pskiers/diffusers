@@ -34,9 +34,20 @@ else
     CHECKPOINT_OVERRIDE="${2:-}"
 fi
 
-PROJECT_ROOT="/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/examples/trm_diffusion"
-VENV="${SCRATCH}/trm_helios_venv"
-EAR_AMAZE_ROOT="${PROJECT_ROOT}/third_party/ear-amaze"
+PROJECT_ROOT="${PROJECT_ROOT:-/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/examples/trm_diffusion}"
+VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
+
+# ear-amaze (full upstream clone) is the tree this project trains against; third_party/amaze
+# is the partial vendored copy. They are NOT interchangeable - prefer ear-amaze, and keep
+# this order identical to slurm_scripts/train_amaze/train_janus.sh so training and sampling
+# never resolve to different checkouts. Override with EAR_AMAZE_ROOT.
+if [[ -z "${EAR_AMAZE_ROOT:-}" ]]; then
+    for _cand in "${PROJECT_ROOT}/third_party/ear-amaze" "${PROJECT_ROOT}/third_party/amaze"; do
+        if [[ -f "${_cand}/infer/infer_janus.py" ]]; then EAR_AMAZE_ROOT="${_cand}"; break; fi
+    done
+fi
+: "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_janus.py under PROJECT_ROOT/third_party (tried ear-amaze, amaze). Set EAR_AMAZE_ROOT=, or run third_party/amaze/setup_ft_code.sh}"
+
 DATA_PATH="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 
 export HF_HOME="${SCRATCH}/.cache/huggingface"

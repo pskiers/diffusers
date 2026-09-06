@@ -32,17 +32,7 @@ VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 T_STARTS="${T_STARTS:-[10,30,50,70,90]}"
 BATCH="${BATCH:-32}"
-# Pinned for BOTH models on purpose. Left unset, each model falls back to its
-# own sampling config — configs/sampling/direct.yaml gives DiT 99 steps and
-# configs/sampling/cfg.yaml gives the thinker 20 — so at the same t_start the
-# two would get a ~5x different denoising budget to repair the corruption with,
-# and any TRM-vs-DiT gap would be unreadable. num_train_timesteps is 100
-# (configs/diffusion/ddpm.yaml), so STEPS=100 puts every integer t in the
-# schedule and every t_start above is valid.
-# Cost scales with it: the probe runs 18 denoising passes per batch per t_start
-# (7 clean-context references + 11 corrupted variants), and t_start=90 alone is
-# 91 steps of those. Drop to 50 (t_starts must stay even) or 20 (multiples of 5)
-# if the job runs out of wall clock — just keep both models on the same number.
+
 STEPS="${STEPS:-100}"
 # Square only: the ADD/WALL neighbour logic in maze_corruption_lib.py assumes a
 # rectangular cell grid, so hex/triangle/circle boards are out of scope here.
