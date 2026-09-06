@@ -59,12 +59,22 @@ EXPERIMENT_NAME="janus_train_${TASK}"
 RUN_NAME="${TASK}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
+# The authors' recipe, from the example at the top of sft.py. argparse's defaults
+# are much weaker (n_epochs 8, lr 5e-6, accum 16) -- on 800 samples that is 400
+# optimizer updates against their 20,000. Lower N_EPOCHS for the big datasets.
+N_EPOCHS="${N_EPOCHS:-200}"
+LR="${LR:-1e-5}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+MIN_LR_RATIO="${MIN_LR_RATIO:-0.01}"
+MAX_CKPTS="${MAX_CKPTS:-10}"
+
 echo "============================================="
 echo "Janus SFT Training"
 echo "Task: $TASK"
 echo "Data: $MAZE_DATASET_PATH"
 echo "Output: $OUTPUT_DIR/$EXPERIMENT_NAME/$RUN_NAME"
-echo "Default sft.py arguments"
+echo "Epochs: $N_EPOCHS | lr: $LR | grad_accum: $GRAD_ACCUM"
 echo "============================================="
 
 # sft.py calls dist.get_world_size() without an is_initialized() guard, but
@@ -86,7 +96,13 @@ srun accelerate launch \
     --output_dir "${OUTPUT_DIR}" \
     --experiment_name "${EXPERIMENT_NAME}" \
     --run_name "${RUN_NAME}" \
-    --log_dir "${LOG_DIR}"
+    --log_dir "${LOG_DIR}" \
+    --n_epochs "${N_EPOCHS}" \
+    --learning_rate "${LR}" \
+    --gradient_accumulation_steps "${GRAD_ACCUM}" \
+    --weight_decay "${WEIGHT_DECAY}" \
+    --min_lr_ratio "${MIN_LR_RATIO}" \
+    --max_ckpts "${MAX_CKPTS}"
 
 echo "Finished -> ${OUTPUT_DIR}/${EXPERIMENT_NAME}/${RUN_NAME}"
 echo "Score it with: sbatch slurm_scripts/sample_amaze/eval_janus.sh ${TASK} <shape-if-maze>"
