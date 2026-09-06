@@ -47,6 +47,7 @@ DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 #   third_party/ear-amaze -> full upstream EaR clone; what this project trains against
 #   third_party/amaze     -> the partial tree vendored by setup_ft_code.sh, whose
 #                            sft/janus/sft.py is locally modified (validation + wandb)
+# ear-amaze wins by default (eval_janus.sh has always used it). Override with AMAZE_ROOT.
 if [[ -z "${AMAZE_ROOT:-}" ]]; then
     for _cand in "${PROJECT_ROOT}/third_party/ear-amaze" "${PROJECT_ROOT}/third_party/amaze"; do
         if [[ -f "${_cand}/sft/janus/sft.py" ]]; then AMAZE_ROOT="${_cand}"; break; fi
@@ -63,11 +64,17 @@ fi
 SFT_DIR="${AMAZE_ROOT}/sft/janus"
 SFT_PY="${SFT_DIR}/sft.py"
 
+# ear-amaze ships pristine upstream code; third_party/amaze's copy is locally modified
+# (validation + wandb). Passing a flag the target doesn't declare is an instant argparse
+# "unrecognized arguments" abort, so probe the source before building the arg list.
 sft_has() { grep -q -- "'$1'" "${SFT_PY}" || grep -q -- "\"$1\"" "${SFT_PY}"; }
 
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 mkdir -p "${HF_HOME}" "${PROJECT_ROOT}/slurm_outputs"
 
+# sft.py needs `janus` (from the cloned base repo) and `data.maze_dataset` (from the
+# AMAZE checkout). PROJECT_ROOT is deliberately NOT on the path: it holds its own
+# top-level data/, which would collide with AMAZE's data/ package.
 export PYTHONPATH="${SFT_DIR}/Janus:${AMAZE_ROOT}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
@@ -97,7 +104,7 @@ if [[ ! -f "${DATA_DIR}/maze_dataset_test.parquet" ]]; then
     fi
     echo "NOTE: no maze_dataset_test.parquet; this sft.py has no validation loop anyway." >&2
 fi
-command -v torchrun >/dev/null || { echo "ERROR: 'torchrun' not on PATH in ${VENV}." >&2; exit 1; }
+command -v accelerate >/dev/null || { echo "ERROR: 'accelerate' not on PATH in ${VENV}." >&2; exit 1; }
 python - <<'PY' || { echo "ERROR: import preflight failed (see above)." >&2; exit 1; }
 import sys, traceback
 try:
@@ -111,8 +118,12 @@ except Exception:
     # janus.models -> attrdict, whose PyPI release does `from collections import Mapping`
     # and therefore cannot import on Python >= 3.10 (this job loads Python 3.11.5).
     if "attrdict" in traceback.format_exc() or "collections" in traceback.format_exc():
-        print("\nHINT: the stock 'attrdict' package is broken on Python 3.11.", file=sys.stderr)
-        print("      Fix in the venv:  pip uninstall -y attrdict && pip install attrdict3", file=sys.stderr)
+        print("\nHINT: 'attrdict' 2.0.1 does `from collections import Mapping` and cannot", file=sys.stderr)
+        print("      import on Python 3.11. attrdict3 is the compatible fork, but BOTH", file=sys.stderr)
+        print("      install the same 'attrdict' module, so whichever landed last wins.", file=sys.stderr)
+        print("      Fix (on an aarch64 compute node - the venv can't run on the login node):", file=sys.stderr)
+        print("        pip uninstall -y attrdict attrdict3 && pip install attrdict3", file=sys.stderr)
+        print("      Offline fallback: python scripts/fix_attrdict.py \"$VIRTUAL_ENV\"", file=sys.stderr)
     sys.exit(1)
 print(f"preflight ok: torch {torch.__version__}, transformers {transformers.__version__}, "
       f"cuda_available={torch.cuda.is_available()}")
@@ -186,23 +197,30 @@ fi
 echo "sft.py args: ${LAUNCH_ARGS[*]}"
 echo "============================================="
 
-# torchrun, NOT `accelerate launch --num_processes 1` (and same launcher as
-# train_bagel_ft.sh). ear-amaze's sft.py calls dist.get_world_size() unguarded in
-# three places -- train()'s num_training_steps, TrainingMetrics.__init__ and
-# get_metric()'s all_reduce. `accelerate launch --num_processes 1` sets
-# distributed_type=NO and never creates a process group, so the first of those
-# raises "Default process group has not been initialized" a few minutes in, right
-# after the model loads. torchrun sets LOCAL_RANK/WORLD_SIZE, which makes
-# Accelerator() init the group, so get_world_size() returns 1 and the code runs.
-# third_party/amaze's copy guards all three and is happy either way.
-#
-# Keep nproc_per_node at 1: sft.py calls model.language_model.model(...) directly,
+# `accelerate launch`, exactly as in sft.py's own docstring. The five env vars
+# below are the only addition, and they are needed: sft.py calls
+# dist.get_world_size() with no is_initialized() guard in three places (train()'s
+# num_training_steps, TrainingMetrics.__init__, get_metric()'s all_reduce). The
+# authors ran this multi-GPU, where accelerate creates a process group; on ONE GPU
+# it sets distributed_type=NO and creates none, so the first of those raises
+# "Default process group has not been initialized" a few minutes in, right after
+# the model loads. Setting the standard torch.distributed variables makes
+# accelerate initialise a 1-rank group, so get_world_size() returns 1 and the
+# authors' code runs unmodified. (`--multi_gpu` can't be used instead: accelerate
+# rejects it below 2 processes.)
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export MASTER_PORT="${MASTER_PORT:-$((29500 + ${SLURM_JOB_ID:-0} % 1000))}"
+export RANK=0
+export LOCAL_RANK=0
+export WORLD_SIZE=1
+
+# Keep --num_processes at 1: sft.py calls model.language_model.model(...) directly,
 # bypassing DDP's forward hook, so >1 rank would silently skip gradient sync.
 # sft.py builds its own Accelerator(mixed_precision='bf16').
-srun torchrun \
-    --standalone \
-    --nnodes=1 \
-    --nproc_per_node=1 \
+srun accelerate launch \
+    --num_processes 1 \
+    --num_machines 1 \
+    --mixed_precision bf16 \
     sft.py \
     "${LAUNCH_ARGS[@]}"
 
