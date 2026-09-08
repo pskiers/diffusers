@@ -192,7 +192,21 @@ def main(cfg: DictConfig):
     load_opt = cfg.get("load_optimizer_state", True)
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
-        accelerator.unwrap_model(model).load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=False)
+        # compile_submodules() (above) already ran if cfg.train.compile, so the
+        # live model's compiled submodules already carry torch.compile's
+        # "._orig_mod." infix in their parameter names — same as the checkpoint,
+        # which was saved from an equally-compiled model. Stripping it in that
+        # case would make the checkpoint's keys stop matching the live model,
+        # silently reinitializing every compiled submodule via strict=False.
+        model_state = ckpt["model_state"]
+        if not cfg.train.compile:
+            model_state = strip_compiled_prefix(model_state)
+        missing, unexpected = accelerator.unwrap_model(model).load_state_dict(model_state, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                f"Resume: model_state mismatch — missing={len(missing)} unexpected={len(unexpected)}. "
+                f"First few missing={missing[:5]} unexpected={unexpected[:5]}"
+            )
         if load_opt and ckpt.get("optimizer_states"):
             for opt, sd in zip(optimizers, ckpt["optimizer_states"]):
                 opt.load_state_dict(sd)
