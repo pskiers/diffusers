@@ -1,0 +1,21 @@
+# @package _global_
+# Pixel-space DiT painter for MNIST Sudoku (no VAE/latents) -- DiT analog of
+# mnist_unet_painter.yaml. patch_size=16=cell_size, so the DiT's 9x9=81
+# patches align 1:1 with sudoku cells, exactly as the UNet's spatial feature
+# map does -- this is stage 1 (unconditional painter pretraining); stage 2
+# is mnist_thinker_dit_direct.
+# Usage: python train_trm.py experiment=mnist_dit_painter_pixel
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_dit_pixel
+  - override /painter: mnist_dit_pixel
+  - override /train: mnist
+  - override /eval_callbacks: mnist
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_dit_painter_pixel"

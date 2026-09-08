@@ -1,0 +1,19 @@
+# Frozen pixel-space DiTPainter with index-matched (direct) IP conditioning,
+# for thinker steering. DiT analog of mnist_unet_controlnet_frozen.yaml:
+# patches align 1:1 with sudoku cells (patch_size=16=cell_size), so IP tokens
+# from the thinker inject additively at matching positions -- the same
+# position-matched guarantee ControlNet residuals give the UNet painter.
+# Loads a trained mnist_dit_painter_pixel checkpoint and freezes the DiT.
+# No trainable painter params of its own -- only the per-block IP linears
+# (added by DirectIPAdapterSteeredDiTPainter), thinker, and translator train.
+_target_: models.painter_base.DirectIPAdapterSteeredDiTPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to mnist_dit_painter_pixel checkpoint
+dit: ${backbone}
+painter_dtype: null
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

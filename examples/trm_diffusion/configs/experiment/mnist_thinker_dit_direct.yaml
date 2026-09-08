@@ -1,0 +1,35 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen pixel-space MNIST DiT (index-matched IP
+# steering). Requires a trained mnist_dit_painter_pixel checkpoint. DiT
+# analog of mnist_thinker_controlnet.yaml: patch_size=16 makes the DiT's 9x9
+# patches align 1:1 with sudoku cells, so index-matched IP injection plays
+# the same role ControlNet residuals play for the UNet version -- no VAE,
+# no latents, no cross-attention lookup.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_dit_direct \
+#     painter.checkpoint=runs/mnist_dit_painter_pixel/checkpoint_final.pt \
+#     eval_callbacks.0.classifier_path=runs/mnist_classifier_cell16.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /backbone: mnist_dit_pixel
+  - override /painter: mnist_dit_pixel_direct_frozen
+  - override /thinker: mnist
+  - override /translator: ip_adapter_mnist
+  - override /condition_encoder: spatial_image_v0
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
+run:
+  output_dir: "runs/mnist_thinker_dit_direct"

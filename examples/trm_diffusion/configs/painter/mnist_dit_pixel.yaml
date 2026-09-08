@@ -1,0 +1,15 @@
+# Trainable MNIST DiTPainter (pixel-space, unconditional).
+# DiT analog of mnist_unet.yaml: no vae key -> DiTPainter runs directly on
+# pixels instead of VAE latents. Optimizer hyperparams match mnist_unet.yaml
+# for parity with the UNet painter this is meant to mirror.
+_target_: models.painter_base.DiTPainter
+_recursive_: false
+dit: ${backbone}
+painter_dtype: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

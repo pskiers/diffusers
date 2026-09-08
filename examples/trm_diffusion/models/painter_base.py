@@ -791,18 +791,23 @@ class ConcatConditionedControlNetSteeredUNetPainter(ConcatConditionedUNetPainter
 
 
 class DiTPainter(PainterBase, BaseModel):
-    """Standalone trainable DiT painter for latent diffusion.
+    """Standalone trainable DiT painter for pixel-space or latent diffusion.
 
-    Wraps a diffusers Transformer2DModel + AutoencoderKL.  Conditioning is
-    routed through the condition_encoder, which accepts a DataSample and
-    returns a dict of DiT kwargs (encoder_hidden_states, encoder_attention_mask).
+    Wraps a diffusers Transformer2DModel, optionally paired with an
+    AutoencoderKL. Pass a VAE to enable latent diffusion (as with
+    UNetPainter); leave it unset for a pixel-space DiT (e.g. patch_size set
+    equal to the dataset's cell_size, so patches align 1:1 with grid cells —
+    the DiT analog of a UNet's spatial feature map). Conditioning is routed
+    through the condition_encoder, which accepts a DataSample and returns a
+    dict of DiT kwargs (encoder_hidden_states, encoder_attention_mask).
 
     condition_keys is derived from condition_encoder.condition_keys at runtime
     (fields that will be zeroed for CFG dropout).  [] means unconditional.
 
     Args:
         dit:               Hydra config for a Transformer2DModel.
-        vae:               Hydra config for an AutoencoderKL (always frozen).
+        vae:               optional Hydra config for an AutoencoderKL (always
+                           frozen); omit for a pixel-space DiT.
         scheduler:         diffusion noise scheduler.
         optim_cfg:         optimizer hyperparams.
         train_cfg:         training hyperparams.
@@ -811,10 +816,13 @@ class DiTPainter(PainterBase, BaseModel):
                            must expose condition_keys and accept DataSample,
                            returning a dict of DiT kwargs.
         eval_callbacks:    optional list of Hydra configs for EvalCallbackBase.
+        pixel_range:       native pixel range when vae is None — "[0,1]"
+                           (default) or "[-1,1]". Unused when vae is set
+                           (vae_pixel_range governs that case instead).
     """
 
     dit: nn.Module
-    vae: nn.Module
+    vae: Optional[nn.Module]
     condition_encoder: Optional[nn.Module]
     eval_callbacks: list
     loss_fn: LossBase
@@ -822,22 +830,23 @@ class DiTPainter(PainterBase, BaseModel):
     def __init__(
         self,
         dit,
-        vae,
         scheduler,
         optim_cfg: PainterOptimConfig,
         train_cfg: TrainConfig,
         eval_cfg: EvalConfig,
+        vae=None,
         condition_encoder=None,
         eval_callbacks=None,
         painter_dtype: Optional[str] = None,
         vae_pixel_range: str = "[-1,1]",
+        pixel_range: str = "[0,1]",
         sampling_pipeline=None,
     ):
         super().__init__()
         self.sampling_pipeline = instantiate(sampling_pipeline) if sampling_pipeline is not None else None
         self.dit: nn.Module = instantiate(dit)
-        self.vae: nn.Module = instantiate(vae)
-        self.scaling_factor = self.vae.config.scaling_factor
+        self.vae: Optional[nn.Module] = instantiate(vae) if vae is not None else None
+        self.scaling_factor = self.vae.config.scaling_factor if self.vae is not None else 1.0
         self.scheduler = scheduler
         self.optim_cfg = optim_cfg
         self.train_cfg = train_cfg
@@ -855,9 +864,13 @@ class DiTPainter(PainterBase, BaseModel):
         # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
         # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
         self._vae_tanh = vae_pixel_range == "[-1,1]"
+        # Same idea, but for pixel-space DiTs (no VAE) — mirrors UNetPainter's
+        # pixel_range. Unused when self.vae is set.
+        self._pixel_tanh = pixel_range == "[-1,1]"
 
-        for p in self.vae.parameters():
-            p.requires_grad_(False)
+        if self.vae is not None:
+            for p in self.vae.parameters():
+                p.requires_grad_(False)
 
     @property
     def condition_keys(self) -> list[str]:
@@ -873,19 +886,33 @@ class DiTPainter(PainterBase, BaseModel):
         return (c, s, s)
 
     def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents → [0, 1] pixel images for logging."""
-        pixels = self.vae.decode(latents / self.scaling_factor).sample
-        if self._vae_tanh:
-            return ((pixels + 1.0) / 2.0).clamp(0.0, 1.0)
-        return pixels.clamp(0.0, 1.0)
+        """Decode latents → pixel images for logging/eval. Latent-space
+        models decode through the VAE (clamped to [0, 1] unless vae_pixel_range
+        selects tanh rescaling). Pixel-space models (no VAE) just clamp to
+        their own native range (see pixel_range)."""
+        if self.vae is not None:
+            pixels = self.vae.decode(latents / self.scaling_factor).sample
+            if self._vae_tanh:
+                return ((pixels + 1.0) / 2.0).clamp(0.0, 1.0)
+            return pixels.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return latents.clamp(-1.0, 1.0)
+        return latents.clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
-        """Convert dataset batch images → [0, 1] for display."""
-        if self._vae_tanh:
-            return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+        """Convert dataset batch images → the painter's native range for display."""
+        if self.vae is not None:
+            if self._vae_tanh:
+                return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+            return images.clamp(0.0, 1.0)
+        if self._pixel_tanh:
+            return images.clamp(-1.0, 1.0)
         return images.clamp(0.0, 1.0)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode pixel images to scaled latents. Requires VAE."""
+        if self.vae is None:
+            raise RuntimeError("encode() requires a VAE")
         with torch.no_grad():
             return self.vae.encode(images).latent_dist.sample() * self.scaling_factor
 
@@ -913,12 +940,14 @@ class DiTPainter(PainterBase, BaseModel):
     def _prepare_training_sample(self, mb: DataSample, device: torch.device) -> DataSample:
         """Build a DataSample with x_noisy, timesteps, and target from a batch.
 
-        All other batch fields are preserved so the condition encoder can read
+        If the painter has a VAE, images are encoded to latents before adding
+        noise; pixel-space painters (no VAE) noise the images directly. All
+        other batch fields are preserved so the condition encoder can read
         embedding_conditions, embedding_mask, etc.
         """
         images = mb.images.to(device)
         bsz = images.shape[0]
-        z = self.encode(images)
+        z = self.encode(images) if self.vae is not None else images
 
         noise = torch.randn_like(z)
         timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (bsz,), device=device, dtype=torch.long)
