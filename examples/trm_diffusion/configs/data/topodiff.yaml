@@ -1,0 +1,30 @@
+# TopoDiff (Mazé & Ahmed, AAAI 2023) topology-optimization dataset.
+#
+# Unlike Steiner/Polygon/Ball-Drop, this is NOT HF-hosted: the raw data
+# (dataset_1_diff, ~5.6GB unzipped) comes from the paper's own Dropbox link
+# (see datasets/topodiff_dataset.py's module docstring) with no license file
+# in the source repo, so it isn't mirrored/redistributed here — data_dir must
+# point at your own local extraction of dataset_1_diff.zip.
+#
+# train/val is a held-out split of training_data (last 1000 of 30000 ids),
+# NOT the paper's own test_data_level_1/2 (those have no ground-truth image,
+# only conditioning + a precomputed reference compliance — see
+# datasets/topodiff_dataset.py) — those are used exclusively inside
+# eval_callbacks' extra_eval_sets to compute the headline CE/VFE/LV/FM
+# metrics against the paper's official test split.
+image_size: 64
+grid_factor: 8   # thinker/condition-encoder spatial downsampling factor: 64/8 = 8x8 = 64 tokens
+num_workers: 4
+data_dir: "data/topodiff/dataset_1_diff/dataset_1_diff"
+
+train_dataset:
+  _target_: datasets.topodiff_dataset.TopodiffDataset
+  data_dir: "${data.data_dir}"
+  split: "training_data"
+  id_end: 29000
+
+val_dataset:
+  _target_: datasets.topodiff_dataset.TopodiffDataset
+  data_dir: "${data.data_dir}"
+  split: "training_data"
+  id_start: 29000

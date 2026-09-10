@@ -59,3 +59,13 @@ patchelf
 gin-config
 absl-py
 six
+
+# TopoDiff — eval/topodiff_analysis.py (a verbatim vendored copy of the
+# paper's own FEA-based compliance solver) calls solidspy's assembler API
+# with the calling convention of solidspy<=1.0.16 (the latest release that
+# existed when that paper code was written, Dec 2022). The current PyPI
+# "latest" (1.1.0.post1, released Nov 2023) changed both DME's expected
+# `cons` array shape and assembler's return arity, breaking that exact call
+# — see eval/topodiff_eval.py's module docstring. Pin the old release, not
+# "latest":
+solidspy==1.0.16

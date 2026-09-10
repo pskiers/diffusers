@@ -1,0 +1,15 @@
+# Same protocol as configs/eval_callbacks/topodiff.yaml (see its comments) --
+# run against the TRM+frozen-painter model, so the same metrics are directly
+# comparable against the plain unconditional painter's.
+- _target_: models.eval_callbacks.TopodiffEvalCallback
+  data_dir: ${data.data_dir}
+  image_size: ${data.image_size}
+  num_samples: 64
+  num_log_images: 8
+  extra_eval_sets:
+    - name: level_1
+      split: test_data_level_1
+      num_samples: 64
+    - name: level_2
+      split: test_data_level_2
+      num_samples: 64

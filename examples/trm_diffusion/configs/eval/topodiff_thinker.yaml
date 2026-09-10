@@ -1,0 +1,11 @@
+eval_every: 2000
+save_every: 10000
+log_every: 200
+cfg_scale: 2.0
+num_samples: 1000
+# Kept close to eval_callbacks/topodiff_thinker.yaml's num_samples (64) --
+# see configs/eval/topodiff.yaml's comment on why an oversized eval batch is
+# expensive specifically for TopoDiff's per-sample FEA solve.
+batch_size: 32
+num_ddim_steps: 20
+num_log_images: 8

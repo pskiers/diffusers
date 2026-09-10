@@ -1,0 +1,22 @@
+# TopoDiff eval callback: single-sample generation + the paper's own
+# CE/VFE/LV/FM metrics (see models.eval_callbacks.TopodiffEvalCallback).
+# The primary dataloader (this model's own held-out training-data split) has
+# no precomputed reference compliance, so it only ever reports VFE/LV/FM;
+# CE comes from extra_eval_sets, which point at the paper's own official
+# test_data_level_1 (in-distribution BCs) / test_data_level_2 (OOD BCs)
+# splits -- each has a precomputed reference SIMP compliance per instance.
+# The FEA solve is CPU-bound (~2s/sample) -- num_samples is kept modest here
+# for periodic training-time eval; run a much larger offline pass (e.g. the
+# full 1800-instance test_data_level_1) for a one-off final evaluation.
+- _target_: models.eval_callbacks.TopodiffEvalCallback
+  data_dir: ${data.data_dir}
+  image_size: ${data.image_size}
+  num_samples: 64
+  num_log_images: 8
+  extra_eval_sets:
+    - name: level_1
+      split: test_data_level_1
+      num_samples: 64
+    - name: level_2
+      split: test_data_level_2
+      num_samples: 64

@@ -1,0 +1,13 @@
+# Thinker-side condition encoder: spatial image CNN (V0, no noisy input)
+# over the 5-channel condition map (3 physical fields + 2 load components —
+# see datasets/topodiff_dataset.py), same pattern as Steiner/Maze/Sudoku's
+# spatial_image_v0 — pixel-aligned physical fields keep their spatial
+# correspondence with the topology being generated, rather than collapsing
+# them into an abstract token set.
+_target_: models.condition_encoders.SpatialConditionEncoder
+in_channels: 5
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.grid_factor}
+with_timestep_emb: true

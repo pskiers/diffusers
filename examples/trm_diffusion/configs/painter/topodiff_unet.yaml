@@ -1,0 +1,19 @@
+# Trainable TopoDiff UNetPainter (pixel-space, unconditional) — stage 1.
+# No condition_encoder: matches Sudoku/Maze/Steiner's convention of an
+# unconditional painter that just learns what valid topologies look like;
+# all real conditioning on physical fields/loads happens in stage 2 via the
+# TRM + ControlNet steering, not here.
+_target_: models.painter_base.UNetPainter
+_recursive_: false
+unet: ${backbone}
+painter_dtype: null
+# gt_topo images are loaded as {0,255} -> {-1,+1} (see
+# datasets/topodiff_dataset.py), not the [0,1] default.
+pixel_range: "[-1,1]"
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

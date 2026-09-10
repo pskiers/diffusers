@@ -1,0 +1,28 @@
+# @package _global_
+# Stage 2: TRM thinker with frozen TopoDiff UNet (ControlNet steering),
+# conditioned on physical fields + loads (see
+# configs/condition_encoder/topodiff_spatial_v0.yaml).
+# Requires a trained topodiff_unet_painter checkpoint.
+#
+# Usage:
+#   python train_trm.py experiment=topodiff_thinker_controlnet \
+#     painter.checkpoint=runs/topodiff_unet_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: topodiff
+  - override /backbone: topodiff_unet
+  - override /painter: topodiff_unet_controlnet_frozen
+  - override /thinker: topodiff
+  - override /translator: controlnet_topodiff
+  - override /condition_encoder: topodiff_spatial_v0
+  - override /train: topodiff_thinker
+  - override /eval: topodiff_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: topodiff_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/topodiff_thinker_controlnet"

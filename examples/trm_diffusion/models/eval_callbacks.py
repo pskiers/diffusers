@@ -36,6 +36,7 @@ from eval.steiner_eval import evaluate_steiner, make_steiner_panel_image
 from eval.polygon_eval import evaluate_polygon, make_polygon_panel_image, _orders_equivalent
 from eval.ball_drop_eval import evaluate_ball_drop, make_ball_drop_panel_image
 from eval.squares_eval import evaluate_squares, make_squares_panel_image
+from eval.topodiff_eval import evaluate_topodiff, make_topodiff_panel_image
 from datasets.data_sample import DataSample
 
 
@@ -1358,6 +1359,176 @@ class SquaresEvalCallback(EvalCallbackBase):
             "squareness_mean": _weighted_mean(weighted_squareness),
             "alignment_mean": _weighted_mean(weighted_alignment),
         }
+        if panels:
+            result["samples"] = panels
+        return result
+
+
+# ── TopoDiff (topology optimization) ──────────────────────────────────────────
+
+
+class TopodiffEvalCallback(EvalCallbackBase):
+    """
+    Single-sample DDIM eval for TopoDiff models: draw one generated topology
+    per test instance (no best-of-N — the paper's own evaluation protocol
+    scores exactly one sample per instance; its guidance mechanism, not
+    sample selection, is what's responsible for quality there) and score it
+    with the paper's own 4 metrics (see eval/topodiff_eval.py, a thin
+    wrapper around eval/topodiff_analysis.py — a verbatim vendored copy of
+    the paper's own topodiff/topodiff_analysis.py):
+
+      CE  — compliance error: FEA-computed compliance of the generated
+            topology relative to the reference SIMP-optimal compliance,
+            C(generated)/C(SIMP) - 1. Only computable when the dataloader's
+            dataset has a precomputed reference compliance for every
+            instance in the batch (TopodiffDataset.compliance_for() —
+            only non-None for the test_data_level_1/2 splits, see
+            datasets/topodiff_dataset.py); silently omitted from the result
+            otherwise (e.g. a training-split validation dataloader still
+            gets VFE/LV/FM, just no CE).
+      VFE — volume fraction error: |VF(generated) - VF(target)| / VF(target).
+      LV  — load violation rate: proportion of instances with no material at
+            the applied load point.
+      FM  — floating material rate: proportion of instances whose generated
+            topology has disconnected material regions.
+
+    The FEA solve (compute_deflection's replacement, see topodiff_eval.py)
+    is CPU-bound and slow (~2s/sample on a single core) — keep num_samples
+    modest for periodic training-time eval (e.g. 64-256); run a much larger
+    offline pass (e.g. the full 1800-instance test_data_level_1) only for a
+    one-off final evaluation, not every eval_every step.
+
+    extra_eval_sets adds additional held-out test-set dataloaders (typically
+    the paper's own test_data_level_1 in-distribution / test_data_level_2
+    out-of-distribution splits), each contributing metrics suffixed
+    `_{name}` (e.g. "CE_level_1", "VFE_level_2"). Each entry:
+        {name, split, data_dir (optional, defaults to this callback's
+         data_dir), ids (optional), num_samples (optional, defaults to this
+         callback's num_samples)}
+
+    Args:
+        data_dir: root of the extracted dataset_1_diff directory (see
+                  datasets/topodiff_dataset.py's module docstring).
+        image_size: must match the dataset's native resolution (64).
+        num_samples: number of instances to evaluate on the primary
+                     dataloader.
+        num_log_images: WandB panel images (primary dataloader only).
+        extra_eval_sets: optional list of held-out test-set specs.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        image_size: int = 64,
+        num_samples: int = 256,
+        num_log_images: int = 8,
+        extra_eval_sets: Optional[list] = None,
+    ):
+        self.data_dir = data_dir
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.num_log_images = num_log_images
+        self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
+        self._extra_dataloaders = None  # built lazily on first __call__
+
+    def _build_extra_dataloaders(self, batch_size: int) -> list:
+        from datasets.topodiff_dataset import TopodiffDataset
+
+        loaders = []
+        for spec in self._extra_specs:
+            ds = TopodiffDataset(
+                data_dir=spec.get("data_dir", self.data_dir),
+                split=spec["split"],
+                ids=spec.get("ids"),
+            )
+            dl = DataLoader(
+                ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=TopodiffDataset.collate_fn
+            )
+            loaders.append((spec["name"], spec.get("num_samples", self.num_samples), dl))
+        return loaders
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        if not hasattr(model, "_batch_to_sample"):
+            import logging
+            logging.getLogger(__name__).warning(
+                "TopodiffEvalCallback: model has no _batch_to_sample method, skipping eval."
+            )
+            return {}
+
+        if self._extra_dataloaders is None:
+            self._extra_dataloaders = self._build_extra_dataloaders(dataloader.batch_size)
+
+        result = self._eval_one(model, dataloader, accelerator, self.num_samples, suffix="", log_panels=True)
+        for name, n_samples, extra_dl in self._extra_dataloaders:
+            result.update(
+                self._eval_one(model, extra_dl, accelerator, n_samples, suffix=f"_{name}", log_panels=False)
+            )
+        return result
+
+    def _eval_one(self, model, dataloader, accelerator, n_total: int, suffix: str, log_panels: bool) -> dict:
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+        n_log = self.num_log_images if log_panels else 0
+        dataset = dataloader.dataset
+        chunk = max(1, pipeline.batch_size)
+
+        weighted_ce, weighted_vfe, weighted_lv, weighted_fm = [], [], [], []
+        panels: list = []
+        n_done = 0
+
+        n_batches = (n_total + dataloader.batch_size - 1) // dataloader.batch_size
+        for batch in tqdm(dataloader, "TopoDiff eval" + suffix, total=n_batches):
+            if n_done >= n_total:
+                break
+            B_full = batch["spatial_conditions"].shape[0]
+
+            for start in range(0, B_full, chunk):
+                end = min(start + chunk, B_full)
+                sub = batch.slice(start, end)
+                B = end - start
+
+                conditions = model._batch_to_sample(sub, device)
+                gen = pipeline.sample_one_batch(model, conditions, device)  # (B, 1, H, W)
+                gen = model.decode_for_eval(gen)
+
+                puzzle_ids = sub["puzzle_id"].cpu().tolist()
+                summaries = [dataset.summary_for(pid) for pid in puzzle_ids]
+                compliance_opt = np.array([dataset.compliance_for(pid) for pid in puzzle_ids], dtype=np.float64)
+                has_compliance = not np.isnan(compliance_opt).any()
+
+                acc = evaluate_topodiff(gen, summaries, compliance_opt=compliance_opt if has_compliance else None)
+
+                if has_compliance:
+                    weighted_ce.append((acc["CE"], B))
+                weighted_vfe.append((acc["VFE"], B))
+                weighted_lv.append((acc["LV"], B))
+                weighted_fm.append((acc["FM"], B))
+
+                if _wandb is not None and len(panels) < n_log:
+                    n_new = min(n_log - len(panels), B)
+                    cond_cpu = sub["spatial_conditions"].cpu()
+                    true_cpu = sub["images"].cpu() if sub["images"] is not None else None
+                    gen_cpu = gen.cpu()
+                    for i in range(n_new):
+                        ref = true_cpu[i] if true_cpu is not None else None
+                        panel = make_topodiff_panel_image(cond_cpu[i], gen_cpu[i], ref)
+                        caption = (
+                            f"sample[{n_done + i}] "
+                            f"CE={acc['per_sample_ce'][i]:.3f} VFE={acc['per_sample_vfe'][i]:.3f}"
+                        )
+                        panels.append(_wandb.Image(panel, caption=caption))
+
+            n_done += B_full
+
+        result: dict = {
+            f"VFE{suffix}": _weighted_mean(weighted_vfe),
+            f"LV{suffix}": _weighted_mean(weighted_lv),
+            f"FM{suffix}": _weighted_mean(weighted_fm),
+        }
+        if weighted_ce:
+            result[f"CE{suffix}"] = _weighted_mean(weighted_ce)
         if panels:
             result["samples"] = panels
         return result

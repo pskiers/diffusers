@@ -1,0 +1,17 @@
+# Painter stage. TopoDiff's training_data has only 29000 samples (after the
+# 1000-sample val holdout, see configs/data/topodiff.yaml) — much smaller
+# than the synthetic-generator-scale datasets (Steiner/Polygon), so this
+# uses a more modest effective batch than Steiner's paper-matched 4096
+# rather than starving each epoch down to a handful of steps.
+seed: 42
+compile: true
+
+batch_size: 128
+num_steps: 50000
+gradient_accumulation_steps: 2  # 128*2=256 effective batch
+cfg_prob: 0.0  # unconditional painter -- no CFG dropout needed (see configs/painter/topodiff_unet.yaml)
+
+noisy_swap:
+  prob: 0.0
+  t_min: 80
+  t_max: 100

@@ -1,0 +1,22 @@
+# @package _global_
+# Unconditional TopoDiff UNetPainter.
+# Usage: python train_trm.py experiment=topodiff_unet_painter
+#
+# Requires a local extraction of dataset_1_diff.zip -- see
+# configs/data/topodiff.yaml and datasets/topodiff_dataset.py's module
+# docstring. Override data.data_dir if it isn't at the default path.
+
+defaults:
+  - override /data: topodiff
+  - override /backbone: topodiff_unet
+  - override /painter: topodiff_unet
+  - override /train: topodiff
+  - override /eval: topodiff
+  - override /eval_callbacks: topodiff
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/topodiff_unet_painter"

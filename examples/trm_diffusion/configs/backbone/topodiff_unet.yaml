@@ -1,0 +1,20 @@
+# 3-level UNet, no attention — same scaled-down shape as Steiner/MNIST's
+# backbones (configs/backbone/steiner_unet.yaml), adapted to TopoDiff's
+# native 64x64 resolution (vs. Steiner's 128px) — one fewer implicit
+# downsampling step is already "free" at this resolution, so the same
+# 3-level/32-64-64 shape here reaches an 8x8 bottleneck instead of 16x16.
+_target_: diffusers.UNet2DModel
+sample_size: 64
+in_channels: 1
+out_channels: 1
+block_out_channels: [32, 64, 64]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

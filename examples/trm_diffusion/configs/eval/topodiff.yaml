@@ -1,0 +1,18 @@
+# Painter-stage eval. Overrides the default eval.batch_size (384, see
+# configs/eval/default.yaml) down to something close to
+# eval_callbacks/topodiff.yaml's num_samples (64): the eval-callback loop
+# always processes at least one full eval.batch_size batch before checking
+# its own num_samples budget (same pattern as Steiner/BallDrop), which is
+# cheap for those datasets' fast per-sample metrics but NOT for TopoDiff's
+# ~2s/sample FEA compliance solve — an unshrunk 384-sample default batch
+# would cost ~15 minutes on top of the intended budget, every eval_every
+# steps. 32 keeps the worst-case overshoot bounded to one extra ~32-sample
+# (~1 min) batch instead.
+eval_every: 2000
+save_every: 10000
+log_every: 200
+cfg_scale: 2.0
+num_samples: 1000
+batch_size: 32
+num_ddim_steps: 20
+num_log_images: 8
