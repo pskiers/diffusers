@@ -173,6 +173,8 @@ class AmazeMetrics:
             w = sl[1].stop - sl[1].start
             if h == 0 or w == 0 or max(h, w) / min(h, w) > 2.0:
                 continue  # not roughly circular -> grid-line fragment
+            if area / float(h * w) < 0.5:
+                continue
             cy = (sl[0].start + sl[0].stop) / 2.0
             cx = (sl[1].start + sl[1].stop) / 2.0
             row = int(cy // cell_size)

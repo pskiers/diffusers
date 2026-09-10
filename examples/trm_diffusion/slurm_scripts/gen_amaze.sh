@@ -10,9 +10,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
-
 # Usage: sbatch slurm_scripts/gen_amaze.sh <test|train|ft> <maze|queens|both> [--shape all --size all --image-size 256]
-
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
