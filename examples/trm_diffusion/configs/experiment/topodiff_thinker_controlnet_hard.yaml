@@ -1,0 +1,33 @@
+# @package _global_
+# Same as topodiff_thinker_controlnet.yaml, except the thinker is
+# conditioned on [VF, load_x, load_y, BC_x, BC_y] instead of the paper's own
+# [VF, von Mises, strain energy density, load_x, load_y] -- see
+# configs/data/topodiff_hard.yaml / datasets/topodiff_dataset.py's
+# docstring. Everything else (backbone, painter, thinker, translator,
+# condition_encoder shape) is unchanged: both modes are 5 channels.
+# Requires the SAME trained topodiff_unet_painter checkpoint as the
+# non-hard variant (the painter stage is unconditional, so condition_mode
+# doesn't affect it at all).
+#
+# Usage:
+#   python train_trm.py experiment=topodiff_thinker_controlnet_hard \
+#     painter.checkpoint=runs/topodiff_unet_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: topodiff_hard
+  - override /backbone: topodiff_unet
+  - override /painter: topodiff_unet_controlnet_frozen
+  - override /thinker: topodiff
+  - override /translator: controlnet_topodiff
+  - override /condition_encoder: topodiff_spatial_v0
+  - override /train: topodiff_thinker
+  - override /eval: topodiff_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: topodiff_thinker_hard
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/topodiff_thinker_controlnet_hard"

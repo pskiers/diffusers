@@ -1,0 +1,27 @@
+# Same as configs/data/topodiff.yaml except condition_mode="hard": the
+# thinker sees [VF, load_x, load_y, BC_x, BC_y] instead of
+# [VF, von Mises, strain energy density, load_x, load_y] — dropping the
+# pre-solved physical fields in favor of the raw boundary-condition node
+# lists (rasterized from the summary .npy), so the model has to infer the
+# physics itself rather than being handed FEA hints. Same channel count (5)
+# either way — condition_encoder/painter/thinker configs are unchanged; see
+# datasets/topodiff_dataset.py's module docstring for the exact rasterization
+# and its validation against real ground truth.
+image_size: 64
+grid_factor: 8
+num_workers: 4
+data_dir: "data/topodiff/dataset_1_diff/dataset_1_diff"
+
+train_dataset:
+  _target_: datasets.topodiff_dataset.TopodiffDataset
+  data_dir: "${data.data_dir}"
+  split: "training_data"
+  id_end: 29000
+  condition_mode: "hard"
+
+val_dataset:
+  _target_: datasets.topodiff_dataset.TopodiffDataset
+  data_dir: "${data.data_dir}"
+  split: "training_data"
+  id_start: 29000
+  condition_mode: "hard"

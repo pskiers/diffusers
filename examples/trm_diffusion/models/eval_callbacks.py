@@ -1413,6 +1413,13 @@ class TopodiffEvalCallback(EvalCallbackBase):
         num_samples: number of instances to evaluate on the primary
                      dataloader.
         num_log_images: WandB panel images (primary dataloader only).
+        condition_mode: must match the condition_mode the model's own
+                        train_dataset/val_dataset use ("full" or "hard" —
+                        see datasets/topodiff_dataset.py) — applied to the
+                        primary dataloader's extra_eval_sets siblings built
+                        here; the primary dataloader itself is whatever the
+                        caller passes in (already built with the right mode
+                        by train_trm.py from configs/data/*.yaml).
         extra_eval_sets: optional list of held-out test-set specs.
     """
 
@@ -1422,12 +1429,14 @@ class TopodiffEvalCallback(EvalCallbackBase):
         image_size: int = 64,
         num_samples: int = 256,
         num_log_images: int = 8,
+        condition_mode: str = "full",
         extra_eval_sets: Optional[list] = None,
     ):
         self.data_dir = data_dir
         self.image_size = image_size
         self.num_samples = num_samples
         self.num_log_images = num_log_images
+        self.condition_mode = condition_mode
         self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
         self._extra_dataloaders = None  # built lazily on first __call__
 
@@ -1440,6 +1449,7 @@ class TopodiffEvalCallback(EvalCallbackBase):
                 data_dir=spec.get("data_dir", self.data_dir),
                 split=spec["split"],
                 ids=spec.get("ids"),
+                condition_mode=spec.get("condition_mode", self.condition_mode),
             )
             dl = DataLoader(
                 ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=TopodiffDataset.collate_fn

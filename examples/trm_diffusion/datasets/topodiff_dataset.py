@@ -49,17 +49,60 @@ Directory layout (after extracting dataset_1_diff.zip into `data_dir`):
                                   order that doesn't apply to summary/
                                   compliance indexing itself).
 
-Conditioning channels: this dataset exposes `spatial_conditions` as the
-channel-concat of cons_pf_array (3ch) + cons_load_array (2ch) = 5 channels,
-matching the paper's own main diffusion model's conditioning exactly (see
-topodiff/image_datasets_diffusion_model.py: `concat([constraints_pf, loads],
-axis=2)`, no additional normalization applied beyond the raw float32 values
-already baked into the .npy files at dataset-generation time). cons_bc_array
-(boundary-condition field, only present in the test_data_level_* dirs) is
-NOT included — the paper's own generative diffusion model doesn't condition
-on it either (only its separate compliance-regressor guidance model does),
-so BC information is only available to our model implicitly, through the
-stress/strain patterns in cons_pf_array — matching the paper's own choice.
+Conditioning channels: `condition_mode` selects what `spatial_conditions`
+contains (always 5 channels either way, so the thinker/condition-encoder
+config is identical for both):
+
+  "full" (default) — channel-concat of cons_pf_array (3ch: VF, von Mises
+    stress, strain energy density) + cons_load_array (2ch: load x, load y),
+    matching the paper's own main diffusion model's conditioning exactly
+    (see topodiff/image_datasets_diffusion_model.py: `concat([constraints_pf,
+    loads], axis=2)`), no additional normalization beyond the raw float32
+    values already baked into the .npy files at dataset-generation time.
+
+  "hard" — [VF, load_x, load_y, BC_x, BC_y]: drops the von Mises/strain-
+    energy fields (which already hand the model a solved FEA hint) in favor
+    of the two raw boundary-condition node lists (BC_conf_x/BC_conf_y from
+    the summary .npy — 1-indexed FEA node numbers on a 65x65 node grid, ';'-
+    separated), rasterized to a 64x64 spatial field via
+    rasterize_bc_field(). This is deliberately a harder task: the model has
+    to infer how BC + loads propagate into stress/strain itself rather than
+    being handed the solved fields directly.
+
+    Rasterization convention (validated against test_data_level_1's real
+    cons_bc_array ground truth, not just derived by hand — see
+    conversation/commit history): decode each 1-indexed node id into its
+    (X, Y) position on the 65x65 FEA node grid via
+    X, Y = (node_id - 1) // 65, (node_id - 1) % 65 (matches
+    eval/topodiff_analysis.py's create_files' own node numbering), scatter
+    a 1.0 into a (65, 65) array at [Y, X], then apply
+    eval.topodiff_analysis.resize() — the vendored paper code's own
+    4-corner-average node-grid -> 64x64-element-grid downsampler (present
+    in that file but otherwise unused elsewhere in this codebase) — exactly
+    the operation needed here, since a constrained FEA *node* is naturally
+    shared by up to 4 neighboring pixels/elements, unlike a point *load*
+    (which lands on a single crisp pixel — cons_load_array's own
+    convention, confirmed by checking its nonzero pixel against load_coord
+    directly; resize() is the WRONG tool for loads specifically, which is
+    why they're rasterized offline into cons_load_array with a different,
+    single-pixel convention instead).
+
+    Validated over 100 test_data_level_1 samples: 0 false-positive pixels,
+    ~98.3% of true nonzero BC pixels reproduced exactly (3893/3960 for the
+    x-channel). The ~1.7% miss rate is concentrated at domain CORNER nodes,
+    where the source dataset's own BC_conf/BC_conf_x/BC_conf_y encoding is
+    internally inconsistent about corner double-constraint (a genuine
+    idiosyncrasy in the original data, not a bug in this rasterization —
+    e.g. id=204's cons_bc_array marks corner node 4225 in its x-channel even
+    though BC_conf lists it only as type=2/y-constrained). Given this
+    channel exists specifically to make the task harder rather than to
+    reproduce a metric, that residual is acceptable rather than something to
+    chase further; not part of the eval, only of training-time conditioning.
+
+cons_bc_array (the paper's own pre-rendered BC field, only present in the
+test_data_level_* dirs — never in training_data, hence "hard" mode
+rasterizes from the summary instead of reading it directly, so the SAME
+code path works for both training and test) is otherwise NOT read directly.
 
 Per this project's convention (unconditional stage-1 painter, all real
 conditioning applied by the stage-2 thinker's ControlNet steering — see
@@ -89,9 +132,27 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from datasets.data_sample import DataSample, collate_data_samples
+from eval.topodiff_analysis import resize as _fea_node_grid_resize
 
 IMAGE_SIZE = 64
 _ID_RE = re.compile(r"_(\d+)\.npy$")
+_CONDITION_MODES = ("full", "hard")
+
+
+def rasterize_bc_field(node_str: str) -> np.ndarray:
+    """';'-separated 1-indexed FEA node ids (65x65 node grid) -> (64, 64)
+    float32 field, via a 1.0-per-node scatter onto the 65x65 node grid
+    followed by the vendored paper code's own 4-corner-average downsampler
+    (eval.topodiff_analysis.resize). See this module's docstring
+    ("hard" condition_mode) for the validation this convention is based on."""
+    arr = np.zeros((65, 65), dtype=np.float64)
+    for tok in node_str.split(";"):
+        if not tok:
+            continue
+        node0 = int(tok) - 1  # 0-indexed
+        X, Y = node0 // 65, node0 % 65
+        arr[Y, X] = 1.0
+    return _fea_node_grid_resize(arr).astype(np.float32)
 
 
 def _discover_ids(split_dir: str) -> list[int]:
@@ -120,6 +181,9 @@ class TopodiffDataset(Dataset):
              files on disk or spelling out an explicit id list in a Hydra
              config (e.g. id_end=29000 for train, id_start=29000 for val).
              Ignored if `ids` is given.
+        condition_mode: "full" (default, VF+von Mises+SED+load_x+load_y) or
+             "hard" (VF+load_x+load_y+BC_x+BC_y) — see this module's
+             docstring. Same channel count (5) either way.
     """
 
     def __init__(
@@ -129,12 +193,16 @@ class TopodiffDataset(Dataset):
         ids: Optional[list[int]] = None,
         id_start: Optional[int] = None,
         id_end: Optional[int] = None,
+        condition_mode: str = "full",
     ):
         super().__init__()
         if split not in ("training_data", "test_data_level_1", "test_data_level_2"):
             raise ValueError(f"unknown split {split!r}")
+        if condition_mode not in _CONDITION_MODES:
+            raise ValueError(f"unknown condition_mode {condition_mode!r}, expected one of {_CONDITION_MODES}")
         self.data_dir = data_dir
         self.split = split
+        self.condition_mode = condition_mode
         self.split_dir = os.path.join(data_dir, split)
         self.has_images = split == "training_data"
 
@@ -175,9 +243,18 @@ class TopodiffDataset(Dataset):
         return float(self._compliance[self._summary_index(puzzle_id)])
 
     def _load_condition(self, puzzle_id: int) -> np.ndarray:
-        pf = np.load(os.path.join(self.split_dir, f"cons_pf_array_{puzzle_id}.npy"))  # (64, 64, 3)
         load = np.load(os.path.join(self.split_dir, f"cons_load_array_{puzzle_id}.npy"))  # (64, 64, 2)
-        cond = np.concatenate([pf, load], axis=-1).astype(np.float32)  # (64, 64, 5)
+
+        if self.condition_mode == "full":
+            pf = np.load(os.path.join(self.split_dir, f"cons_pf_array_{puzzle_id}.npy"))  # (64, 64, 3)
+            cond = np.concatenate([pf, load], axis=-1).astype(np.float32)  # (64, 64, 5): VF, vM, SED, load_x, load_y
+        else:  # "hard"
+            s = self.summary_for(puzzle_id)
+            vf = np.full((IMAGE_SIZE, IMAGE_SIZE, 1), s["VF"], dtype=np.float32)
+            bc_x = rasterize_bc_field(s["BC_conf_x"])[..., None]
+            bc_y = rasterize_bc_field(s["BC_conf_y"])[..., None]
+            cond = np.concatenate([vf, load, bc_x, bc_y], axis=-1).astype(np.float32)  # (64,64,5): VF, load_x, load_y, BC_x, BC_y
+
         return np.transpose(cond, (2, 0, 1))  # (5, 64, 64)
 
     def __getitem__(self, idx: int) -> DataSample:

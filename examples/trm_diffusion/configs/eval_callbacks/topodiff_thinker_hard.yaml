@@ -1,0 +1,17 @@
+# Same protocol as configs/eval_callbacks/topodiff_thinker.yaml, but with
+# condition_mode="hard" so the extra_eval_sets (test_data_level_1/2)
+# dataloaders this callback builds internally match the "hard" conditioning
+# the model was actually trained with — see configs/data/topodiff_hard.yaml.
+- _target_: models.eval_callbacks.TopodiffEvalCallback
+  data_dir: ${data.data_dir}
+  image_size: ${data.image_size}
+  num_samples: 64
+  num_log_images: 8
+  condition_mode: "hard"
+  extra_eval_sets:
+    - name: level_1
+      split: test_data_level_1
+      num_samples: 64
+    - name: level_2
+      split: test_data_level_2
+      num_samples: 64
