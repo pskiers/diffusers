@@ -380,8 +380,11 @@ class AmazeMetrics:
 MAZE_SCALES = [int(x) for x in os.environ.get("MAZE_SCALES", "5,7,8,9,11,13,16").split(",") if x.strip()]
 MAZE_OOD_SCALES = [int(x) for x in os.environ.get("MAZE_OOD_SCALES", "3").split(",") if x.strip()]
 MAZE_GEOMETRIES = ["square", "hexagon", "triangle", "circle"]
-QUEEN_SCALES = [4, 5, 6, 7, 8, 9, 10]
-QUEEN_OOD_SCALES = [12]
+QUEEN_SCALES = [int(x) for x in os.environ.get("QUEEN_SCALES", "4,5,6,7,8,9,10").split(",") if x.strip()]
+# Env-overridable like the maze lists: a run that did not generate n=12 (it is the
+# most expensive board to make) sets QUEEN_OOD_SCALES= to skip the OOD tables
+# instead of crashing on a missing parquet.
+QUEEN_OOD_SCALES = [int(x) for x in os.environ.get("QUEEN_OOD_SCALES", "12").split(",") if x.strip()]
 
 # The six aggregated per-puzzle row keys (distinct from ``_METRIC_KEYS`` above, which
 # are the raw per-image scorer keys).

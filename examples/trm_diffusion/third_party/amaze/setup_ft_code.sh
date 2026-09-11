@@ -31,6 +31,18 @@ else
   echo "   (set FORCE_VENDOR=1 to overwrite with upstream)"
 fi
 
+for extra in dataset config; do
+  if [[ -d "${HERE}/${extra}" && "${FORCE_VENDOR:-0}" != "1" ]]; then
+    echo ">> ${extra}/ already present -> keeping it."
+  elif [[ -d "${TMP}/amaze/${extra}" ]]; then
+    mkdir -p "${HERE}/${extra}"
+    cp -r "${TMP}/amaze/${extra}/." "${HERE}/${extra}/"
+    echo ">> vendored ${extra}/ (needed by infer/infer_bagel.py)"
+  else
+    echo ">> WARNING: upstream has no ${extra}/ — infer/infer_bagel.py will not run" >&2
+  fi
+done
+
 if [[ "${SKIP_BASE:-0}" != "1" ]]; then
   echo ">> cloning base model repos (large)"
   [[ -d "${HERE}/sft/bagel/Bagel" ]] || git clone --depth 1 https://github.com/ByteDance-Seed/Bagel.git "${HERE}/sft/bagel/Bagel"
@@ -71,5 +83,5 @@ else
 fi
 
 echo "Done."
-echo "  glue code : ${HERE}/{sft,infer,data}"
+echo "  glue code : ${HERE}/{sft,infer,data,dataset,config}"
 echo "  base repos: ${HERE}/sft/bagel/Bagel , ${HERE}/sft/janus/Janus"

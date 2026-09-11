@@ -32,11 +32,13 @@ mkdir -p slurm_outputs
 export PYTHONUNBUFFERED=1
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
-WANDB_PROJECT="${WANDB_PROJECT:-amaze}"
+WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
+# One root for both generating and scoring, so they cannot drift apart.
+DATA_ROOT="${AMAZE_OUT_ROOT:-${PROJECT_ROOT}/data/amaze}"
 CKPT="${CHECKPOINT:-${3:?need the checkpoint path as arg 3}}"
-AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py --task "${TASK}" --stage test
+python scripts/gen_amaze.py --task "${TASK}" --stage test --output-root "${DATA_ROOT}"
 
-ARGS=( +checkpoint="${CKPT}" +task="${TASK}" +data_root="${PROJECT_ROOT}/data/amaze"
+ARGS=( +checkpoint="${CKPT}" +task="${TASK}" +data_root="${DATA_ROOT}"
         +samples_per_puzzle="${SAMPLES}" run.wandb_project="${WANDB_PROJECT}" )
 if [[ "${MODEL}" == "dit" ]]; then
   ARGS+=( experiment="amaze_dit_${TASK}" )

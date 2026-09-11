@@ -86,6 +86,23 @@ export RANK=0
 export LOCAL_RANK=0
 export WORLD_SIZE=1
 
+# RESUME=auto -> newest checkpoint-* under OUTPUT_DIR; RESUME=<dir> -> that one.
+# sft.py restores the weights, start_epoch and global_step, but NOT the optimizer
+# moments or the LR schedule (it rebuilds the cosine+warmup from step 0).
+RESUME_ARGS=()
+if [[ -n "${RESUME:-}" ]]; then
+    if [[ "${RESUME}" == "auto" ]]; then
+        RESUME_DIR=$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)
+        [[ -n "${RESUME_DIR}" ]] || { echo "RESUME=auto but no checkpoint-* under ${OUTPUT_DIR}" >&2; exit 1; }
+    else
+        RESUME_DIR="${RESUME}"
+    fi
+    [[ -d "${RESUME_DIR}/tfmr" ]] || { echo "ERROR: ${RESUME_DIR} has no tfmr/ subdirectory" >&2; exit 1; }
+    echo "Resuming from: ${RESUME_DIR}"
+    RESUME_ARGS=( --resume_from_checkpoint "${RESUME_DIR}" )
+fi
+
 srun accelerate launch \
     --num_processes 1 \
     --num_machines 1 \
@@ -102,7 +119,8 @@ srun accelerate launch \
     --gradient_accumulation_steps "${GRAD_ACCUM}" \
     --weight_decay "${WEIGHT_DECAY}" \
     --min_lr_ratio "${MIN_LR_RATIO}" \
-    --max_ckpts "${MAX_CKPTS}"
+    --max_ckpts "${MAX_CKPTS}" \
+    ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
 
 echo "Finished -> ${OUTPUT_DIR}/${EXPERIMENT_NAME}/${RUN_NAME}"
 echo "Score it with: sbatch slurm_scripts/sample_amaze/eval_janus.sh ${TASK} <shape-if-maze>"

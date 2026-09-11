@@ -11,7 +11,7 @@
 #SBATCH --output=slurm_outputs/%x_%j.out
 #SBATCH --error=slurm_outputs/%x_%j.err
 
-# Wrong-path recovery probe on 13x13 square mazes, ablated over TRM
+# Wrong-path recovery probe on 8x8 square mazes, ablated over TRM
 # (Painter-Thinker) and the DiT baseline.
 #   ADD  0/20/50%      wrong path walked off the prefix's frontier to a dead end
 #   WALL 10/30/50/75%  straight shortcut to the target, through walls
@@ -27,8 +27,9 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 # gen_amaze.py writes maze.test.in_distribution[<size>] (default 100) puzzles per
-# (shape, scale), so 100 is the whole n13-square test split. Raising this alone
-# does nothing — raise MAZE_TEST_PER_SCALE and regenerate (GEN_DATA=1) as well.
+# (shape, scale), so 100 is the whole n8-square test split. Raising this alone
+# does nothing — raise maze.test.in_distribution[8] in the generation config and
+# regenerate (GEN_DATA=1) as well.
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 T_STARTS="${T_STARTS:-[10,30,50,70,90]}"
 BATCH="${BATCH:-32}"
@@ -36,11 +37,11 @@ BATCH="${BATCH:-32}"
 STEPS="${STEPS:-100}"
 # Square only: the ADD/WALL neighbour logic in maze_corruption_lib.py assumes a
 # rectangular cell grid, so hex/triangle/circle boards are out of scope here.
-DATA="${DATA:-data/amaze/maze/square/n13_test.parquet}"
+DATA="${DATA:-data/amaze/maze/square/n8_test.parquet}"
 OUT_DIR="${OUT_DIR:-runs/maze_corruption}"
 DUMP_N="${DUMP_N:-5}"
 # The test split is already generated on the cluster; set GEN_DATA=1 only to
-# rebuild it (e.g. after changing MAZE_TEST_PER_SCALE).
+# rebuild it (e.g. after changing the counts in configs/data/amaze_generation.yaml).
 GEN_DATA="${GEN_DATA:-0}"
 TRM_CKPT="${TRM_CKPT:-runs/pt_maze_final_thinker/checkpoint_final.pt}"
 PAINTER_CKPT="${PAINTER_CKPT:-runs/pt_maze_final_painter/checkpoint_final.pt}"
@@ -89,4 +90,9 @@ srun python experiments/amaze_corruption_recovery_probe.py \
   +probe.model_name=dit "${COMMON[@]}" \
   +probe.out="${OUT_DIR}/dit.json"
 
-echo "DONE -> ${OUT_DIR}/{trm,dit}.json"
+echo "=== [maze corruption] figures ==="
+python experiments/amaze_corruption_recovery_probe.py report \
+  --runs trm="${OUT_DIR}/trm.json" dit="${OUT_DIR}/dit.json" \
+  --out-dir "${OUT_DIR}/report"
+
+echo "DONE -> ${OUT_DIR}/{trm,dit}.json and ${OUT_DIR}/report/"

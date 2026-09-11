@@ -1,6 +1,24 @@
 from __future__ import annotations
 
-"""experiments/maze_corruption_recovery_probe.py — wrong-path recovery probe (AMAZE, 13x13).
+"""experiments/amaze_corruption_recovery_probe.py — wrong-path recovery probe (AMAZE, 8x8 square).
+
+Two modes:
+
+    probe   (default, hydra)  run one model, write runs/.../<model>.json
+    report  (argparse)        read those JSONs and write the figures:
+
+        summary.md                 per-mode tables
+        heatmap_<mode>.png         level x t_start recovery, one panel per model
+                                   plus a TRM-minus-DiT difference panel
+        curves_<mode>.png          recovery vs t_start, one line per level
+        references_<mode>.png      Pass@1 floor / denoised / ceiling
+        qualitative_<mode>_t<t>.png
+                                   GT | clean | corrupted | denoised strips
+
+    python experiments/amaze_corruption_recovery_probe.py report \
+        --runs trm=runs/maze_corruption/trm.json dit=runs/maze_corruption/dit.json \
+        --out-dir runs/maze_corruption/report
+
 
 Question: given a *partially drawn and deliberately wrong* solution as the
 starting point of the reverse process, does the model repair it?
@@ -34,11 +52,13 @@ absolute skill nor the amount of noise injected can be mistaken for it.
 Usage: see slurm_scripts/sample_amaze/maze_corruption_recovery.sh.
 """
 
+import argparse
 import dataclasses
 import json
 import logging
 import os
 import random
+import re
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -47,6 +67,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2
 import hydra
+import matplotlib
+matplotlib.use("Agg")          # headless: the probe runs on compute nodes
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from accelerate import Accelerator
@@ -344,7 +367,7 @@ def main(cfg: DictConfig):
     model_name = str(pb.get("model_name", "model"))
     checkpoint = cfg.get("checkpoint", None)
 
-    default_data = "data/amaze/maze/square/n13_test.parquet"
+    default_data = "data/amaze/maze/square/n8_test.parquet"
     data_parquet = str(pb.get("data_parquet", default_data))
     out_path = str(pb.get("out", f"runs/maze_corruption/{model_name}.json"))
 
@@ -413,47 +436,8 @@ def main(cfg: DictConfig):
     return all_results
 
 
-if __name__ == "__main__":
-    main()
 
-
-
-# ---- MERGE THIS
-"""experiments/report_maze_corruption.py — tables and figures for the wrong-path probe.
-
-Reads the per-model JSONs written by maze_corruption_recovery_probe.py and
-emits, into --out-dir:
-
-    summary.csv            one row per (model, mode, level, t_start) — everything.
-    summary.md             the same as readable tables, one per corruption mode.
-    heatmap_<mode>.png     level x t_start recovery, one panel per model + a
-                           TRM-minus-DiT difference panel.
-    curves_<mode>.png      recovery vs t_start, one line per level, both models.
-    references_<mode>.png  Pass@1 floor / denoised / ceiling — shows whether the
-                           model actually got closer to a valid solve, not just
-                           whether it moved pixels.
-    qualitative_<mode>_t<t>.png
-                           GT | clean context | corrupted | denoised | denoised-
-                           from-clean strips, built from the probe's dumped PNGs.
-
-Usage:
-    python experiments/report_maze_corruption.py \
-        --runs trm=runs/maze_corruption/trm.json dit=runs/maze_corruption/dit.json \
-        --out-dir runs/maze_corruption/report
-"""
-import argparse
-import csv
-import json
-import os
-import re
-from pathlib import Path
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-
+# ----------------------------------------------------------------- reporting
 MODES = ("add", "wall", "gap")
 MODE_TITLE = {
     "add": "ADD — wrong path walked off the drawn prefix, run to a dead end",
@@ -523,13 +507,7 @@ def grid(rows: list, model: str, mode: str, field: str) -> tuple:
 
 
 def write_tables(rows: list, models: list, out_dir: Path) -> None:
-    fields = sorted({k for r in rows for k in r}, key=lambda k: (k not in
-                    ("model", "mode", "level", "t_start"), k))
-    with open(out_dir / "summary.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rows)
-
+    """Readable per-mode tables. (The old summary.csv is deliberately not written.)"""
     lines = ["# Wrong-path recovery probe", ""]
     for mode in MODES:
         cols = BASE_COLS + EXTRA_COLS[mode]
@@ -727,4 +705,11 @@ def report_main() -> None:
 
 
 if __name__ == "__main__":
-    report_main()
+    # Two entry points in one file: the probe (hydra) writes the per-model JSONs,
+    # `report` (argparse) turns them into the figures. Keeping them together means
+    # the chart code cannot drift away from the JSON schema that feeds it.
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        del sys.argv[1]
+        report_main()
+    else:
+        main()

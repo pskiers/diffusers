@@ -32,7 +32,14 @@ VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 TASK="${1:?usage: sbatch train_bagel_ft.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
 
-AMAZE_DIR="third_party/amaze"
+# Same checkout resolution as the Janus/eval scripts: a full upstream clone at
+# third_party/ear-amaze wins, else the vendored third_party/amaze glue.
+if [[ -z "${AMAZE_DIR:-}" ]]; then
+  for _cand in "${PROJECT_ROOT}/third_party/ear-amaze" "${PROJECT_ROOT}/third_party/amaze"; do
+    if [[ -d "${_cand}/sft/bagel" ]]; then AMAZE_DIR="${_cand}"; break; fi
+  done
+fi
+: "${AMAZE_DIR:?no AMAZE checkout with sft/bagel under third_party (tried ear-amaze, amaze)}"
 BAGEL_SFT="${AMAZE_DIR}/sft/bagel"
 BAGEL_BASE="${BAGEL_SFT}/Bagel"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"

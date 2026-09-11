@@ -69,13 +69,19 @@ def _to_tensor(image: Image.Image) -> torch.Tensor:
 # look exactly like that, which silently reduced every queens score to 0.
 # So: when the prefix is known (maze) anchor on it; otherwise (queens) rely on
 # that prefix having no underscore.
-_QUEENS_ATTEMPT_RE = re.compile(r"^(?P<prefix>[^_]+)_(?P<id>.+)_attempt(?P<attempt>\d+)\.png$")
+# Backends differ in two cosmetic ways that both break naive matching:
+#   infer_janus.py -> "9×9_<id>_attempt001.png"   (U+00D7 MULTIPLICATION SIGN, PNG)
+#   infer_bagel.py -> "9x9_<id>_attempt001.jpg"    (ASCII 'x', JPEG)
+# Accept either spelling and either container so one scorer serves both.
+_EXT = r"(?:png|jpe?g)"
+_QUEENS_ATTEMPT_RE = re.compile(rf"^(?P<prefix>[^_]+)_(?P<id>.+)_attempt(?P<attempt>\d+)\.{_EXT}$")
 
 
 def _attempt_re(prefix: str | None) -> re.Pattern:
     if prefix is None:
         return _QUEENS_ATTEMPT_RE
-    return re.compile(rf"^(?P<prefix>{re.escape(prefix)})_(?P<id>.+)_attempt(?P<attempt>\d+)\.png$")
+    spelling = re.escape(prefix).replace("×", "[×x]")
+    return re.compile(rf"^(?P<prefix>{spelling})_(?P<id>.+)_attempt(?P<attempt>\d+)\.{_EXT}$")
 
 
 def _load_img(path: Path) -> tuple[torch.Tensor, tuple[int, int] | None]:
@@ -126,10 +132,12 @@ def _discover_generated(gen_dir: Path, prefix: str | None) -> dict:
 
     Returns {id: {attempt_idx (0-based): file_path}}
     """
-    pattern = "*_attempt*.png" if prefix is None else f"{prefix}_*_attempt*.png"
+    # Glob every candidate and let the regex enforce the prefix: a glob cannot
+    # express "× or x", and the filter is exact either way.
     matcher = _attempt_re(prefix)
     by_id: dict = {}
-    for f in gen_dir.glob(pattern):
+    candidates = [f for ext in ("png", "jpg", "jpeg") for f in gen_dir.glob(f"*_attempt*.{ext}")]
+    for f in candidates:
         m = matcher.match(f.name)
         if not m:
             continue

@@ -138,6 +138,12 @@ def sample_and_score(
     return rows, sample_pair
 
 
+def _ood_label(scales) -> str:
+    """Render a scale list for a table header, so the header cannot claim 3x3 while
+    MAZE_OOD_SCALES actually says 10."""
+    return ", ".join(f"{s}x{s}" for s in scales) if scales else "none generated"
+
+
 def _print_metrics_row(label: str, agg: dict) -> None:
     print("\n" + "=" * 78)
     print(f"Metrics — {label}")
@@ -276,9 +282,9 @@ def main(cfg: DictConfig):
                 [(f"{s}x{s}", result["per_shape"][g][str(s)]) for s in MAZE_SCALES],
             )
         _print_metrics_table("Maze — per geometry (general)", [(g, result["per_geometry"][g]) for g in MAZE_GEOMETRIES])
-        _print_metrics_row("Maze — overall general (7 scales)", result["overall"])
-        _print_metrics_table("Maze — per geometry OOD (3x3)", [(g, result["per_geometry_ood"][g]) for g in MAZE_GEOMETRIES])
-        _print_metrics_row("Maze — overall OOD (3x3)", result["overall_ood"])
+        _print_metrics_row(f"Maze — overall general ({len(MAZE_SCALES)} scales: {_ood_label(MAZE_SCALES)})", result["overall"])
+        _print_metrics_table(f"Maze — per geometry OOD ({_ood_label(MAZE_OOD_SCALES)})", [(g, result["per_geometry_ood"][g]) for g in MAZE_GEOMETRIES])
+        _print_metrics_row(f"Maze — overall OOD ({_ood_label(MAZE_OOD_SCALES)})", result["overall_ood"])
 
         samples = {**combo_samples, **ood_samples}
 
@@ -307,9 +313,9 @@ def main(cfg: DictConfig):
         result = build_queens_result(per_scale_rows, ood_scale_rows)
 
         _print_metrics_table("Queen — per scale", [(f"{s}x{s}", result["per_scale"][s]) for s in result["per_scale"]])
-        _print_metrics_row("Queen — overall general (4..10)", result["overall"])
+        _print_metrics_row(f"Queen — overall general ({_ood_label(QUEEN_SCALES)})", result["overall"])
         _print_metrics_table("Queen — OOD per scale", [(f"{s}x{s}", result["per_scale_ood"][s]) for s in result["per_scale_ood"]])
-        _print_metrics_row("Queen — overall OOD (12x12)", result["overall_ood"])
+        _print_metrics_row(f"Queen — overall OOD ({_ood_label(QUEEN_OOD_SCALES)})", result["overall_ood"])
 
         samples = {**scale_samples, **ood_samples}
 
