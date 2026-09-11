@@ -43,7 +43,7 @@ source "${VENV}/bin/activate"
 
 [[ -f "${MAZE_DATASET_PATH}/maze_dataset_train.parquet" ]] || {
     echo "ERROR: ${MAZE_DATASET_PATH}/maze_dataset_train.parquet missing." >&2
-    echo "       Run: python ${PROJECT_ROOT}/scripts/gen_amaze.py ft ${TASK}" >&2; exit 1; }
+    echo "       Run: python scripts/gen_amaze.py --task ${TASK}   (ft_links: true in the generation config symlinks data/amaze/ft/${TASK} at the generated parquets)" >&2; exit 1; }
 
 python -c "import torch, wandb, transformers
 from janus.models import VLChatProcessor

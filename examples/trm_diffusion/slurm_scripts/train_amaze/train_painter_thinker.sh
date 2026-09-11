@@ -51,9 +51,9 @@ PAINTER_CKPT="${PAINTER_CKPT:-runs/${RUN_NAME}_painter/checkpoint_final.pt}"
 THINKER_CKPT="${THINKER_CKPT:-runs/${RUN_NAME}_thinker/checkpoint_final.pt}"
 
 if [[ "${TASK}" == "maze" ]]; then
-  EVAL_CB=amaze; GEN_ARGS=(--shape all --size all)
+  EVAL_CB=amaze
 else
-  EVAL_CB=amaze_queens; GEN_ARGS=(--size all)
+  EVAL_CB=amaze_queens
 fi
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
@@ -63,11 +63,12 @@ mkdir -p slurm_outputs runs
 export PYTHONUNBUFFERED=1
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
-DATA_DIR="${PROJECT_ROOT}/data/amaze/train_${TASK}/all_train_size144"
+DATA_DIR="${PROJECT_ROOT}/data/amaze/${TASK}"
 
 if is_true "${PAINTER}" || is_true "${THINKER}"; then
+  # What gets generated is configured in configs/data/amaze_generation.yaml.
   AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-    python scripts/gen_amaze.py train "${TASK}" "${GEN_ARGS[@]}"
+    python scripts/gen_amaze.py --task "${TASK}" --stage train
 fi
 
 # Stage 1: unconditional painter
@@ -113,8 +114,8 @@ if is_true "${SAMPLE}"; then
     echo "ERROR: thinker checkpoint not found for eval: ${THINKER_CKPT}" >&2; exit 1
   fi
   AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-    python scripts/gen_amaze.py test "${TASK}"
-  srun python experiments/sample_amaze_metrics.py \
+    python scripts/gen_amaze.py --task "${TASK}" --stage test
+  srun python experiments/amaze_generate_and_calculate_metrics.py \
     experiment=amaze_thinker_v2_controlnet \
     painter.checkpoint="${PAINTER_CKPT}" \
     +checkpoint="${THINKER_CKPT}" \

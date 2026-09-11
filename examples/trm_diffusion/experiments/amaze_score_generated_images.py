@@ -3,38 +3,7 @@
 SAME AmazeMetrics used for PT/DiT, and log the same general/OOD/per-shape/
 per-size tables to wandb.
 
-This is adapted from the original index-aligned-parquet scorer to match what
-infer_janus.py actually writes: a FLAT directory (no per-combo subfolder),
-files keyed by a stable puzzle `id` (not a 0-based row index), with 1-indexed
-3-digit attempt suffixes.
-
-    <gen_dir>/{width}×{height}_{id}_attempt{NNN}.png     (square/triangle/hexagon)
-    <gen_dir>/layers_{N}_{id}_attempt{NNN}.png           (circle)
-
-Because generation is keyed by `id` and not row position, this script builds
-an id -> row-index lookup against the same per-combo test parquet AmazeDataset
-reads, then reuses AmazeMetrics exactly as before.
-
-*** UNVERIFIED ASSUMPTION - CHECK BEFORE TRUSTING RESULTS ***
-This assumes each AmazeDataset item's `.metadata` dict contains the same `id`
-value infer_janus.py used to name files. If AmazeDataset doesn't carry an
-`id` field through from the parquet, _build_id_index() will raise instead of
-silently misaligning results - if it raises, grep datasets/amaze_dataset.py
-for how it exposes the puzzle id (may be a different key name) and adjust
-_build_id_index() accordingly.
-
-Because infer_janus.py has no filename slot for "shape" on non-circle mazes
-(square_7x7 and triangle_7x7 would collide in one flat dir), this script
-takes --geometry explicitly and expects you to have generated each shape into
-its own --gen-dir (matching --filter_shape at generation time).
-
-QUEENS: infer_janus.py has no maze_config for queens boards, so it names every
-attempt "0\u00d70_<id>_attempt{NNN}.png" (degenerate size prefix). This script
-handles that by matching on the puzzle `id` alone (prefix ignored) against each
-per-scale test_queens/n{scale}_test.parquet. Generate queens WITHOUT
---filter_shape so infer_janus emits all boards into one flat dir.
-
-Usage (one shape per invocation, matching one infer_janus.py run):
+Usage (one shape per invocation):
     python score_amaze_images.py maze --gen-dir runs/ft_janus_square/generated \
         --geometry square --run-name ft_janus_square_maze --wandb-project amaze_final
 """
@@ -72,23 +41,49 @@ from eval.amaze_eval import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
 
+# Resolution the generations are scored at. PT/DiT genuinely produce 144px, but a
+# Janus/Bagel generation is usually larger, and shrinking it here throws away detail
+# the scorer could have used (AmazeMetrics upsamples to the cell_map's native size
+# either way). Override with --image-size; score_combo warns when it is downscaling.
 IMAGE_SIZE = 144
-_TO_TENSOR = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
-    transforms.ToTensor(),
-])
-
-# infer_janus.py's own filename regex:
-#   {prefix}_{id}_attempt{NNN}.png   where prefix is "{w}x{h}" or "layers_{N}"
-# `id` itself may contain underscores, so we split on the *known* "_attempt"
-# marker from the right rather than by position.
-_ATTEMPT_RE = re.compile(r"^(?P<prefix>.+)_(?P<id>.+)_attempt(?P<attempt>\d+)\.png$")
 
 
-def _load_img(path: Path) -> torch.Tensor:
+def _set_image_size(size: int) -> None:
+    global IMAGE_SIZE
+    IMAGE_SIZE = int(size)
+
+
+def _to_tensor(image: Image.Image) -> torch.Tensor:
+    return transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE),
+                          interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
+        transforms.ToTensor(),
+    ])(image)
+
+# infer_janus.py names its output {prefix}_{id}_attempt{NNN}.png, where prefix is
+# "{w}x{h}" (maze), "layers_{N}" (circle) or "0x0" (queens).
+#
+# Splitting this generically is impossible: BOTH halves can contain underscores
+# ("layers_9" on the left, "level_7_000001" on the right), so a greedy prefix
+# steals the id's leading fields and a lazy one steals the prefix's. Queens ids
+# look exactly like that, which silently reduced every queens score to 0.
+# So: when the prefix is known (maze) anchor on it; otherwise (queens) rely on
+# that prefix having no underscore.
+_QUEENS_ATTEMPT_RE = re.compile(r"^(?P<prefix>[^_]+)_(?P<id>.+)_attempt(?P<attempt>\d+)\.png$")
+
+
+def _attempt_re(prefix: str | None) -> re.Pattern:
+    if prefix is None:
+        return _QUEENS_ATTEMPT_RE
+    return re.compile(rf"^(?P<prefix>{re.escape(prefix)})_(?P<id>.+)_attempt(?P<attempt>\d+)\.png$")
+
+
+def _load_img(path: Path) -> tuple[torch.Tensor, tuple[int, int] | None]:
+    """(tensor, native size) — a missing file yields a blank image and size None."""
     if path is not None and path.exists():
-        return _TO_TENSOR(Image.open(path).convert("RGB"))
-    return torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE)
+        image = Image.open(path).convert("RGB")
+        return _to_tensor(image), image.size
+    return torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE), None
 
 
 def _maze_combo(geometry: str, scale: int) -> str:
@@ -96,7 +91,7 @@ def _maze_combo(geometry: str, scale: int) -> str:
 
 
 def _maze_parquet(data_root: Path, geometry: str, scale: int) -> Path:
-    return data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
+    return data_root / "maze" / geometry / f"n{scale}_test.parquet"
 
 
 def _build_id_index(ds) -> dict:
@@ -132,10 +127,11 @@ def _discover_generated(gen_dir: Path, prefix: str | None) -> dict:
     Returns {id: {attempt_idx (0-based): file_path}}
     """
     pattern = "*_attempt*.png" if prefix is None else f"{prefix}_*_attempt*.png"
+    matcher = _attempt_re(prefix)
     by_id: dict = {}
     for f in gen_dir.glob(pattern):
-        m = _ATTEMPT_RE.match(f.name)
-        if not m or (prefix is not None and m.group("prefix") != prefix):
+        m = matcher.match(f.name)
+        if not m:
             continue
         pid = m.group("id")
         attempt_idx = int(m.group("attempt")) - 1  # infer_janus.py writes attempt+1 (1-indexed)
@@ -161,6 +157,8 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
 
     scorer = AmazeMetrics(device=device, task=task)
     rows, sample_pair = [], None
+    missing_attempts = 0
+    native_sizes: set = set()
 
     # Order by original row index so per-combo tables read the same as before,
     # even though iteration is keyed by id rather than a contiguous range.
@@ -173,6 +171,16 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
         logger.warning(
             f"{len(missing_ids)} generated ids for combo={combo} were not found "
             f"in {parquet} (e.g. {missing_ids[:5]}) - skipped."
+        )
+    # Queens matches every scale's files against every per-scale parquet, so most ids
+    # SHOULD be missing here. Matching none of them is the real failure, and used to
+    # be reported as a clean 0.0 for every metric.
+    if by_id and not ordered_ids:
+        logger.error(
+            f"combo={combo}: none of the {len(by_id)} generated ids exist in "
+            f"{parquet.name} (generated e.g. {list(by_id)[:3]}, "
+            f"parquet e.g. {list(id_to_idx)[:3]}). Scoring nothing - were the images "
+            f"generated from a different version of this dataset?"
         )
 
     chunk = 64
@@ -187,7 +195,11 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
             puzzles.append(puzzle)
             attempts = by_id[pid]
             for a in range(k):
-                inputs[pi, a] = _load_img(attempts.get(a))
+                inputs[pi, a], native = _load_img(attempts.get(a))
+                if native is None:
+                    missing_attempts += 1
+                else:
+                    native_sizes.add(native)
 
             if saved_counter[0] < 25:
                 cond = puzzle.spatial_conditions
@@ -213,6 +225,20 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
                 "pass1": rec["pass"], "pass5": pass_at_k,
             })
 
+    # A missing attempt is scored as a blank image, i.e. a failed attempt. That is
+    # defensible, but it must not be silent: it drags Pass@K down while leaving the
+    # violation column looking clean.
+    if missing_attempts:
+        logger.warning(
+            f"combo={combo}: {missing_attempts} of {len(ordered_ids) * k} attempts had no "
+            f"image file and were scored as blank (each counts as a failed attempt)."
+        )
+    if native_sizes and max(max(wh) for wh in native_sizes) > IMAGE_SIZE:
+        logger.warning(
+            f"combo={combo}: generations are {sorted(native_sizes)[-1][0]}px but scored at "
+            f"{IMAGE_SIZE}px — detail is being discarded. Pass --image-size to score closer "
+            f"to native."
+        )
     return rows, sample_pair
 
 
@@ -247,7 +273,7 @@ def _score_maze(gen_dir, geometry, data_root, device, k, samples_dir, saved_coun
 
 
 def _queens_parquet(data_root: Path, scale: int) -> Path:
-    return data_root / "test_queens" / f"n{scale}_test.parquet"
+    return data_root / "queens" / f"n{scale}_test.parquet"
 
 
 def _score_queens(gen_dir, data_root, device, k, samples_dir, saved_counter):
@@ -278,6 +304,9 @@ def main():
                     help="maze only: shape this --gen-dir was generated with (must match --filter_shape at gen time)")
     ap.add_argument("--data-root", type=Path, default=TRM_ROOT / "data" / "amaze")
     ap.add_argument("--samples-per-puzzle", type=int, default=5)
+    ap.add_argument("--image-size", type=int, default=IMAGE_SIZE,
+                    help=f"resolution the generations are scored at (default {IMAGE_SIZE}; "
+                         f"raise it for models that generate larger images)")
     ap.add_argument("--wandb-project", default="amaze_final")
     ap.add_argument("--run-name", required=True)
     ap.add_argument("--out-json", type=Path, default=None)
@@ -285,6 +314,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     k = args.samples_per_puzzle
+    _set_image_size(args.image_size)
 
     samples_dir = args.gen_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)

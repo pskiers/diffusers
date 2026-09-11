@@ -1,0 +1,59 @@
+# AMAZE dataset generation settings (consumed by scripts/gen_amaze.py)
+output_root: data/amaze
+overwrite: false # regenerate everything from scratch or keep existing files
+nproc: null
+
+scaled_image_sizes: [144] # # One train parquet per entry, resized to <S>x<S> (bicubic, antialias) and named
+# maze_dataset_train_<S>.parquet
+
+train_columns: [id, instruction, m_original_img, sol_img] # Columns kept in BOTH train parquets
+
+chunk_rows: 256
+
+verify: # Ground-truth self-consistency check
+  enabled: true
+  min_pass: 1.0
+  fail_on_low: false # true -> exit non-zero instead of only printing FAIL
+
+report: true # Print a table of rows + on-disk size for every produced parquet.
+
+# Mirror the FT inputs into <output_root>/ft/<task>/maze_dataset_{train,test}.parquet
+# as symlinks (train -> maze_dataset_train_original.parquet), which is the layout
+# slurm_scripts/train_bagel_ft.sh expects. Costs no extra disk.
+ft_links: true
+
+queens:
+  enabled: true
+  renderer:
+    cell_size: 64
+    queen_radius: 16
+  seeds:
+    train: 5000000
+    test: 8000000
+  test:
+    in_distribution: { 4: 5, 5: 5, 6: 5, 7: 5, 8: 5, 9: 5, 10: 5 }
+    # in_distribution: { 4: 50, 5: 50, 6: 50, 7: 50, 8: 50, 9: 50, 10: 50 }
+    ood: { 12: 0 }
+    # ood: { 12: 10 }
+  train:
+    # samples: { 4: 60, 5: 3040, 6: 5380, 7: 5380, 8: 5380, 9: 5380, 10: 5380 } # 30000 total
+    samples: { 4: 5, 5: 5, 6: 5, 7: 5, 8: 5, 9: 5, 10: 5 } # 30000 total
+
+maze:
+  enabled: true
+  shapes: [square, hexagon, triangle, circle]
+  exit_config: hardest # start/end placement passed to batch-maze-generator.js
+  seeds:
+    train: 1000000
+    test: 7000000
+  test:
+    in_distribution:
+      { 5: 5, 7: 5, 8: 5, 9: 5, 11: 5, 13: 5, 16: 5 }
+      # { 5: 100, 7: 100, 8: 100, 9: 100, 11: 100, 13: 100, 16: 100 }
+    ood: { 10: 0 }
+    # ood: { 10: 100 }
+  train:
+    # size -> rows PER SHAPE (so 4 shapes x 7 sizes x 1071 = 29988 rows total)
+    samples:
+      { 5: 5, 7: 5, 8: 5, 9: 5, 11: 5, 13: 5, 16: 5 }
+      # { 5: 1071, 7: 1071, 8: 1071, 9: 1071, 11: 1071, 13: 1071, 16: 1071 }

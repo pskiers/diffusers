@@ -20,6 +20,13 @@ from scipy import ndimage
 from third_party.amaze.infer.maze_metrics import MazeRewardFunction, extract_blue_path
 
 
+# A maze cell counts as covered by the drawn path only once this fraction of its
+# area is blue. Guards the exact-match `pass` against a few pixels bleeding over a
+# wall, which used to invent a whole neighbouring cell. It has to stay small: the
+# renderer leaves some genuine path cells barely marked — the worst GT cell measured
+# over 140 mazes (every shape x size) is 0.0096 blue, so this sits ~3x below it.
+MAZE_MIN_CELL_FILL = 0.003
+
 _METRIC_KEYS: Tuple[str, ...] = (
     "mse_inside",
     "mse_outside",
@@ -43,11 +50,13 @@ class AmazeMetrics:
     is the paper's Pass@1 and ``mean_pass_at_{K}`` its Pass@K.
     """
 
-    def __init__(self, device=None, task: str = "maze"):
+    def __init__(self, device=None, task: str = "maze",
+                 min_cell_fill: float = MAZE_MIN_CELL_FILL):
         if task not in ("maze", "queens"):
             raise ValueError(f"Unknown task: {task}")
         self.device = device
         self.task = task
+        self.min_cell_fill = float(min_cell_fill)
         self._per_key: dict[str, list[float]] = {}
         self._n = 0
 
@@ -244,6 +253,35 @@ class AmazeMetrics:
         arr = self._to_pixel_array(img, size)                        # (H, W, 3) uint8
         return torch.from_numpy(arr.transpose(2, 0, 1).copy())
 
+    def _cells_covered(self, mask: np.ndarray, cell_ids: np.ndarray) -> set:
+        """Cell ids whose area is at least ``min_cell_fill`` covered by ``mask``.
+
+        A cell used to count the moment a SINGLE mask pixel landed in it, so a path
+        bleeding a few pixels over a wall invented a whole neighbouring cell and cost
+        the exact-match `pass` — while coverage and violation barely moved. The queen
+        scorer already guards its blobs by area, aspect and fill; this is the maze
+        equivalent.
+        """
+        flat = cell_ids.ravel()
+        if flat.size == 0:
+            return set()
+        weights = mask.ravel().astype(np.float64)
+        top = int(flat.max()) + 1
+        if top <= 1 << 20:                  # the renderer's own dense numbering
+            ids = np.arange(top)
+            area = np.bincount(flat, minlength=top)
+            covered = np.bincount(flat, weights=weights, minlength=top)
+        else:                               # sparse RGB-packed ids: don't allocate 16M bins
+            ids, inverse = np.unique(flat, return_inverse=True)
+            area = np.bincount(inverse)
+            covered = np.bincount(inverse, weights=weights)
+        # `covered > 0` keeps a threshold of 0 meaning the old "any pixel" rule
+        # rather than selecting every cell in the maze.
+        keep = (covered > 0) & ((covered / np.maximum(area, 1)) >= self.min_cell_fill)
+        cells = {int(i) for i in ids[keep]}
+        cells.discard(0)                    # 0 = wall / background
+        return cells
+
     def _compute_maze_metrics(self, generated_image: torch.Tensor, metadata: Dict) -> Dict[str, float]:
         """Score one generated Maze against its ground truth (AMAZE paper §2.2).
 
@@ -276,8 +314,7 @@ class AmazeMetrics:
         size = (cell_ids.shape[1], cell_ids.shape[0])          # (W, H)
         gen_arr = self._to_pixel_array(generated_image, size)        # (H, W, 3) uint8
         blue = self._morph_open(extract_blue_path(gen_arr))  # type: ignore[arg-type]
-        predicted = {int(c) for c in cell_ids[blue].tolist()}
-        predicted.discard(0)                                    # 0 = wall / background
+        predicted = self._cells_covered(blue, cell_ids)
 
         coverage = len(predicted & gt_cell_ids) / len(gt_cell_ids) if gt_cell_ids else 0.0
         violation = len(predicted - gt_cell_ids) / len(predicted) if predicted else 0.0

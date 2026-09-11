@@ -22,6 +22,7 @@
 # NB: each checkpoint = full model (~29GB) + optimizer state (~100GB+), and fsdp_save_ckpt does NOT
 #     rotate/prune. SAVE_EVERY 500 over 5000 steps = 10 ckpts (~1.5TB). eval_every=50 keeps the wandb
 #     val curve fine-grained so you can locate + pick the best checkpoint by val loss / Pass@K.
+# NB: this script only fine-tunes — sampling and scoring are separate steps (see the end of the file).
 
 set -euo pipefail
 
@@ -43,9 +44,6 @@ WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 RUN_NAME="${RUN_NAME:-ft_bagel_${TASK}}"
 CPU_OFFLOAD="${CPU_OFFLOAD:-false}"
 NPROC="${NPROC:-4}"
-SAMPLE="${SAMPLE:-true}"
-SAMPLES="${SAMPLES:-5}"
-SELECT="${SELECT:-val}"   # val: score only the lowest-val-MSE checkpoint; all: score every checkpoint
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
@@ -56,7 +54,7 @@ export PYTHONUNBUFFERED=1
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
 [[ -d "${BAGEL_BASE}" ]] || { echo "ERROR: ${BAGEL_BASE} missing. Run: bash ${AMAZE_DIR}/setup_ft_code.sh" >&2; exit 1; }
-[[ -f "${DATA_DIR}/maze_dataset_train.parquet" ]] || { echo "ERROR: ${DATA_DIR}/maze_dataset_train.parquet missing. Run: python scripts/gen_amaze.py ft ${TASK}." >&2; exit 1; }
+[[ -f "${DATA_DIR}/maze_dataset_train.parquet" ]] || { echo "ERROR: ${DATA_DIR}/maze_dataset_train.parquet missing. Run: python scripts/gen_amaze.py --task ${TASK}   (ft_links: true in the generation config symlinks data/amaze/ft/${TASK} at the generated parquets)." >&2; exit 1; }
 
 # ── Assemble: overlay AMAZE sft.py + maze data + tolerate LoRA kwargs / use_orig_params ──
 cp "${BAGEL_SFT}/sft.py" "${BAGEL_BASE}/sft.py"
@@ -130,48 +128,8 @@ srun torchrun --standalone --nproc_per_node="${NPROC}" sft.py \
 
 echo "Bagel FULL FT (${TASK}, 1 node x ${NPROC} GPU) complete -> runs/${RUN_NAME}"
 
-# ── Checkpoint selection + scoring on the AMAZE metrics (one wandb run per scored checkpoint) ──
-# SELECT=val (default) -> pick the checkpoint with the lowest validation MSE (recorded in each step's
-#   val.json) and score ONLY that one on the full test set. SELECT=all -> score EVERY step-checkpoint.
-# COST of ONE checkpoint = N_test_puzzles x SAMPLES image-gens (queens ~450 puzzles, maze ~3200; Bagel also
-# does 50 diffusion steps/img + a base-model reload). Resumable: scored checkpoints are skipped (.scored).
-if [[ "${SAMPLE}" != "false" ]]; then
-  cd "${PROJECT_ROOT}"
-  CKPT_DIR="${PROJECT_ROOT}/runs/${RUN_NAME}/checkpoints"
-  if [[ ! -d "${CKPT_DIR}" ]]; then
-    echo "WARN: ${CKPT_DIR} not found -> skipping auto-sampling." >&2
-  else
-    mapfile -t CKPTS < <(find "${CKPT_DIR}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -V)
-    if [[ ${#CKPTS[@]} -eq 0 ]]; then
-      echo "WARN: no numeric step dirs under ${CKPT_DIR} -> skipping auto-sampling." >&2
-    else
-      if [[ "${SELECT}" == "val" ]]; then
-        BEST=$(python experiments/select_best_ckpt.py bagel "${CKPT_DIR}")
-        if [[ -n "${BEST}" ]]; then
-          echo ">> SELECT=val -> best Bagel checkpoint by validation MSE: ${BEST}"
-          CKPTS=("${BEST}")
-        else
-          echo "WARN: SELECT=val but no validation metrics recorded -> scoring the LAST checkpoint only." >&2
-          CKPTS=("${CKPTS[-1]}")
-        fi
-      fi
-      AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py test "${TASK}"   # build the test set ONCE
-      echo ">> scoring ${#CKPTS[@]} Bagel checkpoint(s) x ${SAMPLES} samples (SELECT=${SELECT})."
-      for CKPT in "${CKPTS[@]}"; do
-        TAG=$(basename "${CKPT}")                       # <step> (zero-padded)
-        GEN_DIR="runs/${RUN_NAME}/generated/${TAG}"
-        if [[ -f "${GEN_DIR}/.scored" ]]; then echo ">> [step ${TAG}] already scored -> skip."; continue; fi
-        echo ">> [step ${TAG}] sampling: ${CKPT}"
-        python experiments/generate_amaze_ft.py "${TASK}" --backend bagel \
-          --checkpoint "${CKPT}" --bagel-model-path "${BAGEL_MODEL_PATH}" \
-          --gen-dir "${GEN_DIR}" --samples-per-puzzle "${SAMPLES}" \
-        && python experiments/score_amaze_images.py "${TASK}" \
-          --gen-dir "${GEN_DIR}" --samples-per-puzzle "${SAMPLES}" \
-          --wandb-project "${WANDB_PROJECT}" --run-name "${RUN_NAME}-${TAG}" \
-        && touch "${GEN_DIR}/.scored" \
-        || echo "WARN: [step ${TAG}] sampling/scoring failed -- continuing with the next checkpoint."
-      done
-      echo "Auto-sampling (bagel ${TASK}, ${#CKPTS[@]} ckpt(s), SELECT=${SELECT}) done -> wandb ${WANDB_PROJECT}."
-    fi
-  fi
-fi
+# Scoring is a separate step: this script only fine-tunes. The in-line auto-sampler
+# was removed with experiments/generate_amaze_ft.py and experiments/select_best_ckpt.py.
+# To score a checkpoint, generate images yourself, then run:
+#   python experiments/amaze_score_generated_images.py <maze|queens> --gen-dir <dir> \
+#     --samples-per-puzzle 5 --run-name "${RUN_NAME}"

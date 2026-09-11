@@ -4,7 +4,7 @@
 # conditioned on the puzzle image by channel concat (Palette/SR3 style), CFG off.
 # Usage:
 #   python train_trm.py experiment=amaze_dit_maze \
-#     data.amaze_root=data/amaze/train_maze/all_train_size144
+#     data.amaze_root=data/amaze/maze
 defaults:
   - override /data: amaze
   - override /backbone: amaze_dit
@@ -14,6 +14,8 @@ defaults:
   - override /sampling: direct
   - _self_
 
+data:
+  amaze_root: data/amaze/maze
 mode: "painter_base"
 
 train:

@@ -34,7 +34,7 @@ export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBR
 
 WANDB_PROJECT="${WANDB_PROJECT:-amaze}"
 CKPT="${CHECKPOINT:-${3:?need the checkpoint path as arg 3}}"
-AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py test "${TASK}"
+AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" python scripts/gen_amaze.py --task "${TASK}" --stage test
 
 ARGS=( +checkpoint="${CKPT}" +task="${TASK}" +data_root="${PROJECT_ROOT}/data/amaze"
         +samples_per_puzzle="${SAMPLES}" run.wandb_project="${WANDB_PROJECT}" )
@@ -46,6 +46,6 @@ else
   ARGS+=( experiment=amaze_thinker_v2_controlnet painter.checkpoint="${PAINTER_CKPT}"
           data.cell_size="${CELL_SIZE}" thinker.seq_len="${SEQ_LEN}" translator.grid="${GRID}" )
 fi
-srun python experiments/sample_amaze_metrics.py "${ARGS[@]}"
+srun python experiments/amaze_generate_and_calculate_metrics.py "${ARGS[@]}"
 
 echo "eval_amaze ${MODEL} ${TASK} done"

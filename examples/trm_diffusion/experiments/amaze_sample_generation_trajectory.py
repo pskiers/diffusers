@@ -17,7 +17,7 @@ from omegaconf import DictConfig
 
 from models.sampling import TrajectoryRecorder
 from eval.amaze_eval import make_wandb_image as _make_wandb_image
-from experiments.sample_amaze_metrics import (
+from examples.trm_diffusion.experiments.amaze_generate_and_calculate_metrics import (
     TRM_ROOT,
     _build_amaze_dataset,
     _require_test_parquet,
@@ -36,11 +36,11 @@ def _resolve_combo(task: str, data_root: Path, combo: str | None) -> tuple[Path,
         combo = combo or "square_n9"
         geometry, ntok = combo.split("_n")
         scale = int(ntok)
-        parquet = data_root / "test_maze" / geometry / f"n{scale}_{geometry}_test.parquet"
+        parquet = data_root / "maze" / geometry / f"n{scale}_test.parquet"
         return parquet, f"{geometry}_n{scale}"
     combo = combo or "n8"
     scale = int(combo.lstrip("n"))
-    parquet = data_root / "test_queens" / f"n{scale}_test.parquet"
+    parquet = data_root / "queens" / f"n{scale}_test.parquet"
     return parquet, f"n{scale}"
 
 

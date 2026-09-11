@@ -1,4 +1,13 @@
-amaze_root: "data/amaze"
+# Amaze data. The parquets come from scripts/gen_amaze.py — see
+# configs/data/amaze_generation.yaml for how they are built.
+#
+# amaze_root selects the task directory: data/amaze/maze or data/amaze/queens.
+# It is mandatory on purpose — a default would silently train a queens run on maze
+# data. Task-specific experiments pin it; task-agnostic ones (thinker, painter) take
+# it from the caller.
+# image_size selects which precomputed train parquet is loaded, so it must be one
+# of amaze_generation.yaml's scaled_image_sizes.
+amaze_root: ???
 image_size: 144
 painter_size: 144
 cell_size: 20
@@ -7,8 +16,9 @@ num_channels: 3
 
 train_dataset:
   _target_: datasets.amaze_dataset.AmazeDataset
-  dataset_path: "${data.amaze_root}"
-  split: "train"
+  # Already resized to image_size and stripped to the columns training reads.
+  dataset_path: "${data.amaze_root}/maze_dataset_train_${data.image_size}.parquet"
+  split: "train"   # ignored — dataset_path points at a file
   image_size: "${data.image_size}"
   condition_field: "m_original_img"
   target_field: "sol_img"
@@ -17,8 +27,10 @@ train_dataset:
 
 val_dataset:
   _target_: datasets.amaze_dataset.AmazeDataset
-  dataset_path: "${data.amaze_root}"
-  split: "val"
+  # Native resolution with every column: the eval callbacks score against
+  # cell_map + metadata, which the train parquets do not carry.
+  dataset_path: "${data.amaze_root}/maze_dataset_test.parquet"
+  split: "test"    # ignored — dataset_path points at a file
   image_size: "${data.image_size}"
   condition_field: "m_original_img"
   target_field: "sol_img"

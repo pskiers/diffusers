@@ -70,6 +70,6 @@ else
   ARGS=( experiment="amaze_dit_${TASK}" "${ARGS[@]}" )
 fi
 
-srun python experiments/sample_amaze_trajectory.py "${ARGS[@]}"
+srun python experiments/amaze_sample_generation_trajectory.py "${ARGS[@]}"
 
 echo "Trajectory (${MODEL}/${TASK}) complete — PNGs under $(dirname "${CKPT}")/trajectory/${TASK}."

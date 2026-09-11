@@ -84,7 +84,9 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
             # the attempts differ.
             attempts = []
             for k in range(n_attempts):
-                gen_k = torch.Generator(device=accelerator.device).manual_seed(k)
+                # Offset by n_done so different batches get different noise: seeding
+                # with just k reused one noise sequence for the whole eval set.
+                gen_k = torch.Generator(device=accelerator.device).manual_seed(k * 1_000_003 + n_done)
                 sampled = pipeline.sample_one_batch(model, conditions, accelerator.device, generator=gen_k)
                 attempts.append(model.decode_for_eval(sampled)[:B].cpu())
             generated = attempts[0]                       # first attempt -> WandB panels

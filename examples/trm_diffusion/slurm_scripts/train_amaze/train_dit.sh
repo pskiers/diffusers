@@ -33,7 +33,6 @@ DIT_MAX_SECONDS=${DIT_MAX_SECONDS:-0}   # 0 = no wall-clock limit
 WANDB_PROJECT="${WANDB_PROJECT:-${2:-amaze}}"
 RUN_NAME="${RUN_NAME:-${3:-${TASK}_dit${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
-if [[ "${TASK}" == "maze" ]]; then GEN_ARGS=(--shape all --size all); else GEN_ARGS=(--size all); fi
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
@@ -42,9 +41,10 @@ mkdir -p slurm_outputs runs
 export PYTHONUNBUFFERED=1
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
+# What gets generated is configured in configs/data/amaze_generation.yaml.
 AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-  python scripts/gen_amaze.py train "${TASK}" "${GEN_ARGS[@]}"
-DATA_DIR="${PROJECT_ROOT}/data/amaze/train_${TASK}/all_train_size144"
+  python scripts/gen_amaze.py --task "${TASK}" --stage train
+DATA_DIR="${PROJECT_ROOT}/data/amaze/${TASK}"
 
 srun python train_trm.py experiment="amaze_dit_${TASK}" \
   data.amaze_root="${DATA_DIR}" \
@@ -57,8 +57,8 @@ echo "${TASK} DiT complete -> runs/${RUN_NAME}/checkpoint_final.pt"
 
 if [[ "${RUN_METRICS:-1}" == "1" ]]; then
   AMAZE_OUT_ROOT="${PROJECT_ROOT}/data/amaze" \
-    python scripts/gen_amaze.py test "${TASK}"
-  srun python experiments/sample_amaze_metrics.py \
+    python scripts/gen_amaze.py --task "${TASK}" --stage test
+  srun python experiments/amaze_generate_and_calculate_metrics.py \
     experiment="amaze_dit_${TASK}" \
     +checkpoint="runs/${RUN_NAME}/checkpoint_final.pt" \
     +task="${TASK}" \

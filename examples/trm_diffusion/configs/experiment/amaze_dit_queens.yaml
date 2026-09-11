@@ -3,7 +3,7 @@
 # Pixel-space pure DiT conditioned on the puzzle image by channel concat, trained on the multi-scale queens mix (n=4..10).
 # Usage:
 #   python train_trm.py experiment=amaze_dit_queens \
-#     data.amaze_root=data/amaze/train_queens/all_train_size144
+#     data.amaze_root=data/amaze/queens
 defaults:
   - override /data: amaze
   - override /backbone: amaze_dit
@@ -13,6 +13,8 @@ defaults:
   - override /sampling: direct
   - _self_
 
+data:
+  amaze_root: data/amaze/queens
 mode: "painter_base"
 
 train:

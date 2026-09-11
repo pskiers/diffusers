@@ -114,6 +114,6 @@ SCORE_ARGS=(
 )
 # Maze needs the shape; queens scores all scales in one pass (no --geometry).
 [ "${KIND}" = "maze" ] && SCORE_ARGS+=( --geometry "${SHAPE}" )
-python "${PROJECT_ROOT}/experiments/score_amaze_images.py" "${SCORE_ARGS[@]}"
+python "${PROJECT_ROOT}/experiments/amaze_score_generated_images.py" "${SCORE_ARGS[@]}"
 
 echo "Done."
