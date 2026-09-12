@@ -83,10 +83,22 @@ WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 if [ -n "${CHECKPOINT_OVERRIDE}" ]; then
     CHECKPOINT_PATH="${CHECKPOINT_OVERRIDE}"
 else
+    # fsdp_save_ckpt writes <checkpoint_dir>/<7-digit step>/model.safetensors (+ optimizer
+    # shards). Take the highest step that actually holds weights — the LAST checkpoint, not
+    # the best by val. Pass a checkpoint explicitly to pin a specific one.
     CKPT_ROOT="${CKPT_ROOT:-${PROJECT_ROOT}/runs/ft_bagel_${TASK}/checkpoints}"
-    CHECKPOINT_PATH=$(find "${CKPT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -V | tail -n1)
+    CHECKPOINT_PATH=""
+    while IFS= read -r _cand; do
+        if [[ -f "${_cand}/model.safetensors" || -f "${_cand}/ema.safetensors" ]]; then
+            CHECKPOINT_PATH="${_cand}"; break
+        fi
+    done < <(find "${CKPT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -Vr)
     [[ -n "${CHECKPOINT_PATH}" ]] || {
-        echo "ERROR: no checkpoint under ${CKPT_ROOT}; pass one as the last argument or set CHECKPOINT=." >&2; exit 1; }
+        echo "ERROR: no checkpoint with model.safetensors under ${CKPT_ROOT}." >&2
+        echo "Candidates seen (highest step first):" >&2
+        find "${CKPT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -Vr | head -5 >&2
+        echo "Pass a checkpoint as the last argument or set CHECKPOINT=." >&2; exit 1; }
+    echo "Auto-selected checkpoint (highest step, NOT best-by-val): ${CHECKPOINT_PATH}"
 fi
 
 export HF_HOME="${SCRATCH}/.cache/huggingface"

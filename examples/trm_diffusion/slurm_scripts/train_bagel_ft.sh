@@ -102,6 +102,19 @@ open(p, "w").write(s)
 print("patched fsdp_utils.py (tolerate LoRA kwargs + use_orig_params)")
 PY
 
+# --auto_resume picks the newest dir in checkpoint_dir and hands it to try_load_ckpt,
+# which reads ema.safetensors when --finetune_from_ema is true. The HF snapshot has that
+# file, but checkpoints written HERE do not: fsdp_save_ckpt only writes ema.safetensors
+# when ema_model is not None, and sft.py always passes ema_model=None. So EMA loading is
+# right for the first launch and a guaranteed FileNotFoundError on every resume.
+FROM_EMA=true
+if compgen -G "${PROJECT_ROOT}/runs/${RUN_NAME}/checkpoints/[0-9]*" > /dev/null 2>&1; then
+  FROM_EMA=false
+  echo ">> resuming from an existing checkpoint -> --finetune_from_ema false (reads model.safetensors)"
+else
+  echo ">> fresh start from ${BAGEL_MODEL_PATH} -> --finetune_from_ema true (reads ema.safetensors)"
+fi
+
 cd "${BAGEL_BASE}"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export WANDB_PROJECT="${WANDB_PROJECT}"
@@ -116,7 +129,7 @@ srun torchrun --standalone --nproc_per_node="${NPROC}" sft.py \
   --checkpoint_dir "${PROJECT_ROOT}/runs/${RUN_NAME}/checkpoints" \
   --wandb_project "${WANDB_PROJECT}" --wandb_name "${RUN_NAME}" --wandb_offline false \
   --visual_gen true --visual_und true \
-  --finetune_from_ema true --resume_model_only true --finetune_from_hf true --auto_resume true \
+  --finetune_from_ema "${FROM_EMA}" --resume_model_only true --finetune_from_hf true --auto_resume true \
   --total_steps "${TOTAL_STEPS}" --save_every "${SAVE_EVERY}" --log_every 1 --eval_every 50 --eval_samples 8 \
   --warmup_steps 10 --lr "${LR}" --lr_scheduler cosine --min_lr 1e-7 \
   --expected_num_tokens 5000 --max_num_tokens 5000 --max_num_tokens_per_sample 5000 \

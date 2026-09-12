@@ -71,13 +71,24 @@ mkdir -p "${GEN_DIR}"
 if [ -n "${CHECKPOINT_OVERRIDE}" ]; then
     CHECKPOINT_PATH="${CHECKPOINT_OVERRIDE}"
 else
+    # sft.py writes <task>/janus_train_<task>/<run_name>/checkpoint-<epoch>-<step>/tfmr,
+    # and RUN_NAME is timestamped, so there is one run dir per training attempt. Take the
+    # most recently WRITTEN checkpoint that actually holds weights — note that is the last
+    # one, not the best by val loss. Pass a checkpoint explicitly to pin a specific one.
     CKPT_ROOT="${EAR_AMAZE_ROOT}/sft/janus/outputs/${TASK}/janus_train_${TASK}"
-    LATEST_CKPT_DIR=$(find "${CKPT_ROOT}" -maxdepth 3 -type d -name "checkpoint-*" \
-        -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)
+    LATEST_CKPT_DIR=""
+    while IFS= read -r _cand; do
+        if [ -d "${_cand}/tfmr" ]; then LATEST_CKPT_DIR="${_cand}"; break; fi
+    done < <(find "${CKPT_ROOT}" -mindepth 1 -maxdepth 3 -type d -name "checkpoint-*" \
+                -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
     if [ -z "${LATEST_CKPT_DIR}" ]; then
-        echo "No checkpoint found under ${CKPT_ROOT}" >&2
+        echo "No checkpoint-*/tfmr found under ${CKPT_ROOT}" >&2
+        echo "Candidates seen (newest first):" >&2
+        find "${CKPT_ROOT}" -mindepth 1 -maxdepth 3 -type d -name "checkpoint-*" \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2- | head -5 >&2
         exit 1
     fi
+    echo "Auto-selected checkpoint (newest written, NOT best-by-val): ${LATEST_CKPT_DIR}"
     CHECKPOINT_PATH="${LATEST_CKPT_DIR}/tfmr"
 fi
 

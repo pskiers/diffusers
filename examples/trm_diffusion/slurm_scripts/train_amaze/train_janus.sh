@@ -56,7 +56,9 @@ cd "${SFT_DIR}"
 OUTPUT_DIR="${SFT_DIR}/outputs/${TASK}"
 LOG_DIR="${SFT_DIR}/train_logs"
 EXPERIMENT_NAME="janus_train_${TASK}"
-RUN_NAME="${TASK}_$(date +%Y%m%d_%H%M%S)"
+# Timestamped so each attempt gets its own directory. Override RUN_NAME= to pin it
+# (eval_janus.sh does not need it — it resolves the newest checkpoint at launch).
+RUN_NAME="${RUN_NAME:-${TASK}_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
 # The authors' recipe, from the example at the top of sft.py. argparse's defaults
@@ -92,9 +94,19 @@ export WORLD_SIZE=1
 RESUME_ARGS=()
 if [[ -n "${RESUME:-}" ]]; then
     if [[ "${RESUME}" == "auto" ]]; then
-        RESUME_DIR=$(find "${OUTPUT_DIR}" -maxdepth 1 -type d -name 'checkpoint-*' \
-            -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)
-        [[ -n "${RESUME_DIR}" ]] || { echo "RESUME=auto but no checkpoint-* under ${OUTPUT_DIR}" >&2; exit 1; }
+        # sft.py nests output_dir as <output_dir>/<experiment_name>/<run_name>, and
+        # RUN_NAME carries a fresh timestamp per submit, so checkpoints sit three levels
+        # down and are spread across one run dir per attempt. Take the most recently
+        # written checkpoint that actually holds weights (has a tfmr/ subdirectory).
+        RESUME_DIR=""
+        while IFS= read -r _cand; do
+            if [[ -d "${_cand}/tfmr" ]]; then RESUME_DIR="${_cand}"; break; fi
+        done < <(find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 4 -type d -name 'checkpoint-*' \
+                    -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+        [[ -n "${RESUME_DIR}" ]] || {
+            echo "RESUME=auto found no checkpoint-*/tfmr under ${OUTPUT_DIR}" >&2
+            echo "  (looked for <output_dir>/<experiment_name>/<run_name>/checkpoint-*/tfmr)" >&2
+            exit 1; }
     else
         RESUME_DIR="${RESUME}"
     fi
