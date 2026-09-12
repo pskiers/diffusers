@@ -8,11 +8,22 @@
 # The FEA solve is CPU-bound (~2s/sample) -- num_samples is kept modest here
 # for periodic training-time eval; run a much larger offline pass (e.g. the
 # full 1800-instance test_data_level_1) for a one-off final evaluation.
+# num_workers parallelizes that FEA solve across worker processes (see
+# models.eval_callbacks.TopodiffEvalCallback / eval.topodiff_eval.evaluate_topodiff).
+# Size this against your job's TOTAL allocated CPUs, not just "cores idle
+# right now": configs/data/topodiff.yaml's num_workers=4 persistent
+# DataLoader workers are alive for the whole job (they idle, not release
+# their slot, between batches), and the main process itself needs a core
+# too. On a 10-CPU allocation, 4 (leaving 4 (dataloader) + 1 (main) + 1
+# spare) is a reasonable default; raise it for a large one-off final-eval
+# run where nothing else is competing (e.g. a standalone eval script with no
+# concurrent training dataloader).
 - _target_: models.eval_callbacks.TopodiffEvalCallback
   data_dir: ${data.data_dir}
   image_size: ${data.image_size}
   num_samples: 64
   num_log_images: 8
+  num_workers: 4
   extra_eval_sets:
     - name: level_1
       split: test_data_level_1

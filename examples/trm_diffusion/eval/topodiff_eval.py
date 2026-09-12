@@ -48,8 +48,12 @@ applied as a shim rather than editing the installed third-party package).
 
 from __future__ import annotations
 
+import atexit
+import multiprocessing
+import os
 import shutil
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -64,6 +68,72 @@ if not hasattr(np, "float"):
     np.float = float  # type: ignore[attr-defined]
 
 import eval.topodiff_analysis as ta
+
+# ── Per-sample worker (parallelizable across processes) ──────────────────────
+#
+# Each sample's FEA solve is fully independent (own tempdir already, per the
+# module docstring above) — an embarrassingly parallel loop over B samples.
+# The FEA solve itself is the bottleneck (~2s/sample, single-threaded CPU),
+# not the DDIM sampling or the VF/FM/LV checks (all sub-ms), so this is
+# worth parallelizing across CPU cores when B is more than a handful.
+
+
+def _pool_worker_init() -> None:
+    """Each worker only ever solves one sample at a time — numpy/scipy's own
+    BLAS backend spawning an internal thread pool inside every worker process
+    on top of that would just oversubscribe CPUs (N worker processes x M
+    BLAS threads each competing for N*M physical cores), not speed anything
+    up. Force single-threaded BLAS per worker; the parallelism comes entirely
+    from running separate samples in separate processes instead."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def _solve_one(topo: np.ndarray, s: dict) -> tuple:
+    """One sample's full metric computation (FEA compliance + VFE + FM + LV).
+    Module-level (not a closure) so it's picklable and can run in a worker
+    process — see evaluate_topodiff's num_workers."""
+    tmp = tempfile.mkdtemp(prefix="topodiff_fem_")
+    try:
+        folder = tmp + "/"
+        ta.create_files(topo, s["BC_conf"], s["load_nodes"], s["x_loads"], s["y_loads"], folder)
+        _, E_nodes, S_nodes = ta.mysolidspy(folder)
+        compliance = float(np.sum(np.multiply(E_nodes, S_nodes)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    vfe = float(abs(ta.compute_vf(topo) - s["VF"]) / s["VF"])
+    fm = bool(ta.check_floating_material(topo))
+    lv = bool(ta.check_load(s["load_coord"][0], topo))
+    return compliance, vfe, fm, lv
+
+
+_pool: Optional[ProcessPoolExecutor] = None
+_pool_workers = 0
+
+
+def _get_pool(num_workers: int) -> ProcessPoolExecutor:
+    """Lazily-created, process-lifetime-persistent pool (avoids re-paying
+    worker-startup/import cost — numpy/scipy/solidspy — on every eval-callback
+    invocation across a training run). Recreated only if num_workers changes.
+    Uses the 'spawn' start method (not the Linux default 'fork') so workers
+    never inherit the parent training process's already-initialized CUDA
+    context, regardless of whether anything they do would actually touch it —
+    this module doesn't import torch.cuda-touching code, but spawn is the
+    robust default for "multiprocessing alongside an active CUDA process"
+    regardless."""
+    global _pool, _pool_workers
+    if _pool is None or _pool_workers != num_workers:
+        if _pool is not None:
+            _pool.shutdown(wait=False)
+        _pool = ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_pool_worker_init,
+        )
+        _pool_workers = num_workers
+        atexit.register(_pool.shutdown, wait=False)
+    return _pool
+
 
 # ── Tensor <-> vendored-code array conventions ────────────────────────────────
 
@@ -81,8 +151,16 @@ def evaluate_topodiff(
     images: torch.Tensor,  # (B, 1, H, W) float in [-1, 1], generated
     summaries: list[dict],  # length B; each: BC_conf, load_nodes, x_loads, y_loads, VF, load_coord
     compliance_opt: Optional[np.ndarray] = None,  # (B,) reference SIMP compliance; None => CE not computed
+    num_workers: int = 1,
 ) -> dict:
     """Score a batch of generated topologies against the paper's 4 metrics.
+
+    num_workers: run the per-sample FEA solve (the bottleneck, ~2s/sample,
+        single-threaded CPU) across this many worker processes instead of
+        sequentially in the caller's process. 1 (default) preserves the
+        original sequential behavior exactly (no pool created at all). See
+        _get_pool's docstring for the persistent-pool/BLAS-oversubscription
+        reasoning.
 
     Returns dict with keys:
       per_sample_compliance — (B,) float64; raw FEA compliance (sum(E_nodes*S_nodes))
@@ -104,27 +182,16 @@ def evaluate_topodiff(
 
     topo_arrays = [_to_topo_array(images[i]) for i in range(B)]
 
-    per_sample_compliance = np.empty(B, dtype=np.float64)
-    per_sample_vfe = np.empty(B, dtype=np.float64)
-    per_sample_lv = np.empty(B, dtype=bool)
-    per_sample_fm = np.empty(B, dtype=bool)
+    if num_workers > 1:
+        pool = _get_pool(num_workers)
+        results = list(pool.map(_solve_one, topo_arrays, summaries))
+    else:
+        results = [_solve_one(topo_arrays[i], summaries[i]) for i in range(B)]
 
-    for i in range(B):
-        topo = topo_arrays[i]
-        s = summaries[i]
-
-        tmp = tempfile.mkdtemp(prefix="topodiff_fem_")
-        try:
-            folder = tmp + "/"
-            ta.create_files(topo, s["BC_conf"], s["load_nodes"], s["x_loads"], s["y_loads"], folder)
-            _, E_nodes, S_nodes = ta.mysolidspy(folder)
-            per_sample_compliance[i] = np.sum(np.multiply(E_nodes, S_nodes))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-
-        per_sample_vfe[i] = abs(ta.compute_vf(topo) - s["VF"]) / s["VF"]
-        per_sample_fm[i] = ta.check_floating_material(topo)
-        per_sample_lv[i] = ta.check_load(s["load_coord"][0], topo)
+    per_sample_compliance = np.array([r[0] for r in results], dtype=np.float64)
+    per_sample_vfe = np.array([r[1] for r in results], dtype=np.float64)
+    per_sample_fm = np.array([r[2] for r in results], dtype=bool)
+    per_sample_lv = np.array([r[3] for r in results], dtype=bool)
 
     if compliance_opt is not None:
         compliance_opt = np.asarray(compliance_opt, dtype=np.float64)

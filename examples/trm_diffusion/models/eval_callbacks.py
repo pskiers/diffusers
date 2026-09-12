@@ -1420,6 +1420,12 @@ class TopodiffEvalCallback(EvalCallbackBase):
                         here; the primary dataloader itself is whatever the
                         caller passes in (already built with the right mode
                         by train_trm.py from configs/data/*.yaml).
+        num_workers: parallelize the per-sample FEA solve (the bottleneck,
+                     ~2s/sample single-threaded CPU) across this many worker
+                     processes — see eval/topodiff_eval.py's
+                     evaluate_topodiff/_get_pool docstrings. 1 (default)
+                     runs sequentially in the main process, matching prior
+                     behavior exactly.
         extra_eval_sets: optional list of held-out test-set specs.
     """
 
@@ -1430,6 +1436,7 @@ class TopodiffEvalCallback(EvalCallbackBase):
         num_samples: int = 256,
         num_log_images: int = 8,
         condition_mode: str = "full",
+        num_workers: int = 1,
         extra_eval_sets: Optional[list] = None,
     ):
         self.data_dir = data_dir
@@ -1437,6 +1444,7 @@ class TopodiffEvalCallback(EvalCallbackBase):
         self.num_samples = num_samples
         self.num_log_images = num_log_images
         self.condition_mode = condition_mode
+        self.num_workers = num_workers
         self._extra_specs = list(extra_eval_sets) if extra_eval_sets else []
         self._extra_dataloaders = None  # built lazily on first __call__
 
@@ -1508,7 +1516,10 @@ class TopodiffEvalCallback(EvalCallbackBase):
                 compliance_opt = np.array([dataset.compliance_for(pid) for pid in puzzle_ids], dtype=np.float64)
                 has_compliance = not np.isnan(compliance_opt).any()
 
-                acc = evaluate_topodiff(gen, summaries, compliance_opt=compliance_opt if has_compliance else None)
+                acc = evaluate_topodiff(
+                    gen, summaries, compliance_opt=compliance_opt if has_compliance else None,
+                    num_workers=self.num_workers,
+                )
 
                 if has_compliance:
                     weighted_ce.append((acc["CE"], B))

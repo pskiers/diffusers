@@ -8,6 +8,7 @@
   num_samples: 64
   num_log_images: 8
   condition_mode: "hard"
+  num_workers: 4  # see configs/eval_callbacks/topodiff.yaml's comment on sizing this
   extra_eval_sets:
     - name: level_1
       split: test_data_level_1
