@@ -107,10 +107,23 @@ PY
 # file, but checkpoints written HERE do not: fsdp_save_ckpt only writes ema.safetensors
 # when ema_model is not None, and sft.py always passes ema_model=None. So EMA loading is
 # right for the first launch and a guaranteed FileNotFoundError on every resume.
+# sft.py's get_latest_ckpt() takes the HIGHEST-numbered dir under checkpoint_dir with no
+# regard for what is inside it, so a half-written checkpoint from a killed job is picked and
+# then explodes ~3 minutes in, after the 14.6B model has loaded. Check it here instead.
 FROM_EMA=true
-if compgen -G "${PROJECT_ROOT}/runs/${RUN_NAME}/checkpoints/[0-9]*" > /dev/null 2>&1; then
-  FROM_EMA=false
-  echo ">> resuming from an existing checkpoint -> --finetune_from_ema false (reads model.safetensors)"
+CKPT_DIR="${PROJECT_ROOT}/runs/${RUN_NAME}/checkpoints"
+LATEST_CKPT=$(find "${CKPT_DIR}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -V | tail -n1)
+if [[ -n "${LATEST_CKPT}" ]]; then
+  if [[ -f "${LATEST_CKPT}/model.safetensors" ]]; then
+    FROM_EMA=false
+    echo ">> resuming from ${LATEST_CKPT} -> --finetune_from_ema false (reads model.safetensors)"
+  else
+    echo "ERROR: ${LATEST_CKPT} exists but has no model.safetensors — a partial/aborted save." >&2
+    echo "       --auto_resume would select it regardless and fail after loading the model." >&2
+    echo "       Delete it (it is step $(basename "${LATEST_CKPT}") of ${TOTAL_STEPS}, worth nothing):" >&2
+    echo "         rm -rf ${LATEST_CKPT}" >&2
+    exit 1
+  fi
 else
   echo ">> fresh start from ${BAGEL_MODEL_PATH} -> --finetune_from_ema true (reads ema.safetensors)"
 fi
