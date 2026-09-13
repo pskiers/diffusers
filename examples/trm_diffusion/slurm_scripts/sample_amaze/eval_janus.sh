@@ -44,7 +44,9 @@ if [[ -z "${EAR_AMAZE_ROOT:-}" ]]; then
 fi
 : "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_janus.py under PROJECT_ROOT/third_party (tried ear-amaze, amaze). Set EAR_AMAZE_ROOT=, or run third_party/amaze/setup_ft_code.sh}"
 
-DATA_PATH="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
+# Override DATA_PATH to sample a subset (e.g. a single size) instead of the full
+# ft/ test split; it just needs a directory holding maze_dataset_test.parquet.
+DATA_PATH="${DATA_PATH:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 mkdir -p "${PROJECT_ROOT}/slurm_outputs"
