@@ -73,7 +73,15 @@ fi
     echo "ERROR: config file ${CONFIG} missing — infer_bagel.py is driven by ml_collections." >&2
     echo "       Run: bash third_party/amaze/setup_ft_code.sh, or set CONFIG=<path to a config .py>" >&2; exit 1; }
 
-: "${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot (the base weights)}"
+# Defaults to the snapshot location on Helios so a forgotten/empty env var cannot
+# kill the job at submit. Override only if your snapshot lives elsewhere.
+BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-${SCRATCH}/models/BAGEL-7B-MoT}"
+[[ -f "${BAGEL_MODEL_PATH}/ema.safetensors" ]] || {
+  echo "ERROR: ${BAGEL_MODEL_PATH}/ema.safetensors not found." >&2
+  echo "       Set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot, or download it:" >&2
+  echo "         huggingface-cli download ByteDance-Seed/BAGEL-7B-MoT --local-dir ${BAGEL_MODEL_PATH}" >&2
+  exit 1; }
+echo ">> base model: ${BAGEL_MODEL_PATH}"
 
 DATA_PATH="${DATA_PATH:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 [[ -f "${DATA_PATH}/maze_dataset_test.parquet" ]] || {

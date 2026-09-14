@@ -51,7 +51,15 @@ WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 RUN_NAME="${RUN_NAME:-ft_bagel_${TASK}}"
 CPU_OFFLOAD="${CPU_OFFLOAD:-false}"
 NPROC="${NPROC:-4}"
-BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:?set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot}"
+# Defaults to the snapshot location on Helios so a forgotten/empty env var cannot
+# kill the job at submit. Override only if your snapshot lives elsewhere.
+BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-${SCRATCH}/models/BAGEL-7B-MoT}"
+[[ -f "${BAGEL_MODEL_PATH}/ema.safetensors" ]] || {
+  echo "ERROR: ${BAGEL_MODEL_PATH}/ema.safetensors not found." >&2
+  echo "       Set BAGEL_MODEL_PATH to a local BAGEL-7B-MoT snapshot, or download it:" >&2
+  echo "         huggingface-cli download ByteDance-Seed/BAGEL-7B-MoT --local-dir ${BAGEL_MODEL_PATH}" >&2
+  exit 1; }
+echo ">> base model: ${BAGEL_MODEL_PATH}"
 
 module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
 source "${VENV}/bin/activate"
