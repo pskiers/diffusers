@@ -63,12 +63,21 @@ export PYTHONPATH="${EAR_AMAZE_ROOT}/sft/janus/Janus:${EAR_AMAZE_ROOT}:${PYTHONP
 
 # Maze: shape gets its own output dir (flat filenames don't encode shape for
 # non-circle mazes). Queens: one flat dir for the whole run (scale recovered by id).
-if [ "${KIND}" = "maze" ]; then
-    GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}/${SHAPE}"
-else
-    GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}"
+# Queens filenames are identical across models (same test set, same ids), so two
+# runs sharing a GEN_DIR silently overwrite each other's images AND their metrics
+# json. Override GEN_DIR when comparing two checkpoints of the same task.
+if [ -z "${GEN_DIR:-}" ]; then
+    if [ "${KIND}" = "maze" ]; then
+        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}/${SHAPE}"
+    else
+        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}"
+    fi
 fi
 mkdir -p "${GEN_DIR}"
+if [ -n "$(find "${GEN_DIR}" -maxdepth 1 -name '*_attempt*' -print -quit 2>/dev/null)" ]; then
+    echo "WARNING: ${GEN_DIR} already holds generated images — they will be overwritten." >&2
+    echo "         Set GEN_DIR= to keep runs separate." >&2
+fi
 
 if [ -n "${CHECKPOINT_OVERRIDE}" ]; then
     CHECKPOINT_PATH="${CHECKPOINT_OVERRIDE}"
