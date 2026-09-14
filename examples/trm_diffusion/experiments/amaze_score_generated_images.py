@@ -156,8 +156,14 @@ def _discover_generated(gen_dir: Path, kind: str) -> dict:
 
 
 def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: int,
-                samples_dir: Path, saved_counter: list):
+                samples_dir: Path, saved_counter: list, optional: bool = False):
+    """`optional` marks a combo we can live without (OOD). A missing in-distribution
+    parquet is a real error; a missing OOD one must never throw away a completed run's
+    in-distribution scores, which is what used to happen at the very end of a job."""
     if not parquet.exists():
+        if optional:
+            logger.warning(f"combo={combo}: {parquet} not found - skipping (OOD is optional).")
+            return [], None
         raise FileNotFoundError(f"test parquet not found: {parquet}")
 
     ds = AmazeDataset(str(parquet), split="test", image_size=IMAGE_SIZE,
@@ -291,7 +297,9 @@ def _score_maze(gen_dir, geometry, data_root, device, k, samples_dir, saved_coun
     for s in MAZE_OOD_SCALES:
         combo = _maze_combo(geometry, s)
         rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, geometry, s),
-                                  "maze", device, k, samples_dir, saved_counter)
+                                  "maze", device, k, samples_dir, saved_counter, optional=True)
+        if not rows:
+            continue
         ood_combo[f"{geometry}_{s}"] = rows
         samples[combo] = pair
     return build_maze_result(per_combo, ood_combo), samples
@@ -314,7 +322,9 @@ def _score_queens(gen_dir, data_root, device, k, samples_dir, saved_counter):
     for s in QUEEN_OOD_SCALES:
         combo = f"n{s}"
         rows, pair = score_combo(gen_dir, combo, _queens_parquet(data_root, s),
-                                  "queens", device, k, samples_dir, saved_counter)
+                                  "queens", device, k, samples_dir, saved_counter, optional=True)
+        if not rows:
+            continue
         ood_scale[str(s)] = rows
         samples[queens_sample_key(s)] = pair
     return build_queens_result(per_scale, ood_scale), samples
