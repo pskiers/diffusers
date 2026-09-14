@@ -57,9 +57,18 @@ fi
 # infer_bagel.py imports `dataset.maze_dataset` and is driven by an ml_collections
 # config file; neither is needed by infer_janus.py, so an older checkout may lack them.
 CONFIG="${CONFIG:-${EAR_AMAZE_ROOT}/config/maze.py}"
-[[ -f "${EAR_AMAZE_ROOT}/dataset/maze_dataset.py" ]] || {
-    echo "ERROR: ${EAR_AMAZE_ROOT}/dataset/maze_dataset.py missing — infer_bagel.py imports it." >&2
-    echo "       Run: bash third_party/amaze/setup_ft_code.sh   (vendors dataset/ and config/)" >&2; exit 1; }
+# infer_bagel.py does `from dataset.maze_dataset import MazeDataset` while
+# infer_janus.py does `from data.maze_dataset import ...` — and upstream only ships
+# data/. Same class, same constructor, so alias the package rather than edit theirs.
+if [[ ! -e "${EAR_AMAZE_ROOT}/dataset/maze_dataset.py" ]]; then
+    if [[ -f "${EAR_AMAZE_ROOT}/data/maze_dataset.py" ]]; then
+        ln -sfn data "${EAR_AMAZE_ROOT}/dataset"
+        echo ">> linked ${EAR_AMAZE_ROOT}/dataset -> data (infer_bagel.py imports 'dataset.maze_dataset')"
+    else
+        echo "ERROR: neither ${EAR_AMAZE_ROOT}/dataset/maze_dataset.py nor data/maze_dataset.py exists." >&2
+        echo "       Run: bash third_party/amaze/setup_ft_code.sh" >&2; exit 1
+    fi
+fi
 [[ -f "${CONFIG}" ]] || {
     echo "ERROR: config file ${CONFIG} missing — infer_bagel.py is driven by ml_collections." >&2
     echo "       Run: bash third_party/amaze/setup_ft_code.sh, or set CONFIG=<path to a config .py>" >&2; exit 1; }

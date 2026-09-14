@@ -31,7 +31,7 @@ else
   echo "   (set FORCE_VENDOR=1 to overwrite with upstream)"
 fi
 
-for extra in dataset config; do
+for extra in config; do
   if [[ -d "${HERE}/${extra}" && "${FORCE_VENDOR:-0}" != "1" ]]; then
     echo ">> ${extra}/ already present -> keeping it."
   elif [[ -d "${TMP}/amaze/${extra}" ]]; then
@@ -83,5 +83,5 @@ else
 fi
 
 echo "Done."
-echo "  glue code : ${HERE}/{sft,infer,data,dataset,config}"
+echo "  glue code : ${HERE}/{sft,infer,data,config}"
 echo "  base repos: ${HERE}/sft/bagel/Bagel , ${HERE}/sft/janus/Janus"
