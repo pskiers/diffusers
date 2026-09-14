@@ -48,6 +48,12 @@ fi
 # ft/ test split; it just needs a directory holding maze_dataset_test.parquet.
 DATA_PATH="${DATA_PATH:-${PROJECT_ROOT}/data/amaze/ft/${TASK}}"
 
+# Janus/Bagel inference reads the MERGED ft/ test split, which holds in-distribution
+# sizes only — OOD images are never generated. So OOD scoring defaults to OFF here;
+# set MAZE_OOD_SCALES=10 / QUEEN_OOD_SCALES=12 explicitly only if you staged OOD data.
+export MAZE_OOD_SCALES="${MAZE_OOD_SCALES-}"
+export QUEEN_OOD_SCALES="${QUEEN_OOD_SCALES-}"
+
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 mkdir -p "${PROJECT_ROOT}/slurm_outputs"
 
