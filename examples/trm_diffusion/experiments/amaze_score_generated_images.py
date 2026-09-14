@@ -77,17 +77,19 @@ _EXT = r"(?:png|jpe?g)"
 _QUEENS_ATTEMPT_RE = re.compile(rf"^(?P<prefix>[^_]+)_(?P<id>.+)_attempt(?P<attempt>\d+)\.{_EXT}$")
 
 
-def _prefix_pattern(prefix: str) -> str:
-    """Literal prefix -> regex fragment accepting the ASCII and U+00D7 spellings."""
-    return re.escape(prefix).replace("x", "[×x]")
+# Neither half of "{prefix}_{id}_attempt{N}" is underscore-free in general, so the
+# split is driven by the ID FORMAT of each task rather than by the prefix:
+#   maze   ids are uuid4      -> no underscores in the id, any prefix
+#   queens ids are level_N_i  -> underscores in the id, prefix has none ("0x0")
+# Relying on the prefix does not work: infer_janus.py labels every circle board
+# "10×10" (the generator's unused default width/height) whatever its layer count,
+# so the prefix carries no size information. The id alone pins the puzzle, and each
+# combo only scores ids present in its own n<size>_test.parquet.
+_MAZE_ATTEMPT_RE = re.compile(rf"^(?P<prefix>.+)_(?P<id>[^_]+)_attempt(?P<attempt>\d+)\.{_EXT}$")
 
 
-def _attempt_re(prefixes) -> re.Pattern:
-    """`prefixes` is None (queens: any prefix without '_') or a list of literals."""
-    if prefixes is None:
-        return _QUEENS_ATTEMPT_RE
-    alternation = "|".join(_prefix_pattern(p) for p in prefixes)
-    return re.compile(rf"^(?P<prefix>{alternation})_(?P<id>.+)_attempt(?P<attempt>\d+)\.{_EXT}$")
+def _attempt_re(kind: str) -> re.Pattern:
+    return _QUEENS_ATTEMPT_RE if kind == "queens" else _MAZE_ATTEMPT_RE
 
 
 def _load_img(path: Path) -> tuple[torch.Tensor, tuple[int, int] | None]:
@@ -128,7 +130,7 @@ def _build_id_index(ds) -> dict:
     return id_to_idx
 
 
-def _discover_generated(gen_dir: Path, prefix: str | None) -> dict:
+def _discover_generated(gen_dir: Path, kind: str) -> dict:
     """Group infer_janus.py's flat output by puzzle id.
 
     ``prefix=None`` matches every ``*_attempt*.png`` regardless of the size
@@ -140,7 +142,7 @@ def _discover_generated(gen_dir: Path, prefix: str | None) -> dict:
     """
     # Glob every candidate and let the regex enforce the prefix: a glob cannot
     # express "× or x", and the filter is exact either way.
-    matcher = _attempt_re(prefix)
+    matcher = _attempt_re(kind)
     by_id: dict = {}
     candidates = [f for ext in ("png", "jpg", "jpeg") for f in gen_dir.glob(f"*_attempt*.{ext}")]
     for f in candidates:
@@ -154,7 +156,7 @@ def _discover_generated(gen_dir: Path, prefix: str | None) -> dict:
 
 
 def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: int,
-                samples_dir: Path, saved_counter: list, prefix: str | None):
+                samples_dir: Path, saved_counter: list):
     if not parquet.exists():
         raise FileNotFoundError(f"test parquet not found: {parquet}")
 
@@ -165,7 +167,7 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
 
     # Maze: prefix is the size ("9\u00d79", Unicode '\u00d7' not 'x') or "layers_N" (circle).
     # Queens: prefix=None -> match every *_attempt*.png and separate scales by `id`.
-    by_id = _discover_generated(gen_dir, prefix)
+    by_id = _discover_generated(gen_dir, task)
     if not by_id:
         # Distinguish "nothing was generated" from "generated under a name we do not
         # recognise" — the latter used to surface only as a table full of zeros.
@@ -174,11 +176,11 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
         if present:
             logger.error(
                 f"combo={combo}: {len(present)} generated file(s) exist in {gen_dir} but none "
-                f"match prefix {prefix}. Examples: {present[:3]}. The scores below will be a "
-                f"meaningless 0.0 — this is a filename mismatch, not a model result."
+                f"parse as {{prefix}}_{{id}}_attempt{{N}}. Examples: {present[:3]}. The scores below "
+                f"will be a meaningless 0.0 — this is a filename mismatch, not a model result."
             )
         else:
-            logger.warning(f"No generated files found for combo={combo} (prefix={prefix}) in {gen_dir}")
+            logger.warning(f"No generated files found for combo={combo} in {gen_dir}")
 
     scorer = AmazeMetrics(device=device, task=task)
     rows, sample_pair = [], None
@@ -194,9 +196,8 @@ def score_combo(gen_dir: Path, combo: str, parquet: Path, task: str, device, k: 
     # A prefix that cannot discriminate size (queens' "0x0", and circle's when the
     # inference script did not recognise the data as circular) matches every size's
     # files, so ids belonging to other sizes are expected here, not a problem.
-    size_specific = prefix is not None and "0x0" not in prefix
     missing_ids = [pid for pid in by_id if pid not in id_to_idx]
-    if missing_ids and size_specific:
+    if False:   # ids from other sizes are expected: one flat dir holds every size
         logger.warning(
             f"{len(missing_ids)} generated ids for combo={combo} were not found "
             f"in {parquet} (e.g. {missing_ids[:5]}) - skipped."
@@ -278,34 +279,19 @@ def _print_row(label, agg):
           f"P@1 {agg['pass1']*100:.2f}%  P@5 {agg['pass5']*100:.2f}%")
 
 
-def _maze_prefix(geometry, scale):
-    """Filename prefixes the inference scripts may use for this (geometry, size).
-
-    Circle boards are named "layers_<N>" only when the inference script recognises the
-    data as circular, which infer_janus.py decides by looking for the literal substring
-    'circle/maze-dataset' in the data path (their own repo's directory convention).
-    Under any other path it takes the width x height branch, and circle metadata carries
-    `layers` rather than width/height, so every circle board is named "0x0" instead --
-    which matched nothing and scored a clean zero. Accept both; the puzzle `id` still
-    pins the row, exactly as it does for queens.
-    """
-    if geometry == "circle":
-        return [f"layers_{scale}", "0x0"]
-    return [f"{scale}x{scale}"]
-
 
 def _score_maze(gen_dir, geometry, data_root, device, k, samples_dir, saved_counter):
     per_combo, ood_combo, samples = {}, {}, {}
     for s in MAZE_SCALES:
         combo = _maze_combo(geometry, s)
         rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, geometry, s),
-                                  "maze", device, k, samples_dir, saved_counter, _maze_prefix(geometry, s))
+                                  "maze", device, k, samples_dir, saved_counter)
         per_combo[f"{geometry}_{s}"] = rows
         samples[combo] = pair
     for s in MAZE_OOD_SCALES:
         combo = _maze_combo(geometry, s)
         rows, pair = score_combo(gen_dir, combo, _maze_parquet(data_root, geometry, s),
-                                  "maze", device, k, samples_dir, saved_counter, _maze_prefix(geometry, s))
+                                  "maze", device, k, samples_dir, saved_counter)
         ood_combo[f"{geometry}_{s}"] = rows
         samples[combo] = pair
     return build_maze_result(per_combo, ood_combo), samples
@@ -322,13 +308,13 @@ def _score_queens(gen_dir, data_root, device, k, samples_dir, saved_counter):
     for s in QUEEN_SCALES:
         combo = f"n{s}"
         rows, pair = score_combo(gen_dir, combo, _queens_parquet(data_root, s),
-                                  "queens", device, k, samples_dir, saved_counter, None)
+                                  "queens", device, k, samples_dir, saved_counter)
         per_scale[str(s)] = rows
         samples[queens_sample_key(s)] = pair
     for s in QUEEN_OOD_SCALES:
         combo = f"n{s}"
         rows, pair = score_combo(gen_dir, combo, _queens_parquet(data_root, s),
-                                  "queens", device, k, samples_dir, saved_counter, None)
+                                  "queens", device, k, samples_dir, saved_counter)
         ood_scale[str(s)] = rows
         samples[queens_sample_key(s)] = pair
     return build_queens_result(per_scale, ood_scale), samples
