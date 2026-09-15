@@ -70,6 +70,7 @@ if [[ ! -e "${EAR_AMAZE_ROOT}/flow_grpo/bagel/data/data_utils.py" ]]; then
     fi
 fi
 
+CONFIG_NAME="${CONFIG_NAME:-maze_eval}"
 # infer_bagel.py does `from dataset.maze_dataset import MazeDataset` while
 # infer_janus.py does `from data.maze_dataset import ...` — and upstream only ships
 # data/. Same class, same constructor, so alias the package rather than edit theirs.
@@ -162,7 +163,7 @@ echo "============================================="
 
 # --- 1. Generate with the authors' own infer_bagel.py (absl + ml_collections) ---
 INFER_ARGS=(
-    --config "${CONFIG}"
+    --config "${CONFIG}:${CONFIG_NAME}"
     --config.dataset="${DATA_PATH}"
     --config.dataset_split=test
     --config.pretrained.model="${BAGEL_MODEL_PATH}"
@@ -173,6 +174,9 @@ INFER_ARGS=(
     --config.sample.resolution="${RESOLUTION}"
     --config.sample.test_batch_size="${BATCH}"
     --config.sample.eval_num_steps="${STEPS}"
+    --config.sample.filter_size_min=0
+    --config.sample.filter_size_max=100000
+    --config.sample.samples_per_size=1000000
 )
 # Maze filters to one shape; circle boards are sized by layers, which the authors'
 # code keys off is_circle. Queens generates every board (no shape filter).
