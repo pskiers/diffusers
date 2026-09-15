@@ -57,6 +57,19 @@ fi
 # infer_bagel.py imports `dataset.maze_dataset` and is driven by an ml_collections
 # config file; neither is needed by infer_janus.py, so an older checkout may lack them.
 CONFIG="${CONFIG:-${EAR_AMAZE_ROOT}/config/maze.py}"
+# infer/bagel/inferencer.py does `from flow_grpo.bagel.data.data_utils import ...`,
+# the package name from the authors' original flow_grpo project. The module is right
+# there under infer/bagel/, so alias the package instead of editing their file.
+if [[ ! -e "${EAR_AMAZE_ROOT}/flow_grpo/bagel/data/data_utils.py" ]]; then
+    if [[ -f "${EAR_AMAZE_ROOT}/infer/bagel/data/data_utils.py" ]]; then
+        ln -sfn infer "${EAR_AMAZE_ROOT}/flow_grpo"
+        echo ">> linked ${EAR_AMAZE_ROOT}/flow_grpo -> infer (inferencer.py imports 'flow_grpo.bagel...')"
+    else
+        echo "ERROR: ${EAR_AMAZE_ROOT}/infer/bagel/data/data_utils.py missing." >&2
+        echo "       Run: bash third_party/amaze/setup_ft_code.sh" >&2; exit 1
+    fi
+fi
+
 # infer_bagel.py does `from dataset.maze_dataset import MazeDataset` while
 # infer_janus.py does `from data.maze_dataset import ...` — and upstream only ships
 # data/. Same class, same constructor, so alias the package rather than edit theirs.
