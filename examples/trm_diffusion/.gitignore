@@ -37,3 +37,13 @@ third_party/ear_amaze/*.jpg
 # local diagnostic scratch scripts
 diag_*.py
 diag_*.sbatch
+
+# one-off results plumbing / migration scratch (kept local, not tracked)
+collect_final_results.py
+collect_final_results.sh
+run_final_eval.sh
+consolidate.sh
+migrate_ear.sh
+patch_*.py
+slurm-*.sh
+*.sh.bak
