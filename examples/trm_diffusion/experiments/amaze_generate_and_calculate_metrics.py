@@ -63,7 +63,8 @@ def _build_amaze_dataset(cfg: DictConfig, dataset_path: str) -> AmazeDataset:
 @torch.no_grad()
 def sample_and_score(
     model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int,
-    combo_name: str, samples_dir: Path, is_main_process: bool = True
+    combo_name: str, samples_dir: Path, is_main_process: bool = True,
+    generations_dir: Path | None = None, gen_prefix: str = "",
 ) -> tuple[list[dict], dict | None]:
     """Sample `samples_per_puzzle` attempts per puzzle and score them with the AmazeMetrics evaluator.
 
@@ -79,6 +80,7 @@ def sample_and_score(
     scorer = AmazeMetrics(device=device, task=task)
     K = samples_per_puzzle
     pass_k_key = f"pass_at_{K}"
+    exact_k_key = f"exact_at_{K}"
     puzzles_per_batch = max(1, batch_size // K)   # keep all K attempts of a puzzle in the same batch
 
     rows = []
@@ -89,6 +91,8 @@ def sample_and_score(
     combo_dir = samples_dir / combo_name
     if is_main_process:
         combo_dir.mkdir(parents=True, exist_ok=True)
+        if generations_dir is not None:
+            generations_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
     for start in range(0, len(ds), puzzles_per_batch):
         puzzles = [ds[i] for i in range(start, min(start + puzzles_per_batch, len(ds)))]
@@ -116,6 +120,23 @@ def sample_and_score(
                         vutils.save_image(combined_img, out_img_path)
                         saved += 1
 
+        # Persist EVERY attempt, named exactly the way infer_janus.py names its output
+        # ({prefix}_{id}_attempt{N}), so a metric change can be re-scored on CPU with
+        # experiments/amaze_score_generated_images.py instead of re-running sampling on
+        # a GPU. Without this the generations are discarded the moment they are scored,
+        # which is why the VLM results re-score in minutes but DiT/PT have to resample.
+        if is_main_process and generations_dir is not None:
+            for pi in range(P):
+                meta = puzzles[pi].metadata or {}
+                puzzle_id = meta.get("id")
+                if puzzle_id is None:
+                    continue
+                for attempt in range(K):
+                    vutils.save_image(
+                        inputs[pi, attempt].cpu(),
+                        generations_dir / f"{gen_prefix}_{puzzle_id}_attempt{attempt + 1:03d}.png",
+                    )
+
         if sample_pair is None and P > 0:
             cond = puzzles[0].spatial_conditions
             sample_pair = {
@@ -124,16 +145,20 @@ def sample_and_score(
             }
         metadata = [p.metadata if p.metadata is not None else {} for p in puzzles]
 
-        # Pass@K is best-of-K: the evaluator sets pass_at_{K} = any(exact solve) over the K attempts (eval/amaze_eval.py).
+        # Pass@K is the MEAN of the paper's continuous Pass over the K attempts;
+        # Exact@K is best-of-K set equality (eval/amaze_eval.py).
         for rec in scorer.compute_and_accumulate_metrics(inputs, metadata):
             pass_at_k = rec[pass_k_key] if K > 1 else rec["pass"]
+            exact_at_k = rec[exact_k_key] if K > 1 else rec["exact"]
             rows.append({
                 "violation": rec["background_violation"],
                 "coverage": rec["gt_cell_coverage"],
                 "mse_inside": rec["mse_inside"],
                 "mse_outside": rec["mse_outside"],
-                "pass1": rec["pass"],        # exact solve on the first attempt
-                "pass5": pass_at_k,          # exact solve within K attempts (best-of-K)
+                "pass1": rec["pass"],        # paper Pass = max(0, cov - viol), first attempt
+                "pass5": pass_at_k,          # paper Pass averaged over the K attempts
+                "exact1": rec["exact"],      # strict set equality, first attempt
+                "exact5": exact_at_k,        # strict set equality within K attempts
             })
     return rows, sample_pair
 
@@ -246,6 +271,12 @@ def main(cfg: DictConfig):
     if accelerator.is_main_process:
         samples_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep every generation so a later metric change is a CPU re-score, not a resample.
+    # ~14k PNGs per task at 144px (a few hundred MB, against 145MB checkpoints in the
+    # same directory). Set +save_generations=false to restore the old throw-away path.
+    generations_root = (Path(checkpoint).parent / "generations"
+                        if cfg.get("save_generations", True) else None)
+
     # Pack whole puzzles + their K attempts into denoising batches of this size (defaults to the
     # sampling pipeline's own batch_size) instead of sampling one puzzle at a time.
     sample_batch_size = int(cfg.get("sample_batch_size", model.sampling_pipeline.batch_size))
@@ -265,7 +296,12 @@ def main(cfg: DictConfig):
                     rows, sample_pair = sample_and_score(
                         model, ds, "maze", device, samples_per_puzzle, seed, sample_batch_size,
                         combo_name=combo_name, samples_dir=samples_dir,
-                        is_main_process=accelerator.is_main_process
+                        is_main_process=accelerator.is_main_process,
+                        # One flat dir per geometry holding every size, which is the
+                        # layout amaze_score_generated_images.py expects for maze: each
+                        # size's combo picks out the ids present in its own parquet.
+                        generations_dir=(generations_root / "maze" / geometry) if generations_root else None,
+                        gen_prefix=f"{scale}x{scale}",
                     )
 
                     per_combo[combo_name] = rows
@@ -301,7 +337,12 @@ def main(cfg: DictConfig):
                 rows, sample_pair = sample_and_score(
                     model, ds, "queens", device, samples_per_puzzle, seed, sample_batch_size,
                     combo_name=combo_name, samples_dir=samples_dir,
-                    is_main_process=accelerator.is_main_process
+                    is_main_process=accelerator.is_main_process,
+                    # Queens ids ("level_7_000001") contain underscores, so the scorer
+                    # requires an underscore-free prefix and recovers the size from the
+                    # id — hence one flat dir for every scale, prefixed like infer_janus.
+                    generations_dir=(generations_root / "queens") if generations_root else None,
+                    gen_prefix="0x0",
                 )
 
                 per_scale_rows[str(scale)] = rows

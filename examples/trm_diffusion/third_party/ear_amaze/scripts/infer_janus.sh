@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=0 python infer_new.py \
+    --checkpoint_path /root/private_data/janus_outputs/janus_train_hexagon/hexagon_1/checkpoint-8-1703/tfmr \
+    --data_path /root/private_data/hexagon/maze-dataset \
+    --split test \
+    --output_dir ./inference_results \
+    --batch_size 16 \
+    --temperature 1.0 \
+    --num_attempts 5 \
+    --filter_size_min 5 \
+    --filter_size_max 16 \
+    --samples_per_size 50 \
+    --filter_shape hexagon

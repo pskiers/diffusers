@@ -38,11 +38,11 @@ PROJECT_ROOT="${PROJECT_ROOT:-/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/ex
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 if [[ -z "${EAR_AMAZE_ROOT:-}" ]]; then
-    for _cand in "${PROJECT_ROOT}/third_party/ear-amaze" "${PROJECT_ROOT}/third_party/amaze"; do
+    for _cand in "${PROJECT_ROOT}/third_party/ear_amaze"; do
         if [[ -f "${_cand}/infer/infer_janus.py" ]]; then EAR_AMAZE_ROOT="${_cand}"; break; fi
     done
 fi
-: "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_janus.py under PROJECT_ROOT/third_party (tried ear-amaze, amaze). Set EAR_AMAZE_ROOT=, or run third_party/amaze/setup_ft_code.sh}"
+: "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_janus.py under PROJECT_ROOT/third_party (tried ear_amaze). Set EAR_AMAZE_ROOT=, or run third_party/ear_amaze/setup_ft_code.sh}"
 
 # Override DATA_PATH to sample a subset (e.g. a single size) instead of the full
 # ft/ test split; it just needs a directory holding maze_dataset_test.parquet.
@@ -72,11 +72,16 @@ export PYTHONPATH="${EAR_AMAZE_ROOT}/sft/janus/Janus:${EAR_AMAZE_ROOT}:${PYTHONP
 # Queens filenames are identical across models (same test set, same ids), so two
 # runs sharing a GEN_DIR silently overwrite each other's images AND their metrics
 # json. Override GEN_DIR when comparing two checkpoints of the same task.
+# THINK=1 (CoT) writes to <task>_cot/... so it can never overwrite the plain
+# generations that the non-CoT tables were scored from. An explicit GEN_DIR
+# still wins, as before.
+COT_SUFFIX=""
+[ "${THINK:-0}" = "1" ] && COT_SUFFIX="_cot"
 if [ -z "${GEN_DIR:-}" ]; then
     if [ "${KIND}" = "maze" ]; then
-        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}/${SHAPE}"
+        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}${COT_SUFFIX}/${SHAPE}"
     else
-        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}"
+        GEN_DIR="${EAR_AMAZE_ROOT}/inference_results/${TASK}${COT_SUFFIX}"
     fi
 fi
 mkdir -p "${GEN_DIR}"
@@ -137,7 +142,7 @@ SCORE_ARGS=(
     "${KIND}"
     --gen-dir "${GEN_DIR}"
     --data-root "${PROJECT_ROOT}/data/amaze"
-    --run-name "janus_${TASK}${SHAPE:+_${SHAPE}}"
+    --run-name "janus_${TASK}${SHAPE:+_${SHAPE}}${COT_SUFFIX}"
     --wandb-project amaze_final
 )
 # Maze needs the shape; queens scores all scales in one pass (no --geometry).

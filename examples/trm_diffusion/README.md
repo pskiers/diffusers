@@ -253,3 +253,95 @@ accelerate launch --mixed_precision="fp16" sample.py \
   num_samples=10000 \
   sample_batch_size=64
 ```
+## Vendored AMAZE benchmark code (`third_party/ear_amaze`)
+
+The AMAZE benchmark code is vendored here rather than used as an external
+checkout, because running it required a number of corrections. Everything under
+`third_party/ear_amaze/` is the authors' code plus the fixes listed below; our
+own scripts (`eval/`, `experiments/`, `slurm_scripts/`) import from it directly.
+
+There used to be a second, partial copy at `third_party/amaze/`. It has been
+removed: it lacked every fix below, plus `config/`, `dataset/`, `flow_grpo/`,
+`data/*.py`, the maze-generator JS and `requirements.txt`. The directory is
+named `ear_amaze` with an underscore because a hyphen is not a legal Python
+module name — which is why the scorer previously had to import from the stale
+copy.
+
+Only source is committed. Model weights, generated images and training outputs
+are excluded via `.gitignore` (they run to hundreds of GB).
+
+### Corrections to the authors' code
+
+| file | what was wrong |
+|---|---|
+| `infer/bagel/inferencer.py` | Bagel inference fixes across `InterleaveInferencer` (7 hunks). The `think=` / `max_think_tokens=` CoT parameters were present but unreachable — see below. |
+| `infer/bagel/modeling/bagel/bagel.py` | stray import removed |
+| `infer/infer_bagel.py` | output-resolution fix, a reworked `MazePromptImageDataset`, and substantial changes to the `eval()` loop (batched inference, image/prompt alignment) |
+| `infer/infer_janus.py` | import fix, plus the CoT pass below |
+| `sft/bagel/sft.py`, `sft/janus/sft.py` | fine-tuning script fixes |
+
+### Chain-of-thought (CoT) sampling
+
+The paper describes a `<think>` planning pass before image generation. It was
+not usable as shipped:
+
+- **Bagel** — `InterleaveInferencer` implemented `think=` and
+  `max_think_tokens=` together with `GEN_THINK_SYSTEM_PROMPT`, but
+  `infer_bagel.py` never passed them, so the feature was dead code. It is now
+  forwarded from the `THINK` environment variable.
+- **Janus** — no CoT support of any kind existed. Janus-Pro cannot emit text and
+  an image in one pass, so CoT is implemented as two passes: the conversation is
+  built *without* the trailing `image_start_tag` (leaving the assistant turn open
+  for text), the puzzle's VQ embeddings are injected exactly as in the image
+  path, a plan is generated, and the prompt is rewritten to carry it before the
+  normal image pass runs. A failed planning pass logs an error and falls back to
+  plain generation rather than losing the batch.
+
+Enable with `THINK=1` (optionally `MAX_THINK_TOKENS=...`). CoT is inference-time
+only — neither model was fine-tuned with it — so a CoT run is a full
+re-generation, not a re-score. CoT output is written to a separate
+`<task>_cot` / `*_cot` directory so it can never overwrite the plain generations.
+
+### Metric corrections (`eval/amaze_eval.py`)
+
+- **`Pass` now follows the paper**: `max(0, Coverage - Violation)`, a continuous
+  score, for both maze and queens. It was previously implemented as a binary
+  exact-match. Note the paper's `Violation` is normalised by the *generated*
+  cell count, which is what we use; the authors' released reward code normalises
+  by the total background cell count instead. The two disagree.
+- **`Exact` added** as a separate metric — strict set equality between the
+  predicted and ground-truth cell sets. This is the stricter criterion the old
+  `Pass` implemented, kept because it is not gameable: under the paper's `Pass`,
+  painting every cell of the maze blue scores 0.73–0.82, since the solution path
+  covers most cells.
+- **`Pass@K` is the mean over the K attempts** (the paper evaluates each model
+  five times and reports the average); **`Exact@K` is best-of-K**, the usual
+  pass@k reading.
+- **Start and goal cells are treated as given.** They are drawn into the input as
+  a red dot and cross, so requiring the model to *also* paint them blue measures
+  obedience to a rendering convention rather than planning. One model left them
+  at exactly `0.000` blue fill and lost every triangle board to it while drawing
+  the route correctly; another painted through them. The terminal cells are
+  intersected with the ground truth, so this can never invent a cell or lower
+  `Violation`, and it is a no-op for a model that does paint them.
+
+A ground-truth self-test is available: `sbatch slurm_scripts/test_metrics.sh`
+scores the reference solution image for every geometry and size and asserts
+`Coverage=1, Violation=0, Pass=1, Exact=1`.
+
+### Scoring resolution
+
+Metrics are computed at each puzzle's **native** resolution — the `cell_map` is
+never resized, and the generated image is upscaled to match it. The `IMAGE_SIZE`
+normalisation applied before scoring (default 144) is therefore a bottleneck only
+for models that generate larger images. Pass `IMAGE_SIZE=` to match the
+generation resolution when scoring Janus (384) or Bagel (640), otherwise detail
+is discarded; the scorer warns when it is downscaling.
+
+### Collecting results
+
+`collect_final_results.py` gathers per-model metrics into `final_results/`. It
+merges the per-shape maze JSONs (the scorer writes one file per geometry inside
+the generation directory), strips OOD sections, and refuses to ship a result
+that mixes freshly-scored and stale shards — recording each shard's timestamp so
+a partial re-run is visible rather than silent.

@@ -3,6 +3,8 @@ Implements the AMAZE paper (arXiv:2604.22868) metrics so Maze and
 Queen report the SAME quantities:
     Coverage  = |predicted ∩ GT| / |GT|
     Violation = |predicted different from GT| / |predicted|
+    (Maze only: cells within MAZE_ENDPOINT_TOLERANCE cell widths of the given
+     start/goal are excluded from both sets before any of this is computed.)
     Pass@1    = fraction of exact solves (predicted == GT ⇔ Coverage=1 & Violation=0)
     Pass@5    = fraction of exact solves in 5 attempts
     MSE-In / MSE-Out = MSE inside / outside the path_mask (mask_img)
@@ -17,7 +19,7 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy import ndimage
-from third_party.amaze.infer.maze_metrics import MazeRewardFunction, extract_blue_path
+from third_party.ear_amaze.infer.maze_metrics import MazeRewardFunction, extract_blue_path
 
 
 # A maze cell counts as covered by the drawn path only once this fraction of its
@@ -27,12 +29,32 @@ from third_party.amaze.infer.maze_metrics import MazeRewardFunction, extract_blu
 # over 140 mazes (every shape x size) is 0.0096 blue, so this sits ~3x below it.
 MAZE_MIN_CELL_FILL = 0.003
 
+# Radius, in cell widths, of the neighbourhood around the start and goal that maze
+# scoring ignores. The endpoints are GIVEN by the puzzle (drawn in as the red dot and
+# X), so what a model does within a cell of them reflects a rendering convention, not
+# routing. The neighbourhood is dropped from the prediction AND the ground truth, so
+# the tolerance is symmetric. Crediting only the two endpoint cells (the previous
+# rule) was not: it forgave a model that stopped short of an endpoint but still failed
+# one that painted a single cell past it, which silently penalised whichever
+# geometries a model happened to paint through. Set MAZE_ENDPOINT_TOLERANCE=0 to score
+# strictly, with no endpoint tolerance at all.
+MAZE_ENDPOINT_TOLERANCE = float(os.environ.get("MAZE_ENDPOINT_TOLERANCE", "1.3"))
+
+# The tolerance is meant to absorb a one-cell stub where the stroke stops short of, or
+# overshoots, a given marker. Audited over 400 boards it never hid more than 2 cells on
+# a board it let pass, and never more than 5 on any board at all. A board that passes
+# ONLY because more than this was hidden is the false-positive case the tolerance is
+# supposed to be too small to create, so say so loudly rather than let it score 1.0
+# in silence.
+MAZE_ENDPOINT_HIDDEN_WARN = int(os.environ.get("MAZE_ENDPOINT_HIDDEN_WARN", "2"))
+
 _METRIC_KEYS: Tuple[str, ...] = (
     "mse_inside",
     "mse_outside",
     "gt_cell_coverage",
     "background_violation",
     "pass",
+    "exact",
 )
 
 
@@ -97,9 +119,16 @@ class AmazeMetrics:
                     print(f"Error scoring {self.task} sample {self._n}: {e}")
                     attempts.append(dict.fromkeys(_METRIC_KEYS, 0.0))
 
-            record = dict(attempts[0])                 # first-round metrics + pass (=Pass@1)
+            record = dict(attempts[0])                 # first-round metrics (Pass@1 / Exact@1)
             if n_attempts > 1:
-                record[f"pass_at_{n_attempts}"] = float(any(a["pass"] >= 1.0 for a in attempts))
+                # Paper: "We evaluate each model 5 times and report the average
+                # Pass@5 ... We also supplement with Pass@1 using the first-round
+                # image generation." -> Pass@K is the MEAN over the K attempts.
+                record[f"pass_at_{n_attempts}"] = float(
+                    sum(a["pass"] for a in attempts) / len(attempts))
+                # Exact@K keeps the usual pass@k reading: solved in <= K attempts.
+                record[f"exact_at_{n_attempts}"] = float(
+                    any(a["exact"] >= 1.0 for a in attempts))
             for key, value in record.items():
                 self._per_key.setdefault(key, []).append(float(value))
             self._n += 1
@@ -222,7 +251,8 @@ class AmazeMetrics:
 
         coverage = len(predicted & gt_set) / len(gt_set) if gt_set else 0.0
         violation = len(predicted - gt_set) / len(predicted) if predicted else 0.0
-        pass_metric = float(bool(gt_set) and predicted == gt_set)
+        pass_metric = max(0.0, coverage - violation)
+        exact_metric = float(bool(gt_set) and predicted == gt_set)
 
         mask = self._solution_mask(n, cell_size, queen_radius, gt_queens, size)
         diff_sq = ((gen_arr.astype(np.float64) - gt_arr.astype(np.float64)) / 255.0) ** 2
@@ -236,6 +266,7 @@ class AmazeMetrics:
             "gt_cell_coverage": coverage,
             "background_violation": violation,
             "pass": pass_metric,
+            "exact": exact_metric,
         }
 
     # MAZES
@@ -282,6 +313,56 @@ class AmazeMetrics:
         cells.discard(0)                    # 0 = wall / background
         return cells
 
+    def _cell_centroids(self, cell_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """(ids, cx, cy, area) for every cell id present. Empty ids get an infinite
+        centroid so they can never fall inside a distance test."""
+        flat = cell_ids.ravel()
+        yy, xx = np.mgrid[0:cell_ids.shape[0], 0:cell_ids.shape[1]]
+        top = int(flat.max()) + 1
+        if top <= 1 << 20:                  # dense numbering, same branch as _cells_covered
+            ids = np.arange(top)
+            area = np.bincount(flat, minlength=top).astype(np.float64)
+            sy = np.bincount(flat, weights=yy.ravel(), minlength=top)
+            sx = np.bincount(flat, weights=xx.ravel(), minlength=top)
+        else:                               # sparse RGB-packed ids
+            ids, inverse = np.unique(flat, return_inverse=True)
+            area = np.bincount(inverse).astype(np.float64)
+            sy = np.bincount(inverse, weights=yy.ravel())
+            sx = np.bincount(inverse, weights=xx.ravel())
+        occupied = area > 0
+        safe = np.maximum(area, 1.0)
+        cy = np.where(occupied, sy / safe, np.inf)
+        cx = np.where(occupied, sx / safe, np.inf)
+        return ids, cx, cy, area
+
+    def _endpoint_cells(self, cell_ids: np.ndarray, endpoints: Sequence[int],
+                        radius_cells: float | None = None) -> set:
+        """Cell ids lying within ``radius_cells`` cell widths of the start or goal.
+
+        Cells tile the board, so the median cell area gives a pitch that works for
+        square, triangular, hexagonal and circular geometries alike without special
+        casing any of them.
+        """
+        if radius_cells is None:
+            radius_cells = MAZE_ENDPOINT_TOLERANCE
+        if radius_cells <= 0 or cell_ids.size == 0:
+            return set()
+        ids, cx, cy, area = self._cell_centroids(cell_ids)
+        real = area[(area > 0) & (ids != 0)]
+        if real.size == 0:
+            return set()
+        limit = (radius_cells * float(np.sqrt(np.median(real)))) ** 2
+        position = {int(i): k for k, i in enumerate(ids)}
+        near = np.zeros(len(ids), dtype=bool)
+        for endpoint in endpoints:
+            k = position.get(int(endpoint))
+            if k is None or not np.isfinite(cx[k]):
+                continue
+            near |= ((cx - cx[k]) ** 2 + (cy - cy[k]) ** 2) <= limit
+        cells = {int(i) for i in ids[near]}
+        cells.discard(0)
+        return cells
+
     def _compute_maze_metrics(self, generated_image: torch.Tensor, metadata: Dict) -> Dict[str, float]:
         """Score one generated Maze against its ground truth (AMAZE paper §2.2).
 
@@ -299,7 +380,8 @@ class AmazeMetrics:
         if raw is None:
             raise ValueError("metadata['metadata'] is missing — not a Maze sample?")
         meta = json.loads(raw) if isinstance(raw, str) else raw
-        gt_cell_ids = {int(c) for c in meta.get("path_cell_ids", [])}
+        path_ids = [int(c) for c in meta.get("path_cell_ids", [])]
+        gt_cell_ids = set(path_ids)
 
         # Reuse maze_metrics' metadata unpacking: (original, marked, solution, mask).
         _ori, _marked, sol_img, mask_img = self._mrf.get_reference_images("", metadata)
@@ -315,6 +397,17 @@ class AmazeMetrics:
         gen_arr = self._to_pixel_array(generated_image, size)        # (H, W, 3) uint8
         blue = self._morph_open(extract_blue_path(gen_arr))  # type: ignore[arg-type]
         predicted = self._cells_covered(blue, cell_ids)
+        # Drop the endpoint neighbourhood from BOTH sets (see MAZE_ENDPOINT_TOLERANCE)
+        # so what the model paints around the given start/goal markers cannot decide
+        # the score in either direction. Skipped when it would empty the ground truth,
+        # which would otherwise score a correct but very short path as zero.
+        hidden = 0
+        if path_ids:
+            ignored = self._endpoint_cells(cell_ids, (path_ids[0], path_ids[-1]))
+            if ignored and gt_cell_ids - ignored:
+                hidden = len((predicted ^ gt_cell_ids) & ignored)
+                predicted = predicted - ignored
+                gt_cell_ids = gt_cell_ids - ignored
 
         coverage = len(predicted & gt_cell_ids) / len(gt_cell_ids) if gt_cell_ids else 0.0
         violation = len(predicted - gt_cell_ids) / len(predicted) if predicted else 0.0
@@ -330,7 +423,15 @@ class AmazeMetrics:
         else:
             mse_inside, mse_outside = 0.0, 0.0
 
-        pass_metric = float(bool(gt_cell_ids) and predicted == gt_cell_ids)
+        # Paper (arXiv:2604.22868): "Pass = max(0, Coverage - Violation)".
+        # Continuous; Pass == 1 iff the cell sets match exactly. Exact keeps that
+        # strict criterion as its own metric.
+        pass_metric = max(0.0, coverage - violation)
+        exact_metric = float(bool(gt_cell_ids) and predicted == gt_cell_ids)
+        if exact_metric and hidden > MAZE_ENDPOINT_HIDDEN_WARN:
+            print(f"WARNING: maze board scored EXACT only because the endpoint tolerance "
+                  f"hid {hidden} disagreeing cells (> {MAZE_ENDPOINT_HIDDEN_WARN}). That is "
+                  f"more than a stub at a given marker — inspect this board before trusting it.")
 
         return {
             "mse_inside": float(mse_inside),
@@ -338,6 +439,7 @@ class AmazeMetrics:
             "gt_cell_coverage": coverage,
             "background_violation": violation,
             "pass": pass_metric,
+            "exact": exact_metric,
         }
 
     # Other Helpers
@@ -388,7 +490,8 @@ QUEEN_OOD_SCALES = [int(x) for x in os.environ.get("QUEEN_OOD_SCALES", "12").spl
 
 # The six aggregated per-puzzle row keys (distinct from ``_METRIC_KEYS`` above, which
 # are the raw per-image scorer keys).
-METRIC_KEYS = ("violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5")
+METRIC_KEYS = ("violation", "coverage", "mse_inside", "mse_outside",
+               "pass1", "pass5", "exact1", "exact5")
 
 
 def aggregate(rows: list[dict]) -> dict:
@@ -433,6 +536,10 @@ def build_maze_result(per_combo: dict, ood_combo: dict) -> dict:
     all_rows = [r for rows in per_combo.values() for r in rows]
     return {
         "task": "maze",
+        # Stamped into every maze result so collect_final_results.py can refuse to ship
+        # a mix of tolerances. Changing this constant changes the numbers without
+        # changing the schema, which no key-presence check could ever catch.
+        "endpoint_tolerance": MAZE_ENDPOINT_TOLERANCE,
         # NOTE: "overall" spans exactly the geometries in "geometries", not
         # necessarily all four.
         "geometries": geometries,

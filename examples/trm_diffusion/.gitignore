@@ -16,3 +16,24 @@ third_party/amaze/mazes-generator/node_modules/
 # glue (sft/, infer/, data/) IS committed; these huge base repos are not.
 third_party/amaze/sft/bagel/Bagel/
 third_party/amaze/sft/janus/Janus/
+
+# ── Vendored AMAZE checkout (third_party/ear_amaze) ───────────────────────────
+# Source is committed; model weights, generations and training outputs are not
+# (they are ~779 GB on the cluster).
+third_party/ear_amaze/sft/*/outputs/
+third_party/ear_amaze/sft/bagel/Bagel/
+third_party/ear_amaze/sft/janus/Janus/
+third_party/ear_amaze/inference_results/
+third_party/ear_amaze/wandb/
+third_party/ear_amaze/assets/
+third_party/ear_amaze/assets.zip
+third_party/ear_amaze/*.jpg
+**/node_modules/
+**/__pycache__/
+**/.DS_Store
+*.bak-*
+*.orig-*
+
+# local diagnostic scratch scripts
+diag_*.py
+diag_*.sbatch

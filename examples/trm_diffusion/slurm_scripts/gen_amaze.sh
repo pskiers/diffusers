@@ -42,10 +42,10 @@ mkdir -p slurm_outputs
 
 # The maze generator is a node package
 if [[ "${TASK}" != "queens" && "${STAGE}" != "verify" && "${STAGE}" != "report" ]]; then
-  if [[ ! -d third_party/amaze/mazes-generator/node_modules ]]; then
-    echo "ERROR: third_party/amaze/mazes-generator/node_modules is missing." >&2
+  if [[ ! -d third_party/ear_amaze/mazes-generator/node_modules ]]; then
+    echo "ERROR: third_party/ear_amaze/mazes-generator/node_modules is missing." >&2
     echo "Run ONCE on the LOGIN node (needs internet):" >&2
-    echo "  module load GCCcore/14.3.0 nodejs/22.17.1 && (cd third_party/amaze/mazes-generator && npm install)" >&2
+    echo "  module load GCCcore/14.3.0 nodejs/22.17.1 && (cd third_party/ear_amaze/mazes-generator && npm install)" >&2
     exit 1
   fi
 fi

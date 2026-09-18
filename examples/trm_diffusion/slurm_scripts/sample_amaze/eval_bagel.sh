@@ -48,11 +48,11 @@ PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 if [[ -z "${EAR_AMAZE_ROOT:-}" ]]; then
-    for _cand in "${PROJECT_ROOT}/third_party/ear-amaze" "${PROJECT_ROOT}/third_party/amaze"; do
+    for _cand in "${PROJECT_ROOT}/third_party/ear_amaze"; do
         if [[ -f "${_cand}/infer/infer_bagel.py" ]]; then EAR_AMAZE_ROOT="${_cand}"; break; fi
     done
 fi
-: "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_bagel.py under PROJECT_ROOT/third_party. Set EAR_AMAZE_ROOT=, or run third_party/amaze/setup_ft_code.sh}"
+: "${EAR_AMAZE_ROOT:?no AMAZE checkout with infer/infer_bagel.py under PROJECT_ROOT/third_party. Set EAR_AMAZE_ROOT=, or run third_party/ear_amaze/setup_ft_code.sh}"
 
 # infer_bagel.py imports `dataset.maze_dataset` and is driven by an ml_collections
 # config file; neither is needed by infer_janus.py, so an older checkout may lack them.
@@ -66,7 +66,7 @@ if [[ ! -e "${EAR_AMAZE_ROOT}/flow_grpo/bagel/data/data_utils.py" ]]; then
         echo ">> linked ${EAR_AMAZE_ROOT}/flow_grpo -> infer (inferencer.py imports 'flow_grpo.bagel...')"
     else
         echo "ERROR: ${EAR_AMAZE_ROOT}/infer/bagel/data/data_utils.py missing." >&2
-        echo "       Run: bash third_party/amaze/setup_ft_code.sh" >&2; exit 1
+        echo "       Run: bash third_party/ear_amaze/setup_ft_code.sh" >&2; exit 1
     fi
 fi
 
@@ -80,12 +80,12 @@ if [[ ! -e "${EAR_AMAZE_ROOT}/dataset/maze_dataset.py" ]]; then
         echo ">> linked ${EAR_AMAZE_ROOT}/dataset -> data (infer_bagel.py imports 'dataset.maze_dataset')"
     else
         echo "ERROR: neither ${EAR_AMAZE_ROOT}/dataset/maze_dataset.py nor data/maze_dataset.py exists." >&2
-        echo "       Run: bash third_party/amaze/setup_ft_code.sh" >&2; exit 1
+        echo "       Run: bash third_party/ear_amaze/setup_ft_code.sh" >&2; exit 1
     fi
 fi
 [[ -f "${CONFIG}" ]] || {
     echo "ERROR: config file ${CONFIG} missing — infer_bagel.py is driven by ml_collections." >&2
-    echo "       Run: bash third_party/amaze/setup_ft_code.sh, or set CONFIG=<path to a config .py>" >&2; exit 1; }
+    echo "       Run: bash third_party/ear_amaze/setup_ft_code.sh, or set CONFIG=<path to a config .py>" >&2; exit 1; }
 
 # Defaults to the snapshot location on Helios so a forgotten/empty env var cannot
 # kill the job at submit. Override only if your snapshot lives elsewhere.
@@ -108,6 +108,8 @@ BATCH="${BATCH:-4}"
 STEPS="${STEPS:-50}"
 LOGDIR="${LOGDIR:-${PROJECT_ROOT}/runs/bagel_infer}"
 RUN_NAME="bagel_${TASK}${SHAPE:+_${SHAPE}}"
+# CoT output must not land in the same run dir as the plain generations.
+[ "${THINK:-0}" = "1" ] && RUN_NAME="${RUN_NAME}_cot"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze_final}"
 
 # Resolve the fine-tuned checkpoint: explicit arg wins, else newest step dir.
@@ -174,9 +176,9 @@ INFER_ARGS=(
     --config.sample.resolution="${RESOLUTION}"
     --config.sample.test_batch_size="${BATCH}"
     --config.sample.eval_num_steps="${STEPS}"
-    --config.sample.filter_size_min=0
-    --config.sample.filter_size_max=100000
-    --config.sample.samples_per_size=1000000
+    --config.sample.filter_size_min="${FILTER_SIZE_MIN:-0}"
+    --config.sample.filter_size_max="${FILTER_SIZE_MAX:-100000}"
+    --config.sample.samples_per_size="${SAMPLES_PER_SIZE:-1000000}"
 )
 # Maze filters to one shape; circle boards are sized by layers, which the authors'
 # code keys off is_circle. Queens generates every board (no shape filter).

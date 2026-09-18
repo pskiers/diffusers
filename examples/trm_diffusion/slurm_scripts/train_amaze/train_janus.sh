@@ -21,7 +21,7 @@ TASK="${1:?usage: sbatch slurm_scripts/train_amaze/train_janus.sh <maze|queens|m
 
 PROJECT_ROOT="/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/examples/trm_diffusion"
 VENV="${SCRATCH}/trm_helios_venv"
-EAR_AMAZE_ROOT="${PROJECT_ROOT}/third_party/ear-amaze"
+EAR_AMAZE_ROOT="${PROJECT_ROOT}/third_party/ear_amaze"
 SFT_DIR="${EAR_AMAZE_ROOT}/sft/janus"
 MAZE_DATASET_PATH="${PROJECT_ROOT}/data/amaze/ft/${TASK}"
 
