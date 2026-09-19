@@ -317,6 +317,31 @@ def _run_one_tstart(model, ds, scorer, device, t_start, run_timesteps, n_total, 
                             Image.fromarray(ceil_native[i]).save(f"{stem}_ceilout.png")
                             Image.fromarray(mss[i].sol).save(f"{stem}_gt.png")
                             dumped_counts[k] += 1
+                            _gt = list(mss[i].path)
+                            _qual = {
+                                "model": model_name, "t_start": t_start,
+                                "ctype": ctype, "level": active_p,
+                                "idx": dumped_counts[k] - 1,  # stem used the pre-increment value
+                                "stem": os.path.basename(stem),
+                                "gt_cells": _gt,
+                                "pred_corrupt": sorted(int(c) for c in pred),
+                                "pred_clean": sorted(int(c) for c in ceil_pred[p][i]),
+                                "injected": sorted(int(c) for c in r0.get("cells", set())),
+                                "size": r0["size"],
+                                "board_full": bool(board_full),
+                                # exact = predicted cell set equals the GT path
+                                # exactly, the same criterion as Exact@1.
+                                "exact_corrupt": bool(set(pred) == set(_gt)),
+                                "exact_clean": bool(set(ceil_pred[p][i]) == set(_gt)),
+                                "m_corrupt": {kk: float(vv) for kk, vv in corr_recs[i].items()
+                                              if isinstance(vv, (int, float))},
+                                "m_clean": {kk: float(vv) for kk, vv in ceil_recs[p][i].items()
+                                            if isinstance(vv, (int, float))},
+                                "m_floor": {kk: float(vv) for kk, vv in floor_recs[i].items()
+                                            if isinstance(vv, (int, float))},
+                            }
+                            with open(f"{stem}_qual.json", "w") as _fh:
+                                json.dump(_qual, _fh)
 
     results: dict = {}
     for p in CONTEXT_LEVELS:
