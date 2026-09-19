@@ -16,7 +16,7 @@ module load Python/3.10.4-GCCcore-11.3.0
 cd /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 virtualenv env
 source env/bin/activate
-module load CUDA/12.4.0
+module load "${CUDA_MODULE:-CUDA/12.4.0}"
 
 pip install .
 pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124

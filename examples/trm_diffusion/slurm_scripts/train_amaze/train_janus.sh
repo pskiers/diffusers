@@ -19,7 +19,7 @@ TASK="${1:?usage: sbatch slurm_scripts/train_amaze/train_janus.sh <maze|queens|m
 
 : "${SCRATCH:?SCRATCH is not set - run this under sbatch on Helios, or export SCRATCH yourself}"
 
-PROJECT_ROOT="/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/examples/trm_diffusion"
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${SCRATCH}/trm_helios_venv"
 EAR_AMAZE_ROOT="${PROJECT_ROOT}/third_party/ear_amaze"
 SFT_DIR="${EAR_AMAZE_ROOT}/sft/janus"
@@ -35,7 +35,7 @@ export PYTHONPATH="${SFT_DIR}/Janus:${EAR_AMAZE_ROOT}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
 [[ -d "${VENV}" ]] || { echo "ERROR: venv not found: ${VENV}" >&2; exit 1; }

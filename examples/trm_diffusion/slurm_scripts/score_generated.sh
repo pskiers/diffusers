@@ -64,7 +64,7 @@ RUN_NAME="${RUN_NAME:-janus_${TASK}${SHAPE:+_${SHAPE}}}"
 export MAZE_OOD_SCALES="${MAZE_OOD_SCALES-}"
 export QUEEN_OOD_SCALES="${QUEEN_OOD_SCALES-}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"

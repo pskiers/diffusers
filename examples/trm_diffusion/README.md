@@ -279,6 +279,7 @@ are excluded via `.gitignore` (they run to hundreds of GB).
 | `infer/infer_bagel.py` | output-resolution fix, a reworked `MazePromptImageDataset`, and substantial changes to the `eval()` loop (batched inference, image/prompt alignment) |
 | `infer/infer_janus.py` | import fix, plus the CoT pass below |
 | `sft/bagel/sft.py`, `sft/janus/sft.py` | fine-tuning script fixes |
+| `config/maze.py` | `maze_eval()` never declared `sample.filter_shape` or `is_circle`, the two keys `eval_bagel.sh` overrides per shape. `ml_collections` refuses to set a key a `ConfigDict` does not already have, so every Bagel *maze* run aborted before inference. Declared with defaults (`"square"` / `False`); a `None` default does not work, as `ml_collections` cannot type-check an override against it. |
 
 ### Chain-of-thought (CoT) sampling
 
@@ -337,6 +338,24 @@ normalisation applied before scoring (default 144) is therefore a bottleneck onl
 for models that generate larger images. Pass `IMAGE_SIZE=` to match the
 generation resolution when scoring Janus (384) or Bagel (640), otherwise detail
 is discarded; the scorer warns when it is downscaling.
+
+### Running on a second cluster
+
+The SLURM scripts were written for Helios and hard-coded two things that do not
+exist elsewhere: the absolute project path, and the Helios toolchain modules
+(`Python/3.11.5`, which Athena does not provide). Both are now overridable and
+the defaults are byte-identical to the old behaviour, so Helios is unaffected:
+
+- `PROJECT_ROOT` falls back to `${SLURM_SUBMIT_DIR:-$PWD}` instead of the
+  hard-coded Helios path, so a job runs from wherever it was submitted.
+- Module loads honour `PY_MODULE`, `CUDA_MODULE` and `CUDNN_MODULE`
+  (e.g. `PY_MODULE=Python/3.10.4` on Athena).
+- `slurm_scripts/submit.sh` wraps `sbatch` and picks the account and partition
+  from the hostname, so the same command works on either cluster.
+
+Note that a checkpoint's optimizer state is sharded by FSDP across the world
+size that wrote it: resuming `runs/*/checkpoints/NNNNNNN` requires the *same*
+number of ranks that produced it, regardless of how many GPUs the new node has.
 
 ### Collecting results
 

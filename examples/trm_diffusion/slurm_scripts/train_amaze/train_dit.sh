@@ -34,7 +34,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-${2:-amaze}}"
 RUN_NAME="${RUN_NAME:-${3:-${TASK}_dit${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}}"
 
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs

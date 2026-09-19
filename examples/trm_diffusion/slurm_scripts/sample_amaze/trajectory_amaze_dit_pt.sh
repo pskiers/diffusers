@@ -43,7 +43,7 @@ SEED="${SEED:-0}"
 WANDB_PROJECT="${WANDB_PROJECT:-amaze}"
 DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/amaze}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"

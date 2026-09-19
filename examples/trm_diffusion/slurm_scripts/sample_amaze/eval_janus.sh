@@ -34,7 +34,7 @@ else
     CHECKPOINT_OVERRIDE="${2:-}"
 fi
 
-PROJECT_ROOT="${PROJECT_ROOT:-/net/scratch/hscra/plgrid/plgmgrzanka/diffusers/examples/trm_diffusion}"
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
 if [[ -z "${EAR_AMAZE_ROOT:-}" ]]; then
@@ -57,7 +57,7 @@ export QUEEN_OOD_SCALES="${QUEEN_OOD_SCALES-}"
 export HF_HOME="${SCRATCH}/.cache/huggingface"
 mkdir -p "${PROJECT_ROOT}/slurm_outputs"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
 
 source "${VENV}/bin/activate"

@@ -34,7 +34,7 @@ EXTRA=("${@:3}")
 [[ "${STAGE}" =~ ^(all|test|train|verify|report)$ ]] \
   || { echo "STAGE must be all|test|train|verify|report" >&2; exit 1; }
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0 GCCcore/14.3.0 nodejs/22.17.1
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}" GCCcore/14.3.0 nodejs/22.17.1
 
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"

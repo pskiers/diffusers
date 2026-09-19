@@ -47,7 +47,7 @@ TRM_CKPT="${TRM_CKPT:-runs/pt_maze_final_thinker/checkpoint_final.pt}"
 PAINTER_CKPT="${PAINTER_CKPT:-runs/pt_maze_final_painter/checkpoint_final.pt}"
 DIT_CKPT="${DIT_CKPT:-runs/dit_maze_final/checkpoint_final.pt}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs "${OUT_DIR}"

@@ -13,7 +13,7 @@
 
 source /usr/local/sbin/modules.sh
 module load Python/3.10.4-GCCcore-11.3.0
-module load CUDA/12.4.0
+module load "${CUDA_MODULE:-CUDA/12.4.0}"
 source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/env/bin/activate
 
 cd /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/examples/trm_diffusion

@@ -61,7 +61,7 @@ BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-${SCRATCH}/models/BAGEL-7B-MoT}"
   exit 1; }
 echo ">> base model: ${BAGEL_MODEL_PATH}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs

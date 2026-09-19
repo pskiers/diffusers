@@ -18,7 +18,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 
-module load Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0
+module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
 source "${VENV}/bin/activate"
 cd "${PROJECT_ROOT}"
 export PYTHONUNBUFFERED=1 PROJECT_ROOT="${PROJECT_ROOT}"
