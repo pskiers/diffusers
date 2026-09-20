@@ -161,6 +161,18 @@ def generate_image_batch(
     # puzzle image, then fold it into `prompts` so the image pass below is
     # conditioned on it. No-op when THINK is unset.
     _think = bool(int(os.environ.get("THINK", "0")))
+    _dummy_think = bool(int(os.environ.get("DUMMY_THINK", "0")))
+    if _dummy_think:
+        # Text matching what the planning pass actually emits, so the only
+        # difference from the real CoT path is that no planning pass ran.
+        _fixed = ("1. Start by identifying the pattern in the given puzzle. "
+                  "2. Look for a way to place the queen in each row, column, "
+                  "and colored region without any overlapping. 3. Consider the "
+                  "placement of the queens in the remaining rows and columns.")
+        prompts = ["%s\n<think>%s</think>" % (a, _fixed) for a in prompts]
+        logger.info("[CoT] DUMMY_THINK: appended fixed %d-char plan, no planning pass",
+                    len(_fixed))
+        _think = False
     _max_think = int(os.environ.get("MAX_THINK_TOKENS", "256"))
     if _think:
         _think_pre = []
