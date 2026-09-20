@@ -160,6 +160,7 @@ def generate_image_batch(
     # so when THINK=1 we first generate a short textual plan conditioned on the
     # puzzle image, then fold it into `prompts` so the image pass below is
     # conditioned on it. No-op when THINK is unset.
+    _think_texts = []  # per-sample <think> text, injected in the assistant turn
     _think = bool(int(os.environ.get("THINK", "0")))
     _dummy_think = bool(int(os.environ.get("DUMMY_THINK", "0")))
     if _dummy_think:
@@ -169,9 +170,14 @@ def generate_image_batch(
                   "2. Look for a way to place the queen in each row, column, "
                   "and colored region without any overlapping. 3. Consider the "
                   "placement of the queens in the remaining rows and columns.")
-        prompts = ["%s\n<think>%s</think>" % (a, _fixed) for a in prompts]
-        logger.info("[CoT] DUMMY_THINK: appended fixed %d-char plan, no planning pass",
-                    len(_fixed))
+        _fixed = os.environ.get("DUMMY_THINK_TEXT", _fixed)
+        if os.environ.get("DUMMY_THINK_TAGS", "1") == "1":
+            _suffix = "\n<think>%s</think>" % _fixed
+        else:
+            _suffix = "\n%s" % _fixed
+        _think_texts = [_fixed] * len(prompts)
+        logger.info("[CoT] DUMMY_THINK: appended %d chars, tags=%s, no planning pass",
+                    len(_suffix), os.environ.get("DUMMY_THINK_TAGS", "1"))
         _think = False
     _max_think = int(os.environ.get("MAX_THINK_TOKENS", "256"))
     if _think:
@@ -229,8 +235,7 @@ def generate_image_batch(
 
             _plans = [_strip_think(x) for x in _plans]
             logger.info("[CoT] plan[0]: %s", (_plans[0][:200] if _plans else "<empty>"))
-            prompts = ["%s\n<think>%s</think>" % (a, b) if b else a
-                       for a, b in zip(prompts, _plans)]
+            _think_texts = list(_plans)
         except Exception as _e:
             # A failed planning pass must not lose the whole batch: fall back to
             # plain generation and say so loudly.
@@ -246,9 +251,18 @@ def generate_image_batch(
         else:
             user_content = prompt
         
+        _tt = _think_texts[i] if i < len(_think_texts) else ""
+        if _tt and os.environ.get("THINK_ROLE", "assistant") == "user":
+            # previous (incorrect) placement, kept for comparison
+            user_content = user_content + "\n<think>%s</think>" % _tt
+            _assistant_content = ""
+        elif _tt:
+            _assistant_content = "<think>%s</think>" % _tt
+        else:
+            _assistant_content = ""
         conversation = [
             {"role": "<|User|>", "content": user_content},
-            {"role": "<|Assistant|>", "content": ""}
+            {"role": "<|Assistant|>", "content": _assistant_content}
         ]
         
         # 应用对话模板
