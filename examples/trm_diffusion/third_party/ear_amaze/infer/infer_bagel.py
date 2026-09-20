@@ -447,6 +447,14 @@ def eval(inferencer, inference_hyper, test_dataloader, tokenizer, config, accele
                             **inference_hyper
                         )
                     
+                        _th = output_dict.get('thoughts') or []
+                        if _th:
+                            _t0 = (_th[0] or '')
+                            print(f"[CoT] thought[0] len={len(_t0)} chars: {_t0[:300]!r}",
+                                  flush=True)
+                        elif inference_hyper.get('think'):
+                            print("[CoT] WARNING: think=True but no thoughts returned",
+                                  flush=True)
                         # 批量模式返回字典，包含 'images' 键（图像列表）
                         if 'images' in output_dict and output_dict['images'] is not None:
                             # 批量模式：返回图像列表
@@ -1124,7 +1132,9 @@ def main(_):
         filter_size_min = getattr(config.sample, 'filter_size_min', None)
         filter_size_max = getattr(config.sample, 'filter_size_max', None)
         samples_per_size = getattr(config.sample, 'samples_per_size', None)
-        filter_shape = getattr(config.sample, 'filter_shape', None)
+        #  (the no-filter default) must collapse to None: the dataset
+        # treats any non-None value as an actual shape to match.
+        filter_shape = getattr(config.sample, 'filter_shape', None) or None
         test_dataset = MazePromptImageDataset(
             config.dataset, 
             config.dataset_split,

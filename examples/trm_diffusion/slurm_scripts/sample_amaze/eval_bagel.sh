@@ -159,6 +159,20 @@ echo "Bagel inference: task=${TASK} kind=${KIND} shape=${SHAPE:-<none>}"
 echo "Config:     ${CONFIG}"
 echo "Data:       ${DATA_PATH}"
 echo "Base model: ${BAGEL_MODEL_PATH}"
+# --- CHECKPOINT SANITY -------------------------------------------------------
+# infer_bagel.py only warns when checkpoint_path is missing and then runs the
+# BASE model, which produces plausible-looking but meaningless metrics. Make a
+# relative path absolute and hard-fail if the weights are not there.
+case "${CHECKPOINT_PATH}" in
+    /*) ;;
+    *)  CHECKPOINT_PATH="${PROJECT_ROOT}/${CHECKPOINT_PATH}" ;;
+esac
+if [[ ! -f "${CHECKPOINT_PATH}/model.safetensors" && ! -f "${CHECKPOINT_PATH}/ema.safetensors" ]]; then
+    echo "ERROR: no model.safetensors/ema.safetensors under ${CHECKPOINT_PATH}" >&2
+    echo "Refusing to run: inference would silently fall back to the base model." >&2
+    exit 1
+fi
+# -----------------------------------------------------------------------------
 echo "Checkpoint: ${CHECKPOINT_PATH}"
 echo "Logdir:     ${LOGDIR}"
 echo "============================================="

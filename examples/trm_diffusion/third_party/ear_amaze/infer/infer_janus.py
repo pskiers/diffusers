@@ -208,7 +208,14 @@ def generate_image_batch(
                     eos_token_id=processor.tokenizer.eos_token_id,
                 )
             _plans = processor.tokenizer.batch_decode(_out, skip_special_tokens=True)
-            _plans = [x.strip().replace("\n", " ")[:2000] for x in _plans]
+            def _strip_think(x):
+                # the model opens its own <think>; wrapping again would nest them
+                x = x.strip().replace("\n", " ")
+                for _t in ("<think>", "</think>"):
+                    x = x.replace(_t, " ")
+                return " ".join(x.split())[:2000]
+
+            _plans = [_strip_think(x) for x in _plans]
             logger.info("[CoT] plan[0]: %s", (_plans[0][:200] if _plans else "<empty>"))
             prompts = ["%s\n<think>%s</think>" % (a, b) if b else a
                        for a, b in zip(prompts, _plans)]

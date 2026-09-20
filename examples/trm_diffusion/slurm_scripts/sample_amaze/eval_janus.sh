@@ -127,11 +127,13 @@ INFER_ARGS=(
     --data_path "${DATA_PATH}"
     --split test
     --output_dir "${GEN_DIR}"
-    --batch_size 8
-    --temperature 1.0
-    --num_attempts 5
+    --batch_size "${BATCH:-8}"
+    --temperature "${TEMPERATURE:-1.0}"
+    --num_attempts "${ATTEMPTS:-5}"
 )
 # Maze filters to one shape; queens has no shape filter (generate every board).
+# optional: restrict the run for quick controlled comparisons
+[ -n "${SAMPLES_PER_SIZE:-}" ] && INFER_ARGS+=( --samples_per_size "${SAMPLES_PER_SIZE}" )
 [ "${KIND}" = "maze" ] && INFER_ARGS+=( --filter_shape "${SHAPE}" )
 srun python "${EAR_AMAZE_ROOT}/infer/infer_janus.py" "${INFER_ARGS[@]}"
 

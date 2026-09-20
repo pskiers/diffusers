@@ -125,7 +125,7 @@ def maze_eval():
     config.sample.samples_per_size = 50  # 每个尺寸选择的样本数，如 3 表示每个尺寸选前3个，None 表示选择所有
     # Declared so eval_bagel.sh can override it per shape; without the key
     # ml_collections rejects --config.sample.filter_shape= with AttributeError.
-    config.sample.filter_shape = "square"  # str so ml_collections allows CLI override; eval_bagel.sh always sets it
+    config.sample.filter_shape = ""  # "" = no filter; eval_bagel.sh sets it for maze only  # str so ml_collections allows CLI override; eval_bagel.sh always sets it
     config.is_circle = False  # top-level; eval_bagel.sh sets --config.is_circle=True for circle boards
     config.sample.resolution = 1024
     config.logdir = "output_images/grpo"
