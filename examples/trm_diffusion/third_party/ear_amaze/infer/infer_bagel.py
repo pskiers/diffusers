@@ -1161,7 +1161,10 @@ def main(_):
     test_dataloader = accelerator.prepare(test_dataloader)
 
     # Create output directory for saving images
-    output_dir = os.path.join(config.logdir, f"{config.run_name}_{config.sample.eval_num_steps}", "generated_images")
+    # Set AMAZE_OUTPUT_DIR to an existing generated_images dir to resume into it;
+    # _amaze_load_done_batch then reuses every batch already complete on disk.
+    output_dir = os.environ.get("AMAZE_OUTPUT_DIR") or os.path.join(
+        config.logdir, f"{config.run_name}_{config.sample.eval_num_steps}", "generated_images")
     
     logger.info("***** Running Evaluation *****")
     logger.info(f"  Test dataset size = {len(test_dataset)}")

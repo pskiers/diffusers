@@ -620,7 +620,14 @@ class InterleaveInferencer:
                 **generation_input,
             )
         
-        output = self.tokenizer.decode(unpacked_latent[:,0])
+        # One undecodable token must not abort the whole run: fall back to an
+        # empty plan for this sample (see _amaze_safe_decode).
+        try:
+            output = self.tokenizer.decode(unpacked_latent[:,0])
+        except TypeError as _e:  # _amaze_safe_decode
+            print(f"[CoT] thought decode failed ({_e}); using empty plan for this sample",
+                  flush=True)
+            output = ""
         # 防止 output 为空或格式不对的简单处理
         try:
             output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]

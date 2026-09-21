@@ -1,3 +1,5 @@
+GEN_THINK_SYSTEM_PROMPT = '''You should first think about the planning process in the mind and then generate the image. 
+The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here'''
 """
 CUDA_VISIBLE_DEVICES=0 python infer_new.py \
     --checkpoint_path /root/private_data/janus_outputs/janus_train_hexagon/hexagon_1/checkpoint-8-1703/tfmr \
@@ -161,6 +163,7 @@ def generate_image_batch(
     # puzzle image, then fold it into `prompts` so the image pass below is
     # conditioned on it. No-op when THINK is unset.
     _think_texts = []  # per-sample <think> text, injected in the assistant turn
+    _sysprompt = bool(int(os.environ.get("THINK_SYSPROMPT", "1")))
     _think = bool(int(os.environ.get("THINK", "0")))
     _dummy_think = bool(int(os.environ.get("DUMMY_THINK", "0")))
     if _dummy_think:
@@ -184,13 +187,18 @@ def generate_image_batch(
         _think_pre = []
         for _i, _pr in enumerate(prompts):
             _uc = (image_token_str + "\n" + _pr) if input_images[_i] is not None else _pr
-            _uc = (_uc + "\n\nFirst think step by step about how to solve this "
-                   "puzzle. Put your reasoning inside <think> </think> tags, then stop.")
+            if _sysprompt:
+                # authors' wording, as its own system segment (infer/bagel/inferencer.py)
+                _sys = GEN_THINK_SYSTEM_PROMPT
+            else:
+                _sys = ""
+                _uc = (_uc + "\n\nFirst think step by step about how to solve this "
+                       "puzzle. Put your reasoning inside <think> </think> tags, then stop.")
             _sft = processor.apply_sft_template_for_multi_turn_prompts(
                 conversations=[{"role": "<|User|>", "content": _uc},
                                {"role": "<|Assistant|>", "content": ""}],
                 sft_format=processor.sft_format,
-                system_prompt="",
+                system_prompt=_sys,
             )
             # NOTE: no image_start_tag here -- we want TEXT out, not image tokens.
             _think_pre.append(VLChatProcessorOutput(
@@ -233,8 +241,13 @@ def generate_image_batch(
                     x = x.replace(_t, " ")
                 return " ".join(x.split())[:2000]
 
+            if _plans:
+                logger.info("[CoT] RAW plan[0] len=%d: %s", len(_plans[0]), repr(_plans[0])[:400])
             _plans = [_strip_think(x) for x in _plans]
-            logger.info("[CoT] plan[0]: %s", (_plans[0][:200] if _plans else "<empty>"))
+            _p0 = _plans[0] if _plans else ""
+            _echo = "step by step about how to solve" in _p0
+            logger.info("[CoT] plan[0] len=%d echo=%s: %s",
+                        len(_p0), _echo, _p0[:300] if _p0 else "<empty>")
             _think_texts = list(_plans)
         except Exception as _e:
             # A failed planning pass must not lose the whole batch: fall back to
