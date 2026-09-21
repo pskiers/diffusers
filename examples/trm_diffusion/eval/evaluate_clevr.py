@@ -118,11 +118,18 @@ def print_report(m):
 
 
 def _score_image(image, gt_objects, gt_relationships, H, l_vec, f_vec, sz_thresh,
-                 dino_proc, dino_mod, sig_proc, sig_mod, text_embeds) -> dict:
+                 dino_proc, dino_mod, sig_proc, sig_mod, text_embeds, return_matches: bool = False):
     """Score a single generated PIL image (already at ORIG_W × ORIG_H) against its scene.
 
     Extracted verbatim from evaluate_model_samples — all logic is unchanged.
     Returns metric increments for the standard accumulator keys.
+
+    If return_matches, also returns matched_3d: dict mapping gt_objects index
+    -> detected 3-D (x, y) center (in the same units as scene "3d_coords"),
+    for every gt object a detected box was matched to. Lets a caller (e.g. a
+    corruption probe) check a SPECIFIC object's detected position against
+    ground truth directly, instead of only the aggregate relation score this
+    function already returns.
     """
     device = next(dino_mod.parameters()).device
 
@@ -271,6 +278,8 @@ def _score_image(image, gt_objects, gt_relationships, H, l_vec, f_vec, sz_thresh
                 if si in matched_3d and ti in matched_3d:
                     m["t_rel"] += 1
 
+    if return_matches:
+        return m, matched_3d
     return m
 
 
