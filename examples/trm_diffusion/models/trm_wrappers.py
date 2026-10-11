@@ -476,6 +476,125 @@ class SpatialTRM(BaseModel):
         return {k: float(np.mean(v)) for k, v in accum.items()}
 
 
+class SingleStateSpatialTRMInner(SpatialTRMInner):
+    """Single-state ablation of the TRM recursion.
+
+    The two-state inner model alternates, per H cycle::
+
+        z_L = L_level(z_L, z_H + emb)   (L_cycles times)
+        z_H = L_level(z_H, z_L)         (once)
+
+    Here there is only one state z, updated ``H_cycles * (L_cycles + 1)``
+    times per supervision step — the same number of L_level applications,
+    so depth/FLOPs per reasoning_step match the two-state model exactly.
+    As there, only the last H cycle's worth of updates (L_cycles + 1 of
+    them) carries gradient; the earlier ones run under no_grad.
+
+    input_injection:
+      "all"     — the input embedding is added at every update.
+      "l_steps" — it is added only at the L_cycles updates mirroring the
+                  two-state model's L updates; the update mirroring its H
+                  update gets no injection. Keeps the injection schedule
+                  identical to the baseline, so the number of states is
+                  the only difference.
+
+    The returned carry still has both z_H and z_L fields (so every
+    (z_H, z_L)-threading call site works unchanged), but z_L is only a
+    copy of the single state and is ignored on the way back in.
+    """
+
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config, input_injection: str = "all") -> None:
+        super().__init__(config)
+        if input_injection not in ("all", "l_steps"):
+            raise ValueError(f"input_injection must be 'all' or 'l_steps', got {input_injection!r}")
+        self.input_injection = input_injection
+
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: dict):
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        # Injection used by the update that mirrors the two-state H update.
+        h_inj = input_embeddings if self.input_injection == "all" else torch.zeros_like(input_embeddings)
+
+        def _cycle(z: torch.Tensor) -> torch.Tensor:
+            for _L_step in range(self.config.L_cycles):
+                z = self.L_level(z, input_embeddings, **seq_info)
+            return self.L_level(z, h_inj, **seq_info)
+
+        z = carry.z_H
+        # H_cycles-1 without grad, then 1 with grad (same split as the baseline)
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles - 1):
+                z = _cycle(z)
+        z = _cycle(z)
+
+        if not getattr(self, "_keep_carry_grad", False):
+            z = z.detach()
+        # z_L is a placeholder so the (z_H, z_L) carry API is unchanged; it is
+        # a clone, not an alias, so in-place writes by callers can't alias z_H.
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z, z_L=z.detach().clone())
+        output = self.lm_head(z)[:, self.puzzle_emb_len :]
+        q_logits = self.q_head(z[:, 0]).to(torch.float32)
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
+
+class SingleStateSpatialTRM(SpatialTRM):
+    """SpatialTRM with a single recurrent state instead of the (z_H, z_L) pair.
+
+    Drop-in replacement: it keeps SpatialTRM's whole external API, including
+    the two-tensor carry, so painters/eval callbacks/experiments need no
+    change. The second tensor is inert (see SingleStateSpatialTRMInner).
+
+    H_cycles / L_cycles keep their meaning as a depth budget:
+    H_cycles * (L_cycles + 1) state updates per supervision step, with the
+    last (L_cycles + 1) carrying gradient.
+    """
+
+    def __init__(self, *args, input_injection: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_injection = input_injection
+        # Rebuild the inner model with the single-state recursion. Cheap: the
+        # baseline inner built by super().__init__ is discarded before training.
+        self.inner = SingleStateSpatialTRMInner(self.inner.config, input_injection=input_injection)
+
+    def get_initial_states(self, bs: int):
+        """Both tensors come from H_init: there is one state, and the second
+        slot is only there to keep the carry API two-wide."""
+        total_len = self.inner.config.seq_len + self.inner.puzzle_emb_len
+        z = self.inner.H_init.view(1, 1, -1).expand(bs, total_len, -1).clone()
+        return z, z.clone()
+
+    @torch.no_grad()
+    def predict(
+        self,
+        inputs: torch.Tensor,
+        n_sup: Optional[int] = None,
+        puzzle_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full inference, single-state version of SpatialTRM.predict."""
+        n_sup = n_sup or self.n_sup
+        bs = inputs.shape[0]
+        if puzzle_ids is None:
+            puzzle_ids = torch.zeros(bs, dtype=torch.int32, device=inputs.device)
+
+        z, _ = self.get_initial_states(bs)
+        z = z.to(inputs.device)
+
+        seq_info = {"cos_sin": self.inner.rotary_emb() if hasattr(self.inner, "rotary_emb") else None}
+        input_emb = self.inner._input_embeddings(inputs, puzzle_ids)
+        h_inj = input_emb if self.input_injection == "all" else torch.zeros_like(input_emb)
+
+        for _ in range(n_sup):
+            for _ in range(self.inner.config.H_cycles):
+                for _ in range(self.inner.config.L_cycles):
+                    z = self.inner.L_level(z, input_emb, **seq_info)
+                z = self.inner.L_level(z, h_inj, **seq_info)
+
+        return self.inner.lm_head(z)[:, self.inner.puzzle_emb_len :]
+
+
 class TRMDiffusionBackbone(PainterBase, SpatialTRM):
     """SpatialTRM repurposed as the FULL pixel-space diffusion backbone,
     instead of a reasoning module that steers a separate frozen painter.

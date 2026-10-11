@@ -1,0 +1,48 @@
+# MNIST Sudoku TRM, single-state ablation.
+# Identical to thinker/mnist.yaml except for the recursion: one state z
+# instead of the (z_H, z_L) pair.  Depth budget is unchanged —
+# H_cycles * (L_cycles + 1) = 21 L_level applications per supervision step,
+# the last (L_cycles + 1) with gradient.
+# seq_len = 81 (one token per cell)
+_target_: models.trm_wrappers.SingleStateSpatialTRM
+vocab_size: 11
+seq_len: 81
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 512
+puzzle_emb_len: 16
+num_puzzle_identifiers: 1000
+halt_exploration_prob: 0.0
+freeze_weights: false
+batch_size: 384
+
+# "all": add the input embedding at every state update.
+# "l_steps": add it only at the L_cycles updates that mirror the two-state
+#            model's L updates, leaving the update that mirrors its H update
+#            un-injected (identical injection schedule to the baseline).
+input_injection: "all"
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
+  puzzle_emb:
+    _target_: configs.schemas.PuzzleEmbOptimConfig
+    lr: 1e-4
+    weight_decay: 1.0
+    warmup_steps: 2000
+    lr_min_ratio: 1.0
+with_timestep_emb: false
+with_halt_head: false
