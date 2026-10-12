@@ -24,11 +24,15 @@ halt_exploration_prob: 0.0
 freeze_weights: false
 batch_size: 384
 
-# "all": add the input embedding at every state update.
-# "l_steps": add it only at the L_cycles updates that mirror the two-state
-#            model's L updates, leaving the update that mirrors its H update
-#            un-injected (identical injection schedule to the baseline).
-input_injection: "all"
+# "l_steps": add the input embedding only at the L_cycles updates that mirror
+#            the two-state model's L updates, leaving the update that mirrors
+#            its H update un-injected. This is what the TRM repo's own
+#            single-state ablation does (models/trm/recursive_reasoning/
+#            trm_singlez.py) — keep it unless you are deliberately ablating.
+# "all":     add it at every update, as the paper's pseudocode literally
+#            reads. Gives the lm_head a direct shortcut to the input
+#            embedding; see SingleStateSpatialTRMInner's docstring.
+input_injection: "l_steps"
 
 optim_cfg:
   _target_: configs.schemas.ThinkerOptimConfig

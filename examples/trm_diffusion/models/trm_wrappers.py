@@ -491,23 +491,35 @@ class SingleStateSpatialTRMInner(SpatialTRMInner):
     them) carries gradient; the earlier ones run under no_grad.
 
     input_injection:
-      "all"     — the input embedding is added at every update.
-      "l_steps" — it is added only at the L_cycles updates mirroring the
-                  two-state model's L updates; the update mirroring its H
-                  update gets no injection. Keeps the injection schedule
-                  identical to the baseline, so the number of states is
-                  the only difference.
+      "l_steps" (default, matches the reference implementation) — the input
+                  embedding is added only at the L_cycles updates mirroring
+                  the two-state model's L updates; the update mirroring its
+                  H update gets none. This is verbatim what the TRM repo's
+                  own single-state ablation does, see
+                  models/trm/recursive_reasoning/trm_singlez.py::forward.
+      "all"     — added at every update, as the paper's pseudocode
+                  (`z = net(x, z)` throughout) literally reads. Do not use
+                  it as the ablation baseline: the state the lm_head reads
+                  then has the input added one block-pair before the
+                  readout, so logits get a near-linear shortcut from the
+                  input embedding, which the two-state model structurally
+                  forbids (its readout state z_H is never injected into).
 
     The returned carry still has both z_H and z_L fields (so every
     (z_H, z_L)-threading call site works unchanged), but z_L is only a
     copy of the single state and is ignored on the way back in.
     """
 
-    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config, input_injection: str = "all") -> None:
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config, input_injection: str = "l_steps") -> None:
         super().__init__(config)
         if input_injection not in ("all", "l_steps"):
             raise ValueError(f"input_injection must be 'all' or 'l_steps', got {input_injection!r}")
         self.input_injection = input_injection
+        # Stand-in for "no input injection" on the cycle-final update. A
+        # broadcastable scalar, so it costs nothing next to zeros_like(emb),
+        # and keeps the call going through self.L_level — which
+        # compile_submodules() replaces with a compiled module.
+        self.register_buffer("_no_inj", torch.zeros((), dtype=self.forward_dtype), persistent=False)
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: dict):
         seq_info = dict(
@@ -516,7 +528,7 @@ class SingleStateSpatialTRMInner(SpatialTRMInner):
 
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
         # Injection used by the update that mirrors the two-state H update.
-        h_inj = input_embeddings if self.input_injection == "all" else torch.zeros_like(input_embeddings)
+        h_inj = input_embeddings if self.input_injection == "all" else self._no_inj
 
         def _cycle(z: torch.Tensor) -> torch.Tensor:
             for _L_step in range(self.config.L_cycles):
@@ -530,11 +542,16 @@ class SingleStateSpatialTRMInner(SpatialTRMInner):
                 z = _cycle(z)
         z = _cycle(z)
 
-        if not getattr(self, "_keep_carry_grad", False):
-            z = z.detach()
+        # Only the CARRY is detached — the heads must read the un-detached z,
+        # or the loss reaches nothing but lm_head and the whole recursion
+        # trains on zero gradient. (The reference keeps a separate z_out
+        # reference for exactly this reason; the two-state forward above
+        # gets it for free because its carry and its readout are different
+        # tensors.)
+        carry_z = z if getattr(self, "_keep_carry_grad", False) else z.detach()
         # z_L is a placeholder so the (z_H, z_L) carry API is unchanged; it is
         # a clone, not an alias, so in-place writes by callers can't alias z_H.
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z, z_L=z.detach().clone())
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=carry_z, z_L=carry_z.detach().clone())
         output = self.lm_head(z)[:, self.puzzle_emb_len :]
         q_logits = self.q_head(z[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
@@ -552,7 +569,7 @@ class SingleStateSpatialTRM(SpatialTRM):
     last (L_cycles + 1) carrying gradient.
     """
 
-    def __init__(self, *args, input_injection: str = "all", **kwargs):
+    def __init__(self, *args, input_injection: str = "l_steps", **kwargs):
         super().__init__(*args, **kwargs)
         self.input_injection = input_injection
         # Rebuild the inner model with the single-state recursion. Cheap: the
@@ -584,7 +601,7 @@ class SingleStateSpatialTRM(SpatialTRM):
 
         seq_info = {"cos_sin": self.inner.rotary_emb() if hasattr(self.inner, "rotary_emb") else None}
         input_emb = self.inner._input_embeddings(inputs, puzzle_ids)
-        h_inj = input_emb if self.input_injection == "all" else torch.zeros_like(input_emb)
+        h_inj = input_emb if self.input_injection == "all" else self.inner._no_inj
 
         for _ in range(n_sup):
             for _ in range(self.inner.config.H_cycles):
