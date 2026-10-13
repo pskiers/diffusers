@@ -36,7 +36,7 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm.auto import tqdm
 
 from eval.mnist_eval import evaluate_grids, make_panel_image
-from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_and_step
 from models.spatial_diffusion_utils import (
     add_noise_spatial,
     add_noise_spatial_c,
@@ -503,6 +503,7 @@ class LatentSpatialDiT(nn.Module):
                 total_comps[k] = total_comps.get(k, 0.0) + v
             accelerator.backward(loss / (global_batch_size * K))
 
+        all_reduce_grads(self.dit.parameters())
         accelerator.clip_grad_norm_(self.dit.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()

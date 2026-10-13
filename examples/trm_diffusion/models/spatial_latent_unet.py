@@ -35,7 +35,7 @@ from tqdm.auto import tqdm
 from datasets.mnist_sudoku_dataset import get_solution_tokens  # kept for eval metrics only
 from eval.mnist_eval import evaluate_grids, make_panel_image
 from models.condition_encoders import ObjectFeatureEncoder
-from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_and_step
 from models.spatial_diffusion_utils import (
     add_noise_spatial,
     add_noise_spatial_c,
@@ -462,6 +462,7 @@ class SpatialLatentUNet(nn.Module):
                 total_comps[k] = total_comps.get(k, 0.0) + v
             accelerator.backward(loss / (global_batch_size * K))
 
+        all_reduce_grads(self._trainable_params())
         accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
@@ -539,6 +540,7 @@ class SpatialLatentUNet(nn.Module):
                 total_comps[k] = total_comps.get(k, 0.0) + v
             accelerator.backward(loss / (global_batch_size * K))
 
+        all_reduce_grads(self._trainable_params())
         accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()

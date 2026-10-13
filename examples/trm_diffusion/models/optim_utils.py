@@ -1,4 +1,59 @@
 import math
+from typing import Iterable, Optional
+
+import torch
+import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+
+def all_reduce_grads(params: Iterable[torch.nn.Parameter], weight: Optional[float] = None) -> float:
+    """Average the .grad of `params` across processes, in place.
+
+    train_step always runs on the unwrapped model (train_trm.py,
+    train_spatial.py), bypassing DDP's forward — and DDP only arms its
+    gradient hooks inside its own forward, so without this each rank
+    silently trains its own copy. Call after the last backward and before
+    clip_grad_norm_, so clipping sees the global gradient. A plain mean is
+    right because every loss in models/losses.py is batch-mean-reduced: with
+    the train_steps' `global_batch_size` divisor, the result equals a single
+    GPU's gradient on the whole global batch.
+
+    Assumes every rank holds grads for the same params (true whenever all
+    ranks run the same graph); a mismatch hangs the collective.
+
+    weight: this rank's share of a weighted mean, for when ranks hold
+    different amounts of data (see SpatialTRM.train_halt_head_ragged); None
+    = plain mean. Returns the global total weight (world_size for a plain
+    mean, no host sync) so a caller can skip its step when no rank had data.
+    """
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return 1.0 if weight is None else float(weight)
+    world_size = dist.get_world_size()
+    grads = [p.grad for p in params if p.grad is not None]
+
+    if weight is None:
+        total = float(world_size)
+    else:
+        if grads:
+            device = grads[0].device
+        else:  # NCCL only takes CUDA tensors, gloo (CPU tests) only CPU ones
+            device = torch.device("cuda", torch.cuda.current_device()) if dist.get_backend() == "nccl" else "cpu"
+        total_t = torch.tensor([float(weight)], device=device)
+        dist.all_reduce(total_t)
+        total = total_t.item()
+
+    by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+    for g in grads:
+        by_dtype.setdefault(g.dtype, []).append(g)
+    for group in by_dtype.values():
+        flat = _flatten_dense_tensors(group)
+        flat.mul_(1.0 / world_size if weight is None else float(weight))
+        dist.all_reduce(flat)
+        if weight is not None:
+            flat.div_(max(total, 1e-12))
+        for g, synced in zip(group, _unflatten_dense_tensors(flat, group)):
+            g.copy_(synced)
+    return total
 
 
 class ScheduledOptimizer:

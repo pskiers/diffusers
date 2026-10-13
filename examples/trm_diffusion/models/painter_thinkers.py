@@ -7,7 +7,7 @@ from hydra.utils import instantiate
 from tqdm.auto import tqdm
 
 from models.eval_callbacks import EvalCallbackBase
-from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_and_step
 from configs.schemas import (
     TrainConfig,
     EvalConfig,
@@ -590,8 +590,9 @@ class ThinkerFrozenPainterBase(BaseModel):
                     halt_histories[i]["z_H0"].append(d["z_H"][:, 0].detach())
                     halt_histories[i]["loss"].append(per_sample_loss.detach())
 
-            accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
             enc_params = self.get_encoder_params()
+            all_reduce_grads(self.get_thinker_params() + enc_params)
+            accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
             if enc_params:
                 accelerator.clip_grad_norm_(enc_params, 1.0)
             lr = apply_lr_and_step(optimizers, global_step)
@@ -866,8 +867,9 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 l_seq = torch.stack(slot["hist_loss"][j], dim=0)
                 completed_histories.append((z_seq, l_seq))
 
-        accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
         enc_params = self.get_encoder_params()
+        all_reduce_grads(self.get_thinker_params() + enc_params)
+        accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
         if enc_params:
             accelerator.clip_grad_norm_(enc_params, 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
@@ -876,8 +878,11 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             ema.update(self)
 
         losses = {k: v / K for k, v in total_losses.items()}
+        # Called even with no locally completed histories: its gradient sync is
+        # a collective, and other ranks may have some this step.
+        halt_loss = self.thinker.train_halt_head_ragged(completed_histories)
         if completed_histories:
-            losses["halt_head_loss"] = self.thinker.train_halt_head_ragged(completed_histories)
+            losses["halt_head_loss"] = halt_loss
             losses["act_steps_completed"] = float(len(completed_histories))
 
         return losses, lr, global_step

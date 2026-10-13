@@ -54,7 +54,7 @@ from models.base import BaseModel
 from models.diffusion_utils import apply_noisy_swap
 from models.interfaces import DiffusionPrediction, IPAdapterSteering, ThinkerSteering
 from models.losses import LossBase, build_loss
-from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_and_step
 
 # ── Abstract base ─────────────────────────────────────────────────────────────
 
@@ -408,6 +408,7 @@ class UNetPainter(PainterBase, BaseModel):
         # to tell a real gradient-explosion event (huge/nan norm right at the
         # loss spike) apart from something else entirely (loss jumps with a
         # perfectly normal grad norm) the next time this happens.
+        all_reduce_grads(self.parameters())
         grad_norm = accelerator.clip_grad_norm_(self.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
@@ -1015,6 +1016,7 @@ class DiTPainter(PainterBase, BaseModel):
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
 
+        all_reduce_grads(self.parameters())
         accelerator.clip_grad_norm_([p for p in self.parameters() if p.requires_grad], 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:

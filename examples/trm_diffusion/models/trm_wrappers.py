@@ -29,7 +29,7 @@ from models.trm.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1InnerCarry,
 )
 from models.trm.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
-from models.optim_utils import ScheduledOptimizer
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads
 
 
 class SpatialTRMInner(TinyRecursiveReasoningModel_ACTV1_Inner):
@@ -308,6 +308,7 @@ class SpatialTRM(BaseModel):
         loss = F.mse_loss(preds, targets)
         self.halt_optimizer.zero_grad()
         loss.backward()
+        all_reduce_grads(self.halt_head.parameters())
         self.halt_optimizer.step()
         return loss.item()
 
@@ -333,6 +334,12 @@ class SpatialTRM(BaseModel):
         L < 2 are skipped (no future to compare against, same as
         train_halt_head). All qualifying per-step (input, target) pairs are
         pooled into ONE batched MSE update via self.halt_optimizer.
+
+        Must be called on every rank every step, even with no histories: under
+        multi-GPU the gradient sync is a collective, and ranks complete
+        different numbers of trajectories. Gradients are averaged weighted by
+        each rank's (input, target) pair count — the mean over all pairs
+        globally — and the step is skipped only when no rank had any.
         """
         inputs, targets = [], []
         for z_H0_seq, loss_seq in histories:
@@ -341,17 +348,22 @@ class SpatialTRM(BaseModel):
             targets.append(self._future_min_targets(loss_seq))
             inputs.append(z_H0_seq[:-1].float())
 
-        if not inputs:
-            return 0.0
-
-        preds = self.halt_head(torch.cat(inputs, dim=0)).squeeze(-1)
-        target = torch.cat(targets, dim=0)
-
-        loss = F.mse_loss(preds, target)
         self.halt_optimizer.zero_grad()
-        loss.backward()
-        self.halt_optimizer.step()
-        return loss.item()
+        loss = None
+        n_local = 0
+        if inputs:
+            preds = self.halt_head(torch.cat(inputs, dim=0)).squeeze(-1)
+            target = torch.cat(targets, dim=0)
+            loss = F.mse_loss(preds, target)
+            loss.backward()
+            n_local = target.numel()
+        else:
+            for p in self.halt_head.parameters():
+                p.grad = torch.zeros_like(p)
+
+        if all_reduce_grads(self.halt_head.parameters(), weight=n_local) > 0:
+            self.halt_optimizer.step()
+        return loss.item() if loss is not None else 0.0
 
     @torch.no_grad()
     def predict(
@@ -440,6 +452,7 @@ class SpatialTRM(BaseModel):
                 accelerator.backward(step_loss / (global_batch_size * K))
                 total_loss += step_loss.item()
 
+            all_reduce_grads(self.parameters())
             accelerator.clip_grad_norm_(self.parameters(), 1.0)
             lr = apply_lr_and_step(optimizers, global_step)
             if ema is not None:
@@ -939,6 +952,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                 if step_loss.requires_grad:
                     accelerator.backward(step_loss / (global_batch_size * K))
 
+            all_reduce_grads(self.parameters())
             accelerator.clip_grad_norm_(self.parameters(), 1.0)
             lr = apply_lr_and_step(optimizers, global_step)
             global_step += 1
@@ -1200,6 +1214,7 @@ class DepthMatchedFeedforwardBackbone(PainterBase, BaseModel):
             if step_loss.requires_grad:
                 accelerator.backward(step_loss / (global_batch_size * K))
 
+        all_reduce_grads(self.parameters())
         accelerator.clip_grad_norm_(self.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:

@@ -32,7 +32,7 @@ from models.base import BaseModel
 from models.diffusion_utils import apply_noisy_swap
 from models.interfaces import DiffusionPrediction, IPAdapterSteering, ThinkerSteering
 from models.losses import LossBase, build_loss
-from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
+from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_and_step
 from models.painter_base import PainterBase
 from models.painter_thinkers import ThinkerFrozenPainterBase
 from models.sampling import SamplingPipeline
@@ -257,6 +257,7 @@ class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
 
+        all_reduce_grads(self.parameters())
         accelerator.clip_grad_norm_(self.parameters(), 1.0)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
