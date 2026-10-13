@@ -1,0 +1,32 @@
+# Std-120K text-to-image fine-tuning set (BLIP3o-60K + DALL-E 3 + ShareGPT-4o
+# text-to-image), identical to Looped-DiT's / MiniT2I's fine-tuning data — see
+# datasets/std120k_dataset.py. Built into `root` on first use (~32 GB; ~230 GB
+# downloaded one raw file at a time). Prebuild with
+#   python -m datasets.std120k_dataset --root data/std120k
+root: "data/std120k"
+image_size: 512
+painter_size: 512
+pixel_range: [-1.0, 1.0]   # images are pixel/127.5 - 1, as in looped_dit/train.py
+text_encoder: "google/flan-t5-large"
+prompt_length: 256
+num_workers: 8
+
+# Trained with Std120KMixtureSampler (weighted source mixture), picked up by
+# train_trm.py through the dataset's make_train_sampler().
+train_dataset:
+  _target_: datasets.std120k_dataset.Std120KDataset
+  root: "${data.root}"
+  image_size: "${data.image_size}"
+  tokenizer: "${data.text_encoder}"
+  prompt_length: "${data.prompt_length}"
+
+# Std-120K has no held-out split: this is a fixed 512-sample subset of the
+# training data, for loss monitoring only. Prompt-following is evaluated on
+# T2I-CoReBench instead.
+val_dataset:
+  _target_: datasets.std120k_dataset.Std120KDataset
+  root: "${data.root}"
+  image_size: "${data.image_size}"
+  tokenizer: "${data.text_encoder}"
+  prompt_length: "${data.prompt_length}"
+  max_samples: 512

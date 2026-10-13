@@ -15,6 +15,7 @@ jupyterlab==4.0.13
 jupyterlab-pygments==0.3.0
 jupyterlab-server==2.27.3
 datasets==2.21.0
+webdataset==1.0.2  # Std-120K build (datasets/std120k_dataset.py); version Looped-DiT tested with
 transformers==4.41.2
 accelerate==0.34.2
 mediapy

@@ -121,10 +121,17 @@ def main(cfg: DictConfig):
     n_workers = cfg.data.num_workers
     train_collate_fn = getattr(type(train_ds), "collate_fn", None)
     eval_collate_fn = getattr(type(eval_ds), "collate_fn", None)
+    # Datasets with a prescribed sampling scheme (e.g. Std-120K's weighted
+    # source mixture) provide their own sampler; it's seeded identically on
+    # every rank, and accelerate splits its stream into per-rank batches.
+    # Every other dataset keeps shuffle=True exactly as before.
+    make_sampler = getattr(train_ds, "make_train_sampler", None)
+    train_sampler = make_sampler(seed=cfg.train.seed) if make_sampler is not None else None
     train_dl = DataLoader(
         train_ds,
         batch_size=cfg.train.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=n_workers,
         drop_last=True,
         pin_memory=True,

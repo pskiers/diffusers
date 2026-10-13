@@ -55,7 +55,14 @@ class DataSample:
     """Discrete token sequence used as a conditioning input rather than a
     generation target — e.g. the painter-vocabulary-encoded puzzle tokens for
     an unconditional painter that receives the board state.
-    Shape: (N,), dtype long."""
+    Shape: (N,), dtype long.
+    For text-to-image (Std-120K): the caption's tokenizer ids, padded to the
+    prompt length."""
+
+    token_mask: Optional[Tensor] = None
+    """Attention mask for ``token_conditions``: 1 = real token, 0 = padding.
+    Shape: (N,), dtype long — kept exactly as the tokenizer returns it (the
+    form a text encoder's attention_mask expects)."""
 
     # ── Diffusion runtime fields (populated by the training loop / model) ───
     x_noisy: Optional[Tensor] = None
