@@ -237,6 +237,7 @@ class SamplingPipeline:
         conditions: DataSample,
         device: torch.device,
         generator: Optional[torch.Generator] = None,
+        initial_noise: Optional[Tensor] = None,
     ) -> Tensor:
         """Denoise one pre-batched DataSample using the model's scheduler.
 
@@ -247,6 +248,10 @@ class SamplingPipeline:
                         set per step by this method.
             device:     target device.
             generator:  optional RNG for reproducible initial noise.
+            initial_noise: optional (B, *noise_shape) starting x, already at
+                        the scheduler's noise scale — e.g. per-sample seeded
+                        noise that must not depend on how samples are batched.
+                        Overrides `generator`.
 
         Returns:
             (B, C, H, W) denoised output tensor on device.
@@ -256,9 +261,12 @@ class SamplingPipeline:
         T = model.scheduler.config.num_train_timesteps
 
         model.scheduler.set_timesteps(self.num_inference_steps, device=device)
-        # init_noise_sigma: 1.0 on diffusers' DDPM/DDIM schedulers; 2.0 for
-        # MiniT2IFlowScheduler (noise ~ N(0, 4I)).
-        x = torch.randn(shape, device=device, generator=generator) * getattr(model.scheduler, "init_noise_sigma", 1.0)
+        if initial_noise is not None:
+            x = initial_noise.to(device)
+        else:
+            # init_noise_sigma: 1.0 on diffusers' DDPM/DDIM schedulers; 2.0 for
+            # MiniT2IFlowScheduler (noise ~ N(0, 4I)).
+            x = torch.randn(shape, device=device, generator=generator) * getattr(model.scheduler, "init_noise_sigma", 1.0)
 
         for t in model.scheduler.timesteps:
             t_batch = t.expand(B).to(device)

@@ -3,3 +3,24 @@
   seed: 0
   out_dir: ${run.output_dir}/samples
   tokenizer: ${data.text_encoder}
+# T2I-CoReBench (eval/corebench_eval.py): 1,080 prompts x 4 images generated on
+# all GPUs, then judged by a VLM in a separate environment
+# (scripts/setup_judge_env.sh) — skipped unless judge_python is set, e.g. by
+# exporting COREBENCH_JUDGE_PYTHON=/path/to/judge-env/bin/python.
+# protocol: looped_dit (Looped-DiT's judging, Qwen3-VL-32B-Thinking) | official.
+- _target_: models.eval_callbacks.CoReBenchEvalCallback
+  every_n_steps: 20000
+  out_dir: ${run.output_dir}/corebench
+  protocol: looped_dit
+  judge_python: ${oc.env:COREBENCH_JUDGE_PYTHON,null}
+  judge_model: null
+  judge_tensor_parallel_size: null
+  gpu_memory_utilization: 0.85
+  judge_env: {}             # e.g. {HF_HOME: /big/disk/hf_home}: where the judge's ~66 GB weights live
+  batch_size: 16
+  steps: 100
+  cfg_scale: 6.0
+  tokenizer: ${data.text_encoder}
+  prompt_length: ${data.prompt_length}
+  keep_images: false
+  prompts_per_dimension: null  # k = only the first k of each dimension's 90 prompts (cheaper, noisier; not comparable to full runs)

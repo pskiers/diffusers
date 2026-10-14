@@ -15,6 +15,7 @@ only evaluation-specific knobs: num_samples, num_log_images, cell_size, etc.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -263,6 +264,194 @@ class T2ISampleLogCallback(EvalCallbackBase):
             except Exception:
                 pass
         return {}
+
+
+class CoReBenchEvalCallback(EvalCallbackBase):
+    """
+    T2I-CoReBench during training (see eval/corebench_eval.py,
+    eval/corebench_judge.py). Every `every_n_steps` global steps:
+
+      1. every rank generates its share of the 1,080 prompts x 4 images;
+      2. rank 0 runs the VLM judge (`judge_python`: an interpreter of the
+         separate judge environment) on up to `judge_tensor_parallel_size`
+         GPUs of its node, while the other ranks wait on a marker file — not
+         in a collective, which would time out over a judging run;
+      3. rank 0 returns corebench/{overall, composition, reasoning,
+         mean_of_dimensions, <12 dimensions>} (0-100); the images are then
+         deleted unless keep_images.
+
+    A judge failure is logged (out_dir/step*/judge.log) and returns no
+    metrics; it never stops training. Set eval.step_timeout to cover a
+    whole run (generation + judging).
+
+    Also runs from eval.py (all ranks: `accelerate launch eval.py ...`): with
+    a checkpoint whose step is at least every_n_steps (or every_n_steps=0),
+    and always without a checkpoint (as step 0).
+
+    Args:
+        every_n_steps: run when the eval step reaches the next multiple.
+        out_dir: root for step<N>/{images,results,judge.log}; must be on a
+            filesystem every rank can see.
+        protocol: "looped_dit" (Looped-DiT's judging, default) or "official".
+        judge_python: Python of the judge environment; None skips the whole
+            evaluation (with a warning), since its images could not be scored.
+        judge_model: looped_dit: HF id (default Qwen/Qwen3-VL-32B-Thinking);
+            official: their judge key (default Qwen3_VL_30B_A3B_Thinking).
+        judge_tensor_parallel_size: GPUs for the judge; None = the largest of
+            1/2/4/8 that the node has (the judges need a divisor of 8).
+        gpu_memory_utilization: vLLM's GPU memory share; the paused training
+            processes keep a few GB per GPU.
+        judge_args: extra flags for eval/corebench_judge.py.
+        judge_env: extra environment variables for the judge only (e.g.
+            HF_HOME for where its ~66 GB of weights live).
+        samples_per_prompt, steps, cfg_scale, seed: generation (Looped-DiT's:
+            4, 100 Euler steps, CFG 6.0).
+        batch_size: images per sampling batch, per GPU.
+        tokenizer, prompt_length: the text encoder's tokenizer.
+        keep_images: keep the 4,320 PNGs after judging.
+        model_name: image directory name for the official protocol.
+        prompts_per_dimension: evaluate only the first k prompts of each
+            dimension (e.g. a quick check, or cheaper frequent evals); scores
+            on a subset are noisier and not comparable to full-benchmark ones.
+            None = all 90.
+    """
+
+    def __init__(
+        self,
+        every_n_steps: int,
+        out_dir: str,
+        protocol: str = "looped_dit",
+        judge_python: Optional[str] = None,
+        judge_model: Optional[str] = None,
+        judge_tensor_parallel_size: Optional[int] = None,
+        gpu_memory_utilization: float = 0.85,
+        judge_args: Optional[list] = None,
+        judge_env: Optional[dict] = None,
+        samples_per_prompt: int = 4,
+        steps: int = 100,
+        cfg_scale: float = 6.0,
+        seed: int = 0,
+        batch_size: int = 16,
+        tokenizer: str = "google/flan-t5-large",
+        prompt_length: int = 256,
+        keep_images: bool = False,
+        model_name: str = "model",
+        prompts_per_dimension: Optional[int] = None,
+        poll_seconds: float = 20.0,
+    ):
+        from eval.corebench_eval import PROTOCOLS
+
+        if protocol not in PROTOCOLS:
+            raise ValueError(f"protocol must be one of {PROTOCOLS}, got {protocol!r}")
+        self.every_n_steps = every_n_steps
+        self.out_dir = out_dir
+        self.protocol = protocol
+        self.judge_python = judge_python
+        self.judge_model = judge_model
+        self.judge_tensor_parallel_size = judge_tensor_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.judge_args = list(judge_args or [])
+        self.judge_env = {str(k): str(v) for k, v in (judge_env or {}).items()}
+        self.gen_kwargs = dict(samples_per_prompt=samples_per_prompt, steps=steps, cfg_scale=cfg_scale, seed=seed,
+                               batch_size=batch_size, model_name=model_name)
+        self.tokenizer_name = tokenizer
+        self.prompt_length = prompt_length
+        self.keep_images = keep_images
+        self.prompts_per_dimension = prompts_per_dimension
+        self.poll_seconds = poll_seconds
+        self._next_step = every_n_steps
+        self._warned = False
+
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        step = kwargs.get("step", None)
+        if step is None:  # eval.py without a checkpoint: run now
+            step = 0
+        elif step < self._next_step:
+            return {}
+        else:
+            self._next_step = step + self.every_n_steps
+        if self.judge_python is None:
+            if not self._warned and accelerator.is_main_process:
+                print("[CoReBench] judge_python not set (e.g. COREBENCH_JUDGE_PYTHON) — skipping CoReBench eval", flush=True)
+            self._warned = True
+            return {}
+        return self.run(model, accelerator, step)
+
+    def _judge_command(self, image_dir, results_dir, data_dir=None) -> tuple[list, dict]:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        gpus = visible.split(",") if visible else [str(i) for i in range(torch.cuda.device_count())]
+        tp = self.judge_tensor_parallel_size or max(n for n in (1, 2, 4, 8) if n <= len(gpus))
+        script = Path(__file__).resolve().parents[1] / "eval" / "corebench_judge.py"
+        cmd = [self.judge_python, str(script), "--protocol", self.protocol, "--image-dir", str(image_dir),
+               "--out-dir", str(results_dir), "--samples-per-prompt", str(self.gen_kwargs["samples_per_prompt"]),
+               "--gpu-memory-utilization", str(self.gpu_memory_utilization)]
+        if self.protocol == "looped_dit":
+            cmd += ["--tensor-parallel-size", str(tp)] + (["--judge-model", self.judge_model] if self.judge_model else [])
+            if data_dir is not None:  # a prompt subset; the official evaluate.py judges whatever images exist
+                cmd += ["--data", str(data_dir)]
+        else:
+            cmd += ["--model-name", self.gen_kwargs["model_name"]] + (["--mllm", self.judge_model] if self.judge_model else [])
+        env = {**os.environ, **self.judge_env, "CUDA_VISIBLE_DEVICES": ",".join(gpus[:tp])}
+        return cmd + self.judge_args, env
+
+    def run(self, model, accelerator, step: int) -> dict:
+        """One full evaluation, labelled `step`, regardless of every_n_steps."""
+        import json
+        import shutil
+        import subprocess
+        import time
+
+        from transformers import AutoTokenizer
+
+        from eval.corebench_eval import corebench_prompts, generate_corebench_images, summarize_scores, write_prompt_files
+
+        rank, world = accelerator.process_index, accelerator.num_processes
+        root = Path(self.out_dir) / f"step{step:08d}"
+        image_dir, results_dir, done = root / "images", root / "results", root / "judged.json"
+        prompts = corebench_prompts(self.prompts_per_dimension)
+        data_dir = root / "prompts" if self.prompts_per_dimension is not None else None
+
+        def wait_for(paths):
+            while not all(p.exists() for p in paths):
+                time.sleep(self.poll_seconds)
+
+        if not done.exists():
+            tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, model_max_length=self.prompt_length)
+            t0 = time.time()
+            n = generate_corebench_images(model, image_dir, tokenizer, accelerator.device, self.protocol, rank, world,
+                                          prompts=prompts, **self.gen_kwargs)
+            print(f"[CoReBench rank {rank}] generated {n} images in {(time.time() - t0) / 60:.1f} min", flush=True)
+            (root / f".generated.rank{rank}").touch()
+            torch.cuda.empty_cache()  # leave the judge as much GPU memory as possible
+
+            if accelerator.is_main_process:
+                wait_for([root / f".generated.rank{r}" for r in range(world)])
+                if data_dir is not None:
+                    write_prompt_files(prompts, data_dir)
+                cmd, env = self._judge_command(image_dir, results_dir, data_dir)
+                t0 = time.time()
+                with open(root / "judge.log", "w") as log:
+                    proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+                if proc.returncode == 0:
+                    outcome = {"scores": json.loads((results_dir / "scores.json").read_text())}
+                else:
+                    outcome = {"error": f"judge exited with code {proc.returncode}, see {root / 'judge.log'}"}
+                outcome["judge_minutes"] = (time.time() - t0) / 60
+                done.write_text(json.dumps(outcome, indent=2))
+            else:
+                wait_for([done])
+
+        outcome = json.loads(done.read_text())
+        if not accelerator.is_main_process:
+            return {}
+        if "error" in outcome:
+            print(f"[CoReBench] step {step}: {outcome['error']}", flush=True)
+            return {}
+        if not self.keep_images:
+            shutil.rmtree(image_dir, ignore_errors=True)
+        metrics = summarize_scores(outcome["scores"])
+        print(f"[CoReBench] step {step}: " + "  ".join(f"{k}={v:.1f}" for k, v in metrics.items()), flush=True)
+        return {f"corebench/{k}": v for k, v in metrics.items()}
 
 
 # ── MNIST Sudoku ──────────────────────────────────────────────────────────────
