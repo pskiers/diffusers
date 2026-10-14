@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
 COREBENCH_DATA = ROOT / "third_party" / "t2i_corebench" / "data"
+TIMING: dict = {}
 TASKS = ("C-MI", "C-MA", "C-MR", "C-TR", "R-LR", "R-BR", "R-HR", "R-PR", "R-GR", "R-AR", "R-CR", "R-RR")
 
 # third_party/t2i_corebench/evaluate.py, its `__main__` block (not importable).
@@ -66,7 +68,9 @@ def run_looped_dit(args) -> dict:
 
     class Judge(judge.VLLMJudge):
         def __init__(self, model, tensor_parallel_size, max_model_len, gpu_memory_utilization=0.9, repetition_penalty=1.0):
+            t0 = time.time()
             super().__init__(model, tensor_parallel_size, max_model_len, args.gpu_memory_utilization, repetition_penalty)
+            TIMING["judge_init_seconds"] = time.time() - t0
 
     judge.VLLMJudge = Judge
     argv = ["judge", "--benchmark", "corebench", "--data", str(args.data), "--image-dir", str(args.image_dir),
@@ -90,7 +94,14 @@ def run_official(args) -> dict:
     import evaluate
 
     real_llm = evaluate.LLM
-    evaluate.LLM = lambda **kwargs: real_llm(**{**kwargs, "gpu_memory_utilization": args.gpu_memory_utilization})
+
+    def llm(**kwargs):
+        t0 = time.time()
+        engine = real_llm(**{**kwargs, "gpu_memory_utilization": args.gpu_memory_utilization})
+        TIMING["judge_init_seconds"] = time.time() - t0
+        return engine
+
+    evaluate.LLM = llm
     mllm = args.mllm
     ns = argparse.Namespace(model=args.model_name, mllm=mllm, gen_eval_file=", ".join(TASKS),
                             output_path=str(args.image_dir), update=False, seed=0)
@@ -130,8 +141,10 @@ def main() -> None:
     args.image_dir, args.out_dir = args.image_dir.resolve(), args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.time()
     scores = run_looped_dit(args) if args.protocol == "looped_dit" else run_official(args)
-    scores = {"protocol": args.protocol, **scores}
+    # judge_init_seconds: loading the judge (absent if every judgment was cached)
+    scores = {"protocol": args.protocol, **scores, "timing": {**TIMING, "total_seconds": time.time() - t0}}
     (args.out_dir / "scores.json").write_text(json.dumps(scores, indent=2))
     print(json.dumps(scores, indent=2))
 

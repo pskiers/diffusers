@@ -86,6 +86,28 @@ def save_checkpoint(accelerator, model, optimizers, step, output_dir, tag, ema_h
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 
+def build_train_dataloader(cfg: DictConfig, train_ds) -> DataLoader:
+    """The training DataLoader (also used by experiments/benchmark.py, so it measures the same thing)."""
+    n_workers = cfg.data.num_workers
+    # Datasets with a prescribed sampling scheme (e.g. Std-120K's weighted
+    # source mixture) provide their own sampler; it's seeded identically on
+    # every rank, and accelerate splits its stream into per-rank batches.
+    # Every other dataset keeps shuffle=True exactly as before.
+    make_sampler = getattr(train_ds, "make_train_sampler", None)
+    train_sampler = make_sampler(seed=cfg.train.seed) if make_sampler is not None else None
+    return DataLoader(
+        train_ds,
+        batch_size=cfg.train.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=n_workers,
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=(n_workers > 0),
+        collate_fn=getattr(type(train_ds), "collate_fn", None),
+    )
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     wandb_project = cfg.run.get("wandb_project", None)
@@ -118,26 +140,8 @@ def main(cfg: DictConfig):
     scheduler = instantiate(cfg.diffusion)
     train_ds, eval_ds = build_datasets(cfg)
 
-    n_workers = cfg.data.num_workers
-    train_collate_fn = getattr(type(train_ds), "collate_fn", None)
     eval_collate_fn = getattr(type(eval_ds), "collate_fn", None)
-    # Datasets with a prescribed sampling scheme (e.g. Std-120K's weighted
-    # source mixture) provide their own sampler; it's seeded identically on
-    # every rank, and accelerate splits its stream into per-rank batches.
-    # Every other dataset keeps shuffle=True exactly as before.
-    make_sampler = getattr(train_ds, "make_train_sampler", None)
-    train_sampler = make_sampler(seed=cfg.train.seed) if make_sampler is not None else None
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=cfg.train.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=n_workers,
-        drop_last=True,
-        pin_memory=True,
-        persistent_workers=(n_workers > 0),
-        collate_fn=train_collate_fn,
-    )
+    train_dl = build_train_dataloader(cfg, train_ds)
     eval_dl = DataLoader(
         eval_ds,
         batch_size=cfg.eval.get("batch_size", cfg.train.batch_size),

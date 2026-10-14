@@ -420,8 +420,11 @@ class CoReBenchEvalCallback(EvalCallbackBase):
             t0 = time.time()
             n = generate_corebench_images(model, image_dir, tokenizer, accelerator.device, self.protocol, rank, world,
                                           prompts=prompts, **self.gen_kwargs)
-            print(f"[CoReBench rank {rank}] generated {n} images in {(time.time() - t0) / 60:.1f} min", flush=True)
-            (root / f".generated.rank{rank}").touch()
+            seconds = time.time() - t0
+            print(f"[CoReBench rank {rank}] generated {n} images in {seconds / 60:.1f} min", flush=True)
+            marker, tmp = root / f".generated.rank{rank}", root / f".generated.rank{rank}.tmp"
+            tmp.write_text(json.dumps({"images": n, "seconds": seconds}))
+            os.replace(tmp, marker)  # atomic: rank 0 reads it once it exists
             torch.cuda.empty_cache()  # leave the judge as much GPU memory as possible
 
             if accelerator.is_main_process:
@@ -437,6 +440,7 @@ class CoReBenchEvalCallback(EvalCallbackBase):
                 else:
                     outcome = {"error": f"judge exited with code {proc.returncode}, see {root / 'judge.log'}"}
                 outcome["judge_minutes"] = (time.time() - t0) / 60
+                outcome["generation"] = [json.loads((root / f".generated.rank{r}").read_text()) for r in range(world)]
                 done.write_text(json.dumps(outcome, indent=2))
             else:
                 wait_for([done])
