@@ -10,7 +10,8 @@ of the real code paths, extrapolated.
 Training (`bench.train_batch_sizes`, per-GPU micro-batches; default: the
 config's): for each size, the gradient accumulation that keeps the launched
 effective batch (train.batch_size x accumulation x GPUs, e.g. 768); then
-`bench.warmup_steps` untimed train steps (torch.compile, allocator warm-up) and
+`bench.warmup_steps` untimed train steps (torch.compile — reset for every size, so
+each is compiled as a run with only that size would be — and allocator warm-up) and
 `bench.train_steps` timed ones, as train_trm.py runs them (real data, EMA).
 A size that runs out of memory is reported as such (all GPUs agree on it) and
 larger ones are skipped. The fastest size is projected to train.num_steps.
@@ -49,6 +50,7 @@ from pathlib import Path
 
 import hydra
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from accelerate import Accelerator
 from hydra.utils import instantiate
@@ -118,6 +120,7 @@ def benchmark_training(cfg, accelerator, bench, agreement) -> tuple[dict, object
             trials.append({"batch_size": size, "skipped": f"{effective} is not a multiple of {size} x {world} GPUs"})
             continue
         accum = effective // (size * world)
+        torch._dynamo.reset()  # compile afresh for this size, as a run with only this size would
         with open_dict(cfg):
             cfg.train.batch_size = size
         loader = accelerator.prepare(build_train_dataloader(cfg, train_ds))
@@ -196,6 +199,7 @@ def benchmark_sampling(model, accelerator, callback, bench, agreement) -> dict:
             torch.cuda.synchronize()
 
         torch.cuda.reset_peak_memory_stats()
+        torch._dynamo.reset()  # compile afresh for this size, as a run with only this size would
         ok = True
         try:
             sample(1)  # warm-up (compilation, allocator)
@@ -287,11 +291,17 @@ def main(cfg: DictConfig) -> None:
     bench = type("Bench", (), {**DEFAULTS, **dict(cfg.get("bench") or {})})
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
+    # Each trial compiles one variant per input shape and grad mode (the thinker runs
+    # no-grad and grad cycles); past the default limit of 8, torch runs the rest
+    # uncompiled, which made later (larger) sizes look slower than they are.
+    torch._dynamo.config.cache_size_limit = 64
     accelerator = Accelerator(mixed_precision=cfg.precision.mixed_precision)
     agreement = _Agreement(accelerator.num_processes)
 
     if bench.skip_training:
         train, model = {}, build_model(cfg, instantiate(cfg.diffusion)).to(accelerator.device)
+        if cfg.train.compile:  # as in training: generation runs ~2x slower uncompiled
+            model.compile_submodules()
     else:
         train, model = benchmark_training(cfg, accelerator, bench, agreement)
     callbacks = [cb for cb in model.eval_callbacks if isinstance(cb, CoReBenchEvalCallback)]

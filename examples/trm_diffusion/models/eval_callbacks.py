@@ -492,7 +492,9 @@ class CoReBenchEvalCallback(EvalCallbackBase):
                 failed = [s for s, sh in enumerate(shards) if sh["returncode"] != 0]
                 outcome = {}
                 if failed:
-                    outcome["error"] = f"judge shard(s) {failed} failed, see {shard_dir(failed[0]) / 'judge.log'}"
+                    log = shard_dir(failed[0]) / "judge.log"
+                    tail = "".join(log.read_text(errors="replace").splitlines(keepends=True)[-25:]) if log.exists() else ""
+                    outcome["error"] = f"judge shard(s) {failed} failed; end of {log}:\n{tail}"
                 else:
                     try:
                         outcome["scores"] = merge_judge_shards(self.protocol, [shard_dir(s) / "results" for s in range(num_shards)])

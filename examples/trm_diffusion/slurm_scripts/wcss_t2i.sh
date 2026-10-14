@@ -46,8 +46,10 @@ cd $ROOT/examples/trm_diffusion
 python -m datasets.std120k_dataset --root $DATA_T2I --workers $SLURM_CPUS_PER_TASK
 
 
-# build llm judge env
-PYTHON=python3.10 bash scripts/setup_judge_env.sh $JUDGE_ENV
+# build llm judge env (needs Python >= 3.11, the Python/3.10.4 module breaks vLLM)
+export UV_PYTHON_INSTALL_DIR=$ROOT/uv_python
+pip install uv && uv python install 3.12
+PYTHON=$(uv python find 3.12) bash scripts/setup_judge_env.sh $JUDGE_ENV
 
 
 # download llm judge model
