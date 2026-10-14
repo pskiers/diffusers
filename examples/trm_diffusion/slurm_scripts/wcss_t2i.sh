@@ -47,15 +47,13 @@ python -m datasets.std120k_dataset --root $DATA_T2I --workers $SLURM_CPUS_PER_TA
 
 
 # build llm judge env (needs Python >= 3.11, the Python/3.10.4 module breaks vLLM)
-export UV_PYTHON_INSTALL_DIR=$ROOT/uv_python
-pip install uv && uv python install 3.12
-PYTHON=$(uv python find 3.12) bash scripts/setup_judge_env.sh $JUDGE_ENV
+(module purge && module load Python/3.12.3-GCCcore-13.3.0 && PYTHON=python3.12 bash scripts/setup_judge_env.sh $JUDGE_ENV)
 
 
 # download llm judge model
 $COREBENCH_JUDGE_PYTHON -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-VL-32B-Thinking'))"
 nvidia-smi --query-gpu=name,driver_version --format=csv
-$COREBENCH_JUDGE_PYTHON -c "import torch; print('judge torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.is_available()); torch.zeros(1).cuda()"
+$COREBENCH_JUDGE_PYTHON -c "import sys, torch, vllm; print('judge python', sys.version.split()[0], 'vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.is_available()); torch.zeros(1).cuda()"
 
 
 # benchmark training/evaluation speed + batch sizes
