@@ -309,6 +309,15 @@ class ThinkerFrozenPainterBase(BaseModel):
         """
         bsz = sample.x_noisy.shape[0]
 
+        # Painters whose thinker reads their own early hidden states (e.g.
+        # MiniT2IPainter's painter_hidden) compute them here, once per call,
+        # from this call's x_t and conditioning — never reusing a stale copy
+        # (e.g. the zeroed one in a CFG null_condition_sample). Training
+        # computes them once per micro-batch in _prepare_training_sample.
+        fill_runtime_fields = getattr(self.painter, "fill_runtime_fields", None)
+        if fill_runtime_fields is not None:
+            sample = fill_runtime_fields(sample)
+
         if null_steering:
             logits = torch.zeros(
                 bsz, self.thinker.inner.config.seq_len, self.thinker.vocab_size,

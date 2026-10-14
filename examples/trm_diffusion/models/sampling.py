@@ -256,7 +256,9 @@ class SamplingPipeline:
         T = model.scheduler.config.num_train_timesteps
 
         model.scheduler.set_timesteps(self.num_inference_steps, device=device)
-        x = torch.randn(shape, device=device, generator=generator)
+        # init_noise_sigma: 1.0 on diffusers' DDPM/DDIM schedulers; 2.0 for
+        # MiniT2IFlowScheduler (noise ~ N(0, 4I)).
+        x = torch.randn(shape, device=device, generator=generator) * getattr(model.scheduler, "init_noise_sigma", 1.0)
 
         for t in model.scheduler.timesteps:
             t_batch = t.expand(B).to(device)

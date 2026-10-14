@@ -1,0 +1,6 @@
+eval_every: 5000
+save_every: 10000
+log_every: 100
+cfg_scale: 6.0
+batch_size: 32
+num_log_images: 16

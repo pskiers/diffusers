@@ -1,0 +1,39 @@
+# TRM thinker steering MiniT2I-B/16. seq_len = image tokens + 256 text tokens
+# (MiniT2IHiddenEncoder: 1024 + 256 with condition_encoder.pool 1); vocab_size =
+# channels per output token, read by PainterResidualTranslator (continuous, not
+# class logits).
+# Inference cost per denoising forward: n_sup x H_cycles x (L_cycles + 1) x L_layers
+# = 16 x 3 x 7 x 2 = 672 layers at width 768 over 1280 tokens. Measured (A5000,
+# batch 4): 1.8 s with the thinker vs 0.1 s for MiniT2I alone, ~18x; Looped-DiT
+# B/16 is ~1.9x (32 vs 17 blocks). For comparable compute: n_sup 4, H 2, L 4,
+# width 512, condition_encoder.pool 2 (measured +54% over MiniT2I alone).
+_target_: models.trm_wrappers.SpatialTRM
+vocab_size: 256
+seq_len: 1280
+hidden_size: 768
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+num_puzzle_identifiers: 1
+halt_exploration_prob: 0.1
+freeze_weights: false
+batch_size: 32
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0
+with_timestep_emb: false
+with_halt_head: false

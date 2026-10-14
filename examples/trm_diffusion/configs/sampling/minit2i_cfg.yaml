@@ -1,0 +1,7 @@
+# Looped-DiT's evaluation sampler: 100 Euler steps, CFG 6.0 (with diffusion: minit2i_flow).
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 100
+batch_size: ${eval.batch_size}
+predictor:
+  _target_: models.sampling.CFGPredictor
+  scale: 6.0

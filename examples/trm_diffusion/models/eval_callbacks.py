@@ -14,6 +14,7 @@ only evaluation-specific knobs: num_samples, num_log_images, cell_size, etc.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -149,6 +150,118 @@ class ImageGenEvalCallback(EvalCallbackBase):
             except Exception:
                 pass
 
+        return {}
+
+
+class T2ISampleLogCallback(EvalCallbackBase):
+    """
+    Text-to-image: samples images for the first `num_log_images` captions of
+    the eval set (token_conditions / token_mask) with model.sampling_pipeline,
+    from fixed noise (`seed`) so successive evals are comparable, and logs each
+    next to its reference image with its prompt: to WandB as one captioned
+    image per prompt, and to `out_dir` (if set) as one PNG with the prompts
+    written under the pairs. The prompt is decoded from the token ids, so it is
+    exactly what the model saw (truncated to the prompt length).
+
+    Args:
+        num_log_images: captions to sample.
+        seed: noise seed.
+        out_dir: optional directory for samples_step<step>.png grids.
+        tokenizer: tokenizer the token ids came from.
+    """
+
+    def __init__(
+        self,
+        num_log_images: int = 8,
+        seed: int = 0,
+        out_dir: Optional[str] = None,
+        tokenizer: str = "google/flan-t5-large",
+    ):
+        self.num_log_images = num_log_images
+        self.seed = seed
+        self.out_dir = out_dir
+        self.tokenizer_name = tokenizer
+        self._tokenizer = None
+
+    def _decode(self, token_ids: torch.Tensor) -> list[str]:
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        return [p.strip() for p in self._tokenizer.batch_decode(token_ids, skip_special_tokens=True)]
+
+    @staticmethod
+    def _caption_lines(text: str, width_px: int, max_lines: int = 8) -> list[str]:
+        import textwrap
+
+        lines = textwrap.wrap(text or "(empty prompt)", width=width_px // 9)
+        if len(lines) > max_lines:
+            lines = lines[: max_lines - 1] + [lines[max_lines - 1][:-3] + "..."]
+        return lines
+
+    @staticmethod
+    def _with_caption(image: np.ndarray, lines: list[str], n_lines: int) -> np.ndarray:
+        """`image` (H, W, 3) uint8 with `lines` on a white strip of n_lines below it."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.load_default(size=16)
+        line_h = 20
+        canvas = Image.new("RGB", (image.shape[1], image.shape[0] + line_h * n_lines + 8), "white")
+        canvas.paste(Image.fromarray(image), (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        for i, line in enumerate(lines):
+            draw.text((6, image.shape[0] + 4 + i * line_h), line, fill="black", font=font)
+        return np.asarray(canvas)
+
+    @torch.no_grad()
+    def __call__(self, model, dataloader, accelerator, **kwargs) -> dict:
+        if not accelerator.is_main_process:
+            return {}
+        step = kwargs.get("step", None)
+        device = accelerator.device
+        pipeline = model.sampling_pipeline
+
+        token_ids, token_mask, refs = [], [], []
+        for batch in dataloader:
+            take = self.num_log_images - sum(len(t) for t in token_ids)
+            if take <= 0:
+                break
+            token_ids.append(batch.token_conditions[:take])
+            token_mask.append(batch.token_mask[:take])
+            refs.append(batch.images[:take])
+        conditions = DataSample(token_conditions=torch.cat(token_ids), token_mask=torch.cat(token_mask)).to(device)
+
+        generator = torch.Generator(device=device).manual_seed(self.seed)
+        samples = []
+        for start in range(0, len(conditions.token_conditions), pipeline.batch_size):
+            chunk = conditions.slice(start, start + pipeline.batch_size)
+            samples.append(pipeline.sample_one_batch(model, chunk, device, generator=generator))
+        samples = model.decode_for_eval(torch.cat(samples)).cpu()
+        refs = model.images_to_log(torch.cat(refs)).cpu()
+        prompts = self._decode(conditions.token_conditions.cpu())
+
+        # One (reference | sample) image per prompt.
+        pairs = [
+            (torch.cat([ref, s], dim=2).permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+            for ref, s in zip(refs, samples)
+        ]
+        if self.out_dir is not None:
+            from PIL import Image
+
+            lines = [self._caption_lines(t, p.shape[1]) for p, t in zip(pairs, prompts)]
+            n_lines = max(len(ls) for ls in lines)  # one strip height for the whole grid
+            captioned = torch.from_numpy(np.stack([self._with_caption(p, ls, n_lines) for p, ls in zip(pairs, lines)]))
+            grid = make_grid(captioned.permute(0, 3, 1, 2), nrow=2, padding=8, pad_value=255)
+            os.makedirs(self.out_dir, exist_ok=True)
+            Image.fromarray(grid.permute(1, 2, 0).numpy()).save(os.path.join(self.out_dir, f"samples_step{step}.png"))
+        if step is not None:
+            try:
+                _wandb.log(
+                    {"val/samples": [_wandb.Image(p, caption=f"reference | sample — {t}") for p, t in zip(pairs, prompts)]},
+                    step=step,
+                )
+            except Exception:
+                pass
         return {}
 
 

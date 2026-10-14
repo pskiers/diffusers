@@ -1,0 +1,22 @@
+# Frozen MiniT2I-B/16 (released checkpoint, fine-tuned on Std-120K) + frozen
+# FLAN-T5-Large, steered after block `steer_from_block` (models/minit2i.py).
+_target_: models.minit2i.MiniT2IPainter
+_recursive_: false
+repo: "MiniT2I/MiniT2I"
+subfolder: "minit2i-b-16"
+text_encoder: "google/flan-t5-large"
+steer_from_block: 6          # 6 read / 11 steered, = Looped-DiT's 6/5/6 split boundary
+painter_dtype: "bfloat16"
+# Training draws, as looped_dit/diffusion.py: training_loss
+noise_scale: 2.0
+t_logit_mean: -0.8
+t_logit_std: 0.8
+velocity_clamp: 0.05
+label_drop_rate: 0.1         # text dropped for 10% of samples, for classifier-free guidance
+# Optimizer for the trainable parts outside the thinker (condition encoder, translator).
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

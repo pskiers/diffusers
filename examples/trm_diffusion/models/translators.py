@@ -23,7 +23,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.interfaces import ControlNetSteering, CrossAttnSteering, IPAdapterSteering, ThinkerSteering, TRMOutput
+from models.interfaces import (
+    BlockResidualSteering,
+    ControlNetSteering,
+    CrossAttnSteering,
+    IPAdapterSteering,
+    ThinkerSteering,
+    TRMOutput,
+)
 from models.utility_models import ConditioningPyramid, ConditioningPyramid1D, ConditioningPyramidPaperUNet, TimestepMLP
 
 
@@ -386,3 +393,34 @@ class ControlNetTranslator1D(ThinkerPainterTranslatorBase):
             down_block_additional_residuals=down_res,
             mid_block_additional_residual=mid_res,
         )
+
+
+class PainterResidualTranslator(ThinkerPainterTranslatorBase):
+    """
+    Thinker output → one residual per steered transformer-painter block
+    (BlockResidualSteering, e.g. for MiniT2IPainter).
+
+    Reads the first grid*grid output tokens — the image grid, see
+    MiniT2IHiddenEncoder — upsamples them bilinearly to the painter's own token
+    grid, and projects them to the painter width with one bias-free,
+    zero-initialized Linear per steered block. So training starts exactly from
+    the unsteered painter, and an all-zero thinker output (null steering, CFG
+    dropout of the steering) gives exactly zero residuals.
+    """
+
+    def __init__(self, in_dim: int, painter_dim: int, grid: int, painter_grid: int, num_blocks: int):
+        super().__init__(grid=grid, bridge_mode="logits")
+        self.painter_grid = painter_grid
+        self.projs = nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks))
+        for proj in self.projs:
+            nn.init.zeros_(proj.weight)
+
+    def forward(self, trm_output: TRMOutput, **_) -> BlockResidualSteering:
+        g = self._grid
+        x = trm_output.logits[:, : g * g].float()
+        b, _, c = x.shape
+        x = x.transpose(1, 2).reshape(b, c, g, g)
+        if self.painter_grid != g:
+            x = F.interpolate(x, size=self.painter_grid, mode="bilinear", align_corners=False)
+        x = x.flatten(2).transpose(1, 2)  # (B, painter_grid², C)
+        return BlockResidualSteering(block_residuals=[proj(x) for proj in self.projs])

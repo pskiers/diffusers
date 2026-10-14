@@ -1,0 +1,7 @@
+# MiniT2I flow matching (x_t = t x0 + (1 - t) eps, eps ~ N(0, 4I); t: 0 noise -> 1 image).
+# sample_velocity_clamp 0.05 = Looped-DiT's euler_sample (how Looped-DiT is evaluated);
+# 0.001 = MiniT2I's own Hugging Face pipeline. See models/minit2i.py.
+_target_: models.minit2i.MiniT2IFlowScheduler
+noise_scale: 2.0
+train_velocity_clamp: 0.05
+sample_velocity_clamp: 0.05

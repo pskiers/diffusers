@@ -1,0 +1,5 @@
+- _target_: models.eval_callbacks.T2ISampleLogCallback
+  num_log_images: 16
+  seed: 0
+  out_dir: ${run.output_dir}/samples
+  tokenizer: ${data.text_encoder}

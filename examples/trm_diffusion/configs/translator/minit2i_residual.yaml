@@ -1,0 +1,8 @@
+# Thinker's 16x16 image-grid outputs -> one zero-initialized residual per steered
+# MiniT2I block. num_blocks must equal 17 - painter.steer_from_block (checked).
+_target_: models.translators.PainterResidualTranslator
+in_dim: ${thinker.vocab_size}
+painter_dim: 768
+grid: 32
+painter_grid: 32
+num_blocks: 11

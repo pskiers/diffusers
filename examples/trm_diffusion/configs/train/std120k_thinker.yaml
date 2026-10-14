@@ -1,0 +1,13 @@
+seed: 42
+compile: true
+
+# Effective batch must be 768 for thinker training:
+#   batch_size x gradient_accumulation_steps x num_GPUs = 768
+# (single GPU below; e.g. 8 GPUs: batch_size 32, gradient_accumulation_steps 3).
+batch_size: 32
+gradient_accumulation_steps: 24
+# global_step counts reasoning steps (n_sup per batch).
+num_steps: 80000
+# Text dropout for CFG is done by the painter (painter.label_drop_rate), on the
+# painter and thinker together; no separate steering dropout.
+cfg_prob: 0.0

@@ -155,6 +155,19 @@ class ControlNetSteering(ThinkerSteering):
         }
 
 
+@dataclass
+class BlockResidualSteering(ThinkerSteering):
+    """Steering produced by PainterResidualTranslator for a transformer painter
+    steered block by block (MiniT2IPainter): one residual added to the image
+    token stream after each steered block."""
+
+    block_residuals: list
+    """Per steered block, (B, L_img, D) added to its image-token output."""
+
+    def to_painter_kwargs(self) -> dict:
+        return {"block_residuals": self.block_residuals}
+
+
 # ── Painter output ────────────────────────────────────────────────────────────
 
 PredictionType = Literal["epsilon", "sample", "v_prediction"]

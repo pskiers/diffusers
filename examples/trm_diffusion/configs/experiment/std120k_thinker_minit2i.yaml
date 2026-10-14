@@ -1,0 +1,27 @@
+# @package _global_
+# TRM thinker steering a frozen MiniT2I-B/16 on Std-120K (text-to-image), design A:
+# the thinker reads MiniT2I's hidden states after block 6 and steers blocks 7-17
+# with per-block residuals (models/minit2i.py).
+#
+# Usage:
+#   accelerate launch --multi_gpu --num_processes 8 train_trm.py experiment=std120k_thinker_minit2i \
+#     train.batch_size=32 train.gradient_accumulation_steps=3
+
+defaults:
+  - override /data: std120k
+  - override /diffusion: minit2i_flow
+  - override /train: std120k_thinker
+  - override /eval: std120k_thinker
+  - override /thinker: std120k
+  - override /condition_encoder: minit2i_hidden
+  - override /painter: minit2i_b16_frozen
+  - override /translator: minit2i_residual
+  - override /loss: combined_mse
+  - override /eval_callbacks: t2i_samples
+  - override /sampling: minit2i_cfg
+  - _self_
+
+mode: "thinker_base"
+
+run:
+  output_dir: "runs/std120k_thinker_minit2i"
