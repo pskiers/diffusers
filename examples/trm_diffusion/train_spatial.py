@@ -23,7 +23,7 @@ from tqdm.auto import tqdm
 from datasets.mnist_sudoku_dataset import MNISTSudokuDataset
 from eval.mnist_eval import load_or_train_classifier
 from models.spatial_latent_unet import SpatialLatentConfig, SpatialLatentOptimConfig, SpatialLatentUNet
-from models.utility_models import strip_compiled_prefix
+from models.utility_models import EvalBarrier, strip_compiled_prefix
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -265,6 +265,7 @@ def main(cfg: DictConfig):
     cfg_prob = float(cfg.train.get("cfg_prob", 0.0))
 
     next_log, next_eval, next_save = log_every, eval_every, save_every
+    eval_barrier = EvalBarrier(accelerator.num_processes, float(cfg.eval.get("step_timeout", 3600)))
 
     train_iter = iter(train_dl)
     unwrapped = accelerator.unwrap_model(model)
@@ -317,6 +318,7 @@ def main(cfg: DictConfig):
                 guidance_power=float(cfg.eval.get("guidance_power", 1.0)),
                 guidance_top_m=cfg.eval.get("guidance_top_m", None),
             )
+            eval_barrier.wait()  # main-only callbacks: keep the other ranks out of the next all-reduce
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
             unwrapped.train()
 

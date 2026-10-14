@@ -39,7 +39,7 @@ from tqdm.auto import tqdm
 from factory import build_model, build_datasets
 from hydra.utils import instantiate
 from models.trm.ema import EMAHelper
-from models.utility_models import strip_compiled_prefix
+from models.utility_models import EvalBarrier, strip_compiled_prefix
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -236,6 +236,7 @@ def main(cfg: DictConfig):
     grad_accum_steps = cfg.train.get("gradient_accumulation_steps", 1)
     train_timeout: int = cfg.train.get("step_timeout", 600)
     eval_timeout: int = cfg.eval.get("step_timeout", 3600)
+    eval_barrier = EvalBarrier(accelerator.num_processes, eval_timeout)
 
     next_log = log_every
     next_eval = eval_every
@@ -300,6 +301,7 @@ def main(cfg: DictConfig):
 
             with _StepTimeout(eval_timeout):
                 val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step)
+                eval_barrier.wait()  # main-only callbacks: keep the other ranks out of the next all-reduce
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
 
             if ema_helper is not None:

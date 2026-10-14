@@ -525,3 +525,31 @@ class SpatialBridge(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, size=self.painter_size, mode="bilinear", align_corners=False)
         return self.conv(x)
+
+
+class EvalBarrier:
+    """Holds every rank at the end of an evaluation until all have finished it.
+
+    Most eval callbacks run on the main process only, so the other ranks would
+    otherwise go straight on to the next training step and block in its
+    gradient all-reduce, which NCCL's watchdog kills after 10 minutes — any
+    main-only eval longer than that took the whole run down. This waits on a
+    CPU (gloo) group instead, with its own timeout (the eval timeout), so a
+    long eval is fine and only a genuinely stuck one fails. No-op on one process.
+    Create it on every rank, at the same point, before the training loop.
+    """
+
+    def __init__(self, num_processes: int, timeout_seconds: float):
+        import datetime
+
+        import torch.distributed as dist
+
+        self._group = None
+        if num_processes > 1 and dist.is_available() and dist.is_initialized():
+            self._group = dist.new_group(backend="gloo", timeout=datetime.timedelta(seconds=timeout_seconds))
+
+    def wait(self) -> None:
+        if self._group is not None:
+            import torch.distributed as dist
+
+            dist.barrier(group=self._group)
