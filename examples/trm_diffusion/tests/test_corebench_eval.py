@@ -110,34 +110,90 @@ def test_summarize_scores():
     assert m["mean_of_dimensions"] == np.mean(range(12)) and m["R-RR"] == 11.0
 
 
-def test_callback_flow_with_stand_in_judge(painter, tmp_path, monkeypatch):
-    """The whole callback on one rank: generation, the judge subprocess (a
-    stand-in that checks the images and writes scores.json), metrics, cleanup."""
+# A stand-in judge (no VLM): for the prompts it is given (--data), Looped-DiT-format
+# judgments with a score derived from the judgment key, written as their judge does.
+FAKE_JUDGE = """#!{python}
+import hashlib, json, sys
+from pathlib import Path
+sys.path.insert(0, {root!r})
+from third_party.looped_dit.looped_dit.eval.benchmarks import load_prompts
+args = sys.argv[2:]  # sys.argv[1] is eval/corebench_judge.py
+get = lambda flag: args[args.index(flag) + 1]
+assert get("--protocol") == "looped_dit" and get("--tensor-parallel-size") == "1"
+out = Path(get("--out-dir")); out.mkdir(parents=True, exist_ok=True)
+records = []
+for p in load_prompts("corebench", get("--data")):
+    for s in range(int(get("--samples-per-prompt"))):
+        assert (Path(get("--image-dir")) / p.group / p.item_id / f"{{s:05d}}.png").exists()
+        for i, _ in enumerate(p.metadata["Checklist"]):
+            key = f"{{p.item_id}}|{{s}}|checklist|{{i}}"
+            score = float(int(hashlib.md5(key.encode()).hexdigest(), 16) % 2)
+            records.append({{"key": key, "item_id": p.item_id, "group": p.group, "sample": s,
+                             "metric": "checklist", "score": score, "max_score": 1}})
+(out / "results.jsonl").write_text("".join(json.dumps(r) + "\\n" for r in records))
+(out / "summary.json").write_text(json.dumps({{"failed_judgments": 0}}))
+(out / "scores.json").write_text(json.dumps({{"timing": {{"judge_init_seconds": 1.0, "total_seconds": 2.0}}}}))
+"""
+
+
+def _fake_judgments(prompts, samples):
+    import hashlib
+
+    return [
+        {"key": key, "item_id": p.item_id, "group": p.group, "sample": s, "metric": "checklist",
+         "score": float(int(hashlib.md5(key.encode()).hexdigest(), 16) % 2), "max_score": 1}
+        for p in prompts for s in range(samples) for i, _ in enumerate(p.metadata["Checklist"])
+        for key in [f"{p.item_id}|{s}|checklist|{i}"]
+    ]
+
+
+def test_callback_sharded_judging(painter, tmp_path, monkeypatch):
+    """The whole callback on one rank with two judges (stand-ins, one "GPU"
+    each): generation, both shards judged, merged, metrics, cleanup. The merged
+    scores must equal Looped-DiT's summarize() of one judge over all prompts."""
+    from third_party.looped_dit.looped_dit.eval.judge import summarize
+
     fake_judge = tmp_path / "fake_judge_python"
-    fake_judge.write_text(textwrap.dedent(f"""\
-        #!{sys.executable}
-        import json, sys
-        from pathlib import Path
-        args = sys.argv[2:]  # sys.argv[1] is eval/corebench_judge.py
-        get = lambda flag: args[args.index(flag) + 1]
-        n = len(list(Path(get("--image-dir")).rglob("*.png")))
-        assert n == 24, n  # 1 prompt per dimension x 2 samples
-        assert len(list(Path(get("--data")).glob("*.json"))) == 12  # the subset's prompt files
-        assert get("--protocol") == "looped_dit" and get("--tensor-parallel-size") == "1"
-        dims = {{t: 50.0 for t in {list(cb.COMPOSITION + cb.REASONING)}}}
-        out = Path(get("--out-dir")); out.mkdir(parents=True, exist_ok=True)
-        (out / "scores.json").write_text(json.dumps({{"dimensions": dims, "overall": 50.0}}))
-        """))
+    fake_judge.write_text(FAKE_JUDGE.format(python=sys.executable, root=str(ROOT)))
     fake_judge.chmod(0o755)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     callback = CoReBenchEvalCallback(every_n_steps=100, out_dir=str(tmp_path / "corebench"), judge_python=str(fake_judge),
-                                     samples_per_prompt=2, steps=2, batch_size=24, prompts_per_dimension=1,
-                                     poll_seconds=0.1)
+                                     judge_tensor_parallel_size=1, samples_per_prompt=2, steps=2, batch_size=24,
+                                     prompts_per_dimension=2, poll_seconds=0.1)
     accelerator = SimpleNamespace(process_index=0, num_processes=1, device=DEVICE, is_main_process=True)
     assert callback(painter, None, accelerator, step=50) == {}  # not due yet
     metrics = callback(painter, None, accelerator, step=100)
-    assert metrics["corebench/overall"] == 50.0 and metrics["corebench/reasoning"] == 50.0
-    assert len(metrics) == 4 + 12
+
     step_dir = tmp_path / "corebench" / "step00000100"
+    outcome = json.loads((step_dir / "judged.json").read_text())
+    assert len(outcome["judge_shards"]) == 2 and all(sh["returncode"] == 0 for sh in outcome["judge_shards"])
+    shard_items = [{json.loads(l)["item_id"] for l in (step_dir / f"judge/shard{s}/results/results.jsonl").read_text().splitlines()}
+                   for s in range(2)]
+    subset = cb.corebench_prompts(2)
+    assert not shard_items[0] & shard_items[1] and shard_items[0] | shard_items[1] == {p.item_id for p in subset}
+
+    expected = summarize("corebench", _fake_judgments(subset, 2))
+    assert metrics["corebench/overall"] == pytest.approx(expected["overall"])
+    assert all(metrics[f"corebench/{t}"] == pytest.approx(v) for t, v in expected["groups"].items())
+    assert len(metrics) == 4 + 12
     assert not (step_dir / "images").exists()  # keep_images=False
-    assert "scores" in json.loads((step_dir / "judged.json").read_text())
+
+
+def test_merge_official_shards(tmp_path):
+    """Official protocol: per-dimension means over the images of all shards, as
+    evaluate.py would compute them over one directory with all the images."""
+    shards = {0: {"C-MI": [1.0, 0.5], "R-LR": [0.0]}, 1: {"C-MI": [0.0, "", 0.25], "R-LR": [1.0, 0.5]}}
+    dirs = []
+    for s, tasks in shards.items():
+        d = tmp_path / f"shard{s}"
+        d.mkdir()
+        for task, scores in tasks.items():
+            result = {f"{task}-{s:03d}-{i}": {"image_score": v} for i, v in enumerate(scores)}
+            result["mean_score"] = 0.123  # per-shard, ignored by the merge
+            (d / f"{task}-Qwen3_VL_30B_A3B_Thinking.json").write_text(json.dumps(result))
+        (d / "scores.json").write_text("{}")
+        dirs.append(d)
+    merged = cb.merge_judge_shards("official", dirs)
+    assert merged["dimensions"]["C-MI"] == pytest.approx(100 * np.mean([1.0, 0.5, 0.0, 0.25]))  # "" = unscored
+    assert merged["dimensions"]["R-LR"] == pytest.approx(100 * np.mean([0.0, 1.0, 0.5]))
+    assert merged["overall"] == pytest.approx(np.mean(list(merged["dimensions"].values())))

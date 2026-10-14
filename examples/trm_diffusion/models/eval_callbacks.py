@@ -272,17 +272,22 @@ class CoReBenchEvalCallback(EvalCallbackBase):
     eval/corebench_judge.py). Every `every_n_steps` global steps:
 
       1. every rank generates its share of the 1,080 prompts x 4 images;
-      2. rank 0 runs the VLM judge (`judge_python`: an interpreter of the
-         separate judge environment) on up to `judge_tensor_parallel_size`
-         GPUs of its node, while the other ranks wait on a marker file — not
-         in a collective, which would time out over a judging run;
-      3. rank 0 returns corebench/{overall, composition, reasoning,
-         mean_of_dimensions, <12 dimensions>} (0-100); the images are then
-         deleted unless keep_images.
+      2. judging is split over every node: on each node, local rank 0 starts
+         `judges_per_node` VLM judges (`judge_python`: an interpreter of the
+         separate judge environment), each on its own
+         `judge_tensor_parallel_size` GPUs and its own shard of the prompts
+         (round-robin, all of a prompt's images together). Ranks wait on
+         marker files, not in a collective, which would time out over a
+         judging run;
+      3. rank 0 merges the shards with the protocol's own scoring (see
+         eval/corebench_eval.py: merge_judge_shards — the same scores one judge
+         over everything gives) and returns corebench/{overall, composition,
+         reasoning, mean_of_dimensions, <12 dimensions>} (0-100); the images
+         are then deleted unless keep_images.
 
-    A judge failure is logged (out_dir/step*/judge.log) and returns no
-    metrics; it never stops training. Set eval.step_timeout to cover a
-    whole run (generation + judging).
+    A judge failure is logged (out_dir/step*/judge/shard*/judge.log) and returns
+    no metrics; it never stops training. Set eval.step_timeout to cover a whole
+    run (generation + judging).
 
     Also runs from eval.py (all ranks: `accelerate launch eval.py ...`): with
     a checkpoint whose step is at least every_n_steps (or every_n_steps=0),
@@ -290,20 +295,22 @@ class CoReBenchEvalCallback(EvalCallbackBase):
 
     Args:
         every_n_steps: run when the eval step reaches the next multiple.
-        out_dir: root for step<N>/{images,results,judge.log}; must be on a
-            filesystem every rank can see.
+        out_dir: root for step<N>/{images,judge,judged.json}; must be on a
+            filesystem every rank (every node) can see.
         protocol: "looped_dit" (Looped-DiT's judging, default) or "official".
         judge_python: Python of the judge environment; None skips the whole
             evaluation (with a warning), since its images could not be scored.
         judge_model: looped_dit: HF id (default Qwen/Qwen3-VL-32B-Thinking);
             official: their judge key (default Qwen3_VL_30B_A3B_Thinking).
-        judge_tensor_parallel_size: GPUs for the judge; None = the largest of
-            1/2/4/8 that the node has (the judges need a divisor of 8).
+        judge_tensor_parallel_size: GPUs per judge (a divisor of 8). 2 fits
+            either default judge on 80 GB GPUs; 24 GB GPUs need 4 or 8.
+        judges_per_node: judges per node, each on its own GPUs; None = as many
+            as the node's GPUs allow.
         gpu_memory_utilization: vLLM's GPU memory share; the paused training
             processes keep a few GB per GPU.
         judge_args: extra flags for eval/corebench_judge.py.
-        judge_env: extra environment variables for the judge only (e.g.
-            HF_HOME for where its ~66 GB of weights live).
+        judge_env: extra environment variables for the judges only (e.g.
+            HF_HOME for where their ~66 GB of weights live).
         samples_per_prompt, steps, cfg_scale, seed: generation (Looped-DiT's:
             4, 100 Euler steps, CFG 6.0).
         batch_size: images per sampling batch, per GPU.
@@ -323,7 +330,8 @@ class CoReBenchEvalCallback(EvalCallbackBase):
         protocol: str = "looped_dit",
         judge_python: Optional[str] = None,
         judge_model: Optional[str] = None,
-        judge_tensor_parallel_size: Optional[int] = None,
+        judge_tensor_parallel_size: int = 2,
+        judges_per_node: Optional[int] = None,
         gpu_memory_utilization: float = 0.85,
         judge_args: Optional[list] = None,
         judge_env: Optional[dict] = None,
@@ -349,8 +357,9 @@ class CoReBenchEvalCallback(EvalCallbackBase):
         self.judge_python = judge_python
         self.judge_model = judge_model
         self.judge_tensor_parallel_size = judge_tensor_parallel_size
+        self.judges_per_node = judges_per_node
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.judge_args = list(judge_args or [])
+        self.judge_args = [str(a) for a in (judge_args or [])]  # Hydra parses e.g. [--batch-size,1024] into ints
         self.judge_env = {str(k): str(v) for k, v in (judge_env or {}).items()}
         self.gen_kwargs = dict(samples_per_prompt=samples_per_prompt, steps=steps, cfg_scale=cfg_scale, seed=seed,
                                batch_size=batch_size, model_name=model_name)
@@ -377,21 +386,32 @@ class CoReBenchEvalCallback(EvalCallbackBase):
             return {}
         return self.run(model, accelerator, step)
 
-    def _judge_command(self, image_dir, results_dir, data_dir=None) -> tuple[list, dict]:
+    def _judge_layout(self, num_processes: int) -> tuple[int, int, list[list[str]]]:
+        """(nodes, judges per node, each local judge's GPU ids). Processes
+        are spread evenly over nodes, as torchrun/accelerate launch place them."""
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", num_processes))
+        nodes = max(1, num_processes // local_world)
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         gpus = visible.split(",") if visible else [str(i) for i in range(torch.cuda.device_count())]
-        tp = self.judge_tensor_parallel_size or max(n for n in (1, 2, 4, 8) if n <= len(gpus))
+        tp = self.judge_tensor_parallel_size
+        per_node = self.judges_per_node or len(gpus) // tp
+        if per_node < 1 or per_node * tp > len(gpus):
+            raise ValueError(f"{per_node} judge(s) x {tp} GPUs do not fit the node's {len(gpus)} GPUs "
+                             f"— set judge_tensor_parallel_size / judges_per_node")
+        return nodes, per_node, [gpus[j * tp : (j + 1) * tp] for j in range(per_node)]
+
+    def _judge_command(self, image_dir, results_dir, gpus, data_dir=None, tasks=None) -> tuple[list, dict]:
         script = Path(__file__).resolve().parents[1] / "eval" / "corebench_judge.py"
         cmd = [self.judge_python, str(script), "--protocol", self.protocol, "--image-dir", str(image_dir),
                "--out-dir", str(results_dir), "--samples-per-prompt", str(self.gen_kwargs["samples_per_prompt"]),
                "--gpu-memory-utilization", str(self.gpu_memory_utilization)]
         if self.protocol == "looped_dit":
-            cmd += ["--tensor-parallel-size", str(tp)] + (["--judge-model", self.judge_model] if self.judge_model else [])
-            if data_dir is not None:  # a prompt subset; the official evaluate.py judges whatever images exist
-                cmd += ["--data", str(data_dir)]
-        else:
-            cmd += ["--model-name", self.gen_kwargs["model_name"]] + (["--mllm", self.judge_model] if self.judge_model else [])
-        env = {**os.environ, **self.judge_env, "CUDA_VISIBLE_DEVICES": ",".join(gpus[:tp])}
+            cmd += ["--tensor-parallel-size", str(len(gpus)), "--data", str(data_dir)]
+            cmd += ["--judge-model", self.judge_model] if self.judge_model else []
+        else:  # official: tensor parallelism = all visible GPUs, as in its code
+            cmd += ["--model-name", self.gen_kwargs["model_name"], "--tasks", *tasks]
+            cmd += ["--mllm", self.judge_model] if self.judge_model else []
+        env = {**os.environ, **self.judge_env, "CUDA_VISIBLE_DEVICES": ",".join(gpus)}
         return cmd + self.judge_args, env
 
     def run(self, model, accelerator, step: int) -> dict:
@@ -403,17 +423,36 @@ class CoReBenchEvalCallback(EvalCallbackBase):
 
         from transformers import AutoTokenizer
 
-        from eval.corebench_eval import corebench_prompts, generate_corebench_images, summarize_scores, write_prompt_files
+        from eval.corebench_eval import (
+            corebench_prompts,
+            generate_corebench_images,
+            link_shard_images,
+            merge_judge_shards,
+            summarize_scores,
+            write_prompt_files,
+        )
 
         rank, world = accelerator.process_index, accelerator.num_processes
         root = Path(self.out_dir) / f"step{step:08d}"
-        image_dir, results_dir, done = root / "images", root / "results", root / "judged.json"
+        image_dir, done = root / "images", root / "judged.json"
         prompts = corebench_prompts(self.prompts_per_dimension)
-        data_dir = root / "prompts" if self.prompts_per_dimension is not None else None
+        nodes, per_node, judge_gpus = self._judge_layout(world)
+        num_shards = nodes * per_node
+        local_world = world // nodes
+        node, is_node_leader = rank // local_world, rank % local_world == 0
+        spp = self.gen_kwargs["samples_per_prompt"]
+
+        def shard_dir(s):
+            return root / "judge" / f"shard{s}"
 
         def wait_for(paths):
             while not all(p.exists() for p in paths):
                 time.sleep(self.poll_seconds)
+
+        def write_json(path, obj):  # atomic: other ranks read it as soon as it exists
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(obj, indent=2))
+            os.replace(tmp, path)
 
         if not done.exists():
             tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, model_max_length=self.prompt_length)
@@ -422,26 +461,49 @@ class CoReBenchEvalCallback(EvalCallbackBase):
                                           prompts=prompts, **self.gen_kwargs)
             seconds = time.time() - t0
             print(f"[CoReBench rank {rank}] generated {n} images in {seconds / 60:.1f} min", flush=True)
-            marker, tmp = root / f".generated.rank{rank}", root / f".generated.rank{rank}.tmp"
-            tmp.write_text(json.dumps({"images": n, "seconds": seconds}))
-            os.replace(tmp, marker)  # atomic: rank 0 reads it once it exists
-            torch.cuda.empty_cache()  # leave the judge as much GPU memory as possible
+            write_json(root / f".generated.rank{rank}", {"images": n, "seconds": seconds})
+            torch.cuda.empty_cache()  # leave the judges as much GPU memory as possible
+
+            if is_node_leader:  # this node's judges, on this node's GPUs, each on its shard
+                wait_for([root / f".generated.rank{r}" for r in range(world)])
+                jobs = []
+                for j, gpus in enumerate(judge_gpus):
+                    s = node * per_node + j
+                    shard, d = prompts[s::num_shards], shard_dir(s)
+                    d.mkdir(parents=True, exist_ok=True)
+                    if self.protocol == "looped_dit":
+                        write_prompt_files(shard, d / "prompts")
+                        cmd, env = self._judge_command(image_dir, d / "results", gpus, data_dir=d / "prompts")
+                    else:
+                        link_shard_images(shard, image_dir, d / "images", spp, self.gen_kwargs["model_name"])
+                        tasks = sorted({p.group for p in shard})
+                        cmd, env = self._judge_command(d / "images", d / "results", gpus, tasks=tasks)
+                    log = open(d / "judge.log", "w")
+                    judgments = spp * sum(len(p.metadata["Checklist"]) for p in shard)
+                    jobs.append((s, judgments, log, subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)))
+                for s, judgments, log, proc in jobs:
+                    code = proc.wait()
+                    log.close()
+                    write_json(shard_dir(s) / "done.json", {"returncode": code, "judgments": judgments})
 
             if accelerator.is_main_process:
-                wait_for([root / f".generated.rank{r}" for r in range(world)])
-                if data_dir is not None:
-                    write_prompt_files(prompts, data_dir)
-                cmd, env = self._judge_command(image_dir, results_dir, data_dir)
-                t0 = time.time()
-                with open(root / "judge.log", "w") as log:
-                    proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-                if proc.returncode == 0:
-                    outcome = {"scores": json.loads((results_dir / "scores.json").read_text())}
+                wait_for([shard_dir(s) / "done.json" for s in range(num_shards)])
+                shards = [json.loads((shard_dir(s) / "done.json").read_text()) for s in range(num_shards)]
+                failed = [s for s, sh in enumerate(shards) if sh["returncode"] != 0]
+                outcome = {}
+                if failed:
+                    outcome["error"] = f"judge shard(s) {failed} failed, see {shard_dir(failed[0]) / 'judge.log'}"
                 else:
-                    outcome = {"error": f"judge exited with code {proc.returncode}, see {root / 'judge.log'}"}
-                outcome["judge_minutes"] = (time.time() - t0) / 60
+                    try:
+                        outcome["scores"] = merge_judge_shards(self.protocol, [shard_dir(s) / "results" for s in range(num_shards)])
+                    except Exception as e:  # e.g. too many unparseable judgments in total
+                        outcome["error"] = f"merging judge shards failed: {e}"
+                for s, sh in enumerate(shards):
+                    timing_file = shard_dir(s) / "results" / "scores.json"
+                    sh["timing"] = json.loads(timing_file.read_text()).get("timing", {}) if timing_file.exists() else {}
+                outcome["judge_shards"] = shards
                 outcome["generation"] = [json.loads((root / f".generated.rank{r}").read_text()) for r in range(world)]
-                done.write_text(json.dumps(outcome, indent=2))
+                write_json(done, outcome)
             else:
                 wait_for([done])
 
@@ -453,6 +515,8 @@ class CoReBenchEvalCallback(EvalCallbackBase):
             return {}
         if not self.keep_images:
             shutil.rmtree(image_dir, ignore_errors=True)
+            for shard_images in (root / "judge").glob("shard*/images"):  # official: the shards' symlink views
+                shutil.rmtree(shard_images, ignore_errors=True)
         metrics = summarize_scores(outcome["scores"])
         print(f"[CoReBench] step {step}: " + "  ".join(f"{k}={v:.1f}" for k, v in metrics.items()), flush=True)
         return {f"corebench/{k}": v for k, v in metrics.items()}

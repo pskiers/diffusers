@@ -14,7 +14,8 @@
   protocol: looped_dit
   judge_python: ${oc.env:COREBENCH_JUDGE_PYTHON,null}
   judge_model: null
-  judge_tensor_parallel_size: null
+  judge_tensor_parallel_size: 2   # GPUs per judge: 2 fits on 80 GB GPUs (24 GB ones need 4 or 8)
+  judges_per_node: null           # null = as many as the node's GPUs allow; each judges its own prompt shard
   gpu_memory_utilization: 0.85
   judge_env: {}             # e.g. {HF_HOME: /big/disk/hf_home}: where the judge's ~66 GB weights live
   batch_size: 16

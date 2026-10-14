@@ -136,15 +136,68 @@ def generate_corebench_images(
     return len(todo)
 
 
+def link_shard_images(prompts: list[Prompt], image_dir: Path, shard_image_dir: Path, samples_per_prompt: int,
+                      model_name: str = "model") -> None:
+    """For the official protocol, whose evaluate.py scores every image in a
+    directory: a view of just this shard's images (symlinks, official layout)."""
+    for p in prompts:
+        for s in range(samples_per_prompt):
+            src = output_path("official", image_dir, p, s, model_name)
+            dst = output_path("official", shard_image_dir, p, s, model_name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                dst.symlink_to(src.resolve())
+
+
+def merge_judge_shards(protocol: str, results_dirs: list[Path], max_failed: int = 64) -> dict:
+    """Combine judge shards (each a disjoint set of prompts, all their images)
+    into what one judge over all of them reports, with each protocol's own
+    scoring code:
+      looped_dit — every shard's raw judgments (results.jsonl), concatenated,
+          through Looped-DiT's summarize(); `max_failed` unparseable judgments
+          tolerated in total, as their judge tolerates in one run.
+      official — the per-image scores of each dimension's result files, averaged
+          as evaluate.py averages them; overall = mean of the dimensions.
+    Returns eval/corebench_judge.py's scores.json fields (dimensions, overall, ...)."""
+    import json
+
+    if protocol == "looped_dit":
+        from third_party.looped_dit.looped_dit.eval.judge import summarize
+
+        records, failed = [], 0
+        for d in results_dirs:
+            records += [json.loads(line) for line in (d / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+            failed += json.loads((d / "summary.json").read_text())["failed_judgments"]
+        if failed > max_failed:
+            raise RuntimeError(f"{failed} judgments could not be parsed (tolerance {max_failed})")
+        summary = summarize("corebench", records)
+        return {"dimensions": summary["groups"], "overall": summary["overall"], "failed_judgments": failed,
+                "num_images": summary["num_images"]}
+
+    image_scores: dict[str, list[float]] = {}
+    for d in results_dirs:
+        for f in d.glob("*-*.json"):
+            if f.name == "scores.json":
+                continue
+            task = "-".join(f.name.split("-")[:2])  # <task>-<mllm>.json
+            result = json.loads(f.read_text(encoding="utf-8"))
+            image_scores.setdefault(task, []).extend(
+                v["image_score"] for k, v in result.items() if k != "mean_score" and v.get("image_score") != ""
+            )
+    dims = {task: 100 * mean(scores) for task, scores in image_scores.items() if scores}
+    return {"dimensions": dims, "overall": mean(dims.values())}
+
+
 def summarize_scores(scores: dict) -> dict[str, float]:
     """eval/corebench_judge.py's scores.json → flat metrics (0-100): the
     protocol's overall score, composition and reasoning means, each dimension."""
     dims = scores["dimensions"]
+    present = [t for t in COMPOSITION + REASONING if t in dims]  # all 12 unless a tiny prompt subset
     metrics = {
         "overall": scores["overall"],
-        "composition": mean(dims[t] for t in COMPOSITION),
-        "reasoning": mean(dims[t] for t in REASONING),
-        "mean_of_dimensions": mean(dims[t] for t in COMPOSITION + REASONING),
+        "composition": mean(dims[t] for t in COMPOSITION if t in dims),
+        "reasoning": mean(dims[t] for t in REASONING if t in dims),
+        "mean_of_dimensions": mean(dims[t] for t in present),
     }
-    metrics.update({t: dims[t] for t in COMPOSITION + REASONING})
+    metrics.update({t: dims[t] for t in present})
     return metrics

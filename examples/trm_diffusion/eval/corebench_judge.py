@@ -103,7 +103,7 @@ def run_official(args) -> dict:
 
     evaluate.LLM = llm
     mllm = args.mllm
-    ns = argparse.Namespace(model=args.model_name, mllm=mllm, gen_eval_file=", ".join(TASKS),
+    ns = argparse.Namespace(model=args.model_name, mllm=mllm, gen_eval_file=", ".join(args.tasks),
                             output_path=str(args.image_dir), update=False, seed=0)
     evaluate.seed_everything(ns.seed)
     if "Qwen" in mllm:
@@ -111,7 +111,7 @@ def run_official(args) -> dict:
     if "Gemini" in mllm:
         evaluate.start_evaluation_gemini(ns, OFFICIAL_MLLMS[mllm])
     dims = {}
-    for task in TASKS:
+    for task in args.tasks:
         result = json.loads((args.image_dir / args.model_name / f"{task}-{mllm}.json").read_text())
         dims[task] = 100 * result["mean_score"]
         (args.out_dir / f"{task}-{mllm}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
@@ -137,6 +137,8 @@ def main() -> None:
     # official (tensor parallelism = all GPUs in CUDA_VISIBLE_DEVICES, as in their code)
     parser.add_argument("--mllm", default="Qwen3_VL_30B_A3B_Thinking", choices=sorted(OFFICIAL_MLLMS))
     parser.add_argument("--model-name", default="model", help="official: image sub-directory name")
+    parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=TASKS,
+                        help="official: dimensions to judge (a shard may not have images of every one)")
     args = parser.parse_args()
     args.image_dir, args.out_dir = args.image_dir.resolve(), args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
