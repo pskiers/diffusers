@@ -625,31 +625,41 @@ class ThinkerFrozenPainterBase(BaseModel):
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
         max_batches = kwargs.get("max_batches", 100)
+        # loss_seed: draw the same noise/timesteps (and text dropout) for every
+        # eval, so val losses compare across evals and runs without sampling
+        # jitter; the training RNG stream is left untouched. None = global RNG.
+        loss_seed = kwargs.get("loss_seed")
+        device = accelerator.device
 
         self.train()
         metric_accum: dict[str, float] = {}
         n_batches = 0
 
-        for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
-            if i >= max_batches:
-                break
-            [d] = self.prep_mb_data([batch], accelerator.device)
-            result = self(d["sample"])
-            noise_pred, logits = result.pred, result.logits
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else [], enabled=loss_seed is not None):
+            if loss_seed is not None:
+                torch.random.default_generator.manual_seed(loss_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed(loss_seed)  # this rank's GPU only
+            for i, batch in tqdm(enumerate(dataloader), "Eval", total=max_batches):
+                if i >= max_batches:
+                    break
+                [d] = self.prep_mb_data([batch], device)
+                result = self(d["sample"])
+                noise_pred, logits = result.pred, result.logits
 
-            _, loss_dict = self.loss_fn(noise_pred, logits, d["sample"])
+                _, loss_dict = self.loss_fn(noise_pred, logits, d["sample"])
 
-            if logits is not None and d["sample"].solution is not None:
-                B_, N, _ = logits.shape
-                if N <= d["sample"].solution.shape[1]:
-                    preds = logits.argmax(dim=-1)
-                    correct = preds == d["sample"].solution[:B_, :N]
-                    loss_dict["thinker_puzzle_acc"] = correct.all(dim=1).float().mean().item()
-                    loss_dict["thinker_cell_acc"] = correct.float().mean().item()
+                if logits is not None and d["sample"].solution is not None:
+                    B_, N, _ = logits.shape
+                    if N <= d["sample"].solution.shape[1]:
+                        preds = logits.argmax(dim=-1)
+                        correct = preds == d["sample"].solution[:B_, :N]
+                        loss_dict["thinker_puzzle_acc"] = correct.all(dim=1).float().mean().item()
+                        loss_dict["thinker_cell_acc"] = correct.float().mean().item()
 
-            for k, v in loss_dict.items():
-                metric_accum[k] = metric_accum.get(k, 0.0) + v
-            n_batches += 1
+                for k, v in loss_dict.items():
+                    metric_accum[k] = metric_accum.get(k, 0.0) + v
+                n_batches += 1
 
         result = {k: v / n_batches for k, v in metric_accum.items()} if n_batches > 0 else {}
 

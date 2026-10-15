@@ -219,6 +219,17 @@ def test_max_samples_subset(built_root):
     assert [sub.caption(i) for i in range(10)] == [again.caption(i) for i in range(10)]
 
 
+def test_holdout_excludes_val_subset(built_root):
+    full = Std120KDataset(root=built_root, download=False)
+    val = Std120KDataset(root=built_root, download=False, max_samples=10, subset_seed=3)
+    train = Std120KDataset(root=built_root, download=False, holdout=10, subset_seed=3)
+    keys = lambda ds: {(int(s), int(o)) for s, o in zip(ds._source_ids, ds._offsets)}  # (source, offset): unique
+    assert len(train) == len(full) - 10
+    assert not keys(train) & keys(val) and keys(train) | keys(val) == keys(full)
+    assert (np.diff(train._source_ids) >= 0).all()  # sources stay contiguous for the mixture sampler
+    assert set(train.make_train_sampler(seed=0)) <= set(range(len(train)))
+
+
 def test_mixture_sampler(built_root):
     ds = Std120KDataset(root=built_root, download=False)
     sampler = ds.make_train_sampler(seed=7)

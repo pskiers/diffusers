@@ -19,10 +19,13 @@ train_dataset:
   image_size: "${data.image_size}"
   tokenizer: "${data.text_encoder}"
   prompt_length: "${data.prompt_length}"
+  # 512 = leave val_dataset's subset out of training (e.g. for hyperparameter
+  # tuning on a true held-out loss); 0 = the full dataset, as Looped-DiT.
+  holdout: 0
 
 # Std-120K has no held-out split: this is a fixed 512-sample subset of the
-# training data, for loss monitoring only. Prompt-following is evaluated on
-# T2I-CoReBench instead.
+# training data (held out only with train_dataset.holdout=512), for loss
+# monitoring. Prompt-following is evaluated on T2I-CoReBench instead.
 val_dataset:
   _target_: datasets.std120k_dataset.Std120KDataset
   root: "${data.root}"

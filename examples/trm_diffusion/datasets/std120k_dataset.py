@@ -450,7 +450,10 @@ class Std120KDataset(Dataset):
         tokenizer, prompt_length: caption tokenization, as their loader's.
         max_samples: keep a fixed random subset of this many samples (seeded
             by subset_seed) — e.g. a small validation set. Std-120K has no
-            held-out split, so such a subset overlaps the training data.
+            held-out split, so such a subset overlaps the training data...
+        holdout: ...unless the training set drops it: holdout=k removes exactly
+            the samples that max_samples=k (same subset_seed) keeps. 0 = the
+            full dataset, as Looped-DiT trains on.
         download: build missing sources (downloading their raw files).
         build_workers: processes used when building (default: all CPUs).
 
@@ -473,6 +476,7 @@ class Std120KDataset(Dataset):
         prompt_length: int = PROMPT_LENGTH,
         max_samples: Optional[int] = None,
         subset_seed: int = 0,
+        holdout: int = 0,
         download: bool = True,
         build_workers: Optional[int] = None,
         raw_files=None,
@@ -496,8 +500,11 @@ class Std120KDataset(Dataset):
         self._lengths = np.concatenate(lengths)
         self._captions = np.array(captions, dtype=object)
         self._source_ids = np.concatenate(source_ids)
-        if max_samples is not None and max_samples < len(self._offsets):
-            keep = np.sort(np.random.default_rng(subset_seed).permutation(len(self._offsets))[:max_samples])
+        if holdout and max_samples is not None:
+            raise ValueError("max_samples and holdout select complementary subsets; set one")
+        if holdout or (max_samples is not None and max_samples < len(self._offsets)):
+            perm = np.random.default_rng(subset_seed).permutation(len(self._offsets))
+            keep = np.sort(perm[holdout:] if holdout else perm[:max_samples])  # sorted: sources stay contiguous
             self._offsets, self._lengths = self._offsets[keep], self._lengths[keep]
             self._captions, self._source_ids = self._captions[keep], self._source_ids[keep]
 

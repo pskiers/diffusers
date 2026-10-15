@@ -196,6 +196,30 @@ def test_gradients_reach_thinker(thinker_model, tokens):
                 proj.weight.zero_()
 
 
+def test_eval_loss_seed(thinker_model, tokens):
+    """eval_step(loss_seed=...): the same val loss at every eval, and the
+    training RNG continues as if no eval had run."""
+    from types import SimpleNamespace
+
+    model, callbacks = thinker_model, thinker_model.eval_callbacks
+    model.eval_callbacks = []  # loss only, no sampling
+    batch, acc = [_batch(tokens)], SimpleNamespace(device=DEVICE)
+    try:
+        torch.manual_seed(1)
+        expected = torch.rand(3), torch.rand(3, device=DEVICE)
+        torch.manual_seed(1)
+        a = model.eval_step(batch, acc, loss_seed=0)["diff_loss"]
+        b = model.eval_step(batch, acc, loss_seed=0)["diff_loss"]
+        after = torch.rand(3), torch.rand(3, device=DEVICE)
+        c = model.eval_step(batch, acc, loss_seed=1)["diff_loss"]
+        d, e = (model.eval_step(batch, acc)["diff_loss"] for _ in range(2))  # unseeded, as before
+    finally:
+        model.eval_callbacks = callbacks
+    print(f"\nseed 0: {a:.6f} {b:.6f}, seed 1: {c:.6f}, unseeded: {d:.6f} {e:.6f}")
+    assert a == pytest.approx(b, rel=1e-6) and all(torch.equal(x, y) for x, y in zip(after, expected))
+    assert abs(a - c) > 1e-4 * a and abs(d - e) > 1e-4 * d
+
+
 def test_train_script_smoke(tmp_path):
     """A few real train_trm.py steps of the experiment, incl. an eval with sampling."""
     fixture = ROOT / "data" / "std120k_testfixture"

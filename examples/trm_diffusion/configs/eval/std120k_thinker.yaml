@@ -3,6 +3,8 @@ save_every: 10000
 log_every: 100
 cfg_scale: 6.0
 batch_size: 32
+# same noise/timesteps for the val loss at every eval (comparable across evals and runs)
+loss_seed: 0
 num_log_images: 16
 # One eval can include a full CoReBench run (generation + judging, see
 # eval_callbacks/t2i_samples.yaml); train_trm.py aborts evals exceeding this.

@@ -304,7 +304,8 @@ def main(cfg: DictConfig):
                 ema_helper.ema(unwrapped)
 
             with _StepTimeout(eval_timeout):
-                val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step)
+                val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step,
+                                                  loss_seed=cfg.eval.get("loss_seed"))
                 eval_barrier.wait()  # main-only callbacks: keep the other ranks out of the next all-reduce
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
 
