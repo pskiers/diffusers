@@ -1,0 +1,11 @@
+# minit2i_b16_frozen with the pretrain-only MiniT2I-B/16 (CC12M, 250K steps, no Std-120K
+# fine-tune): the official JAX checkpoint MiniT2I/MiniT2I-B-16-pretrain-jax converted to
+# PyTorch (bit-exact converter, see the repo's README) in the official repo's layout.
+# Private repo: needs an HF token with access (HF_TOKEN or `hf auth login`).
+# Use with: painter=minit2i_b16_pretrain_frozen
+defaults:
+  - minit2i_b16_frozen
+  - _self_
+
+repo: "pskiers/MiniT2I-B-16-pretrain"
+revision: "65ec7df2fad1c76c00e607596dbf13d016b46b77"

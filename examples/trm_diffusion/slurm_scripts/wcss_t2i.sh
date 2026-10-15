@@ -125,3 +125,16 @@ launch train_trm.py experiment=std120k_thinker_minit2i \
 launch eval.py experiment=std120k_thinker_minit2i \
   data.root=$DATA_LOCAL +checkpoint=runs/std120k_thinker_minit2i/checkpoint_final.pt \
   +metrics_path=runs/std120k_thinker_minit2i/corebench_final.json eval_callbacks.1.every_n_steps=0
+
+
+# # train PaTh (CoReBench during training with 1 image per prompt instead of 4)
+# launch train_trm.py experiment=std120k_thinker_minit2i painter=minit2i_b16_pretrain_frozen \
+#   data.root=$DATA_LOCAL data.num_workers=$WORKERS \
+#   train.batch_size=$BATCH train.gradient_accumulation_steps=$ACCUM \
+#   eval_callbacks.1.samples_per_prompt=1 \
+#   run.output_dir=runs/std120k_thinker_minit2i_pretrain
+
+# # eval PaTh
+# launch eval.py experiment=std120k_thinker_minit2i painter=minit2i_b16_pretrain_frozen \
+#   data.root=$DATA_LOCAL +checkpoint=runs/std120k_thinker_minit2i_pretrain/checkpoint_final.pt \
+#   +metrics_path=runs/std120k_thinker_minit2i_pretrain/corebench_final.json eval_callbacks.1.every_n_steps=0
