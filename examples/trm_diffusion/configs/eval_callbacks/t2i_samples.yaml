@@ -18,7 +18,11 @@
   judges_per_node: null           # null = as many as the node's GPUs allow; each judges its own prompt shard
   gpu_memory_utilization: 0.85
   judge_env: {}             # e.g. {HF_HOME: /big/disk/hf_home}: where the judge's ~66 GB weights live
-  batch_size: 16
+  # requests per vLLM call (Looped-DiT's default 256): each call waits for its longest
+  # thinking chain, so bigger calls idle less (H100, 2x2 judges: 0.74 -> 0.61 s/judgment)
+  judge_args: [--batch-size, 1024]
+  samples_per_prompt: 4     # the benchmark's 4 images per prompt; 1 = ~4x cheaper, noisier (e.g. during training)
+  batch_size: 128           # images per generation batch (H100: 9.5 s/image vs 10.1 at 16; flat past 32)
   steps: 100
   cfg_scale: 6.0
   tokenizer: ${data.text_encoder}

@@ -15,22 +15,26 @@ module load Python/3.10.4-GCCcore-11.3.0
 module load CUDA/12.4.0
 source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin/activate
 
+# project paths
 ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 export SCRATCH=$TMPDIR
 export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
 export JUDGE_ENV=$ROOT/llm_judge_env
 export COREBENCH_JUDGE_PYTHON=$ROOT/examples/trm_diffusion/slurm_scripts/wcss_judge_python.sh
 export DATA_T2I=$ROOT/examples/trm_diffusion/data/std120k
+DATA_LOCAL='$TMPDIR/std120k'
+# project flags
 export TOKENIZERS_PARALLELISM=false
 export SRUN_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK
 
+# wcss training cfg
 GPUS_PER_NODE=4
 NGPUS=$((SLURM_NNODES * GPUS_PER_NODE))
-BATCH=32
+BATCH=48
 ACCUM=$((768 / (BATCH * NGPUS)))
 WORKERS=8
 
-# helper function for multi node jobs
+# multi node job launcher
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=29500
 launch() {
@@ -39,60 +43,63 @@ launch() {
     --main_process_ip $MASTER_ADDR --main_process_port $MASTER_PORT $*"
 }
 
+
+# --- PREQUISITES ---
 cd $ROOT/examples/trm_diffusion
+# copy the dataset to each node's local NVMe
+srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 bash -c "set -e
+  for done in $DATA_T2I/*/DONE; do
+    src=\$(dirname \$done); dst=$DATA_LOCAL/\$(basename \$src)
+    mkdir -p \$dst && cp \$src/images.bin \$src/index.parquet \$src/DONE \$dst/
+  done
+  echo \$(hostname): \$(du -sh $DATA_LOCAL)"
 
 
-# build t2i dataset
-python -m datasets.std120k_dataset --root $DATA_T2I --workers $SLURM_CPUS_PER_TASK
+# --- BUILDING ENV AND DATA ---
+
+# # build t2i dataset
+# python -m datasets.std120k_dataset --root $DATA_T2I --workers $SLURM_CPUS_PER_TASK
+
+# # build llm judge env (needs Python >= 3.11, the Python/3.10.4 module breaks vLLM)
+# (module purge && module load Python/3.12.3-GCCcore-13.3.0 && PYTHON=python3.12 bash scripts/setup_judge_env.sh $JUDGE_ENV)
+
+# # download llm judge model
+# $COREBENCH_JUDGE_PYTHON -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-VL-32B-Thinking'))"
 
 
-# build llm judge env (needs Python >= 3.11, the Python/3.10.4 module breaks vLLM)
-(module purge && module load Python/3.12.3-GCCcore-13.3.0 && PYTHON=python3.12 bash scripts/setup_judge_env.sh $JUDGE_ENV)
+# --- BENCHMARKING ---
+
+# # benchmark training/evaluation speed + batch sizes
+# launch experiments/benchmark.py experiment=std120k_thinker_minit2i \
+#   data.root=$DATA_LOCAL data.num_workers=$WORKERS \
+#   train.batch_size=$BATCH train.gradient_accumulation_steps=$ACCUM \
+#   "'+bench.train_batch_sizes=[16,24,32,48,64,96]'" "'+bench.sample_batch_sizes=[8,16,32,64,128]'" \
+#   run.output_dir=runs/benchmark_${NGPUS}gpu
+
+# # benchmark the judges
+# #   2 judges x 2 GPUs per node
+# launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_LOCAL \
+#   +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_2x2
+# #   1 judge x 4 GPUs per node
+# launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_LOCAL \
+#   +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_1x4 \
+#   eval_callbacks.1.judges_per_node=1 eval_callbacks.1.judge_tensor_parallel_size=4
+# #   2 judges x 2 GPUs per node, 4096 requests per vLLM call instead of the default 1024
+# launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_LOCAL \
+#   +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_2x2_b4096 \
+#   "'eval_callbacks.1.judge_args=[--batch-size,4096]'"
 
 
-# download llm judge model
-$COREBENCH_JUDGE_PYTHON -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-VL-32B-Thinking'))"
-nvidia-smi --query-gpu=name,driver_version --format=csv
-$COREBENCH_JUDGE_PYTHON -c "import sys, torch, vllm; print('judge python', sys.version.split()[0], 'vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.is_available()); torch.zeros(1).cuda()"
+# --- TRAINING ---
 
-
-# benchmark training/evaluation speed + batch sizes
-launch experiments/benchmark.py experiment=std120k_thinker_minit2i \
-  data.root=$DATA_T2I data.num_workers=$WORKERS \
-  train.batch_size=$BATCH train.gradient_accumulation_steps=$ACCUM \
-  "'+bench.train_batch_sizes=[16,24,32,48,64,96]'" "'+bench.sample_batch_sizes=[8,16,32,64,128]'" \
-  run.output_dir=runs/benchmark_${NGPUS}gpu
-
-
-# benchmark the judges
-#   2 judges x 2 GPUs per node
-launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_T2I \
-  +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_2x2
-#   1 judge x 4 GPUs per node
-launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_T2I \
-  +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_1x4 \
-  eval_callbacks.1.judges_per_node=1 eval_callbacks.1.judge_tensor_parallel_size=4
-#   2 judges x 2 GPUs per node, 1024 requests per vLLM call instead of 256
-launch experiments/benchmark.py experiment=std120k_thinker_minit2i data.root=$DATA_T2I \
-  +bench.skip_training=true +bench.corebench_prompts_per_dimension=8 run.output_dir=runs/benchmark_judge_2x2_b1024 \
-  "'+eval_callbacks.1.judge_args=[--batch-size,1024]'"
-
-
-# validate llm judge
-launch eval.py experiment=std120k_thinker_minit2i \
-  thinker.n_sup=1 thinker.H_cycles=1 thinker.L_cycles=1 \
-  data.root=$DATA_T2I run.output_dir=runs/corebench_minit2i_baseline \
-  +metrics_path=runs/corebench_minit2i_baseline/metrics.json
-
-
-# train PaTh
+# train PaTh (CoReBench during training with 1 image per prompt instead of 4)
 launch train_trm.py experiment=std120k_thinker_minit2i \
-  data.root=$DATA_T2I data.num_workers=$WORKERS \
+  data.root=$DATA_LOCAL data.num_workers=$WORKERS \
   train.batch_size=$BATCH train.gradient_accumulation_steps=$ACCUM \
+  eval_callbacks.1.samples_per_prompt=1 \
   run.output_dir=runs/std120k_thinker_minit2i
-
 
 # eval PaTh
 launch eval.py experiment=std120k_thinker_minit2i \
-  data.root=$DATA_T2I +checkpoint=runs/std120k_thinker_minit2i/checkpoint_final.pt \
+  data.root=$DATA_LOCAL +checkpoint=runs/std120k_thinker_minit2i/checkpoint_final.pt \
   +metrics_path=runs/std120k_thinker_minit2i/corebench_final.json eval_callbacks.1.every_n_steps=0

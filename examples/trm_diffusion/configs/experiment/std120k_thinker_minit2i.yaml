@@ -5,7 +5,7 @@
 #
 # Usage:
 #   accelerate launch --multi_gpu --num_processes 8 train_trm.py experiment=std120k_thinker_minit2i \
-#     train.batch_size=32 train.gradient_accumulation_steps=3
+#     train.batch_size=48 train.gradient_accumulation_steps=2
 
 defaults:
   - override /data: std120k

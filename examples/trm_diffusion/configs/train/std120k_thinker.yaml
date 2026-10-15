@@ -3,7 +3,8 @@ compile: true
 
 # Effective batch must be 768 for thinker training:
 #   batch_size x gradient_accumulation_steps x num_GPUs = 768
-# (single GPU below; e.g. 8 GPUs: batch_size 32, gradient_accumulation_steps 3).
+# (single GPU below; e.g. 8 H100s: batch_size 48, gradient_accumulation_steps 2 —
+# fastest that fits: 41.0 samples/s at 55 GB vs 38.8 at batch 16; 96 runs out of memory).
 batch_size: 32
 gradient_accumulation_steps: 24
 # global_step counts reasoning steps (n_sup per batch).
