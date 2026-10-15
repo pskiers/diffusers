@@ -90,11 +90,16 @@ cp -r $DATA_T2I $TMPDIR/ || { echo "dataset copy failed" >&2; exit 1; }
 TUNE="experiment=std120k_thinker_minit2i data.root=$DATA_LOCAL data.num_workers=$WORKERS \
   train.batch_size=$BATCH train.gradient_accumulation_steps=$ACCUM data.train_dataset.holdout=512 \
   eval_callbacks.1.judge_python=null eval_callbacks.0.num_log_images=4"
+# Two optimizers: thinker.optim_cfg (the TRM) and painter.optim_cfg (condition encoder +
+# translator; train/lr logs this one). The zero-init translator gates all steering, so both
+# get the same lr. Its cosine decay is off (ratio 1): over a short run it would decay fully
+# instead of staying ~flat as in the first 10% of the real run.
+lr() { echo "thinker.optim_cfg.lr=$1 painter.optim_cfg.lr=$1 painter.optim_cfg.lr_min_ratio=1.0"; }
 
 # # 1) LR range test (~30 min): lr ramps linearly 0 -> 3e-3 over 100 batches (1600 optimizer
 # #    steps), then stops. In wandb, plot train loss against lr: note where it starts rising
 # #    or spiking. If that is already in the first ~10 batches, rerun with a lower peak lr.
-# launch train_trm.py $TUNE thinker.optim_cfg.lr=3e-3 thinker.optim_cfg.warmup_steps=1600 \
+# launch train_trm.py $TUNE $(lr 3e-3) thinker.optim_cfg.warmup_steps=1600 painter.optim_cfg.warmup_steps=1600 \
 #   train.num_steps=1600 eval.log_every=16 eval.eval_every=100000 eval.save_every=100000 \
 #   run.output_dir=runs/tune_lr_range
 
@@ -102,7 +107,7 @@ TUNE="experiment=std120k_thinker_minit2i data.root=$DATA_LOCAL data.num_workers=
 # #    after warmup). LRs ~1/3, 1/10, 1/30 of where the range test blew up; keep the current
 # #    1e-4 as a reference. Pick the best final val/diff_loss that is still falling (ties: lower lr)
 # for LR in 1e-3 3e-4 1e-4; do
-#   launch train_trm.py $TUNE thinker.optim_cfg.lr=$LR train.num_steps=8000 \
+#   launch train_trm.py $TUNE $(lr $LR) train.num_steps=8000 \
 #     eval.eval_every=1000 eval.save_every=100000 run.output_dir=runs/tune_lr$LR
 # done
 
