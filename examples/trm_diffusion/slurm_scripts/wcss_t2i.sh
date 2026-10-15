@@ -111,6 +111,15 @@ lr() { echo "thinker.optim_cfg.lr=$1 painter.optim_cfg.lr=$1 painter.optim_cfg.l
 #     eval.eval_every=1000 eval.save_every=100000 run.output_dir=runs/tune_lr$LR
 # done
 
+# # 3) pretrain-only painter: the same short runs at 2)'s winner and 3x it (the steering has the
+# #    fine-tune's job to do too, which may favor a larger lr). Keep the winner unless 3x is
+# #    clearly better on val/diff_loss. Set BEST to 2)'s winner.
+# BEST=3e-4
+# for LR in $BEST $(python -c "print(f'{3 * $BEST:g}')"); do
+#   launch train_trm.py $TUNE painter=minit2i_b16_pretrain_frozen $(lr $LR) train.num_steps=8000 \
+#     eval.eval_every=1000 eval.save_every=100000 run.output_dir=runs/tune_pretrain_lr$LR
+# done
+
 
 # --- TRAINING ---
 
