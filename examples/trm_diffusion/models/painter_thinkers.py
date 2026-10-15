@@ -219,6 +219,7 @@ class ThinkerFrozenPainterBase(BaseModel):
         halt_steps_out: Optional[list] = None,
         logits_out: Optional[list] = None,
         zH_out: Optional[list] = None,
+        zL_out: Optional[list] = None,
     ) -> tuple[DiffusionPrediction, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Like forward(), but exposes the TRM's recurrent carry (z_H, z_L)
         instead of always resetting it, and allows overriding n_sup/
@@ -299,6 +300,9 @@ class ThinkerFrozenPainterBase(BaseModel):
         probe_reasoning_dynamics.py's halt-threshold ablation. Not
         populated under null_steering (no reasoning happens).
 
+        zL_out: optional list; like zH_out but for z_L, after every
+        reasoning iteration. Only populated when use_halt_head=False.
+
         Returns: (DiffusionPrediction, z_H_next, z_L_next). Under
         null_steering, the carry is passed through unchanged so callers can
         thread state uniformly regardless of null_steering. z_H_next/
@@ -340,6 +344,8 @@ class ThinkerFrozenPainterBase(BaseModel):
                         logits_out.append(logits.detach())
                     if zH_out is not None:
                         zH_out.append(z_H.detach())
+                    if zL_out is not None:
+                        zL_out.append(z_L.detach())
                 if steps_used is not None:
                     steps_used.append(step_count)
             else:

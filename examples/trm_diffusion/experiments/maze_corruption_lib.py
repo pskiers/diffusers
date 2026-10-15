@@ -134,11 +134,11 @@ def _open_nonblocked(ms: MazeSample, cell: int, blocked: set) -> list:
 def render_partial(ms: MazeSample, p: float) -> tuple:
     # Special case for 0.0 - always return at least the start node
     k = max(1, int(round(len(ms.path) * p)))
-    shown = ms.path[:k]
-    img = ms.morig.copy()
-    sel = np.isin(ms.ids, shown) & ms.bmask
-    img[sel] = ms.sol[sel]
-    return img, shown
+    shown_cells = ms.path[:k]
+    partial_board = ms.morig.copy()
+    sel = np.isin(ms.ids, shown_cells) & ms.bmask
+    partial_board[sel] = ms.sol[sel]
+    return partial_board, shown_cells
 
 
 def apply_gap(img: np.ndarray, ms: MazeSample, shown: list, rng: random.Random, gap_frac: float) -> tuple:
@@ -162,17 +162,12 @@ def apply_gap(img: np.ndarray, ms: MazeSample, shown: list, rng: random.Random, 
 
 
 def apply_add(img: np.ndarray, ms: MazeSample, shown: list, rng: random.Random) -> tuple:
-    """Rysuje złą ścieżkę startującą z czoła narysowanego prefixu, aż do dead-endu.
+    """Draws wrong path from the front of the drawn prefix until a dead-end is reached.
 
     Walk rules (as specified):
       a. while the only way forward is the GT path itself, follow the GT path;
       b. the moment a non-GT opening exists, take it and never re-enter a wall,
-         the GT path, or a cell the walk already used — run until a dead end.
-
-    So at level 0% the walk leaves the start cell (a dead end on most AMAZE
-    boards) along the solution until the first junction, then diverges. The GT
-    cells crossed in step (a) are *correct*, so they are drawn but reported
-    separately from the wrong ones.
+         the GT path, or a cell the walk already used — run until a dead end.d
 
     Returns (img, wrong_cells, gt_walked, diverge_offset):
       wrong_cells    — the off-path cells, i.e. what the model has to erase.
