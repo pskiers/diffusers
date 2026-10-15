@@ -9,6 +9,7 @@
 #SBATCH --gres=gpu:hopper:4
 #SBATCH --output=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/examples/trm_diffusion/slurm_outputs/stdout/output_%j.out
 #SBATCH --error=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/examples/trm_diffusion/slurm_outputs/stderr/error_%j.err
+#SBATCH --extra=FORCE_RM_TMPDIR
 
 source /usr/local/sbin/modules.sh
 module load Python/3.10.4-GCCcore-11.3.0
@@ -22,7 +23,7 @@ export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
 export JUDGE_ENV=$ROOT/llm_judge_env
 export COREBENCH_JUDGE_PYTHON=$ROOT/examples/trm_diffusion/slurm_scripts/wcss_judge_python.sh
 export DATA_T2I=$ROOT/examples/trm_diffusion/data/std120k
-DATA_LOCAL='$TMPDIR/std120k'
+DATA_LOCAL=$TMPDIR/std120k
 # project flags
 export TOKENIZERS_PARALLELISM=false
 export SRUN_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK
@@ -46,13 +47,7 @@ launch() {
 
 # --- PREQUISITES ---
 cd $ROOT/examples/trm_diffusion
-# copy the dataset to each node's local NVMe
-srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 bash -c "set -e
-  for done in $DATA_T2I/*/DONE; do
-    src=\$(dirname \$done); dst=$DATA_LOCAL/\$(basename \$src)
-    mkdir -p \$dst && cp \$src/images.bin \$src/index.parquet \$src/DONE \$dst/
-  done
-  echo \$(hostname): \$(du -sh $DATA_LOCAL)"
+cp -r $DATA_T2I $TMPDIR/ || { echo "dataset copy failed" >&2; exit 1; }
 
 
 # --- BUILDING ENV AND DATA ---
