@@ -182,6 +182,10 @@ def main(cfg: DictConfig):
     world_size = accelerator.num_processes
     num_steps = cfg.train.num_steps
     optimizers = model.build_optimizers(world_size, num_steps)
+    if cfg.get("lr_schedule") is not None:
+        lr_schedule = instantiate(cfg.lr_schedule)
+        for opt in optimizers:
+            opt.schedule = lr_schedule
 
     # Don't prepare optimizers — accelerate wraps them in AcceleratedOptimizer
     # which passes closure to step(), but AdamATan2/SignSGD don't accept it.
@@ -245,11 +249,14 @@ def main(cfg: DictConfig):
     next_log = log_every
     next_eval = eval_every
     next_save = save_every
+    # stop_step < num_steps trains only the start of a num_steps run (same lr
+    # schedule), e.g. for tuning/driver.py's short runs.
+    stop_step = cfg.train.get("stop_step") or num_steps
 
     train_iter = iter(train_dl)
     unwrapped = accelerator.unwrap_model(model)
     progress_bar = tqdm(
-        total=num_steps,
+        total=stop_step,
         initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Training",
@@ -263,7 +270,7 @@ def main(cfg: DictConfig):
             train_iter = iter(train_dl)
             return next(train_iter)
 
-    while global_step < num_steps:
+    while global_step < stop_step:
         unwrapped.train()
         micro_batches = [_next_batch() for _ in range(grad_accum_steps)]
 
@@ -304,7 +311,7 @@ def main(cfg: DictConfig):
 
             with _StepTimeout(eval_timeout):
                 val_metrics = unwrapped.eval_step(eval_dl, accelerator, max_batches=100, step=global_step,
-                                                  loss_seed=cfg.eval.get("loss_seed"))
+                                                  loss_seed=cfg.eval.get("loss_seed"), optimizers=optimizers)
                 eval_barrier.wait()  # main-only callbacks: keep the other ranks out of the next all-reduce
             val_log = {f"val/{k}": v for k, v in val_metrics.items()}
 

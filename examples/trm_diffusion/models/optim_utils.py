@@ -56,6 +56,22 @@ def all_reduce_grads(params: Iterable[torch.nn.Parameter], weight: Optional[floa
     return total
 
 
+class ExponentialLRRamp:
+    """LR range-test schedule (Smith 2017): lr grows geometrically from
+    base_lr * start_factor at step 0 to base_lr * end_factor at num_steps, so
+    every decade of lr gets the same number of steps. Set for all optimizers
+    at once by train_trm.py's `lr_schedule` config (configs/lr_schedule/), which
+    keeps their lr ratios."""
+
+    def __init__(self, start_factor: float = 1e-2, end_factor: float = 1e2):
+        self.start_factor = start_factor
+        self.end_factor = end_factor
+
+    def __call__(self, base_lr: float, step: int, num_steps: int) -> float:
+        frac = min(step / max(1, num_steps), 1.0)
+        return base_lr * self.start_factor * (self.end_factor / self.start_factor) ** frac
+
+
 class ScheduledOptimizer:
     def __init__(self, optimizer, base_lr: float, warmup_steps: int, num_steps: int, min_ratio: float = 0.0):
         self.optimizer = optimizer
@@ -63,6 +79,9 @@ class ScheduledOptimizer:
         self.warmup_steps = warmup_steps
         self.num_steps = num_steps
         self.min_ratio = min_ratio
+        # Replaces the warmup + cosine schedule when set: a callable
+        # (base_lr, step, num_steps) -> lr, e.g. ExponentialLRRamp.
+        self.schedule = None
 
     def step(self, global_step: int) -> float:
         lr = self.compute_lr(global_step)
@@ -85,6 +104,8 @@ class ScheduledOptimizer:
         self.optimizer.load_state_dict(sd)
 
     def compute_lr(self, current_step: int, num_cycles: float = 0.5):
+        if self.schedule is not None:
+            return self.schedule(self.base_lr, current_step, self.num_steps)
         if current_step < self.warmup_steps:
             return self.base_lr * float(current_step) / float(max(1, self.warmup_steps))
 

@@ -18,6 +18,8 @@ defaults:
   - translator: null
   - loss: null
   - eval_callbacks: null
+  - tune_callbacks: null
+  - lr_schedule: null
   - sampling: null
   - experiment: null
 

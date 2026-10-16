@@ -135,6 +135,11 @@ def _eval_cfg(cfg: DictConfig) -> EvalConfig:
     )
 
 
+def _eval_callback_cfgs(cfg: DictConfig) -> Optional[list]:
+    """eval_callbacks followed by tune_callbacks (tuning-run diagnostics)."""
+    return [*(cfg.get("eval_callbacks") or []), *(cfg.get("tune_callbacks") or [])] or None
+
+
 # ── Public builders ────────────────────────────────────────────────────────────
 
 
@@ -174,7 +179,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             condition_encoder=cfg.condition_encoder,
             loss=cfg.loss,
             thinker_painter_translator=cfg.translator,
-            eval_callbacks=cfg.get("eval_callbacks") or None,
+            eval_callbacks=_eval_callback_cfgs(cfg),
             scheduler=scheduler,
             sampling_pipeline=sampling,
         )
@@ -199,7 +204,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             condition_encoder=cfg.condition_encoder,
             loss=cfg.loss,
             thinker_painter_translator=cfg.translator,
-            eval_callbacks=cfg.get("eval_callbacks") or None,
+            eval_callbacks=_eval_callback_cfgs(cfg),
             scheduler=scheduler,
             sampling_pipeline=sampling,
             halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
@@ -222,7 +227,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             condition_encoder=cfg.condition_encoder,
             loss=cfg.loss,
             thinker_painter_translator=cfg.translator,
-            eval_callbacks=cfg.get("eval_callbacks") or None,
+            eval_callbacks=_eval_callback_cfgs(cfg),
             scheduler=scheduler,
             sampling_pipeline=sampling,
         )

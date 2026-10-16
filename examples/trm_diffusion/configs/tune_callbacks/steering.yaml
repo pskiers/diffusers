@@ -1,0 +1,12 @@
+# Hyperparameter-tuning diagnostics for thinker-steered painters
+# (models/tune_callbacks.py), run at every eval next to the regular
+# eval_callbacks. Only tuning runs enable it (tuning/driver.py adds
+# tune_callbacks=steering); it logs val/tune/* and appends one JSON line per
+# eval to out_path, which the driver reads.
+- _target_: models.tune_callbacks.SteeringDiagnosticsCallback
+  out_path: ${run.output_dir}/tune_metrics.jsonl
+  max_batches: 16       # eval batches per eval, split across ranks
+  seed: 0               # noise / timesteps / text dropout, the same at every eval and in every run
+  num_t_bins: 4         # dloss by timestep quantile
+  recursion_gain: true  # also evaluate with n_sup = H_cycles = L_cycles = 1
+  grad_norms: true      # one-batch thinker / encoder gradient norms

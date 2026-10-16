@@ -1,0 +1,8 @@
+# LR range test: every optimizer's lr grows geometrically from
+# start_factor x its configured lr at step 0 to end_factor x at train.num_steps,
+# keeping the ratios between optimizers (models/optim_utils.py: ExponentialLRRamp).
+# Used by tuning/driver.py; e.g. with a configured lr of 1e-4 the default spans
+# 1e-6 -> 1e-2.  Use with: lr_schedule=range_test
+_target_: models.optim_utils.ExponentialLRRamp
+start_factor: 1.0e-2
+end_factor: 1.0e+2
