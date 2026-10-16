@@ -144,7 +144,6 @@ class UNetPainter(PainterBase, BaseModel):
         sampling_pipeline=None,
         vae_pixel_range: str = "[-1,1]",
         pixel_range: str = "[0,1]",
-        mean_reduced_loss: bool = False,
         min_train_timestep: int = 0,
     ):
         super().__init__()
@@ -174,17 +173,6 @@ class UNetPainter(PainterBase, BaseModel):
             if painter_dtype is not None
             else None
         )
-        # loss_fn (models/losses.py) is already batch-mean-reduced, unlike the
-        # original TRM pretrain.py's sum-reduced CE loss that the
-        # `global_batch_size * K` divisor in train_step below was designed to
-        # match. Dividing a mean-reduced loss by global_batch_size again
-        # shrinks gradients by an extra ~global_batch_size, risking an AdamW
-        # eps-floor instability once per-parameter gradients get small (e.g.
-        # late in a well-converging run). mean_reduced_loss=True divides only
-        # by the micro-batch accumulation count K instead, matching the
-        # paper's own train_diffusion.py (`loss = loss / grad_accum_steps`).
-        # Default False preserves existing behavior for every other painter.
-        self._mean_reduced_loss = mean_reduced_loss
         # Paper's train_diffusion.py samples t ~ randint(1, diffusion_steps) —
         # excludes t=0 (an almost-noiseless input, which the paper's own
         # scheduler.noise()/denoise_ddim() may not even handle meaningfully at
@@ -348,7 +336,9 @@ class UNetPainter(PainterBase, BaseModel):
                 betas=self.optim_cfg.get("betas", (0.9, 0.999)),
             )
         else:
-            optim = torch.optim.AdamW(self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
+            optim = torch.optim.AdamW(
+                self.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay, eps=getattr(self.optim_cfg, "eps", 1e-8)
+            )
         return [
             ScheduledOptimizer(
                 optim,
@@ -359,23 +349,12 @@ class UNetPainter(PainterBase, BaseModel):
             )
         ]
 
-    def _loss_backward_divisor(self, global_batch_size: int, K: int) -> float:
-        """Divisor applied to `loss_fn`'s (already batch-mean-reduced) output
-        before `accelerator.backward()`. Default matches original pretrain.py's
-        convention for sum-reduced losses (divide by global_batch_size once;
-        the K micro-batch accumulation cancels the extra K here). See
-        `mean_reduced_loss` in __init__ for the corrected divisor (K only),
-        opt-in per instance since most painters' loss_fn is mean-reduced but
-        haven't been verified against this double-normalization."""
-        return K if self._mean_reduced_loss else global_batch_size * K
-
     def train_step(
         self,
         micro_batches,
         accelerator,
         optimizers,
         ema,
-        global_batch_size,
         global_step,
         **kwargs,
     ):
@@ -383,7 +362,6 @@ class UNetPainter(PainterBase, BaseModel):
         device = accelerator.device
         loss_sums: dict[str, float] = {}
         loss_maxes: dict[str, float] = {}
-        divisor = self._loss_backward_divisor(global_batch_size, K)
 
         for mb in micro_batches:
             sample = self._prepare_training_sample(mb, device)
@@ -394,7 +372,7 @@ class UNetPainter(PainterBase, BaseModel):
 
             result = self(sample)
             total_loss, components = self.loss_fn(result.pred, result.logits, sample)
-            accelerator.backward(total_loss / divisor)
+            accelerator.backward(total_loss / K)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
                 # Per-microbatch max, not just the K-averaged mean below — a
@@ -409,7 +387,7 @@ class UNetPainter(PainterBase, BaseModel):
         # loss spike) apart from something else entirely (loss jumps with a
         # perfectly normal grad norm) the next time this happens.
         all_reduce_grads(self.parameters())
-        grad_norm = accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        grad_norm = accelerator.clip_grad_norm_(self.parameters(), self.train_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)
@@ -978,7 +956,7 @@ class DiTPainter(PainterBase, BaseModel):
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
         trainable = [p for p in self.parameters() if p.requires_grad]
-        optim = torch.optim.AdamW(trainable, lr=0, weight_decay=self.optim_cfg.weight_decay)
+        optim = torch.optim.AdamW(trainable, lr=0, weight_decay=self.optim_cfg.weight_decay, eps=getattr(self.optim_cfg, "eps", 1e-8))
         return [
             ScheduledOptimizer(
                 optim,
@@ -995,7 +973,6 @@ class DiTPainter(PainterBase, BaseModel):
         accelerator,
         optimizers,
         ema,
-        global_batch_size,
         global_step,
         **kwargs,
     ):
@@ -1012,12 +989,12 @@ class DiTPainter(PainterBase, BaseModel):
 
             result = self(sample)
             total_loss, components = self.loss_fn(result.pred, result.logits, sample)
-            accelerator.backward(total_loss / (global_batch_size * K))
+            accelerator.backward(total_loss / K)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
 
         all_reduce_grads(self.parameters())
-        accelerator.clip_grad_norm_([p for p in self.parameters() if p.requires_grad], 1.0)
+        accelerator.clip_grad_norm_([p for p in self.parameters() if p.requires_grad], self.train_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)

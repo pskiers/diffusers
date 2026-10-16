@@ -364,7 +364,9 @@ class LatentSpatialDiT(nn.Module):
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def build_optimizers(self, world_size: int, num_steps: int) -> list:
-        optim = torch.optim.AdamW(self.dit.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay)
+        optim = torch.optim.AdamW(
+            self.dit.parameters(), lr=0, weight_decay=self.optim_cfg.weight_decay, eps=self.optim_cfg.eps
+        )
         return [
             ScheduledOptimizer(
                 optim,
@@ -432,7 +434,6 @@ class LatentSpatialDiT(nn.Module):
         micro_batches,
         accelerator,
         optimizers,
-        global_batch_size,
         global_step,
         cfg_prob=0.0,
     ):
@@ -501,10 +502,10 @@ class LatentSpatialDiT(nn.Module):
             total_loss += loss.item()
             for k, v in comps.items():
                 total_comps[k] = total_comps.get(k, 0.0) + v
-            accelerator.backward(loss / (global_batch_size * K))
+            accelerator.backward(loss / K)
 
         all_reduce_grads(self.dit.parameters())
-        accelerator.clip_grad_norm_(self.dit.parameters(), 1.0)
+        accelerator.clip_grad_norm_(self.dit.parameters(), self.optim_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1

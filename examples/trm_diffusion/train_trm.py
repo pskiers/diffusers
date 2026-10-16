@@ -17,7 +17,8 @@ Design notes:
   - Training logic lives in model classes (train_step / eval_step).
   - LR schedule and EMA copied verbatim from TinyRecursiveModels/pretrain.py.
   - Optimizer: AdamATan2 (same as original) + optional SignSGD for puzzle embeddings.
-  - Loss scaled by 1/global_batch_size to match original pretrain.py.
+  - Gradients are the true mean loss over the effective batch (AdamW eps and
+    train.grad_clip act on that scale — see configs/schemas.py).
   - No accelerator.autocast() — TRM handles its own dtype via forward_dtype/CastedEmbedding.
 """
 
@@ -179,7 +180,6 @@ def main(cfg: DictConfig):
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     world_size = accelerator.num_processes
-    global_batch_size = cfg.train.batch_size * world_size
     num_steps = cfg.train.num_steps
     optimizers = model.build_optimizers(world_size, num_steps)
 
@@ -273,7 +273,6 @@ def main(cfg: DictConfig):
                 accelerator,
                 optimizers,
                 ema_helper,
-                global_batch_size,
                 global_step,
             )
 

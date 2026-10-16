@@ -4,11 +4,11 @@
 # concatenated onto the noisy input before the UNet call), just for the SRM
 # Sudoku dataset instead. Pairs with backbone/mnist_unet_concat_big.yaml.
 #
-# Deliberately does NOT copy pixel_range/mean_reduced_loss/min_train_timestep
-# from the Steiner/Polygon/Squares configs -- those were fixes specific to
-# matching that paper's own recipe exactly (images in [-1,1], a particular
-# loss-reduction convention, t=0 excluded from training). MNIST-Sudoku has no
-# such external reference: images here are natively [0,1] (see
+# Deliberately does NOT copy pixel_range/min_train_timestep from the
+# Steiner/Polygon/Squares configs -- those were fixes specific to matching
+# that paper's own recipe exactly (images in [-1,1], t=0 excluded from
+# training). MNIST-Sudoku has no such external reference: images here are
+# natively [0,1] (see
 # MNISTSudokuSRMDataset), matching this class's own defaults, so nothing
 # needs overriding.
 _target_: models.painter_base.ConcatConditionedUNetPainter
@@ -23,3 +23,4 @@ optim_cfg:
   weight_decay: 0.01
   warmup_steps: 2000
   lr_min_ratio: 1.0
+  eps: 3.84e-6  # 1e-8 * train.batch_size 384: reproduces pre-true-mean-loss runs

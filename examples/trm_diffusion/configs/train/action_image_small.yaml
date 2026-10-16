@@ -7,4 +7,7 @@ compile: true
 batch_size: 64
 num_steps: 200000
 gradient_accumulation_steps: 1
+# Runs from before train_steps backpropped the true mean loss had gradients
+# 1/batch_size smaller; grad_clip = batch_size reproduces their clipping.
+grad_clip: 64.0
 cfg_prob: 0.0

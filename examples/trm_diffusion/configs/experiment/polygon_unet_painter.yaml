@@ -13,6 +13,12 @@ defaults:
 
 mode: "painter_base"
 
+train:
+  # configs/train/polygon.yaml is the paper's recipe, whose painter already
+  # backpropped the true mean loss. This painter didn't: its gradients were
+  # 1/batch_size smaller, and grad_clip = batch_size reproduces its clipping.
+  grad_clip: 512.0
+
 run:
   output_dir: "runs/polygon_unet_painter"
 

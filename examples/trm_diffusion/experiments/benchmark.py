@@ -141,7 +141,7 @@ def benchmark_training(cfg, accelerator, bench, agreement) -> tuple[dict, object
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 micro_batches = [next_batch() for _ in range(accum)]
-                _, _, new_step = unwrapped.train_step(micro_batches, accelerator, optimizers, ema, size * world, global_step)
+                _, _, new_step = unwrapped.train_step(micro_batches, accelerator, optimizers, ema, global_step)
                 torch.cuda.synchronize()
                 if i >= bench.warmup_steps:
                     times.append(time.perf_counter() - t0)

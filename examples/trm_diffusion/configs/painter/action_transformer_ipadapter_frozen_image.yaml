@@ -23,3 +23,4 @@ optim_cfg:
   weight_decay: 0.0
   warmup_steps: 1000
   lr_min_ratio: 0.1
+  eps: 1.28e-6  # 1e-8 * train.batch_size 128: reproduces pre-true-mean-loss runs

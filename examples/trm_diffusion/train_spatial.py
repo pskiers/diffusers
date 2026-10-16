@@ -98,6 +98,8 @@ def _build_optim_cfg(cfg: DictConfig) -> SpatialLatentOptimConfig:
         weight_decay=float(o.weight_decay),
         warmup_steps=int(o.warmup_steps),
         lr_min_ratio=float(o.lr_min_ratio),
+        eps=float(o.get("eps", 1e-8)),
+        grad_clip=float(cfg.train.get("grad_clip", 1.0)),
     )
 
 
@@ -239,7 +241,6 @@ def main(cfg: DictConfig):
 
     # ── Optimizers ────────────────────────────────────────────────────────────
     world_size = accelerator.num_processes
-    global_batch_size = int(cfg.train.batch_size) * world_size
     num_steps = int(cfg.train.num_steps)
     optimizers = model.build_optimizers(world_size, num_steps)
 
@@ -289,7 +290,6 @@ def main(cfg: DictConfig):
             micro_batches,
             accelerator,
             optimizers,
-            global_batch_size,
             global_step,
             cfg_prob=cfg_prob,
         )

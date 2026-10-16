@@ -145,6 +145,8 @@ class SpatialLatentOptimConfig:
     weight_decay: float = 0.0
     warmup_steps: int = 1000
     lr_min_ratio: float = 0.1
+    eps: float = 1e-8  # AdamW eps — see configs/schemas.py's PainterOptimConfig
+    grad_clip: float = 1.0  # from cfg.train — see configs/schemas.py's TrainConfig
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -217,7 +219,7 @@ class SpatialLatentUNet(nn.Module):
 
     def build_optimizers(self, world_size: int, num_steps: int) -> list:
         params = list(self.unet.parameters()) + list(self.cond_encoder.parameters())
-        optim = torch.optim.AdamW(params, lr=0, weight_decay=self.optim_cfg.weight_decay)
+        optim = torch.optim.AdamW(params, lr=0, weight_decay=self.optim_cfg.weight_decay, eps=self.optim_cfg.eps)
         return [
             ScheduledOptimizer(
                 optim,
@@ -383,7 +385,6 @@ class SpatialLatentUNet(nn.Module):
         micro_batches: list,
         accelerator,
         optimizers: list,
-        global_batch_size: int,
         global_step: int,
         cfg_prob: float = 0.0,
     ) -> tuple[dict, float, int]:
@@ -392,7 +393,6 @@ class SpatialLatentUNet(nn.Module):
                 micro_batches,
                 accelerator,
                 optimizers,
-                global_batch_size,
                 global_step,
                 cfg_prob,
             )
@@ -400,7 +400,6 @@ class SpatialLatentUNet(nn.Module):
             micro_batches,
             accelerator,
             optimizers,
-            global_batch_size,
             global_step,
             cfg_prob,
         )
@@ -410,7 +409,6 @@ class SpatialLatentUNet(nn.Module):
         micro_batches,
         accelerator,
         optimizers,
-        global_batch_size,
         global_step,
         cfg_prob,
     ):
@@ -460,10 +458,10 @@ class SpatialLatentUNet(nn.Module):
             total_loss += loss.item()
             for k, v in comps.items():
                 total_comps[k] = total_comps.get(k, 0.0) + v
-            accelerator.backward(loss / (global_batch_size * K))
+            accelerator.backward(loss / K)
 
         all_reduce_grads(self._trainable_params())
-        accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
+        accelerator.clip_grad_norm_(self._trainable_params(), self.optim_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1
@@ -482,7 +480,6 @@ class SpatialLatentUNet(nn.Module):
         micro_batches,
         accelerator,
         optimizers,
-        global_batch_size,
         global_step,
         cfg_prob,
     ):
@@ -538,10 +535,10 @@ class SpatialLatentUNet(nn.Module):
             total_loss += loss.item()
             for k, v in comps.items():
                 total_comps[k] = total_comps.get(k, 0.0) + v
-            accelerator.backward(loss / (global_batch_size * K))
+            accelerator.backward(loss / K)
 
         all_reduce_grads(self._trainable_params())
-        accelerator.clip_grad_norm_(self._trainable_params(), 1.0)
+        accelerator.clip_grad_norm_(self._trainable_params(), self.optim_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         self._update_teacher()
         global_step += 1

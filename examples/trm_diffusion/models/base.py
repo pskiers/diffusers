@@ -18,10 +18,12 @@ class BaseModel(ABC, nn.Module):
         accelerator: Accelerator,
         optimizers: list[ScheduledOptimizer],
         ema: EMAHelper | None,
-        global_batch_size: int,
         global_step: int,
         **kwargs,
     ) -> tuple[dict, float, int]:
+        """Backprops the true mean loss over all micro_batches (each loss is
+        batch-mean-reduced, so divide by len(micro_batches)); call
+        all_reduce_grads before clipping so multi-GPU averages it over ranks."""
         pass
 
     @abstractmethod

@@ -70,6 +70,11 @@ class TrainConfig:
     # by min(SNR(t), gamma)/SNR(t) for x0-prediction or min(SNR(t), gamma) for
     # epsilon-prediction, upweighting high-noise steps relative to easy low-noise ones.
     minsnr_gamma: Optional[float] = None
+    # clip_grad_norm_ max_norm. train_steps backprop the true mean loss over
+    # the effective batch, so gradients don't depend on how it is split into
+    # micro-batches or GPUs. Runs from before that had gradients 1/batch_size
+    # smaller: configs/train/*.yaml's grad_clip = batch_size reproduces them.
+    grad_clip: float = 1.0
 
 
 @dataclass
@@ -121,6 +126,10 @@ class PainterOptimConfig:
     lr_min_ratio: float = 0.0
     betas: tuple[float, float] = (0.9, 0.999)
     use_adam_atan2: bool = False  # AdamATan2 instead of AdamW — see trm_wrappers.py
+    # AdamW eps. Configs set 1e-8 * train.batch_size where it reproduces runs
+    # from before train_steps backpropped the true mean loss (gradients were
+    # 1/batch_size smaller then); see TrainConfig.grad_clip.
+    eps: float = 1e-8
 
 
 # ── Latent DiT configs ────────────────────────────────────────────────────────

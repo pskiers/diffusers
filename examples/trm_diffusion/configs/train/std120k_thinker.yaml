@@ -7,6 +7,9 @@ compile: true
 # fastest that fits: 41.0 samples/s at 55 GB vs 38.8 at batch 16; 96 runs out of memory).
 batch_size: 32
 gradient_accumulation_steps: 24
+# Runs from before train_steps backpropped the true mean loss had gradients
+# 1/batch_size smaller; grad_clip = batch_size reproduces their clipping.
+grad_clip: 32.0
 # global_step counts reasoning steps (n_sup per batch).
 num_steps: 80000
 # Text dropout for CFG is done by the painter (painter.label_drop_rate), on the

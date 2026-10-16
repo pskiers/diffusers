@@ -415,7 +415,6 @@ class SpatialTRM(BaseModel):
         accelerator: Any,
         optimizers: list,
         ema: Any,
-        global_batch_size: int,
         global_step: int,
         **kwargs,
     ) -> tuple[dict, float, int]:
@@ -449,7 +448,7 @@ class SpatialTRM(BaseModel):
                     d["labels"].view(-1).clamp(min=0),
                     ignore_index=IGNORE_LABEL_ID,
                 )
-                accelerator.backward(step_loss / (global_batch_size * K))
+                accelerator.backward(step_loss / K)
                 total_loss += step_loss.item()
 
             all_reduce_grads(self.parameters())
@@ -921,7 +920,6 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         accelerator,
         optimizers,
         ema,
-        global_batch_size: int,
         global_step: int,
         **kwargs,
     ) -> tuple[dict, float, int]:
@@ -950,10 +948,10 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                 for k, v in loss_dict.items():
                     total_losses[k] = total_losses.get(k, 0.0) + v
                 if step_loss.requires_grad:
-                    accelerator.backward(step_loss / (global_batch_size * K))
+                    accelerator.backward(step_loss / K)
 
             all_reduce_grads(self.parameters())
-            accelerator.clip_grad_norm_(self.parameters(), 1.0)
+            accelerator.clip_grad_norm_(self.parameters(), self.train_cfg.grad_clip)
             lr = apply_lr_and_step(optimizers, global_step)
             global_step += 1
             if ema is not None:
@@ -1195,7 +1193,6 @@ class DepthMatchedFeedforwardBackbone(PainterBase, BaseModel):
         accelerator,
         optimizers,
         ema,
-        global_batch_size: int,
         global_step: int,
         **kwargs,
     ) -> tuple[dict, float, int]:
@@ -1212,10 +1209,10 @@ class DepthMatchedFeedforwardBackbone(PainterBase, BaseModel):
             for k, v in loss_dict.items():
                 total_losses[k] = total_losses.get(k, 0.0) + v
             if step_loss.requires_grad:
-                accelerator.backward(step_loss / (global_batch_size * K))
+                accelerator.backward(step_loss / K)
 
         all_reduce_grads(self.parameters())
-        accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        accelerator.clip_grad_norm_(self.parameters(), self.train_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)

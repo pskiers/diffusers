@@ -14,9 +14,9 @@ def all_reduce_grads(params: Iterable[torch.nn.Parameter], weight: Optional[floa
     gradient hooks inside its own forward, so without this each rank
     silently trains its own copy. Call after the last backward and before
     clip_grad_norm_, so clipping sees the global gradient. A plain mean is
-    right because every loss in models/losses.py is batch-mean-reduced: with
-    the train_steps' `global_batch_size` divisor, the result equals a single
-    GPU's gradient on the whole global batch.
+    right because each rank backprops the mean loss over its own micro-batches
+    (see BaseModel.train_step): the rank average is then the mean over the
+    whole effective batch, the same gradient one GPU gets on it.
 
     Assumes every rank holds grads for the same params (true whenever all
     ranks run the same graph); a mismatch hangs the collective.

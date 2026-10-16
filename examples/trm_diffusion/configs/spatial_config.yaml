@@ -114,6 +114,7 @@ optim:
   weight_decay: 0.0
   warmup_steps: 1000
   lr_min_ratio: 0.1
+  eps: 1.28e-6  # = 1e-8 * train.batch_size: reproduces pre-true-mean-loss runs
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 train:
@@ -121,6 +122,9 @@ train:
   batch_size: 128
   num_steps: 150000
   gradient_accumulation_steps: 1
+  # Runs from before train_steps backpropped the true mean loss had gradients
+  # 1/batch_size smaller; grad_clip = batch_size reproduces their clipping.
+  grad_clip: 128.0
   cfg_prob: 0.1
   compile: false
 

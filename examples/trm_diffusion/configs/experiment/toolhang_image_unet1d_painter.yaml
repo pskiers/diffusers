@@ -17,5 +17,9 @@ defaults:
 
 mode: "painter_base"
 
+painter:
+  optim_cfg:
+    eps: 3.2e-7  # 1e-8 * train.batch_size 32 (configs/painter/action_unet1d.yaml's is for another batch size)
+
 run:
   output_dir: "runs/toolhang_image_unet1d_painter"

@@ -25,5 +25,9 @@ defaults:
 
 mode: "action_thinker_base"
 
+painter:
+  optim_cfg:
+    eps: 6.4e-7  # 1e-8 * train.batch_size 64 (configs/painter/action_unet1d_controlnet1d_frozen_image.yaml's is for another batch size)
+
 run:
   output_dir: "runs/toolhang_image_unet1d_thinker_controlnet"

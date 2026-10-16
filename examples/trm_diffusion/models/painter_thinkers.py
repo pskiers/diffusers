@@ -522,7 +522,9 @@ class ThinkerFrozenPainterBase(BaseModel):
         if not extra_params:
             return thinker_optims
         optim_cfg = self.painter.optim_cfg
-        enc_optim = torch.optim.AdamW(extra_params, lr=0, weight_decay=optim_cfg.weight_decay)
+        enc_optim = torch.optim.AdamW(
+            extra_params, lr=0, weight_decay=optim_cfg.weight_decay, eps=getattr(optim_cfg, "eps", 1e-8)
+        )
         enc_scheduled = ScheduledOptimizer(
             enc_optim,
             base_lr=optim_cfg.lr,
@@ -562,7 +564,6 @@ class ThinkerFrozenPainterBase(BaseModel):
         accelerator,
         optimizers,
         ema,
-        global_batch_size,
         global_step,
         **kwargs,
     ):
@@ -590,7 +591,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                 for k, v in loss_dict.items():
                     total_losses[k] = total_losses.get(k, 0.0) + v
                 if step_loss.requires_grad:
-                    accelerator.backward(step_loss / (global_batch_size * K))
+                    accelerator.backward(step_loss / K)
 
                 if halt_histories is not None:
                     per_sample_loss = (
@@ -600,10 +601,10 @@ class ThinkerFrozenPainterBase(BaseModel):
                     halt_histories[i]["loss"].append(per_sample_loss.detach())
 
             enc_params = self.get_encoder_params()
-            all_reduce_grads(self.get_thinker_params() + enc_params)
-            accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+            all_reduce_grads(self.get_thinker_params() + enc_params + self.get_painter_params())
+            accelerator.clip_grad_norm_(self.get_thinker_params(), self.train_cfg.grad_clip)
             if enc_params:
-                accelerator.clip_grad_norm_(enc_params, 1.0)
+                accelerator.clip_grad_norm_(enc_params, self.train_cfg.grad_clip)
             lr = apply_lr_and_step(optimizers, global_step)
             global_step += 1
             if ema is not None:
@@ -803,7 +804,6 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         accelerator,
         optimizers,
         ema,
-        global_batch_size,
         global_step,
         **kwargs,
     ):
@@ -854,7 +854,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             for k, v in loss_dict.items():
                 total_losses[k] = total_losses.get(k, 0.0) + v
             if step_loss.requires_grad:
-                accelerator.backward(step_loss / (global_batch_size * K))
+                accelerator.backward(step_loss / K)
 
             slot["steps"] = slot["steps"] + 1
 
@@ -887,10 +887,10 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 completed_histories.append((z_seq, l_seq))
 
         enc_params = self.get_encoder_params()
-        all_reduce_grads(self.get_thinker_params() + enc_params)
-        accelerator.clip_grad_norm_(self.get_thinker_params(), 1.0)
+        all_reduce_grads(self.get_thinker_params() + enc_params + self.get_painter_params())
+        accelerator.clip_grad_norm_(self.get_thinker_params(), self.train_cfg.grad_clip)
         if enc_params:
-            accelerator.clip_grad_norm_(enc_params, 1.0)
+            accelerator.clip_grad_norm_(enc_params, self.train_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         global_step += 1
         if ema is not None:

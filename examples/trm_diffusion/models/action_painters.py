@@ -219,6 +219,7 @@ class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
             lr=0,
             betas=tuple(self.optim_cfg.betas),
             weight_decay=self.optim_cfg.weight_decay,
+            eps=getattr(self.optim_cfg, "eps", 1e-8),
         )
         return [
             ScheduledOptimizer(
@@ -236,7 +237,6 @@ class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
         accelerator,
         optimizers,
         ema,
-        global_batch_size,
         global_step,
         **kwargs,
     ):
@@ -253,12 +253,12 @@ class ActionPainterBase(PainterBase, BaseModel, ClosedLoopActionMixin):
 
             result = self(sample)
             total_loss, components = self.loss_fn(result.pred, result.logits, sample)
-            accelerator.backward(total_loss / (global_batch_size * K))
+            accelerator.backward(total_loss / K)
             for k, v in components.items():
                 loss_sums[k] = loss_sums.get(k, 0.0) + v
 
         all_reduce_grads(self.parameters())
-        accelerator.clip_grad_norm_(self.parameters(), 1.0)
+        accelerator.clip_grad_norm_(self.parameters(), self.train_cfg.grad_clip)
         lr = apply_lr_and_step(optimizers, global_step)
         if ema is not None:
             ema.update(self)

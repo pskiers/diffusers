@@ -7,6 +7,9 @@ compile: true
 batch_size: 384
 num_steps: 200000
 gradient_accumulation_steps: 2
+# Runs from before train_steps backpropped the true mean loss had gradients
+# 1/batch_size smaller; grad_clip = batch_size reproduces their clipping.
+grad_clip: 384.0
 cfg_prob: 0.0
 
 # Only used by mode=thinker_act (ThinkerFrozenPainterACT) -- see its

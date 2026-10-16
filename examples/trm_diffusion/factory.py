@@ -114,6 +114,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         two_stage=_two_stage_cfg(cfg),
         noisy_dropout_p_max=float(tr.get("noisy_dropout_p_max", 0.0)),
         minsnr_gamma=float(tr["minsnr_gamma"]) if tr.get("minsnr_gamma") is not None else None,
+        grad_clip=float(tr.get("grad_clip", 1.0)),
     )
 
 
