@@ -215,7 +215,9 @@ def sbatch(state: dict, args: list[str]) -> str:
     if state["dry_run"]:
         print("[dry-run] sbatch", " ".join(args))
         return "0"
-    out = subprocess.run(["sbatch", "--parsable", *args], check=True, capture_output=True, text=True)
+    out = subprocess.run(["sbatch", "--parsable", *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"sbatch {' '.join(args)} failed: {out.stderr.strip()}")
     return out.stdout.strip().split(";")[0]
 
 
@@ -358,8 +360,10 @@ def advance(family: str, round_id: int | None = None, if_done: bool = False, for
             if others:
                 print(f"round {round_id}: jobs {others} still queued, leaving the advance to the last one")
                 return
-        _advance(state, stage)
-        save_state(state)
+        try:
+            _advance(state, stage)
+        finally:  # also on a failed submission: jobs already submitted stay recorded
+            save_state(state)
 
 
 def _advance(state: dict, stage: dict) -> None:
@@ -398,12 +402,14 @@ def skip(family: str, index: int) -> None:
             raise SystemExit(f"stage {index} is already finished")
         stage = state["stages"][index]
         stage["skip"] = True
-        if index == state["stage"]:
-            scancel(state, stage.get("jobs") or [state["runs"][k]["job"] for k in stage.get("keys", [])])
-            state["round"] = state.get("round", 0) + 1  # stale advance calls become no-ops
-            next_stage(state)
-        print(f"stage {index} ({stage['kind']} {stage.get('param', '')}) skipped")
-        save_state(state)
+        try:
+            if index == state["stage"]:
+                scancel(state, stage.get("jobs") or [state["runs"][k]["job"] for k in stage.get("keys", [])])
+                state["round"] = state.get("round", 0) + 1  # stale advance calls become no-ops
+                next_stage(state)
+            print(f"stage {index} ({stage['kind']} {stage.get('param', '')}) skipped")
+        finally:
+            save_state(state)
 
 
 def start(args) -> None:
@@ -435,8 +441,10 @@ def start(args) -> None:
         state["params"] = dict(prior["params"])
         state["prior_lr_div_ratio"] = prior.get("lr_div_ratio") or 0.1
     print(f"{args.family}: {args.change} from {state['params']}, full run {full} steps")
-    start_stage(state)
-    save_state(state)
+    try:
+        start_stage(state)
+    finally:
+        save_state(state)
 
 
 def status_text(state: dict) -> str:

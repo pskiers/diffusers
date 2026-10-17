@@ -131,6 +131,24 @@ def test_skip(tune_dirs):
         driver.skip("fam2", 0)  # already finished
 
 
+def test_failed_submission_keeps_submitted_runs(tune_dirs, monkeypatch):
+    start_session("fam", "cold")
+    first = finish_round("fam")
+    real_sbatch = driver.sbatch
+
+    def sbatch(state, args):  # the runs go in, the fallback advance job is rejected
+        if "advance.sh" in args:
+            raise RuntimeError("sbatch failed: rejected")
+        return real_sbatch(state, args)
+
+    monkeypatch.setattr(driver, "sbatch", sbatch)
+    with pytest.raises(RuntimeError):
+        driver.advance("fam", first)
+    state = driver.load_state("fam")
+    assert state["stage"] == 1 and state["round"] == first + 1 and len(state["stages"][1]["keys"]) == 3
+    assert not (driver.TUNE_DIR / "fam" / ".lock").exists()
+
+
 def test_run_overrides(tune_dirs):
     state = {"base": ["experiment=x"], "n_sup": 16, "full_steps": 80000}
     spec = {"lr": 2e-4, "r": 3.0, "tau_frac": 0.25, "seed": 1, "horizon": "short"}
