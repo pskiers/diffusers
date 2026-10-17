@@ -50,23 +50,33 @@ def tune_dirs(tmp_path, monkeypatch):
     return tmp_path
 
 
-def run_session(family, change, from_family=None, tau_frac=0.25):
-    args = SimpleNamespace(
+def start_session(family, change, from_family=None, tau_frac=0.25):
+    driver.start(SimpleNamespace(
         family=family, change=change, from_family=from_family, lr=None, r=None, tau_frac=tau_frac,
         nodes=2, job_script="job.sh", advance_script="advance.sh", sbatch_args="", advance_sbatch_args="",
         dry_run=True, force=False, overrides=["experiment=x", "thinker.optim_cfg.lr=5e-4"],
-    )
-    driver.start(args)
+    ))
+
+
+def finish_round(family):
+    """Write the current round's results; returns the round."""
+    state = driver.load_state(family)
+    for key in state["stages"][state["stage"]]["keys"]:
+        run = state["runs"][key]
+        path = Path(run["dir"]) / "tune_metrics.jsonl"
+        if not path.exists():
+            path.write_text("".join(json.dumps(r) + "\n" for r in fake_records(run["spec"])))
+    return state["round"]
+
+
+def run_session(family, change, from_family=None, tau_frac=0.25, skip=()):
+    start_session(family, change, from_family, tau_frac)
+    for index in skip:
+        driver.skip(family, index)
     for _ in range(20):
-        state = driver.load_state(family)
-        if state.get("done"):
+        if driver.load_state(family).get("done"):
             break
-        for key in state["stages"][state["stage"]]["keys"]:
-            run = state["runs"][key]
-            path = Path(run["dir"]) / "tune_metrics.jsonl"
-            if not path.exists():
-                path.write_text("".join(json.dumps(r) + "\n" for r in fake_records(run["spec"])))
-        driver.advance(family)
+        driver.advance(family, finish_round(family), if_done=True)
     state = driver.load_state(family)
     assert state.get("done")
     return state, json.loads((driver.BEST_DIR / f"{family}.json").read_text())
@@ -89,6 +99,36 @@ def test_cold_then_small_then_large(tune_dirs, capsys):
     state, large = run_session("fam_large", "large", from_family="fam")
     assert large["params"]["lr"] == pytest.approx(p["lr"], rel=0.15)
     assert state["stages"][1]["values"][1] == pytest.approx(best["lr_div_ratio"] * large["lr_div"])
+
+
+def test_rounds_make_advance_idempotent(tune_dirs):
+    start_session("fam", "cold")
+    first = finish_round("fam")
+    driver.advance("fam", first)  # range test -> lr sweep (a new round)
+    state = driver.load_state("fam")
+    assert state["stage"] == 1 and state["round"] == first + 1
+    driver.advance("fam", first)  # the fallback job of the old round: no-op
+    driver.advance("fam")  # a job from before rounds existed: no-op once rounds exist
+    assert driver.load_state("fam")["stage"] == 1
+    (driver.TUNE_DIR / "fam" / ".lock").mkdir()  # another advance in progress
+    with pytest.raises(SystemExit):
+        driver.advance("fam", first + 1)
+
+
+def test_skip(tune_dirs):
+    # a future stage: the lr refine never runs, and the result is the same here
+    state, best = run_session("fam", "cold", skip=[3])
+    assert state["stages"][3].get("skip") and "keys" not in state["stages"][3]
+    assert len(state["runs"]) == 1 + 3 + 3 + 3
+    assert best["params"]["lr"] == pytest.approx(3e-4, rel=0.15)
+    # the running stage: moves straight on to the next one
+    start_session("fam2", "cold")
+    driver.advance("fam2", finish_round("fam2"))
+    driver.skip("fam2", 1)
+    state = driver.load_state("fam2")
+    assert state["stage"] == 2 and state["stages"][2]["param"] == "r"
+    with pytest.raises(SystemExit):
+        driver.skip("fam2", 0)  # already finished
 
 
 def test_run_overrides(tune_dirs):

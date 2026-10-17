@@ -10,7 +10,9 @@
 #SBATCH --extra=FORCE_RM_TMPDIR
 
 # One tuning run, submitted by tuning/driver.py: train_trm.py with the
-# overrides listed in $1 (one per line) at an effective batch of 768.
+# overrides listed in $1 (one per line) at an effective batch of 768. Then,
+# if it is the last job of its round ($2 = family, $3 = round) to end, it
+# advances the tuning session itself, without waiting in the CPU queue.
 # Environment (from slurm_scripts/wcss_tune.sh): TUNE_BATCH = per-GPU batch;
 # TUNE_DATA = optional dataset copied to $TMPDIR, read as ${oc.env:DATA_LOCAL}.
 
@@ -44,3 +46,7 @@ MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 bash -c "accelerate launch $MULTI_GPU \
   --num_machines $SLURM_NNODES --num_processes $NGPUS --machine_rank \$SLURM_NODEID \
   --main_process_ip $MASTER_ADDR --main_process_port 29500 $CMD"
+
+if [ -n "$2" ]; then
+  python -m tuning.driver advance "$2" --round "$3" --if-done
+fi

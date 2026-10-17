@@ -14,8 +14,11 @@
 # each stage's runs (slurm_scripts/wcss_tune_job.sh) plus an advance job
 # (wcss_tune_advance.sh) that scores them and submits the next stage; the
 # result goes to tuning/best/$FAMILY.json, which later sessions start from.
+# Each run advances the session itself when it is the last of its stage to end
+# (a queued CPU job is the fallback). From the login node (system python3 is enough):
 #   progress:  cat runs/tune/$FAMILY/status.txt   (rewritten at every stage)
-#   resume:    sbatch slurm_scripts/wcss_tune_advance.sh $FAMILY   (e.g. after fixing a failed stage)
+#   skip:      python3 -m tuning.driver skip $FAMILY STAGE   (a stage index from status.txt)
+#   resume:    python3 -m tuning.driver advance $FAMILY --force   (after fixing a failed stage)
 #
 # CHANGE:
 #   cold   nothing tuned yet: range test, lr, r, lr refine, tau

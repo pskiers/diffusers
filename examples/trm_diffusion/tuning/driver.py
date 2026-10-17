@@ -30,7 +30,9 @@ comparisons ranked correctly by 5% of the run and tau comparisons by 13%.
 Usage (from examples/trm_diffusion; see slurm_scripts/wcss_tune.sh):
     python -m tuning.driver start --family NAME --change cold [--nodes 1] -- <train_trm.py overrides>
     python -m tuning.driver status NAME
+    python -m tuning.driver skip NAME STAGE  # e.g. a sweep that can no longer change anything
     python -m tuning.driver advance NAME     # what each stage's advance job runs
+status, skip and advance need only the standard library (e.g. the login node's python3).
 """
 
 from __future__ import annotations
@@ -217,12 +219,30 @@ def sbatch(state: dict, args: list[str]) -> str:
     return out.stdout.strip().split(";")[0]
 
 
-def submit_runs(state: dict, specs: list[dict]) -> list[str]:
-    """Submit the specs not already in state["runs"]; returns all their keys."""
-    keys = []
-    for spec in specs:
+def scancel(state: dict, jobs: list[str]) -> None:
+    jobs = [j for j in jobs if j and j != "0" and j != os.environ.get("SLURM_JOB_ID")]
+    if jobs and not state["dry_run"]:
+        subprocess.run(["scancel", *jobs], check=False)
+
+
+def queued_jobs(jobs: list[str]) -> list[str]:
+    """The given jobs that SLURM still lists (pending, running or completing)."""
+    jobs = [j for j in jobs if j and j != "0"]
+    if not jobs:
+        return []
+    out = subprocess.run(["squeue", "-h", "-o", "%i", "-j", ",".join(jobs)], capture_output=True, text=True)
+    return out.stdout.split()
+
+
+def submit_round(state: dict, stage: dict) -> None:
+    """Submit the stage's runs that don't exist yet, as a new round, plus a
+    fallback advance job for when no run's own end-of-job advance gets to it
+    (wcss_tune_job.sh runs `advance --round R --if-done` after training)."""
+    state["round"] = state.get("round", 0) + 1
+    stage["keys"], stage["jobs"] = [], []
+    for spec in stage_specs(state, stage):
         key = _key(spec)
-        keys.append(key)
+        stage["keys"].append(key)
         if key in state["runs"]:
             continue
         run_dir = TUNE_DIR / state["family"] / f"{state['family']}-{key}"  # dir name = wandb run name
@@ -232,19 +252,18 @@ def submit_runs(state: dict, specs: list[dict]) -> list[str]:
             f"--nodes={state['nodes']}", f"--job-name=tune-{state['family']}",
             f"--output={run_dir}/slurm-%j.out", f"--error={run_dir}/slurm-%j.err",
             *state["sbatch_args"], state["job_script"], str(run_dir / "overrides.txt"),
+            state["family"], str(state["round"]),
         ])
         state["runs"][key] = {"spec": spec, "dir": str(run_dir), "job": job}
-    return keys
+        stage["jobs"].append(job)
 
-
-def submit_advance(state: dict, keys: list[str]) -> None:
-    jobs = [state["runs"][k]["job"] for k in keys if state["runs"][k]["job"] != "0"]
-    dependency = [f"--dependency=afterany:{':'.join(jobs)}"] if jobs else []
+    scancel(state, [state.get("advance_job", "")])  # the previous round's fallback, if still queued
+    real = [j for j in stage["jobs"] if j != "0"]
     log_dir = TUNE_DIR / state["family"]
-    sbatch(state, [
-        *dependency, f"--job-name=tune-{state['family']}-advance",
-        f"--output={log_dir}/advance-%j.out", *state["advance_sbatch_args"],
-        state["advance_script"], state["family"],
+    state["advance_job"] = sbatch(state, [
+        *([f"--dependency=afterany:{':'.join(real)}"] if real else []),
+        f"--job-name=tune-{state['family']}-advance", f"--output={log_dir}/advance-%j.out",
+        *state["advance_sbatch_args"], state["advance_script"], state["family"], str(state["round"]),
     ])
 
 
@@ -267,8 +286,20 @@ def start_stage(state: dict) -> None:
             "lr_div_scaled": state.get("lr_div", 0) * state.get("prior_lr_div_ratio", 0.1),
         }.get(stage.get("center"), state["params"][stage["param"]])
         stage["values"] = sorted(center * f for f in stage["factors"])
-    stage["keys"] = submit_runs(state, stage_specs(state, stage))
-    submit_advance(state, stage["keys"])
+    submit_round(state, stage)
+
+
+def next_stage(state: dict) -> None:
+    """Move past the current stage and any skipped ones; start the next or finish."""
+    state["stage"] += 1
+    while state["stage"] < len(state["stages"]) and state["stages"][state["stage"]].get("skip"):
+        print(f"stage {state['stage']} skipped")
+        state["stage"] += 1
+    if state["stage"] < len(state["stages"]):
+        start_stage(state)
+    else:
+        scancel(state, [state.get("advance_job", "")])
+        finish(state)
 
 
 def finish(state: dict) -> None:
@@ -289,11 +320,49 @@ def finish(state: dict) -> None:
     print(f"done: {state['params']} -> {BEST_DIR / (state['family'] + '.json')}")
 
 
-def advance(family: str) -> None:
-    state = load_state(family)
-    if state.get("done"):
-        return
-    stage = state["stages"][state["stage"]]
+class _Lock:
+    """Only one advance / skip at a time per family (mkdir is atomic on Lustre too).
+    A crash inside can leave runs/tune/<family>/.lock behind: remove it by hand."""
+
+    def __init__(self, family: str):
+        self.path = TUNE_DIR / family / ".lock"
+
+    def __enter__(self):
+        try:
+            self.path.mkdir()
+        except FileExistsError:
+            raise SystemExit(f"{self.path} exists: another advance is running (or crashed, then remove it)")
+        return self
+
+    def __exit__(self, *_):
+        self.path.rmdir()
+
+
+def advance(family: str, round_id: int | None = None, if_done: bool = False, force: bool = False) -> None:
+    """Score the current round and move on. round_id: only act if it is still the
+    current round (else a newer advance already did); without one (jobs from
+    before rounds existed), only act if the session has no rounds yet. if_done:
+    only act if no other job of the round is still queued (end-of-job calls).
+    force: act regardless (manual resume after a failed stage)."""
+    with _Lock(family):
+        state = load_state(family)
+        if state.get("done"):
+            return
+        stale = state.get("round") != round_id if round_id is not None else "round" in state
+        if stale and not force:
+            print(f"round {round_id} is not the current round ({state.get('round')}): nothing to do")
+            return
+        stage = state["stages"][state["stage"]]
+        if if_done and not state["dry_run"]:
+            others = [j for j in queued_jobs(stage.get("jobs", [])) if j != os.environ.get("SLURM_JOB_ID")]
+            if others:
+                print(f"round {round_id}: jobs {others} still queued, leaving the advance to the last one")
+                return
+        _advance(state, stage)
+        save_state(state)
+
+
+def _advance(state: dict, stage: dict) -> None:
     results = {k: score_run(read_records(Path(state["runs"][k]["dir"]))) for k in stage["keys"]}
     stage["results"] = {k: list(v) for k, v in results.items()}
 
@@ -313,19 +382,28 @@ def advance(family: str) -> None:
             stage["extensions"] = stage.get("extensions", 0) + 1
             stage["values"] = sorted(stage["values"] + [extra])
             print(f"{param}: best at the edge ({chosen:.3g}), extending to {extra:.3g}")
-            stage["keys"] = submit_runs(state, stage_specs(state, stage))
-            submit_advance(state, stage["keys"])
-            save_state(state)
+            submit_round(state, stage)
             return
         state["params"][param] = chosen
         print(f"{param}: {chosen:.3g}")
+    next_stage(state)
 
-    state["stage"] += 1
-    if state["stage"] < len(state["stages"]):
-        start_stage(state)
-    else:
-        finish(state)
-    save_state(state)
+
+def skip(family: str, index: int) -> None:
+    """Skip stage `index` (keeping the current params for it). If it is the
+    running stage, its jobs are cancelled and the next stage starts now."""
+    with _Lock(family):
+        state = load_state(family)
+        if state.get("done") or index < state["stage"]:
+            raise SystemExit(f"stage {index} is already finished")
+        stage = state["stages"][index]
+        stage["skip"] = True
+        if index == state["stage"]:
+            scancel(state, stage.get("jobs") or [state["runs"][k]["job"] for k in stage.get("keys", [])])
+            state["round"] = state.get("round", 0) + 1  # stale advance calls become no-ops
+            next_stage(state)
+        print(f"stage {index} ({stage['kind']} {stage.get('param', '')}) skipped")
+        save_state(state)
 
 
 def start(args) -> None:
@@ -363,8 +441,10 @@ def start(args) -> None:
 
 def status_text(state: dict) -> str:
     lines = [f"{state['family']} ({state['change']}): stage {state['stage']}/{len(state['stages'])}"
-             + (" done" if state.get("done") else "") + f", params {state['params']}"]
+             + (" done" if state.get("done") else "") + f", round {state.get('round')}, params {state['params']}"]
     for i, stage in enumerate(state["stages"]):
+        if stage.get("skip"):
+            lines.append(f"  stage {i}: {stage['kind']} {stage.get('param', '')} (skipped)")
         if "keys" not in stage:
             continue
         lines.append(f"  stage {i}: {stage['kind']} {stage.get('param', '')}")
@@ -402,13 +482,22 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="print sbatch commands instead of submitting")
     p.add_argument("--force", action="store_true")
     p.add_argument("overrides", nargs="*")
-    for name in ("advance", "status"):
-        sub.add_parser(name).add_argument("family")
+    p = sub.add_parser("advance")
+    p.add_argument("family")
+    p.add_argument("--round", type=int, help="only act if this is still the current round")
+    p.add_argument("--if-done", action="store_true", help="only act if no other job of the round is queued")
+    p.add_argument("--force", action="store_true", help="act even if the round is not current (manual resume)")
+    p = sub.add_parser("skip")
+    p.add_argument("family")
+    p.add_argument("stage", type=int, help="stage index, as in status.txt")
+    sub.add_parser("status").add_argument("family")
     args = parser.parse_args()
     if args.command == "start":
         start(args)
     elif args.command == "advance":
-        advance(args.family)
+        advance(args.family, args.round, args.if_done, args.force)
+    elif args.command == "skip":
+        skip(args.family, args.stage)
     else:
         status(args.family)
 
