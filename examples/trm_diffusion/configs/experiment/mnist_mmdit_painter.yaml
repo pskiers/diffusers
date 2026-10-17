@@ -1,0 +1,20 @@
+# @package _global_
+# Stage 1: MM-DiT painter (MiniT2I architecture, scaled down) on MNIST Sudoku,
+# conditioned on the puzzle image. Painter-only accuracy = the no-thinker floor.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_mmdit_painter
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /diffusion: flow
+  - override /painter: mmdit_sudoku
+  - override /train: mmdit_painter
+  - override /eval_callbacks: mnist
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/mnist_mmdit_painter"

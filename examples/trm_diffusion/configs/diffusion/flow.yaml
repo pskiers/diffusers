@@ -1,0 +1,6 @@
+# Flow matching as MiniT2I (x_t = t x0 + (1 - t) eps; t: 0 noise -> 1 image), at
+# noise std 1 for the small puzzle images (minit2i_flow: std 2 at 512x512).
+_target_: models.mmdit_painter.FlowMatchingScheduler
+noise_scale: 1.0
+train_velocity_clamp: 0.05
+sample_velocity_clamp: 0.05

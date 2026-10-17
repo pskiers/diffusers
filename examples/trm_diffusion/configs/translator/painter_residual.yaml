@@ -1,0 +1,10 @@
+# Thinker's image-grid outputs -> one zero-initialized residual per steered
+# MMDiTPainter block; steer_cond: also the condition-stream outputs -> residuals
+# on the condition tokens (models/translators.py).
+_target_: models.translators.PainterResidualTranslator
+in_dim: ${thinker.vocab_size}
+painter_dim: ${painter.net.hidden_size}
+grid: ???          # thinker's image grid: condition_encoder.img_grid / pool
+painter_grid: ???  # painter.net.image_size / painter.net.patch_size
+num_blocks: ???    # painter.net.depth - painter.steer_from_block
+steer_cond: false

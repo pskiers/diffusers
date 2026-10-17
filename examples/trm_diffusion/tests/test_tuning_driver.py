@@ -149,6 +149,26 @@ def test_failed_submission_keeps_submitted_runs(tune_dirs, monkeypatch):
     assert not (driver.TUNE_DIR / "fam" / ".lock").exists()
 
 
+def test_job_env_and_retry(tune_dirs, monkeypatch, capsys):
+    monkeypatch.setenv("TUNE_DATA", "/data/std120k")
+    monkeypatch.setenv("TUNE_BATCH", "48")
+    start_session("fam", "cold")
+    monkeypatch.delenv("TUNE_DATA")  # e.g. a later submission from a shell without it
+    first = finish_round("fam")
+    capsys.readouterr()
+    driver.advance("fam", first)
+    submitted = [line for line in capsys.readouterr().out.splitlines() if "job.sh" in line]
+    assert len(submitted) == 3 and all("--export=ALL,TUNE_DATA=/data/std120k,TUNE_BATCH=48" in s for s in submitted)
+
+    state = driver.load_state("fam")  # the lr sweep's runs all fail: retry resubmits them as a new round
+    old_dirs = [state["runs"][k]["dir"] for k in state["stages"][1]["keys"]]
+    driver.retry("fam")
+    state = driver.load_state("fam")
+    assert state["round"] == first + 2 and all(Path(f"{d}.failed-0").exists() for d in old_dirs)
+    driver.advance("fam", finish_round("fam"))
+    assert driver.load_state("fam")["stage"] == 2
+
+
 def test_run_overrides(tune_dirs):
     state = {"base": ["experiment=x"], "n_sup": 16, "full_steps": 80000}
     spec = {"lr": 2e-4, "r": 3.0, "tau_frac": 0.25, "seed": 1, "horizon": "short"}

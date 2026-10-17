@@ -1,0 +1,37 @@
+# Trainable MM-DiT painter for MNIST Sudoku (stage 1): MiniT2I's architecture
+# (models/mmdit_painter.py) scaled down, in pixel space. 144x144 images in 12-pixel
+# patches -> 12x12 image tokens, deliberately not aligned with the 9x9 cells (as
+# MiniT2I's patches aren't aligned with image content). The puzzle image is the
+# condition stream: the same 12-pixel patches -> 144 tokens, 2D RoPE.
+_target_: models.mmdit_painter.MMDiTPainter
+_recursive_: false
+net:
+  image_size: ${data.painter_size}
+  patch_size: 12
+  in_channels: 1
+  hidden_size: 384
+  depth: 8
+  preamble_depth: 1
+  num_heads: 6
+  head_dim: 64
+  mlp_ratio: 2.6667
+  pca_channels: 128
+cond_tokenizer:
+  _target_: models.mmdit_painter.PatchCondTokenizer
+  in_channels: 1
+  patch_size: ${painter.net.patch_size}
+steer_from_block: 4          # read after block 4, steer blocks 4-7
+painter_dtype: "bfloat16"
+pixel_range: "[0,1]"
+t_logit_mean: -0.8
+t_logit_std: 0.8
+label_drop_rate: 0.1         # condition dropped for 10% of samples (CFG), in both stages
+freeze: false
+checkpoint: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

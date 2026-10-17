@@ -1,7 +1,7 @@
 # Thinker reads MiniT2I's hidden states after block painter.steer_from_block:
 # (32/pool)^2 image tokens + 256 text tokens = thinker.seq_len (pool 1: 1280,
 # pool 2: 512); translator.grid must be 32/pool.
-_target_: models.minit2i.MiniT2IHiddenEncoder
+_target_: models.mmdit_painter.PainterHiddenEncoder
 output_dim: ${thinker.hidden_size}
 painter_dim: 768
 img_grid: 32

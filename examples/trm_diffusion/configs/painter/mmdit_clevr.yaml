@@ -1,0 +1,35 @@
+# Trainable MM-DiT painter for CLEVR (stage 1): MiniT2I's architecture
+# (models/mmdit_painter.py) scaled down, in pixel space like MiniT2I (no VAE).
+# 256x256 RGB in 16-pixel patches -> 16x16 image tokens; the scene's objects are
+# the condition stream, one token each (missing objects -> mask token), no RoPE.
+_target_: models.mmdit_painter.MMDiTPainter
+_recursive_: false
+net:
+  image_size: ${data.image_size}
+  patch_size: 16
+  in_channels: 3
+  hidden_size: 512
+  depth: 12
+  preamble_depth: 1
+  num_heads: 8
+  head_dim: 64
+  mlp_ratio: 2.6667
+  pca_channels: 128
+cond_tokenizer:
+  _target_: models.mmdit_painter.EmbeddingCondTokenizer
+  in_dim: ${data.object_feat_dim}
+steer_from_block: 6          # read after block 6, steer blocks 6-11
+painter_dtype: "bfloat16"
+pixel_range: "[-1,1]"
+t_logit_mean: -0.8
+t_logit_std: 0.8
+label_drop_rate: 0.1
+freeze: false
+checkpoint: null
+eval_callbacks: ${eval_callbacks}
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

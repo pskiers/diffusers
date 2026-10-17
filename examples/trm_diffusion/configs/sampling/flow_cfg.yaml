@@ -1,0 +1,7 @@
+# Euler sampling for FlowMatchingScheduler with classifier-free guidance.
+_target_: models.sampling.SamplingPipeline
+num_inference_steps: 50
+batch_size: ${eval.batch_size}
+predictor:
+  _target_: models.sampling.CFGPredictor
+  scale: 2.0

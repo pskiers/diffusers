@@ -158,14 +158,22 @@ class ControlNetSteering(ThinkerSteering):
 @dataclass
 class BlockResidualSteering(ThinkerSteering):
     """Steering produced by PainterResidualTranslator for a transformer painter
-    steered block by block (MiniT2IPainter): one residual added to the image
-    token stream after each steered block."""
+    steered block by block (MMDiTPainter, e.g. MiniT2I): one residual added to
+    the image token stream after each steered block, and optionally one to the
+    condition token stream."""
 
     block_residuals: list
     """Per steered block, (B, L_img, D) added to its image-token output."""
 
+    cond_block_residuals: Optional[list] = None
+    """Per steered block but the last, (B, L_cond, D) added to its
+    condition-token output (the output head only reads image tokens)."""
+
     def to_painter_kwargs(self) -> dict:
-        return {"block_residuals": self.block_residuals}
+        kwargs = {"block_residuals": self.block_residuals}
+        if self.cond_block_residuals is not None:
+            kwargs["cond_block_residuals"] = self.cond_block_residuals
+        return kwargs
 
 
 # ── Painter output ────────────────────────────────────────────────────────────

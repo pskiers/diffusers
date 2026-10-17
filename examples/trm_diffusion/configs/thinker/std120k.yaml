@@ -1,5 +1,5 @@
 # TRM thinker steering MiniT2I-B/16. seq_len = image tokens + 256 text tokens
-# (MiniT2IHiddenEncoder: 1024 + 256 with condition_encoder.pool 1); vocab_size =
+# (PainterHiddenEncoder: 1024 + 256 with condition_encoder.pool 1); vocab_size =
 # channels per output token, read by PainterResidualTranslator (continuous, not
 # class logits).
 # Inference cost per denoising forward: n_sup x H_cycles x (L_cycles + 1) x L_layers

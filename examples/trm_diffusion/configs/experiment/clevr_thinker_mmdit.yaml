@@ -1,0 +1,47 @@
+# @package _global_
+# Stage 2: TRM thinker steering the frozen MM-DiT CLEVR painter the way
+# std120k_thinker_minit2i steers MiniT2I: the thinker reads the painter's hidden
+# states after block 6 (16x16 image tokens + 10 object tokens) and steers blocks
+# 6-11 (translator.steer_cond=true: the object tokens too).
+#
+# Pooling the image tokens (condition_encoder.pool=2) also needs
+# thinker.seq_len=74 (8x8 + 10) and translator.grid=8.
+#
+# Usage:
+#   python train_trm.py experiment=clevr_thinker_mmdit \
+#     painter.checkpoint=runs/clevr_mmdit_painter/checkpoint_final.pt data.clevr_root=/path/to/clevr
+
+defaults:
+  - override /data: clevr
+  - override /diffusion: flow
+  - override /painter: mmdit_clevr_frozen
+  - override /thinker: clevr_v1
+  - override /condition_encoder: painter_hidden
+  - override /translator: painter_residual
+  - override /train: clevr_thinker
+  - override /eval: clevr_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: clevr
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  seq_len: 266       # 16x16 image tokens + 10 object tokens
+  vocab_size: 256    # channels per output token (continuous), read by the translator
+
+condition_encoder:
+  img_grid: 16
+  pool: 1
+
+translator:
+  grid: 16
+  painter_grid: 16
+  num_blocks: 6
+
+run:
+  output_dir: "runs/clevr_thinker_mmdit"
+
+data:
+  mode: "reduced"

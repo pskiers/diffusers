@@ -1,0 +1,9 @@
+# mmdit_sudoku, frozen from a stage-1 checkpoint, for thinker steering (stage 2).
+# optim_cfg: for the condition encoder and translator, as minit2i_b16_frozen.
+defaults:
+  - mmdit_sudoku
+  - _self_
+
+freeze: true
+checkpoint: ???  # REQUIRED: runs/mnist_mmdit_painter/checkpoint_final.pt
+eval_callbacks: null

@@ -88,6 +88,9 @@ class SpatialConditionEncoder(ConditionEncoderBase):
     Input:  condition  (B, C, H, W) — spatial condition image
     Output: TRMInput with enc_emb (B, grid², output_dim)
             where grid = image_size // factor
+
+    timestep_scale: multiplies timesteps before the embedding — e.g. 1000 for
+    flow-matching painters, whose t is in [0, 1] rather than DDPM's [0, 1000).
     """
 
     condition_keys: list[str] = ["spatial_conditions"]
@@ -100,10 +103,12 @@ class SpatialConditionEncoder(ConditionEncoderBase):
         output_dim: int,
         factor: int,
         with_timestep_emb: bool = False,
+        timestep_scale: float = 1.0,
     ):
         super().__init__()
         self.enc, self.proj = _build_spatial_enc(in_channels, enc_channels, hidden_channels, output_dim, factor)
         self.with_timestep_emb = with_timestep_emb
+        self.timestep_scale = timestep_scale
         if with_timestep_emb:
             self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=output_dim)
 
@@ -111,6 +116,8 @@ class SpatialConditionEncoder(ConditionEncoderBase):
         feat = self.enc(condition)
         emb = self.proj(feat).flatten(2).transpose(1, 2)  # (B, grid², output_dim)
         if self.with_timestep_emb and timesteps is not None:
+            if self.timestep_scale != 1.0:
+                timesteps = timesteps.float() * self.timestep_scale
             emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
         return TRMInput(enc_emb=emb)
 

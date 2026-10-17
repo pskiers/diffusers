@@ -398,21 +398,33 @@ class ControlNetTranslator1D(ThinkerPainterTranslatorBase):
 class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     """
     Thinker output → one residual per steered transformer-painter block
-    (BlockResidualSteering, e.g. for MiniT2IPainter).
+    (BlockResidualSteering, for MMDiTPainter / MiniT2IPainter).
 
     Reads the first grid*grid output tokens — the image grid, see
-    MiniT2IHiddenEncoder — upsamples them bilinearly to the painter's own token
+    PainterHiddenEncoder — upsamples them bilinearly to the painter's own token
     grid, and projects them to the painter width with one bias-free,
     zero-initialized Linear per steered block. So training starts exactly from
     the unsteered painter, and an all-zero thinker output (null steering, CFG
     dropout of the steering) gives exactly zero residuals.
+
+    steer_cond: also steer the painter's condition stream from the output tokens
+    after the image grid (one per condition token, as PainterHiddenEncoder lays
+    them out), with num_blocks - 1 more such projections — a condition residual
+    after the last steered block could not reach the output.
     """
 
-    def __init__(self, in_dim: int, painter_dim: int, grid: int, painter_grid: int, num_blocks: int):
+    def __init__(
+        self, in_dim: int, painter_dim: int, grid: int, painter_grid: int, num_blocks: int, steer_cond: bool = False
+    ):
         super().__init__(grid=grid, bridge_mode="logits")
         self.painter_grid = painter_grid
         self.projs = nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks))
-        for proj in self.projs:
+        self.cond_projs = (
+            nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks - 1))
+            if steer_cond
+            else None
+        )
+        for proj in [*self.projs, *(self.cond_projs or [])]:
             nn.init.zeros_(proj.weight)
 
     def forward(self, trm_output: TRMOutput, **_) -> BlockResidualSteering:
@@ -423,4 +435,10 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         if self.painter_grid != g:
             x = F.interpolate(x, size=self.painter_grid, mode="bilinear", align_corners=False)
         x = x.flatten(2).transpose(1, 2)  # (B, painter_grid², C)
-        return BlockResidualSteering(block_residuals=[proj(x) for proj in self.projs])
+        cond_residuals = None
+        if self.cond_projs is not None:
+            cond = trm_output.logits[:, g * g :].float()
+            cond_residuals = [proj(cond) for proj in self.cond_projs]
+        return BlockResidualSteering(
+            block_residuals=[proj(x) for proj in self.projs], cond_block_residuals=cond_residuals
+        )

@@ -1,0 +1,8 @@
+# Thinker reads an MMDiTPainter's hidden states after block painter.steer_from_block:
+# (img_grid/pool)^2 image tokens + the condition tokens = thinker.seq_len;
+# translator.grid must be img_grid/pool.
+_target_: models.mmdit_painter.PainterHiddenEncoder
+output_dim: ${thinker.hidden_size}
+painter_dim: ${painter.net.hidden_size}
+img_grid: ???   # painter.net.image_size / painter.net.patch_size
+pool: 1

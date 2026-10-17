@@ -1,0 +1,47 @@
+# @package _global_
+# Stage 2: TRM thinker steering the frozen MM-DiT Sudoku painter the way
+# std120k_thinker_minit2i steers MiniT2I: the thinker reads the painter's hidden
+# states after block 4 (12x12 image + 144 puzzle tokens) and steers blocks 4-7
+# with per-block residuals on the image tokens (translator.steer_cond=true: on the
+# puzzle tokens too).
+#
+# Pooling the image tokens (condition_encoder.pool=2) also needs
+# thinker.seq_len=180 (6x6 + 144) and translator.grid=6.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_mmdit \
+#     painter.checkpoint=runs/mnist_mmdit_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /diffusion: flow
+  - override /painter: mmdit_sudoku_frozen
+  - override /thinker: mnist
+  - override /condition_encoder: painter_hidden
+  - override /translator: painter_residual
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  seq_len: 288       # 12x12 image tokens + 144 puzzle tokens
+  vocab_size: 256    # channels per output token (continuous), read by the translator
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
+condition_encoder:
+  img_grid: 12
+  pool: 1
+
+translator:
+  grid: 12
+  painter_grid: 12
+  num_blocks: 4
+
+run:
+  output_dir: "runs/mnist_thinker_mmdit"

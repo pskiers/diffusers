@@ -1,0 +1,41 @@
+# @package _global_
+# Stage 2, the step between mnist_thinker_controlnet (works) and
+# mnist_thinker_mmdit: the frozen MM-DiT Sudoku painter steered by block residuals,
+# but the thinker reads the puzzle image through the same CNN encoder (with
+# timestep embedding) and outputs the same 11 logits per cell as the ControlNet
+# version. Its 9x9 grid is upsampled to the painter's 12x12 token grid.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_mmdit_cnn \
+#     painter.checkpoint=runs/mnist_mmdit_painter/checkpoint_final.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /diffusion: flow
+  - override /painter: mmdit_sudoku_frozen
+  - override /thinker: mnist
+  - override /condition_encoder: spatial_image_v0
+  - override /translator: painter_residual
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+
+condition_encoder:
+  timestep_scale: 1000   # flow t in [0, 1] -> the [0, 1000) the embedding was built for
+
+translator:
+  grid: 9
+  painter_grid: 12
+  num_blocks: 4
+
+run:
+  output_dir: "runs/mnist_thinker_mmdit_cnn"

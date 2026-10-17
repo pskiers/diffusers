@@ -87,8 +87,8 @@ class DataSample:
     painter_hidden: Optional[Tensor] = None
     """A frozen painter's hidden states partway through its forward pass, for
     thinkers that read early painter features and steer its later layers
-    (MiniT2IPainter: the joint text+image token stream after its first
-    `steer_from_block` blocks, (L_txt + L_img, D)). Like ``x_noisy``, computed
+    (MMDiTPainter, e.g. MiniT2I: the joint condition+image token stream after
+    its first `steer_from_block` blocks, (L_cond + L_img, D)). Like ``x_noisy``, computed
     at runtime from x_noisy and the conditioning — never stored in a dataset."""
 
     # ── Identity / metadata ─────────────────────────────────────────────────

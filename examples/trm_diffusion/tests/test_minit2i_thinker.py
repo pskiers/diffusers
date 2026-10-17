@@ -150,7 +150,7 @@ def thinker_model(painter):
         model = build_model(cfg, instantiate(cfg.diffusion))
     finally:
         minit2i.load_minit2i = real_load
-    model.painter.text_encoder = painter.text_encoder
+    model.painter.cond_tokenizer.encoder = painter.text_encoder
     model.painter.painter_dtype = None
     return model.to(DEVICE)
 

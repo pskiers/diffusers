@@ -1,0 +1,24 @@
+# @package _global_
+# Stage 1: MM-DiT painter (MiniT2I architecture, scaled down) on CLEVR, in pixel
+# space, conditioned on the scene's objects.
+#
+# Usage:
+#   python train_trm.py experiment=clevr_mmdit_painter data.clevr_root=/path/to/clevr
+
+defaults:
+  - override /data: clevr
+  - override /diffusion: flow
+  - override /eval: clevr
+  - override /painter: mmdit_clevr
+  - override /train: mmdit_painter
+  - override /eval_callbacks: clevr
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "painter_base"
+
+run:
+  output_dir: "runs/clevr_mmdit_painter"
+
+data:
+  mode: "reduced"

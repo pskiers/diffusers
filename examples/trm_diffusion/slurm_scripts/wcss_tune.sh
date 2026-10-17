@@ -18,7 +18,9 @@
 # (a queued CPU job is the fallback). From the login node (system python3 is enough):
 #   progress:  cat runs/tune/$FAMILY/status.txt   (rewritten at every stage)
 #   skip:      python3 -m tuning.driver skip $FAMILY STAGE   (a stage index from status.txt)
-#   resume:    python3 -m tuning.driver advance $FAMILY --force   (after fixing a failed stage)
+#   retry:     python3 -m tuning.driver retry $FAMILY   (resubmit the current stage's failed runs)
+#   resume:    python3 -m tuning.driver advance $FAMILY --force   (re-score a stage, e.g. after fixing results)
+# TUNE_DATA / TUNE_BATCH are stored in the session at start and passed to every job.
 #
 # CHANGE:
 #   cold   nothing tuned yet: range test, lr, r, lr refine, tau

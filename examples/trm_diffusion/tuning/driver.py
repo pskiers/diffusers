@@ -31,6 +31,7 @@ Usage (from examples/trm_diffusion; see slurm_scripts/wcss_tune.sh):
     python -m tuning.driver start --family NAME --change cold [--nodes 1] -- <train_trm.py overrides>
     python -m tuning.driver status NAME
     python -m tuning.driver skip NAME STAGE  # e.g. a sweep that can no longer change anything
+    python -m tuning.driver retry NAME       # resubmit the current stage's failed runs
     python -m tuning.driver advance NAME     # what each stage's advance job runs
 status, skip and advance need only the standard library (e.g. the login node's python3).
 """
@@ -227,6 +228,20 @@ def scancel(state: dict, jobs: list[str]) -> None:
         subprocess.run(["scancel", *jobs], check=False)
 
 
+JOB_ENV = ("TUNE_DATA", "TUNE_BATCH")  # read by wcss_tune_job.sh
+
+
+def record_job_env(state: dict) -> None:
+    """Store JOB_ENV from this process's environment (set by wcss_tune.sh) in
+    the state, so jobs get it wherever the driver submits them from."""
+    state.setdefault("env", {}).update({k: os.environ[k] for k in JOB_ENV if k in os.environ})
+
+
+def _export_args(state: dict) -> list[str]:
+    env = state.get("env", {})
+    return [f"--export=ALL,{','.join(f'{k}={v}' for k, v in env.items())}"] if env else []
+
+
 def queued_jobs(jobs: list[str]) -> list[str]:
     """The given jobs that SLURM still lists (pending, running or completing)."""
     jobs = [j for j in jobs if j and j != "0"]
@@ -253,7 +268,7 @@ def submit_round(state: dict, stage: dict) -> None:
         job = sbatch(state, [
             f"--nodes={state['nodes']}", f"--job-name=tune-{state['family']}",
             f"--output={run_dir}/slurm-%j.out", f"--error={run_dir}/slurm-%j.err",
-            *state["sbatch_args"], state["job_script"], str(run_dir / "overrides.txt"),
+            *_export_args(state), *state["sbatch_args"], state["job_script"], str(run_dir / "overrides.txt"),
             state["family"], str(state["round"]),
         ])
         state["runs"][key] = {"spec": spec, "dir": str(run_dir), "job": job}
@@ -393,6 +408,30 @@ def _advance(state: dict, stage: dict) -> None:
     next_stage(state)
 
 
+def retry(family: str) -> None:
+    """Resubmit the current stage's runs that have no results (failed, killed),
+    as a new round; their old directories are kept as <dir>.failed-<job>.
+    Also records TUNE_DATA / TUNE_BATCH from this environment, if set."""
+    with _Lock(family):
+        state = load_state(family)
+        if state.get("done"):
+            raise SystemExit("the session is done")
+        record_job_env(state)
+        stage = state["stages"][state["stage"]]
+        failed = [k for k in stage["keys"] if not math.isfinite(score_run(read_records(Path(state["runs"][k]["dir"])))[0])]
+        running = queued_jobs([state["runs"][k]["job"] for k in failed]) if not state["dry_run"] else []
+        if running:
+            raise SystemExit(f"jobs {running} of the stage are still queued: wait, or scancel them first")
+        for k in failed:
+            run = state["runs"].pop(k)
+            os.replace(run["dir"], f"{run['dir']}.failed-{run['job']}")
+        print(f"retrying {failed}")
+        try:
+            submit_round(state, stage)
+        finally:
+            save_state(state)
+
+
 def skip(family: str, index: int) -> None:
     """Skip stage `index` (keeping the current params for it). If it is the
     running stage, its jobs are cancelled and the next stage starts now."""
@@ -429,6 +468,7 @@ def start(args) -> None:
         "job_script": args.job_script, "advance_script": args.advance_script,
         "sbatch_args": args.sbatch_args.split(), "advance_sbatch_args": args.advance_sbatch_args.split(),
     }
+    record_job_env(state)
     if args.change == "cold":
         lr = args.lr or composed["lr"]
         state["params"] = {
@@ -498,6 +538,7 @@ def main() -> None:
     p = sub.add_parser("skip")
     p.add_argument("family")
     p.add_argument("stage", type=int, help="stage index, as in status.txt")
+    sub.add_parser("retry").add_argument("family")
     sub.add_parser("status").add_argument("family")
     args = parser.parse_args()
     if args.command == "start":
@@ -506,6 +547,8 @@ def main() -> None:
         advance(args.family, args.round, args.if_done, args.force)
     elif args.command == "skip":
         skip(args.family, args.stage)
+    elif args.command == "retry":
+        retry(args.family)
     else:
         status(args.family)
 
