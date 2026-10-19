@@ -6,7 +6,8 @@ by tests/test_minit2i_thinker.py):
 - stage-1 training reaches every painter parameter;
 - condition dropout in training == null_condition_sample (what CFG sampling uses);
 - steering, image and condition stream: a no-op at initialization, and
-  gradients reaching the thinker's output at both kinds of position;
+  gradients reaching the thinker's output at both kinds of position; with
+  bridge_mode "normalized", independent of the thinker output's scale;
 - every new experiment config builds, with consistent token counts.
 
 Run from examples/trm_diffusion:  pytest tests/test_mmdit_painter.py -s
@@ -109,15 +110,17 @@ def test_condition_dropout_equals_cfg_null(kind):
     assert not torch.equal(painter.fill_runtime_fields(real).painter_hidden, null.painter_hidden)
 
 
+@pytest.mark.parametrize("bridge_mode", ["logits", "normalized"])
 @pytest.mark.parametrize("kind", ["patch", "embedding"])
-def test_steering_noop_at_init_and_gradients(kind):
+def test_steering_noop_at_init_and_gradients(kind, bridge_mode):
     painter = _painter(kind, freeze=True)
     torch.manual_seed(3)
     with torch.no_grad():  # as after stage 1: the zero-initialized output layer has moved
         painter.net.final_layer.linear.weight.normal_(std=0.02)
     sample = painter._prepare_training_sample(_batch(kind), DEV)
     n_cond = sample.painter_hidden.shape[1] - 16
-    translator = PainterResidualTranslator(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=2, steer_cond=True)
+    translator = PainterResidualTranslator(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=2,
+                                           steer_cond=True, bridge_mode=bridge_mode)
     logits = torch.randn(3, 4 + n_cond, 8, requires_grad=True)  # 2x2 image grid (pooled) + condition tokens
     plain = painter(sample).pred
     assert torch.equal(painter(sample, translator(TRMOutput(logits=logits))).pred, plain)
@@ -135,6 +138,15 @@ def test_steering_noop_at_init_and_gradients(kind):
     cond_only[:, :4] = 0
     with torch.no_grad():
         assert not torch.equal(painter(sample, translator(TRMOutput(logits=cond_only))).pred, plain)
+
+    # normalized: shrinking the thinker's output (e.g. by weight decay) leaves the steering as it was
+    # (up to BatchNorm's eps, 1e-5 — negligible next to the output's variance here, 1e-2)
+    if bridge_mode == "normalized":
+        with torch.no_grad():
+            full = translator(TRMOutput(logits=logits))
+            small = translator(TRMOutput(logits=logits * 0.1))
+        for a, b in zip(full.block_residuals + full.cond_block_residuals, small.block_residuals + small.cond_block_residuals):
+            assert torch.allclose(a, b, atol=1e-3 * a.abs().max())
 
 
 TINY_THINKER = ["thinker.hidden_size=64", "thinker.n_heads=2", "thinker.n_sup=1", "thinker.H_cycles=1",
@@ -164,6 +176,7 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
     "painter_exp, thinker_exp, batch, extra",
     [
         ("mnist_mmdit_painter", "mnist_thinker_mmdit", SUDOKU, ["translator.steer_cond=true"]),
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit", SUDOKU, ["painter.steer_from_block=1", "translator.num_blocks=7"]),
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, []),
         ("clevr_mmdit_painter", "clevr_thinker_mmdit", CLEVR, ["translator.steer_cond=true"]),
     ],

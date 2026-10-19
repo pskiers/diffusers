@@ -62,21 +62,23 @@ class ThinkerPainterTranslatorBase(nn.Module):
                 raise ValueError("bridge_mode='normalized' requires bridge_channels")
             self._norm = nn.BatchNorm1d(bridge_channels)
 
+    def _bridge_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        """(B, N, C) → (B, N, C) using self._bridge_mode."""
+        if self._bridge_mode == "onehot":
+            soft = logits.float().softmax(dim=-1)
+            hard = F.one_hot(logits.argmax(dim=-1), num_classes=logits.shape[-1]).float()
+            return hard - soft.detach() + soft  # straight-through
+        elif self._bridge_mode == "softmax":
+            return logits.float().softmax(dim=-1)
+        elif self._bridge_mode == "normalized":
+            return self._norm(logits.float().transpose(1, 2)).transpose(1, 2)
+        else:
+            return logits.float()
+
     def _logits_to_spatial(self, logits: torch.Tensor) -> torch.Tensor:
         """(B, N, C) → (B, C, grid, grid) using self._bridge_mode."""
         B, N, C = logits.shape
-        if self._bridge_mode == "onehot":
-            soft = logits.float().softmax(dim=-1)
-            hard = F.one_hot(logits.argmax(dim=-1), num_classes=C).float()
-            onehot = hard - soft.detach() + soft  # straight-through
-            return onehot.transpose(1, 2).reshape(B, C, self._grid, self._grid)
-        elif self._bridge_mode == "softmax":
-            return logits.float().softmax(dim=-1).transpose(1, 2).reshape(B, C, self._grid, self._grid)
-        elif self._bridge_mode == "normalized":
-            normed = self._norm(logits.float().transpose(1, 2))  # (B, C, N)
-            return normed.reshape(B, C, self._grid, self._grid)
-        else:
-            return logits.float().transpose(1, 2).reshape(B, C, self._grid, self._grid)
+        return self._bridge_tokens(logits).transpose(1, 2).reshape(B, C, self._grid, self._grid)
 
     @abstractmethod
     def forward(self, trm_output: TRMOutput, **kwargs) -> ThinkerSteering:
@@ -404,8 +406,16 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     PainterHiddenEncoder — upsamples them bilinearly to the painter's own token
     grid, and projects them to the painter width with one bias-free,
     zero-initialized Linear per steered block. So training starts exactly from
-    the unsteered painter, and an all-zero thinker output (null steering, CFG
-    dropout of the steering) gives exactly zero residuals.
+    the unsteered painter, and (with bridge_mode "logits") an all-zero thinker
+    output (null steering, CFG dropout of the steering) gives exactly zero
+    residuals.
+
+    bridge_mode: applied to every output token first (see
+    ThinkerPainterTranslatorBase). "normalized" (BatchNorm over channels, as the
+    ControlNet translators use) makes the steering independent of the thinker
+    output's scale — e.g. of weight decay shrinking the thinker's output layer
+    while the zero-initialized projections are still growing. All-zero thinker
+    output then no longer maps to zero residuals.
 
     steer_cond: also steer the painter's condition stream from the output tokens
     after the image grid (one per condition token, as PainterHiddenEncoder lays
@@ -414,9 +424,16 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     """
 
     def __init__(
-        self, in_dim: int, painter_dim: int, grid: int, painter_grid: int, num_blocks: int, steer_cond: bool = False
+        self,
+        in_dim: int,
+        painter_dim: int,
+        grid: int,
+        painter_grid: int,
+        num_blocks: int,
+        steer_cond: bool = False,
+        bridge_mode: str = "logits",
     ):
-        super().__init__(grid=grid, bridge_mode="logits")
+        super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
         self.painter_grid = painter_grid
         self.projs = nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks))
         self.cond_projs = (
@@ -429,7 +446,8 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
 
     def forward(self, trm_output: TRMOutput, **_) -> BlockResidualSteering:
         g = self._grid
-        x = trm_output.logits[:, : g * g].float()
+        tokens = self._bridge_tokens(trm_output.logits)
+        x = tokens[:, : g * g]
         b, _, c = x.shape
         x = x.transpose(1, 2).reshape(b, c, g, g)
         if self.painter_grid != g:
@@ -437,7 +455,7 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         x = x.flatten(2).transpose(1, 2)  # (B, painter_grid², C)
         cond_residuals = None
         if self.cond_projs is not None:
-            cond = trm_output.logits[:, g * g :].float()
+            cond = tokens[:, g * g :]
             cond_residuals = [proj(cond) for proj in self.cond_projs]
         return BlockResidualSteering(
             block_residuals=[proj(x) for proj in self.projs], cond_block_residuals=cond_residuals

@@ -33,6 +33,8 @@ thinker:
   vocab_size: 256    # channels per output token (continuous), read by the translator
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+  optim_cfg:
+    weight_decay: 0.3  # 1.0 shrinks the thinker's output while the zero-init translator grows
 
 condition_encoder:
   img_grid: 12
@@ -42,6 +44,7 @@ translator:
   grid: 12
   painter_grid: 12
   num_blocks: 4
+  bridge_mode: normalized  # steering independent of the thinker output's scale
 
 run:
   output_dir: "runs/mnist_thinker_mmdit"

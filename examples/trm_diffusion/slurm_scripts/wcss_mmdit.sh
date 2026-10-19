@@ -2,7 +2,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=120G
+#SBATCH --mem=60G
 #SBATCH --time=72:00:00
 #SBATCH --account=hpc-kamildeja-1773916679
 #SBATCH --partition=lem-gpu-short
@@ -16,8 +16,12 @@
 #   sbatch slurm_scripts/wcss_mmdit.sh <run>
 # Stage 1 (painters):  mnist_painter  clevr_painter
 # Stage 2 (thinkers, once the painter's checkpoint_final.pt exists):
-#   mnist_thinker  mnist_thinker_steercond  mnist_thinker_cnn
+#   mnist_thinker  mnist_thinker_steer1  mnist_thinker_cnn  mnist_thinker_steercond
 #   clevr_thinker  clevr_thinker_steercond
+# The thinker experiments use translator.bridge_mode=normalized and thinker weight
+# decay 0.3 (runs/*_norm*): with raw outputs and weight decay 1.0 the thinker's
+# output shrank to ~4% of its initial size and the steering stayed ~0
+# (runs/mnist_thinker_mmdit, runs/clevr_thinker_mmdit).
 #
 # Measured on one H100 (one training micro-batch, torch.compile, peak memory):
 #   mnist_painter   256     19.0 GB  0.19 s   -> ~5 h  (100k steps)
@@ -52,20 +56,24 @@ case $RUN in
   clevr_painter)
     RUN=clevr_mmdit_painter
     train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=512 ;;
-  mnist_thinker)  # as T2I: reads the painter's hidden states, steers the image stream
-    RUN=mnist_thinker_mmdit
+  mnist_thinker)  # as T2I: reads the painter's hidden states after block 4, steers the image stream of blocks 4-7
+    RUN=mnist_thinker_mmdit_norm
     train experiment=mnist_thinker_mmdit painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
-  mnist_thinker_steercond)  # + steers the puzzle (condition) stream
-    RUN=mnist_thinker_mmdit_steercond
-    train experiment=mnist_thinker_mmdit translator.steer_cond=true painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
-  mnist_thinker_cnn)  # ladder step: the working version's CNN encoder + 11 logits
+  mnist_thinker_steer1)  # reads after block 1, steers blocks 1-7 (same painter checkpoint)
+    RUN=mnist_thinker_mmdit_norm_steer1
+    train experiment=mnist_thinker_mmdit painter.steer_from_block=1 translator.num_blocks=7 \
+      painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn)  # reads the raw puzzle + x_t through the working runs' CNN encoder instead
     RUN=mnist_thinker_mmdit_cnn
     train experiment=mnist_thinker_mmdit_cnn painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_steercond)  # + steers the puzzle (condition) stream
+    RUN=mnist_thinker_mmdit_norm_steercond
+    train experiment=mnist_thinker_mmdit translator.steer_cond=true painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
   clevr_thinker)
-    RUN=clevr_thinker_mmdit
+    RUN=clevr_thinker_mmdit_norm
     train experiment=clevr_thinker_mmdit painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
   clevr_thinker_steercond)
-    RUN=clevr_thinker_mmdit_steercond
+    RUN=clevr_thinker_mmdit_norm_steercond
     train experiment=clevr_thinker_mmdit translator.steer_cond=true painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;

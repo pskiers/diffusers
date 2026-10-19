@@ -30,6 +30,8 @@ mode: "thinker_base"
 thinker:
   seq_len: 266       # 16x16 image tokens + 10 object tokens
   vocab_size: 256    # channels per output token (continuous), read by the translator
+  optim_cfg:
+    weight_decay: 0.3  # 1.0 shrinks the thinker's output while the zero-init translator grows
 
 condition_encoder:
   img_grid: 16
@@ -39,6 +41,7 @@ translator:
   grid: 16
   painter_grid: 16
   num_blocks: 6
+  bridge_mode: normalized  # steering independent of the thinker output's scale
 
 run:
   output_dir: "runs/clevr_thinker_mmdit"

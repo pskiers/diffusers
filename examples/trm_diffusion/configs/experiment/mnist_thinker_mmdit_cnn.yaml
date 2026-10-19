@@ -1,9 +1,11 @@
 # @package _global_
 # Stage 2, the step between mnist_thinker_controlnet (works) and
-# mnist_thinker_mmdit: the frozen MM-DiT Sudoku painter steered by block residuals,
-# but the thinker reads the puzzle image through the same CNN encoder (with
-# timestep embedding) and outputs the same 11 logits per cell as the ControlNet
-# version. Its 9x9 grid is upsampled to the painter's 12x12 token grid.
+# mnist_thinker_mmdit: the same frozen MM-DiT Sudoku painter and block-residual
+# steering, but the thinker reads the puzzle image and x_t through the CNN encoder
+# of the working UNet / DiT runs (NoisySpatialConditionEncoder, no timestep
+# embedding, no noisy dropout — as x0_hint_v1 with enabled=false there) instead
+# of the painter's hidden states, and outputs the same 11 logits per cell. Its
+# 9x9 grid is upsampled to the painter's 12x12 token grid.
 #
 # Usage:
 #   python train_trm.py experiment=mnist_thinker_mmdit_cnn \
@@ -14,7 +16,7 @@ defaults:
   - override /diffusion: flow
   - override /painter: mmdit_sudoku_frozen
   - override /thinker: mnist
-  - override /condition_encoder: spatial_image_v0
+  - override /condition_encoder: spatial_image_v1
   - override /translator: painter_residual
   - override /train: mnist_thinker
   - override /eval: mnist_thinker
@@ -28,14 +30,18 @@ mode: "thinker_base"
 thinker:
   puzzle_emb_ndim: 0
   puzzle_emb_len: 0
+  optim_cfg:
+    weight_decay: 0.3  # 1.0 shrinks the thinker's output while the zero-init translator grows
 
 condition_encoder:
-  timestep_scale: 1000   # flow t in [0, 1] -> the [0, 1000) the embedding was built for
+  noisy_dropout_p_max: 0.0
+  with_timestep_emb: false
 
 translator:
   grid: 9
   painter_grid: 12
   num_blocks: 4
+  bridge_mode: normalized
 
 run:
   output_dir: "runs/mnist_thinker_mmdit_cnn"

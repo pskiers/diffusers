@@ -4,3 +4,4 @@ _target_: models.mmdit_painter.FlowMatchingScheduler
 noise_scale: 1.0
 train_velocity_clamp: 0.05
 sample_velocity_clamp: 0.05
+num_train_timesteps: 1000  # only for ${diffusion.num_train_timesteps} interpolations; t itself is continuous
