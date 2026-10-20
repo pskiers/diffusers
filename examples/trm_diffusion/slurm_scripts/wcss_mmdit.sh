@@ -18,6 +18,12 @@
 # Stage 2 (thinkers, once the painter's checkpoint_final.pt exists):
 #   mnist_thinker  mnist_thinker_steer1  mnist_thinker_cnn  mnist_thinker_steercond
 #   clevr_thinker  clevr_thinker_steercond
+# Oracle-screen follow-ups (Sudoku, steering from block 1):
+#   mnist_thinker_uncond_tshift  painter conditioning nulled + training t shifted noisy
+#   mnist_thinker_tshift         training t shifted noisy only
+#   mnist_thinker_uncond         painter conditioning nulled only
+# Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
+# (W&B 0il6x2cq) without force_unconditional_painter.
 # The thinker experiments use translator.bridge_mode=normalized and thinker weight
 # decay 0.3 (runs/*_norm*): with raw outputs and weight decay 1.0 the thinker's
 # output shrank to ~4% of its initial size and the steering stayed ~0
@@ -47,6 +53,7 @@ MNIST_PAINTER=runs/mnist_mmdit_painter/checkpoint_final.pt
 CLEVR_PAINTER=runs/clevr_mmdit_painter/checkpoint_final.pt
 MNIST_EVAL="eval.eval_every=20000 eval_callbacks.0.num_samples=1024"
 CLEVR_EVAL="eval.eval_every=15000 eval_callbacks.1.n_samples=512"
+MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
 train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@"; }
 
 case $RUN in
@@ -69,6 +76,23 @@ case $RUN in
   mnist_thinker_steercond)  # + steers the puzzle (condition) stream
     RUN=mnist_thinker_mmdit_norm_steercond
     train experiment=mnist_thinker_mmdit translator.steer_cond=true painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_uncond_tshift)
+    RUN=mnist_thinker_mmdit_s1_uncond_mu-1.6
+    train experiment=mnist_thinker_mmdit $MNIST_S1 +train.force_unconditional_painter=true painter.t_logit_mean=-1.6 \
+      painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_tshift)
+    RUN=mnist_thinker_mmdit_s1_mu-1.6
+    train experiment=mnist_thinker_mmdit $MNIST_S1 painter.t_logit_mean=-1.6 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_uncond)
+    RUN=mnist_thinker_mmdit_s1_uncond
+    train experiment=mnist_thinker_mmdit $MNIST_S1 +train.force_unconditional_painter=true \
+      painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
+    RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
+    train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \
+      "backbone.block_out_channels=[128,256,512]" condition_encoder=object_feature_v1_centroidmask_presence_fused_x0hint \
+      condition_encoder.threshold=80 translator=controlnet_clevr_v1_sliced "translator.painter_channels=[128,256,512]" \
+      thinker.seq_len=266 data.include_centroid_mask=true data.centroid_mask_presence_only=true ;;
   clevr_thinker)
     RUN=clevr_thinker_mmdit_norm
     train experiment=clevr_thinker_mmdit painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;

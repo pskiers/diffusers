@@ -326,7 +326,8 @@ class MMDiTPainter(PainterBase, BaseModel):
         cond_tokenizer: CondTokenizerBase instance or Hydra config.
         net: build_mmdit kwargs (except cond_dim, cond_rope), or a ready MMJiT.
         cond_rope: condition-stream rotary embedding; None = the tokenizer's.
-        steer_from_block: blocks [0, steer_from_block) form the read-only head.
+        steer_from_block: blocks [0, steer_from_block) form the read-only head
+            (0: the thinker reads the embedded tokens and every block is steered).
         painter_dtype: autocast dtype for the painter's forward (None = fp32 /
             whatever the caller's autocast says).
         pixel_range: range of the dataset's images, "[0,1]" or "[-1,1]"; the
@@ -377,8 +378,8 @@ class MMDiTPainter(PainterBase, BaseModel):
         )
         self.condition_keys = list(self.cond_tokenizer.condition_keys)
 
-        if not 0 < steer_from_block < len(self.net.double_blocks):
-            raise ValueError(f"steer_from_block must be in [1, {len(self.net.double_blocks) - 1}]")
+        if not 0 <= steer_from_block < len(self.net.double_blocks):
+            raise ValueError(f"steer_from_block must be in [0, {len(self.net.double_blocks) - 1}]")
         if pixel_range not in ("[0,1]", "[-1,1]"):
             raise ValueError(f"pixel_range must be '[0,1]' or '[-1,1]', got {pixel_range!r}")
         self.steer_from_block = steer_from_block
@@ -490,6 +491,13 @@ class MMDiTPainter(PainterBase, BaseModel):
         """Compute painter_hidden for the sample's x_t and condition (see
         ThinkerFrozenPainterBase.forward_with_carry)."""
         return dataclasses.replace(sample, painter_hidden=self.encode_head(sample.x_noisy, *self._cond(sample)))
+
+    def null_condition_sample(self, sample: DataSample) -> DataSample:
+        """Condition fields zeroed, and painter_hidden dropped so forward recomputes
+        it from the null condition — painter_hidden was computed from the real one.
+        (ThinkerFrozenPainterBase's force_unconditional_painter: the thinker keeps
+        reading the real sample's painter_hidden, the painter paints from null.)"""
+        return dataclasses.replace(super().null_condition_sample(sample), painter_hidden=None)
 
     def velocity(self, x0_hat: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         scale = (1.0 - t.float()).view(-1, 1, 1, 1).clamp_min(self.velocity_clamp)

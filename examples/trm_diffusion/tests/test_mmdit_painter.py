@@ -195,3 +195,24 @@ def test_experiment_configs_build(tmp_path, painter_exp, thinker_exp, batch, ext
     assert torch.equal(steered, plain)  # zero-initialized translator
     noise_pred, logits, _, _ = model.reasoning_step(d["sample"], d["z_H"], d["z_L"])
     assert noise_pred.shape == batch.images.shape
+
+
+def test_force_unconditional_painter(tmp_path):
+    """The painter paints from its null condition; the thinker still reads the real one."""
+    painter = _build(["experiment=mnist_mmdit_painter", *TINY_PAINTER])
+    with torch.no_grad():  # as after stage 1: the zero-initialized output layer has moved
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    ckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, ckpt)
+    model = _build(["experiment=mnist_thinker_mmdit", f"painter.checkpoint={ckpt}", "painter.steer_from_block=1",
+                    "translator.num_blocks=7", "+train.force_unconditional_painter=true", *TINY_PAINTER, *TINY_THINKER])
+    [d] = model.prep_mb_data([SUDOKU], DEV)
+    s = d["sample"]
+    with torch.no_grad():
+        steered = model(s).pred  # zero-initialized translator: just the painter, as it is run
+        real = model.painter(s).pred
+        null = model.painter(model.painter.null_condition_sample(s)).pred
+        enc = model._encode_condition(s)
+        enc_null = model.condition_encoder(model.painter.fill_runtime_fields(model.painter.null_condition_sample(s)).painter_hidden).enc_emb
+    assert torch.equal(steered, null) and not torch.allclose(steered, real)
+    assert not torch.allclose(enc, enc_null)  # the thinker's input is still the real condition's
