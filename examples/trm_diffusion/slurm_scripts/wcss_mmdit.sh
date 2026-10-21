@@ -22,6 +22,9 @@
 #   mnist_thinker_uncond_tshift  painter conditioning nulled + training t shifted noisy
 #   mnist_thinker_tshift         training t shifted noisy only
 #   mnist_thinker_uncond         painter conditioning nulled only
+#   mnist_thinker_cnn12_uncond   thinker reads puzzle + x_t through the CNN of the working grid12 run
+#                                (W&B s26ed73n: factor 12, 144 tokens) instead of painter states; painter nulled
+#   mnist_thinker_cnn12_cond     the same, painter keeps its puzzle conditioning
 # Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
 # (W&B 0il6x2cq) without force_unconditional_painter.
 # The thinker experiments use translator.bridge_mode=normalized and thinker weight
@@ -54,6 +57,7 @@ CLEVR_PAINTER=runs/clevr_mmdit_painter/checkpoint_final.pt
 MNIST_EVAL="eval.eval_every=20000 eval_callbacks.0.num_samples=1024"
 CLEVR_EVAL="eval.eval_every=15000 eval_callbacks.1.n_samples=512"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
+MNIST_CNN12="condition_encoder.factor=12 translator.grid=12 thinker.seq_len=144 train.batch_size=192 train.gradient_accumulation_steps=4"
 train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@"; }
 
 case $RUN in
@@ -87,6 +91,13 @@ case $RUN in
     RUN=mnist_thinker_mmdit_s1_uncond
     train experiment=mnist_thinker_mmdit $MNIST_S1 +train.force_unconditional_painter=true \
       painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_uncond)  # batch 192x4: 384 per micro-batch did not fit a 40 GB A100
+    RUN=mnist_thinker_mmdit_cnn12_s1_uncond
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
+      painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_cond)
+    RUN=mnist_thinker_mmdit_cnn12_s1_cond
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
   clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
     RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
     train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \
