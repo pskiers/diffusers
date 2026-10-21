@@ -38,7 +38,8 @@
 #   mnist_thinker   384x2   37.0 GB  4.75 s   -> ~33 h (cnn: 29.9 GB, 3.30 s -> ~23 h)
 #   clevr_thinker   256x3   32.2 GB  6.02 s   -> ~47 h
 # Sampling during evals costs ~4.0 s (Sudoku, batch 384) / ~2.6 s (CLEVR, batch
-# 256) per Euler step, so evals use fewer samples, less often than the defaults.
+# 256) per Euler step, so evals use fewer samples than the defaults (thinkers: 1024
+# samples every 5k steps, ~5 min each).
 
 source /usr/local/sbin/modules.sh
 module load Python/3.10.4-GCCcore-11.3.0
@@ -54,8 +55,8 @@ cd $ROOT/examples/trm_diffusion
 RUN=$1
 MNIST_PAINTER=runs/mnist_mmdit_painter/checkpoint_final.pt
 CLEVR_PAINTER=runs/clevr_mmdit_painter/checkpoint_final.pt
-MNIST_EVAL="eval.eval_every=20000 eval_callbacks.0.num_samples=1024"
-CLEVR_EVAL="eval.eval_every=15000 eval_callbacks.1.n_samples=512"
+MNIST_EVAL="eval.eval_every=5000 eval_callbacks.0.num_samples=1024"
+CLEVR_EVAL="eval.eval_every=5000 eval_callbacks.1.n_samples=1024"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
 MNIST_CNN12="condition_encoder.factor=12 translator.grid=12 thinker.seq_len=144 train.batch_size=192 train.gradient_accumulation_steps=4"
 train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@"; }
@@ -66,7 +67,7 @@ case $RUN in
     train experiment=mnist_mmdit_painter eval.eval_every=10000 eval_callbacks.0.num_samples=1024 ;;
   clevr_painter)
     RUN=clevr_mmdit_painter
-    train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=512 ;;
+    train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=1024 ;;
   mnist_thinker)  # as T2I: reads the painter's hidden states after block 4, steers the image stream of blocks 4-7
     RUN=mnist_thinker_mmdit_norm
     train experiment=mnist_thinker_mmdit painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
