@@ -29,6 +29,8 @@
 #   mnist_thinker_cnn12_uncond_temb   translator gets a timestep embedding (as both working translators)
 #   mnist_thinker_cnn12_uncond_chain  translator = DiT-direct's IP construction (shared Linear, per-block
 #                                     to_v + zero-init to_out), no timestep embedding
+#   mnist_thinker_cnn12_uncond_chain_temb  both: DiT-direct's IP translator incl. its timestep embedding
+#                                     (only its bridge differs: normalized here, raw logits there)
 #   mnist_thinker_cnn12_uncond_x0     stage-2 loss = x0 MSE (velocity MSE x (1-t)^2); its loss values are
 #                                     not comparable to the other runs', its accuracies are
 # Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
@@ -113,6 +115,10 @@ case $RUN in
     RUN=mnist_thinker_mmdit_cnn12_s1_uncond_chain
     train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
       translator.hidden_dim=384 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_uncond_chain_temb)
+    RUN=mnist_thinker_mmdit_cnn12_s1_uncond_chain_temb
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
+      translator.hidden_dim=384 translator.with_timestep_emb=true painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
   mnist_thinker_cnn12_uncond_x0)
     RUN=mnist_thinker_mmdit_cnn12_s1_uncond_x0
     train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
