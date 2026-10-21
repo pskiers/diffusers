@@ -421,6 +421,18 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     after the image grid (one per condition token, as PainterHiddenEncoder lays
     them out), with num_blocks - 1 more such projections — a condition residual
     after the last steered block could not reach the output.
+
+    hidden_dim: instead of one Linear per block, the IPAdapterTranslator +
+    _DirectIPAdapterDiTBlock construction (models/painter_base.py): a shared
+    Linear(in_dim, hidden_dim) with ordinary init, then per block a bias-free
+    Linear(hidden_dim, hidden_dim) ("to_v", ordinary init) and a bias-free,
+    zero-initialized Linear(hidden_dim, painter_dim) ("to_out").
+
+    with_timestep_emb: add a TimestepMLP embedding of timesteps * timestep_scale
+    to every token before the per-block projections (after the shared Linear
+    with hidden_dim, as IPAdapterTranslator), so the steering can depend on the
+    noise level. timestep_scale 1000 maps flow-matching t in [0, 1] to the
+    DDPM-step range the sinusoidal embedding was built for.
     """
 
     def __init__(
@@ -432,21 +444,42 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         num_blocks: int,
         steer_cond: bool = False,
         bridge_mode: str = "logits",
+        hidden_dim: Optional[int] = None,
+        with_timestep_emb: bool = False,
+        timestep_scale: float = 1000.0,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
         self.painter_grid = painter_grid
-        self.projs = nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks))
-        self.cond_projs = (
-            nn.ModuleList(nn.Linear(in_dim, painter_dim, bias=False) for _ in range(num_blocks - 1))
-            if steer_cond
-            else None
-        )
-        for proj in [*self.projs, *(self.cond_projs or [])]:
-            nn.init.zeros_(proj.weight)
+        self.in_proj = nn.Linear(in_dim, hidden_dim) if hidden_dim is not None else None
+        feat = hidden_dim if hidden_dim is not None else in_dim
 
-    def forward(self, trm_output: TRMOutput, **_) -> BlockResidualSteering:
+        def head() -> nn.Module:
+            if hidden_dim is None:
+                out = nn.Linear(feat, painter_dim, bias=False)
+                nn.init.zeros_(out.weight)
+                return out
+            to_v, to_out = nn.Linear(feat, feat, bias=False), nn.Linear(feat, painter_dim, bias=False)
+            nn.init.zeros_(to_out.weight)
+            return nn.Sequential(to_v, to_out)
+
+        self.projs = nn.ModuleList(head() for _ in range(num_blocks))
+        self.cond_projs = nn.ModuleList(head() for _ in range(num_blocks - 1)) if steer_cond else None
+        self.with_timestep_emb = with_timestep_emb
+        self.timestep_scale = timestep_scale
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=feat)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> BlockResidualSteering:
         g = self._grid
         tokens = self._bridge_tokens(trm_output.logits)
+        if self.in_proj is not None:
+            tokens = self.in_proj(tokens)
+        if self.with_timestep_emb:
+            tokens = tokens + self.timestep_mlp(timesteps.float() * self.timestep_scale).unsqueeze(1)
         x = tokens[:, : g * g]
         b, _, c = x.shape
         x = x.transpose(1, 2).reshape(b, c, g, g)

@@ -71,9 +71,14 @@ class MSELoss(LossBase):
 
     def forward(self, noise_pred, logits, batch_dict):
         target = batch_dict["target"]
-        if self.minsnr_gamma is not None:
+        loss_weight = batch_dict.get("loss_weight")  # per-sample, e.g. MMDiTPainter loss_weighting="x0"
+        if self.minsnr_gamma is not None or loss_weight is not None:
             per_sample = (noise_pred.float() - target).pow(2).flatten(1).mean(1)
-            w = self._minsnr_weights(batch_dict["timesteps"])
+            w = torch.ones_like(per_sample)
+            if self.minsnr_gamma is not None:
+                w = w * self._minsnr_weights(batch_dict["timesteps"])
+            if loss_weight is not None:
+                w = w * loss_weight.float()
             diff_loss = (w * per_sample).mean()
         else:
             diff_loss = F.mse_loss(noise_pred.float(), target)

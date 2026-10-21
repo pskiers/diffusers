@@ -25,6 +25,12 @@
 #   mnist_thinker_cnn12_uncond   thinker reads puzzle + x_t through the CNN of the working grid12 run
 #                                (W&B s26ed73n: factor 12, 144 tokens) instead of painter states; painter nulled
 #   mnist_thinker_cnn12_cond     the same, painter keeps its puzzle conditioning
+#   One change each from mnist_thinker_cnn12_uncond:
+#   mnist_thinker_cnn12_uncond_temb   translator gets a timestep embedding (as both working translators)
+#   mnist_thinker_cnn12_uncond_chain  translator = DiT-direct's IP construction (shared Linear, per-block
+#                                     to_v + zero-init to_out), no timestep embedding
+#   mnist_thinker_cnn12_uncond_x0     stage-2 loss = x0 MSE (velocity MSE x (1-t)^2); its loss values are
+#                                     not comparable to the other runs', its accuracies are
 # Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
 # (W&B 0il6x2cq) without force_unconditional_painter.
 # The thinker experiments use translator.bridge_mode=normalized and thinker weight
@@ -99,6 +105,18 @@ case $RUN in
   mnist_thinker_cnn12_cond)
     RUN=mnist_thinker_mmdit_cnn12_s1_cond
     train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_uncond_temb)
+    RUN=mnist_thinker_mmdit_cnn12_s1_uncond_temb
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
+      translator.with_timestep_emb=true painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_uncond_chain)
+    RUN=mnist_thinker_mmdit_cnn12_s1_uncond_chain
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
+      translator.hidden_dim=384 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_thinker_cnn12_uncond_x0)
+    RUN=mnist_thinker_mmdit_cnn12_s1_uncond_x0
+    train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
+      painter.loss_weighting=x0 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
   clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
     RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
     train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \

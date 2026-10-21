@@ -108,6 +108,11 @@ class DataSample:
     latent space for VAE models.  Populated by _prepare_training_sample;
     never stored in the raw dataset."""
 
+    loss_weight: Optional[Tensor] = None
+    """Optional per-sample weight on the MSE loss, shape (), e.g. (1 - t)^2 to
+    train a velocity-predicting painter on the x0 error (MMDiTPainter
+    loss_weighting="x0"). None = unweighted. Populated at training time."""
+
     # ── Dict-style access (backwards-compat with code that uses mb["key"]) ──
 
     def __getitem__(self, key: str):

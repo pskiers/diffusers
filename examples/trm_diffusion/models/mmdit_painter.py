@@ -50,7 +50,7 @@ from models.optim_utils import ScheduledOptimizer, all_reduce_grads, apply_lr_an
 from models.painter_base import PainterBase, _load_frozen_checkpoint
 from third_party.minit2i import mmdit
 
-_RUNTIME_FIELDS = {"x_noisy", "timesteps", "target", "enc_x_noisy", "painter_hidden"}
+_RUNTIME_FIELDS = {"x_noisy", "timesteps", "target", "enc_x_noisy", "painter_hidden", "loss_weight"}
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -337,6 +337,10 @@ class MMDiTPainter(PainterBase, BaseModel):
         t_logit_mean, t_logit_std: logit-normal training timestep distribution.
         label_drop_rate: fraction of training samples whose condition is
             dropped (for classifier-free guidance), in both training stages.
+        loss_weighting: "velocity" (the velocity MSE, MiniT2I's objective) or
+            "x0" (the x0 MSE: the velocity MSE weighted per sample by
+            max(1 - t, velocity_clamp)^2, via DataSample.loss_weight). Only the
+            loss changes; the prediction and sampling stay the same.
         freeze: freeze every parameter (the thinker stage).
         checkpoint: train_trm.py checkpoint of this painter to load (stage 1's).
     """
@@ -358,6 +362,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         t_logit_mean: float = -0.8,
         t_logit_std: float = 0.8,
         label_drop_rate: float = 0.1,
+        loss_weighting: str = "velocity",
         freeze: bool = False,
         checkpoint: Optional[str] = None,
         eval_callbacks=None,
@@ -390,6 +395,9 @@ class MMDiTPainter(PainterBase, BaseModel):
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
         self.label_drop_rate = label_drop_rate
+        if loss_weighting not in ("velocity", "x0"):
+            raise ValueError(f"loss_weighting must be 'velocity' or 'x0', got {loss_weighting!r}")
+        self.loss_weighting = loss_weighting
 
         if checkpoint is not None:
             _load_frozen_checkpoint(self, checkpoint)
@@ -544,7 +552,10 @@ class MMDiTPainter(PainterBase, BaseModel):
         noise = torch.randn_like(images) * self.noise_scale
         x_t = images * t4 + noise * (1.0 - t4)
         target = (images - x_t) / (1.0 - t4).clamp_min(self.velocity_clamp)
-        sample = DataSample(**{**fields, "images": images, "x_noisy": x_t, "timesteps": t, "target": target})
+        weight = (1.0 - t).clamp_min(self.velocity_clamp) ** 2 if self.loss_weighting == "x0" else None
+        sample = DataSample(
+            **{**fields, "images": images, "x_noisy": x_t, "timesteps": t, "target": target, "loss_weight": weight}
+        )
         return self.fill_runtime_fields(sample) if self.frozen else sample
 
     def build_optimizers(self, world_size, num_steps) -> list[ScheduledOptimizer]:
@@ -568,7 +579,8 @@ class MMDiTPainter(PainterBase, BaseModel):
         ]
 
     def _loss(self, sample: DataSample) -> torch.Tensor:
-        return F.mse_loss(self(sample).pred, sample.target.float())
+        per_sample = (self(sample).pred - sample.target.float()).pow(2).flatten(1).mean(1)
+        return (per_sample * sample.loss_weight).mean() if sample.loss_weight is not None else per_sample.mean()
 
     def train_step(self, micro_batches, accelerator, optimizers, ema, global_step, **kwargs):
         K = len(micro_batches)

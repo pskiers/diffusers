@@ -149,6 +149,58 @@ def test_steering_noop_at_init_and_gradients(kind, bridge_mode):
             assert torch.allclose(a, b, atol=1e-3 * a.abs().max())
 
 
+@pytest.mark.parametrize("hidden_dim, temb", [(None, True), (32, False), (32, True)])
+def test_translator_chain_and_timestep_emb(hidden_dim, temb):
+    """Translator variants: still a no-op at initialization; once the zero-initialized
+    output layers move, gradients reach every new part, and with the timestep
+    embedding the steering depends on t."""
+    painter = _painter("patch", freeze=True)
+    torch.manual_seed(4)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    sample = painter._prepare_training_sample(_batch("patch"), DEV)
+    translator = PainterResidualTranslator(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=2,
+                                           bridge_mode="normalized", hidden_dim=hidden_dim, with_timestep_emb=temb)
+    assert translator.condition_keys == (["timesteps"] if temb else [])
+    logits = torch.randn(3, 4, 8, requires_grad=True)
+    steer = lambda t: translator(TRMOutput(logits=logits), timesteps=t)
+    assert torch.equal(painter(sample, steer(sample.timesteps)).pred, painter(sample).pred)
+
+    with torch.no_grad():
+        for proj in translator.projs:
+            (proj[-1] if hidden_dim else proj).weight.normal_(std=0.1)
+    torch.nn.functional.mse_loss(painter(sample, steer(sample.timesteps)).pred, sample.target).backward()
+    assert logits.grad.abs().sum() > 0
+    parts = list(translator.projs.parameters())
+    parts += list(translator.in_proj.parameters()) if hidden_dim else []
+    parts += list(translator.timestep_mlp.parameters()) if temb else []
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in parts)
+    with torch.no_grad():
+        r1 = steer(torch.full((3,), 0.1)).block_residuals[0]
+        r2 = steer(torch.full((3,), 0.7)).block_residuals[0]
+    assert torch.equal(r1, r2) != temb
+
+
+def test_x0_loss_weighting():
+    """loss_weighting="x0": the thinker-stage MSE equals the x0 MSE (velocity MSE x (1 - t)^2)."""
+    from models.losses import MSELoss
+
+    painter = _painter("patch", freeze=True, loss_weighting="x0")
+    torch.manual_seed(6)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    s = painter._prepare_training_sample(_batch("patch"), DEV)
+    t4 = s.timesteps.view(-1, 1, 1, 1)
+    assert (1 - s.timesteps).min() > painter.velocity_clamp  # unclamped: v * (1 - t) = x0 - x_t exactly
+    pred = painter(s).pred
+    loss, _ = MSELoss(1.0, painter.scheduler)(pred, None, s)
+    x0_hat, x0 = s.x_noisy + pred * (1 - t4), s.images
+    assert torch.allclose(loss, (x0_hat - x0).pow(2).mean(), rtol=1e-4)
+    assert torch.allclose(painter._loss(s), loss, rtol=1e-5)
+    unweighted, _ = MSELoss(1.0, painter.scheduler)(pred, None, dataclasses.replace(s, loss_weight=None))
+    assert torch.allclose(unweighted, torch.nn.functional.mse_loss(pred, s.target))
+
+
 TINY_THINKER = ["thinker.hidden_size=64", "thinker.n_heads=2", "thinker.n_sup=1", "thinker.H_cycles=1",
                 "thinker.L_cycles=1", "thinker.L_layers=1", "thinker.forward_dtype=float32"]
 TINY_PAINTER = ["painter.net.hidden_size=64", "painter.net.num_heads=2", "painter.net.head_dim=32", "painter.painter_dtype=null"]
@@ -166,6 +218,8 @@ def _build(overrides):
     return build_model(cfg, instantiate(cfg.diffusion))
 
 
+CNN12 = ["painter.steer_from_block=1", "translator.num_blocks=7", "condition_encoder.factor=12", "translator.grid=12",
+         "thinker.seq_len=144", "+train.force_unconditional_painter=true"]
 SUDOKU = DataSample(images=torch.rand(2, 1, 144, 144), spatial_conditions=torch.rand(2, 1, 144, 144),
                     solution=torch.randint(0, 9, (2, 81)))
 CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditions=torch.randn(2, 10, 55),
@@ -178,6 +232,8 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
         ("mnist_mmdit_painter", "mnist_thinker_mmdit", SUDOKU, ["translator.steer_cond=true"]),
         ("mnist_mmdit_painter", "mnist_thinker_mmdit", SUDOKU, ["painter.steer_from_block=1", "translator.num_blocks=7"]),
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, []),
+        *[("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, CNN12 + [v]) for v in
+          ("translator.with_timestep_emb=true", "translator.hidden_dim=64", "painter.loss_weighting=x0")],
         ("clevr_mmdit_painter", "clevr_thinker_mmdit", CLEVR, ["translator.steer_cond=true"]),
     ],
 )

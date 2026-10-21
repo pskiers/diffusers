@@ -26,6 +26,7 @@ pixel_range: "[0,1]"
 t_logit_mean: -0.8
 t_logit_std: 0.8
 label_drop_rate: 0.1         # condition dropped for 10% of samples (CFG), in both stages
+loss_weighting: "velocity"   # "x0": train on the x0 MSE (velocity MSE x (1 - t)^2)
 freeze: false
 checkpoint: null
 eval_callbacks: ${eval_callbacks}
