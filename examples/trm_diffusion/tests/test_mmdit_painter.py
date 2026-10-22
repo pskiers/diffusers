@@ -29,6 +29,7 @@ from datasets.data_sample import DataSample  # noqa: E402
 from models.interfaces import TRMOutput  # noqa: E402
 from models.mmdit_painter import (  # noqa: E402
     EmbeddingCondTokenizer,
+    NullCondTokenizer,
     FlowMatchingScheduler,
     MMDiTPainter,
     PatchCondTokenizer,
@@ -201,6 +202,78 @@ def test_x0_loss_weighting():
     assert torch.allclose(unweighted, torch.nn.functional.mse_loss(pred, s.target))
 
 
+def test_time_cond_painter():
+    """net.time_cond: every block starts as the identity (adaLN-Zero), stage-1 training
+    reaches the modulation layers, and afterwards the output depends on t."""
+    painter = MMDiTPainter(
+        scheduler=FlowMatchingScheduler(noise_scale=1.0), train_cfg=SimpleNamespace(grad_clip=1.0), eval_cfg=None,
+        optim_cfg=OPTIM, cond_tokenizer=PatchCondTokenizer(1, 12), net={**NET, "time_cond": True}, steer_from_block=2,
+        pixel_range="[0,1]", label_drop_rate=0.0)
+    torch.manual_seed(7)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    s = painter._prepare_training_sample(_batch("patch"), DEV)
+    x = torch.randn(3, 16, 64)
+    for block in painter.net.double_blocks:  # identity at init
+        out, _ = block(x, torch.randn(3, 16, 64), painter._vec(s.timesteps))
+        assert torch.equal(out, x)
+    painter._loss(s).backward()
+    adaln = [p for b in painter.net.double_blocks for p in b.adaln.parameters()] + list(painter.net.final_adaln.parameters())
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in adaln)
+    with torch.no_grad():
+        for p in adaln:
+            p.normal_(std=0.02)
+        t1, t2 = torch.full((3,), 0.2), torch.full((3,), 0.7)
+        x0a = painter.decode_tail(painter.encode_head(s.x_noisy, s.spatial_conditions, t=t1), t=t1)
+        x0b = painter.decode_tail(painter.encode_head(s.x_noisy, s.spatial_conditions, t=t2), t=t2)
+    assert not torch.allclose(x0a, x0b)
+    with pytest.raises(ValueError):
+        painter.encode_head(s.x_noisy, s.spatial_conditions)  # a time-conditioned net needs t
+
+
+def test_ddpm_objective():
+    """objective="ddpm": integer t, x_t from the DDPM scheduler, x0 prediction as output and target."""
+    from diffusers import DDPMScheduler
+
+    sched = DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2", prediction_type="sample")
+    painter = MMDiTPainter(
+        scheduler=sched, train_cfg=SimpleNamespace(grad_clip=1.0), eval_cfg=None, optim_cfg=OPTIM,
+        cond_tokenizer=PatchCondTokenizer(1, 12), net={**NET, "time_cond": True}, steer_from_block=2,
+        pixel_range="[0,1]", objective="ddpm", time_cond_scale=1.0, label_drop_rate=0.0)
+    batch = _batch("patch")
+    torch.manual_seed(8)
+    s = painter._prepare_training_sample(batch, DEV)
+    assert s.timesteps.dtype == torch.long and int(s.timesteps.max()) < 100
+    assert torch.equal(s.target, painter.to_model_range(batch.images))
+    torch.manual_seed(8)
+    t = torch.randint(0, 100, (3,), dtype=torch.long)
+    assert torch.allclose(s.x_noisy, sched.add_noise(s.target, torch.randn_like(s.target), t))
+    out = painter(s)
+    assert out.pred_type == "sample" and out.pred.shape == s.target.shape
+    with pytest.raises(ValueError):
+        MMDiTPainter(scheduler=FlowMatchingScheduler(), train_cfg=None, eval_cfg=None, optim_cfg=OPTIM,
+                     cond_tokenizer=PatchCondTokenizer(1, 12), net=NET, objective="ddpm")
+
+
+def test_null_cond_painter():
+    """NullCondTokenizer: no condition tokens — image-only attention, nothing to drop or null."""
+    painter = MMDiTPainter(
+        scheduler=FlowMatchingScheduler(noise_scale=1.0), train_cfg=SimpleNamespace(grad_clip=1.0), eval_cfg=None,
+        optim_cfg=OPTIM, cond_tokenizer=NullCondTokenizer(in_channels=1, patch_size=12), net={**NET, "preamble_depth": 0},
+        steer_from_block=0, pixel_range="[0,1]", label_drop_rate=1.0)
+    assert painter.condition_keys == []
+    torch.manual_seed(9)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    s = painter._prepare_training_sample(_batch("patch"), DEV)
+    hidden = painter.encode_head(s.x_noisy, t=s.timesteps)
+    assert hidden.shape[1] == painter.img_grid**2  # image tokens only
+    painter._loss(s).backward()
+    img = [p for n, p in painter.named_parameters() if ".img_" in n or "img_embedder" in n]
+    assert img and all(p.grad is not None for p in img)
+    assert torch.equal(painter(painter.null_condition_sample(s)).pred, painter(s).pred)
+
+
 TINY_THINKER = ["thinker.hidden_size=64", "thinker.n_heads=2", "thinker.n_sup=1", "thinker.H_cycles=1",
                 "thinker.L_cycles=1", "thinker.L_layers=1", "thinker.forward_dtype=float32"]
 TINY_PAINTER = ["painter.net.hidden_size=64", "painter.net.num_heads=2", "painter.net.head_dim=32", "painter.painter_dtype=null"]
@@ -220,6 +293,8 @@ def _build(overrides):
 
 CNN12 = ["painter.steer_from_block=1", "translator.num_blocks=7", "condition_encoder.factor=12", "translator.grid=12",
          "thinker.seq_len=144", "+train.force_unconditional_painter=true"]
+P16 = ["painter.net.patch_size=16", "painter.steer_from_block=1", "translator.num_blocks=7", "translator.painter_grid=9",
+       "translator.hidden_dim=64", "translator.with_timestep_emb=true", "+train.force_unconditional_painter=true"]
 SUDOKU = DataSample(images=torch.rand(2, 1, 144, 144), spatial_conditions=torch.rand(2, 1, 144, 144),
                     solution=torch.randint(0, 9, (2, 81)))
 CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditions=torch.randn(2, 10, 55),
@@ -234,11 +309,29 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, []),
         *[("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, CNN12 + [v]) for v in
           ("translator.with_timestep_emb=true", "translator.hidden_dim=64", "painter.loss_weighting=x0")],
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU,
+         CNN12 + ["translator.hidden_dim=64", "translator.with_timestep_emb=true"]),
+        *[("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + v) for v in (
+            [], ["painter.label_drop_rate=1.0"], ["painter.net.time_cond=true"],
+            ["diffusion=ddpm", "sampling=cfg", "painter.objective=ddpm", "painter.time_cond_scale=1", "translator.timestep_scale=1"],
+            ["painter.label_drop_rate=1.0", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",
+             "painter.objective=ddpm", "painter.time_cond_scale=1", "translator.timestep_scale=1"])],
+        # the most DiT-like combination: no condition stream, depth 3, every block steered, fp32 painter
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
+            "painter.net.patch_size=16", "painter.net.depth=3", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",
+            "painter.objective=ddpm", "painter.time_cond_scale=1", "translator.timestep_scale=1",
+            "painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer", "painter.net.preamble_depth=0",
+            "painter.steer_from_block=0", "translator.num_blocks=3", "translator.painter_grid=9", "translator.hidden_dim=64",
+            "translator.with_timestep_emb=true", "+train.force_unconditional_painter=true", "painter.painter_dtype=null",
+            "painter.label_drop_rate=0.0"]),
         ("clevr_mmdit_painter", "clevr_thinker_mmdit", CLEVR, ["translator.steer_cond=true"]),
     ],
 )
 def test_experiment_configs_build(tmp_path, painter_exp, thinker_exp, batch, extra):
-    painter = _build([f"experiment={painter_exp}", *TINY_PAINTER])
+    # stage 1 with the same painter-side overrides (architecture, objective) as stage 2
+    painter_side = [o for o in extra if o.startswith(("painter.net.", "painter.objective", "painter.time_cond_scale",
+                                                      "painter.cond_tokenizer", "painter.steer_from_block", "diffusion=", "sampling="))]
+    painter = _build([f"experiment={painter_exp}", *TINY_PAINTER, *painter_side])
     ckpt = tmp_path / "painter.pt"
     torch.save({"model_state": painter.state_dict()}, ckpt)
 

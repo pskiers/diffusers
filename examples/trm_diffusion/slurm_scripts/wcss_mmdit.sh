@@ -33,6 +33,20 @@
 #                                     (only its bridge differs: normalized here, raw logits there)
 #   mnist_thinker_cnn12_uncond_x0     stage-2 loss = x0 MSE (velocity MSE x (1-t)^2); its loss values are
 #                                     not comparable to the other runs', its accuracies are
+# Patch-16 painter variants (patches aligned with the 9x9 cells, as the working DiT painter) —
+# stage 1 then stage 2, each thinker run = DiT-direct's recipe on our side (CNN over puzzle + x_t,
+# 81 tokens; IP-chain translator with timestep embedding; steering from block 1; painter blinded):
+#   mnist_painter_p16{,_uncond,_tcond,_ddpm,_all}   then   mnist_thinker_p16{,_uncond,_tcond,_ddpm,_all}
+#   (none)  patch 16 only (control)
+#   _uncond painter trained unconditionally (condition always dropped)
+#   _tcond  painter timestep-conditioned (adaLN-Zero)
+#   _ddpm   painter trained with DDPM x0 prediction (100-step cosine, uniform t), sampled as the working runs
+#   _all    _uncond + _tcond + _ddpm: the closest MM-DiT replica of the working DiT-direct painter
+#   _small  painter depth 3, width 512, 8 heads (the working DiT painter's size)
+#   _nocond no condition stream at all (NullCondTokenizer): an unconditional, single-stream painter
+#   thinker-only: _steer0 (steer every block, from block 0), _fp32 (painter in fp32 in stage 2)
+#   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
+# Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
 # (W&B 0il6x2cq) without force_unconditional_painter.
 # The thinker experiments use translator.bridge_mode=normalized and thinker weight
@@ -123,6 +137,41 @@ case $RUN in
     RUN=mnist_thinker_mmdit_cnn12_s1_uncond_x0
     train experiment=mnist_thinker_mmdit_cnn $MNIST_S1 $MNIST_CNN12 +train.force_unconditional_painter=true \
       painter.loss_weighting=x0 painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
+  mnist_painter_p16*|mnist_thinker_p16*)
+    # suffixes after _p16 compose, e.g. mnist_thinker_p16_all_small_nocond_steer0_fp32;
+    # painter suffixes pick the painter checkpoint, thinker-only ones (_steer0, _fp32) do not
+    DDPM="diffusion=ddpm sampling=cfg painter.objective=ddpm painter.time_cond_scale=1"
+    PSIDE="painter.net.patch_size=16"; STAGE1=""; STAGE2=""; PV=""; TV=""; WIDTH=384; DEPTH=8; STEER=1
+    for tok in $(echo "${RUN##*_p16}" | tr '_' ' '); do
+      case $tok in
+        uncond) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PV="${PV}_$tok" ;;
+        tcond) PSIDE="$PSIDE painter.net.time_cond=true"; PV="${PV}_$tok" ;;
+        ddpm) PSIDE="$PSIDE $DDPM"; STAGE2="$STAGE2 translator.timestep_scale=1"; PV="${PV}_$tok" ;;
+        all) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PSIDE="$PSIDE painter.net.time_cond=true $DDPM"
+             STAGE2="$STAGE2 translator.timestep_scale=1"; PV="${PV}_$tok" ;;
+        small) PSIDE="$PSIDE painter.net.depth=3 painter.net.hidden_size=512 painter.net.num_heads=8 painter.net.head_dim=64"
+               STAGE1="$STAGE1 painter.steer_from_block=1"  # config default 4 is invalid for 3 blocks
+               WIDTH=512; DEPTH=3; PV="${PV}_$tok" ;;
+        nocond) PSIDE="$PSIDE painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer painter.net.preamble_depth=0"
+                PV="${PV}_$tok" ;;
+        steer0) STEER=0; TV="${TV}_$tok" ;;
+        fp32) STAGE2="$STAGE2 painter.painter_dtype=null"; TV="${TV}_$tok" ;;
+        *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
+      esac
+    done
+    PAINTER_CKPT=runs/mnist_mmdit_painter_p16$PV/checkpoint_final.pt
+    if [[ $RUN == mnist_painter_p16* ]]; then
+      [[ -n $TV ]] && { echo "$TV are thinker-stage variants, not painter ones" >&2; exit 1; }
+      RUN=mnist_mmdit_painter_p16$PV
+      train experiment=mnist_mmdit_painter $PSIDE $STAGE1 eval.eval_every=10000 eval_callbacks.0.num_samples=1024
+    else
+      # the thinker always sees the puzzle (no condition dropout); the painter is blinded instead
+      RUN=mnist_thinker_mmdit_p16$PV${TV}_chain_temb
+      train experiment=mnist_thinker_mmdit_cnn painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
+        painter.steer_from_block=$STEER translator.num_blocks=$((DEPTH - STEER)) translator.painter_grid=9 \
+        translator.hidden_dim=$WIDTH translator.with_timestep_emb=true \
+        +train.force_unconditional_painter=true painter.label_drop_rate=0.0 $MNIST_EVAL
+    fi ;;
   clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
     RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
     train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \

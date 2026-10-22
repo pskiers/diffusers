@@ -1,7 +1,7 @@
 # Stage-1 training of an MMDiTPainter. Condition dropout for CFG is the painter's
 # own (painter.label_drop_rate), so cfg_prob stays 0.
 seed: 42
-compile: false
+compile: true   # MMDiTPainter.compile_submodules: each transformer block
 
 batch_size: 256
 num_steps: 100000

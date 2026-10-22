@@ -16,6 +16,7 @@ net:
   head_dim: 64
   mlp_ratio: 2.6667
   pca_channels: 128
+  time_cond: false            # adaLN-Zero timestep conditioning (MiniT2I has none)
 cond_tokenizer:
   _target_: models.mmdit_painter.PatchCondTokenizer
   in_channels: 1
@@ -26,6 +27,8 @@ pixel_range: "[0,1]"
 t_logit_mean: -0.8
 t_logit_std: 0.8
 label_drop_rate: 0.1         # condition dropped for 10% of samples (CFG), in both stages
+objective: "flow"            # "ddpm": DDPM x0-prediction training (with diffusion=ddpm)
+time_cond_scale: 1000        # t * this into the timestep embedding: 1000 for flow t, 1 for DDPM steps
 loss_weighting: "velocity"   # "x0": train on the x0 MSE (velocity MSE x (1 - t)^2)
 freeze: false
 checkpoint: null

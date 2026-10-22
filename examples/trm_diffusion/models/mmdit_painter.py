@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
+import math
 from types import SimpleNamespace
 from typing import Optional
 
@@ -119,14 +121,50 @@ def _attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tenso
     return out.transpose(1, 2)
 
 
+# Rotary embeddings: mmdit.py's TextRotaryEmbedding1D / VisionRotaryEmbeddingFast
+# rebuild their cos/sin tables in every forward (the 2D one from int(sqrt(length))),
+# which torch.compile (inductor, torch 2.4.1) fails to code-generate. Same formulas,
+# op for op, but the tables are built once per shape outside the compiled graph and
+# cached; applying them is unchanged, so outputs are bit-identical to mmdit.py's.
+
+
+@torch.compiler.disable
+@functools.lru_cache(maxsize=64)
+def _rope_tables(kind: str, length: int, d: int, theta: float, device: torch.device, dtype: torch.dtype):
+    with torch.inference_mode(False), torch.no_grad():
+        if kind == "text":  # TextRotaryEmbedding1D.forward
+            inv = 1.0 / (theta ** (torch.arange(0, d, 2, device=device, dtype=torch.float32) / d))
+            pos = torch.arange(length, device=device, dtype=torch.float32)
+            angles = torch.einsum("l,f->lf", pos, inv)
+            angles = torch.cat([angles, angles], dim=-1)
+        else:  # VisionRotaryEmbeddingFast.forward, with dim = head_dim // 2
+            dim = d // 2
+            side = int(math.sqrt(length))
+            if side * side != length:
+                raise ValueError(f"image token length must be square, got {length}")
+            freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32)[: dim // 2] / dim))
+            t = torch.arange(side, device=device, dtype=torch.float32)
+            base = torch.einsum("l,f->lf", t, freqs)
+            f_h, f_w = torch.broadcast_tensors(base[:, None, :], base[None, :, :])
+            angles = torch.cat([f_h, f_w], dim=-1)
+            angles = torch.cat([angles, angles], dim=-1).reshape(length, -1)
+        return angles.cos().to(dtype=dtype), angles.sin().to(dtype=dtype)
+
+
+def _apply_rope(x: torch.Tensor, kind: str, theta: float = 10000.0) -> torch.Tensor:
+    """(B, L, H, D) → rotated, as mmdit.py's rotary embeddings."""
+    cos, sin = _rope_tables(kind, x.shape[1], x.shape[-1], float(theta), x.device, x.dtype)
+    return x * cos[None, :, None, :] + mmdit.rotate_half(x) * sin[None, :, None, :]
+
+
 class _FusedPlainTextTransformerBlock(mmdit.PlainTextTransformerBlock):
     cond_rope: str = "1d"
 
     def _rope(self, x):
         if self.cond_rope == "1d":
-            return self.rope(x)
+            return _apply_rope(x, "text", self.rope.theta)
         if self.cond_rope == "2d":
-            return mmdit.VisionRotaryEmbeddingFast(self.head_dim)(x)
+            return _apply_rope(x, "vision")
         return x
 
     def forward(self, txt):
@@ -145,12 +183,17 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
     cond_rope: str = "1d"
 
     def _rope(self, q_t, q_i):
+        q_i = _apply_rope(q_i, "vision", self.rope.vision_rope.theta)
         if self.cond_rope == "1d":
-            return self.rope(torch.cat([q_t, q_i], dim=1), txt_len=q_t.shape[1])
-        q_t = self.rope.vision_rope(q_t) if self.cond_rope == "2d" else q_t
-        return torch.cat([q_t, self.rope.vision_rope(q_i)], dim=1)
+            q_t = _apply_rope(q_t, "text", self.rope.text_rope.theta)
+        elif self.cond_rope == "2d":
+            q_t = _apply_rope(q_t, "vision", self.rope.vision_rope.theta)
+        return torch.cat([q_t, q_i], dim=1)
 
     def forward(self, x, txt, vec=None):
+        adaln = getattr(self, "adaln", None)
+        if adaln is not None and vec is not None:
+            return self._forward_adaln(x, txt, adaln(vec).chunk(12, dim=-1))
         b, li, _ = x.shape
         lt = txt.shape[1]
         x_norm = self.img_norm1(x)
@@ -165,10 +208,32 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
         k = self._rope(k_t, k_i)
         v = torch.cat([v_t, v_i], dim=1)
         out = _attention(q, k, v)
-        x = x + self.img_attn_proj(out[:, lt:].reshape(b, li, -1))
-        txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, -1))
+        x = x + self.img_attn_proj(out[:, lt:].reshape(b, li, self.num_heads * self.head_dim))
+        txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
         x = x + self.img_mlp(self.img_norm2(x))
         txt = txt + self.txt_mlp(self.txt_norm2(txt))
+        return x, txt
+
+    def _forward_adaln(self, x, txt, mods):
+        """The block with DiT's adaLN-Zero timestep modulation on both streams
+        (shift/scale before attention and MLP, gates on their outputs; see
+        build_mmdit(time_cond=True))."""
+        sh_ai, sc_ai, g_ai, sh_mi, sc_mi, g_mi, sh_at, sc_at, g_at, sh_mt, sc_mt, g_mt = mods
+        b, li, _ = x.shape
+        lt = txt.shape[1]
+        x_norm = mmdit.modulate(self.img_norm1(x), sh_ai, sc_ai)
+        txt_norm = mmdit.modulate(self.txt_norm1(txt), sh_at, sc_at)
+        qkv_i = self.img_qkv(x_norm).reshape(b, li, 3, self.num_heads, self.head_dim)
+        qkv_t = self.txt_qkv(txt_norm).reshape(b, lt, 3, self.num_heads, self.head_dim)
+        q_i, k_i, v_i = qkv_i[:, :, 0], qkv_i[:, :, 1], qkv_i[:, :, 2]
+        q_t, k_t, v_t = qkv_t[:, :, 0], qkv_t[:, :, 1], qkv_t[:, :, 2]
+        q_i, k_i = self.q_norm(q_i), self.k_norm(k_i)
+        q_t, k_t = self.q_norm(q_t), self.k_norm(k_t)
+        out = _attention(self._rope(q_t, q_i), self._rope(k_t, k_i), torch.cat([v_t, v_i], dim=1))
+        x = x + g_ai[:, None] * self.img_attn_proj(out[:, lt:].reshape(b, li, self.num_heads * self.head_dim))
+        txt = txt + g_at[:, None] * self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
+        x = x + g_mi[:, None] * self.img_mlp(mmdit.modulate(self.img_norm2(x), sh_mi, sc_mi))
+        txt = txt + g_mt[:, None] * self.txt_mlp(mmdit.modulate(self.txt_norm2(txt), sh_mt, sc_mt))
         return x, txt
 
 
@@ -198,13 +263,20 @@ def build_mmdit(
     mlp_ratio: float = 2.6667,
     pca_channels: int = 128,
     cond_rope: str = "1d",
+    time_cond: bool = False,
 ) -> mmdit.MMJiT:
     """A freshly initialized MMJiT of the given size, with fused attention.
 
-    Both streams have width hidden_size. The timestep and pooled-text embedders
-    MMJiT builds are dropped: no block reads their output. Initialization as
-    DiT / JiT: xavier-uniform linears and patch embeddings, zero biases, zero
-    output layer (so the model starts by predicting x0 = 0).
+    Both streams have width hidden_size. MMJiT's pooled-text embedder is dropped,
+    and so is its timestep embedder unless time_cond: no block reads them.
+    Initialization as DiT / JiT: xavier-uniform linears and patch embeddings,
+    zero biases, zero output layer (so the model starts by predicting x0 = 0).
+
+    time_cond: timestep conditioning as DiT's adaLN-Zero (which MiniT2I lacks):
+    MMJiT's TimestepEmbedder gives `vec`; every double-stream block gets a
+    zero-initialized SiLU+Linear producing shift/scale/gate for attention and MLP
+    of both streams (block.adaln), and the output layer a shift/scale
+    (net.final_adaln). Zero-initialized, so every block starts as the identity.
     """
     if image_size % patch_size:
         raise ValueError(f"image_size {image_size} is not a multiple of patch_size {patch_size}")
@@ -224,13 +296,23 @@ def build_mmdit(
         pca_channels=pca_channels,
     )
     net = mmdit.MMJiT(cfg)
-    del net.t_embedder, net.pooled_embedder
+    del net.pooled_embedder
+    if not time_cond:
+        del net.t_embedder
     for m in net.modules():
         if isinstance(m, (nn.Linear, nn.Conv2d)):
             nn.init.xavier_uniform_(m.weight.view(m.weight.shape[0], -1))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
     nn.init.zeros_(net.final_layer.linear.weight)
+    net.time_cond = time_cond
+    if time_cond:
+        for block in net.double_blocks:
+            block.adaln = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 12 * hidden_size))
+        net.final_adaln = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+        for mod in [*(b.adaln for b in net.double_blocks), net.final_adaln]:
+            nn.init.zeros_(mod[1].weight)
+            nn.init.zeros_(mod[1].bias)
     nn.init.zeros_(net.final_layer.linear.bias)
     return fuse_attention(net, cond_rope)
 
@@ -295,6 +377,21 @@ class PatchCondTokenizer(CondTokenizerBase):
         return tokens, torch.ones(tokens.shape[:2], device=cond.device)
 
 
+class NullCondTokenizer(CondTokenizerBase):
+    """No condition stream: zero condition tokens, so the MM-DiT's joint attention
+    is plain self-attention over the image tokens (an unconditional, effectively
+    single-stream DiT; the condition-stream weights are never used). Use with
+    net.preamble_depth 0. Accepts and ignores other tokenizers' arguments, so a
+    config can switch to it by overriding _target_ alone."""
+
+    condition_keys = []
+    rope = "none"
+    out_dim = 1
+
+    def __init__(self, **_ignored):
+        super().__init__()
+
+
 class EmbeddingCondTokenizer(CondTokenizerBase):
     """embedding_conditions (B, N, in_dim) with embedding_mask (B, N): one token
     per entry (e.g. per CLEVR object), padding entries become mask tokens. An
@@ -337,6 +434,14 @@ class MMDiTPainter(PainterBase, BaseModel):
         t_logit_mean, t_logit_std: logit-normal training timestep distribution.
         label_drop_rate: fraction of training samples whose condition is
             dropped (for classifier-free guidance), in both training stages.
+        objective: "flow" (MiniT2I's flow matching: logit-normal t in [0, 1],
+            velocity output for FlowMatchingScheduler) or "ddpm" (the DDPM
+            training of the working puzzle painters: integer t uniform over the
+            scheduler's steps, x_t from scheduler.add_noise, the x0 prediction
+            itself as output and MSE target; needs a DDPMScheduler with
+            prediction_type "sample").
+        time_cond_scale: the net's timestep embedding (net.time_cond) reads
+            t * time_cond_scale — 1000 for flow t in [0, 1], 1 for DDPM steps.
         loss_weighting: "velocity" (the velocity MSE, MiniT2I's objective) or
             "x0" (the x0 MSE: the velocity MSE weighted per sample by
             max(1 - t, velocity_clamp)^2, via DataSample.loss_weight). Only the
@@ -363,6 +468,8 @@ class MMDiTPainter(PainterBase, BaseModel):
         t_logit_std: float = 0.8,
         label_drop_rate: float = 0.1,
         loss_weighting: str = "velocity",
+        objective: str = "flow",
+        time_cond_scale: float = 1000.0,
         freeze: bool = False,
         checkpoint: Optional[str] = None,
         eval_callbacks=None,
@@ -398,6 +505,12 @@ class MMDiTPainter(PainterBase, BaseModel):
         if loss_weighting not in ("velocity", "x0"):
             raise ValueError(f"loss_weighting must be 'velocity' or 'x0', got {loss_weighting!r}")
         self.loss_weighting = loss_weighting
+        if objective not in ("flow", "ddpm"):
+            raise ValueError(f"objective must be 'flow' or 'ddpm', got {objective!r}")
+        if objective == "ddpm" and (getattr(scheduler.config, "prediction_type", None) != "sample" or loss_weighting != "velocity"):
+            raise ValueError("objective 'ddpm' needs a DDPM scheduler with prediction_type 'sample' (and no loss_weighting)")
+        self.objective = objective
+        self.time_cond_scale = time_cond_scale
 
         if checkpoint is not None:
             _load_frozen_checkpoint(self, checkpoint)
@@ -445,14 +558,28 @@ class MMDiTPainter(PainterBase, BaseModel):
 
     # ── The two halves of mmdit.MMJiT.forward ────────────────────────────────
 
-    def encode_head(self, x_t: torch.Tensor, *cond: torch.Tensor) -> torch.Tensor:
+    def _vec(self, t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """The blocks' timestep conditioning (None for nets without it, e.g. MiniT2I)."""
+        if not getattr(self.net, "time_cond", False):
+            return None
+        if t is None:
+            raise ValueError("this painter is timestep-conditioned (net.time_cond): pass t")
+        return self.net.t_embedder(t.float() * self.time_cond_scale)
+
+    def encode_head(self, x_t: torch.Tensor, *cond: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Condition tokens + embeddings + blocks [0, steer_from_block): the joint
         (B, L_cond + L_img, D) token stream, condition first (MMJiT's own order).
-        cond: the fields in self.condition_keys, in order."""
+        cond: the fields in self.condition_keys, in order; t: the timesteps (only
+        read by a timestep-conditioned net)."""
         net = self.net
         grad = torch.is_grad_enabled() and not self.frozen
         with torch.set_grad_enabled(grad), self._autocast(x_t.device):
-            context, mask = self.cond_tokenizer(*cond)
+            vec = self._vec(t)
+            if self.condition_keys:
+                context, mask = self.cond_tokenizer(*cond)
+            else:  # NullCondTokenizer: no condition tokens
+                context = x_t.new_zeros(x_t.shape[0], 0, self.cond_tokenizer.out_dim, dtype=torch.float32)
+                mask = x_t.new_zeros(x_t.shape[0], 0)
             # mmdit.MMJiT.forward up to its block loop (`vec` is computed there but
             # never used by any block, so it is skipped here).
             mask = mask.to(device=context.device)
@@ -463,7 +590,7 @@ class MMDiTPainter(PainterBase, BaseModel):
             for block in net.txt_preamble_blocks:
                 txt = block(txt)
             for block in net.double_blocks[: self.steer_from_block]:
-                x, txt = block(x, txt, None)
+                x, txt = block(x, txt, vec)
         return torch.cat([txt, x], dim=1)
 
     def decode_tail(
@@ -471,6 +598,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         hidden: torch.Tensor,
         block_residuals: Optional[list] = None,
         cond_block_residuals: Optional[list] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Blocks [steer_from_block, depth) + output head → predicted clean image.
         block_residuals[j] is added to the image tokens after the j-th of them,
@@ -482,14 +610,18 @@ class MMDiTPainter(PainterBase, BaseModel):
         if cond_block_residuals is not None and len(cond_block_residuals) > self.num_steered_blocks - 1:
             raise ValueError(f"{len(cond_block_residuals)} condition residuals for {self.num_steered_blocks} steered blocks")
         with self._autocast(hidden.device):
+            vec = self._vec(t)
             for j, block in enumerate(net.double_blocks[self.steer_from_block :]):
-                x, txt = block(x, txt, None)
+                x, txt = block(x, txt, vec)
                 if block_residuals is not None:
                     x = x + block_residuals[j].to(x.dtype)
                 if cond_block_residuals is not None and j < len(cond_block_residuals):
                     txt = txt + cond_block_residuals[j].to(txt.dtype)
             # MMJiT applies final_layer to cat([txt, x]) and keeps the image part;
             # it acts per token, so applying it to x alone is the same.
+            if vec is not None:
+                shift, scale = net.final_adaln(vec).chunk(2, dim=-1)
+                return net.unpatchify(net.final_layer.linear(mmdit.modulate(net.final_layer.norm_final(x), shift, scale)))
             return net.unpatchify(net.final_layer(x))
 
     def _cond(self, sample: DataSample) -> list:
@@ -498,7 +630,8 @@ class MMDiTPainter(PainterBase, BaseModel):
     def fill_runtime_fields(self, sample: DataSample) -> DataSample:
         """Compute painter_hidden for the sample's x_t and condition (see
         ThinkerFrozenPainterBase.forward_with_carry)."""
-        return dataclasses.replace(sample, painter_hidden=self.encode_head(sample.x_noisy, *self._cond(sample)))
+        hidden = self.encode_head(sample.x_noisy, *self._cond(sample), t=sample.timesteps)
+        return dataclasses.replace(sample, painter_hidden=hidden)
 
     def null_condition_sample(self, sample: DataSample) -> DataSample:
         """Condition fields zeroed, and painter_hidden dropped so forward recomputes
@@ -514,7 +647,7 @@ class MMDiTPainter(PainterBase, BaseModel):
     def forward(self, sample: DataSample, steering: Optional[ThinkerSteering] = None) -> DiffusionPrediction:
         hidden = sample.painter_hidden
         if hidden is None:
-            hidden = self.encode_head(sample.x_noisy, *self._cond(sample))
+            hidden = self.encode_head(sample.x_noisy, *self._cond(sample), t=sample.timesteps)
         kwargs = steering.to_painter_kwargs() if steering is not None else {}
         residuals = kwargs.get("block_residuals")
         if residuals is not None and len(residuals) != self.num_steered_blocks:
@@ -522,7 +655,9 @@ class MMDiTPainter(PainterBase, BaseModel):
                 f"{len(residuals)} steering residuals for {self.num_steered_blocks} steered blocks "
                 f"(steer_from_block={self.steer_from_block}) — set translator.num_blocks to match"
             )
-        x0_hat = self.decode_tail(hidden, residuals, kwargs.get("cond_block_residuals"))
+        x0_hat = self.decode_tail(hidden, residuals, kwargs.get("cond_block_residuals"), t=sample.timesteps)
+        if self.objective == "ddpm":
+            return DiffusionPrediction(pred=x0_hat.float(), pred_type="sample")
         return DiffusionPrediction(
             pred=self.velocity(x0_hat, sample.x_noisy, sample.timesteps), pred_type="v_prediction"
         )
@@ -547,12 +682,17 @@ class MMDiTPainter(PainterBase, BaseModel):
             for k in self.condition_keys:
                 v = fields[k]
                 fields[k] = torch.where(drop.view(-1, *[1] * (v.dim() - 1)), torch.zeros_like(v), v)
-        t = torch.sigmoid(torch.randn(b, device=device) * self.t_logit_std + self.t_logit_mean).clamp(1e-5, 1 - 1e-5)
-        t4 = t[:, None, None, None]
-        noise = torch.randn_like(images) * self.noise_scale
-        x_t = images * t4 + noise * (1.0 - t4)
-        target = (images - x_t) / (1.0 - t4).clamp_min(self.velocity_clamp)
-        weight = (1.0 - t).clamp_min(self.velocity_clamp) ** 2 if self.loss_weighting == "x0" else None
+        if self.objective == "ddpm":
+            t = torch.randint(0, self.scheduler.config.num_train_timesteps, (b,), device=device, dtype=torch.long)
+            x_t = self.scheduler.add_noise(images, torch.randn_like(images), t)
+            target, weight = images, None
+        else:
+            t = torch.sigmoid(torch.randn(b, device=device) * self.t_logit_std + self.t_logit_mean).clamp(1e-5, 1 - 1e-5)
+            t4 = t[:, None, None, None]
+            noise = torch.randn_like(images) * self.noise_scale
+            x_t = images * t4 + noise * (1.0 - t4)
+            target = (images - x_t) / (1.0 - t4).clamp_min(self.velocity_clamp)
+            weight = (1.0 - t).clamp_min(self.velocity_clamp) ** 2 if self.loss_weighting == "x0" else None
         sample = DataSample(
             **{**fields, "images": images, "x_noisy": x_t, "timesteps": t, "target": target, "loss_weight": weight}
         )
@@ -596,6 +736,13 @@ class MMDiTPainter(PainterBase, BaseModel):
         if ema is not None:
             ema.update(self)
         return {"diff_loss": loss_sum / K}, lr, global_step + 1
+
+    def compile_submodules(self):
+        """torch.compile every transformer block in place (nn.Module.compile keeps
+        parameter names, so checkpoints are unaffected); the loops around them
+        and the embeddings stay eager."""
+        for block in [*self.net.txt_preamble_blocks, *self.net.double_blocks]:
+            block.compile(fullgraph=False, dynamic=False)
 
     @torch.no_grad()
     def eval_step(self, dataloader, accelerator, **kwargs) -> dict:
