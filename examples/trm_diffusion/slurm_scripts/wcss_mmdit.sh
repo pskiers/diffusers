@@ -13,7 +13,8 @@
 
 # MiniT2I-style painter + thinker (models/mmdit_painter.py) on Sudoku and CLEVR,
 # one run per job, on one H100 with the configs' own batch sizes:
-#   sbatch slurm_scripts/wcss_mmdit.sh <run>
+#   sbatch slurm_scripts/wcss_mmdit.sh <run> [extra train_trm.py overrides...]
+#   resume: sbatch slurm_scripts/wcss_mmdit.sh <run> run.resume_from_checkpoint=runs/<output dir>/checkpoint_step-N.pt
 # Stage 1 (painters):  mnist_painter  clevr_painter
 # Stage 2 (thinkers, once the painter's checkpoint_final.pt exists):
 #   mnist_thinker  mnist_thinker_steer1  mnist_thinker_cnn  mnist_thinker_steercond
@@ -82,13 +83,14 @@ export TOKENIZERS_PARALLELISM=false
 cd $ROOT/examples/trm_diffusion
 
 RUN=$1
+XARGS=("${@:2}")  # extra train_trm.py overrides, e.g. run.resume_from_checkpoint=runs/<run>/checkpoint_step-10000.pt
 MNIST_PAINTER=runs/mnist_mmdit_painter/checkpoint_final.pt
 CLEVR_PAINTER=runs/clevr_mmdit_painter/checkpoint_final.pt
 MNIST_EVAL="eval.eval_every=5000 eval_callbacks.0.num_samples=1024"
 CLEVR_EVAL="eval.eval_every=5000 eval_callbacks.1.n_samples=1024"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
 MNIST_CNN12="condition_encoder.factor=12 translator.grid=12 thinker.seq_len=144 train.batch_size=192 train.gradient_accumulation_steps=4"
-train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@"; }
+train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@" "${XARGS[@]}"; }
 
 case $RUN in
   mnist_painter)
