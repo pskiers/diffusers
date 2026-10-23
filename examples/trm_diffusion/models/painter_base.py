@@ -1228,3 +1228,74 @@ class DirectIPAdapterSteeredDiTPainter(DiTPainter):
         self.dit.transformer_blocks = nn.ModuleList(
             [_DirectIPAdapterDiTBlock(blk, D) for blk in self.dit.transformer_blocks]
         )
+
+
+# ── Frozen DiT steered by per-block residuals (BlockResidualSteering) ─────────
+
+
+class _ResidualDiTBlock(nn.Module):
+    """Wraps a frozen DiT block; adds the steering residual for this block (from
+    cross_attention_kwargs["block_residuals"], one per block from
+    cross_attention_kwargs["steer_from_block"] on) to its output — the same
+    place _DirectIPAdapterDiTBlock adds its IP term."""
+
+    def __init__(self, block: nn.Module, index: int) -> None:
+        super().__init__()
+        self.block = block
+        self.index = index
+
+    def forward(self, hidden_states: torch.Tensor, cross_attention_kwargs=None, **kwargs) -> torch.Tensor:
+        residual, inner = None, cross_attention_kwargs
+        if cross_attention_kwargs is not None and "block_residuals" in cross_attention_kwargs:
+            start = cross_attention_kwargs["steer_from_block"]
+            if self.index >= start:
+                residual = cross_attention_kwargs["block_residuals"][self.index - start]
+            inner = {k: v for k, v in cross_attention_kwargs.items() if k not in ("block_residuals", "steer_from_block")} or None
+        out = self.block(hidden_states, cross_attention_kwargs=inner, **kwargs)
+        return out + residual.to(out.dtype) if residual is not None else out
+
+
+class ResidualSteeredDiTPainter(DiTPainter):
+    """Frozen DiTPainter (e.g. the pixel-space MNIST one DirectIPAdapterSteeredDiTPainter
+    uses) steered like MMDiTPainter: BlockResidualSteering from
+    PainterResidualTranslator, one residual added to the token stream after each
+    block from `steer_from_block` on. No trainable parameters of its own.
+
+    Args:
+        checkpoint: train_trm.py checkpoint of the DiTPainter ("model_state").
+        steer_from_block: first steered block (0 = all, as DirectIPAdapterSteeredDiTPainter).
+        **kwargs: forwarded verbatim to DiTPainter.__init__.
+    """
+
+    def __init__(self, checkpoint: str, steer_from_block: int = 0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.load_state_dict(strip_compiled_prefix(ckpt["model_state"]), strict=True)
+        self.requires_grad_(False)
+        n = len(self.dit.transformer_blocks)
+        if not 0 <= steer_from_block < n:
+            raise ValueError(f"steer_from_block must be in [0, {n - 1}]")
+        self.steer_from_block = steer_from_block
+        self.dit.transformer_blocks = nn.ModuleList(
+            [_ResidualDiTBlock(blk, i) for i, blk in enumerate(self.dit.transformer_blocks)]
+        )
+
+    @property
+    def num_steered_blocks(self) -> int:
+        return len(self.dit.transformer_blocks) - self.steer_from_block
+
+    def forward(self, sample: DataSample, steering: Optional[ThinkerSteering] = None) -> DiffusionPrediction:
+        kwargs: dict = {}
+        if self.condition_encoder is not None:
+            args = [getattr(sample, k) for k in self.condition_encoder.condition_keys]
+            kwargs.update(self.condition_encoder(*args, timesteps=sample.timesteps).to_painter_kwargs(sample.embedding_mask))
+        if steering is not None:
+            sk = steering.to_painter_kwargs()
+            if sk.get("cond_block_residuals") is not None:
+                raise ValueError("ResidualSteeredDiTPainter has no condition stream to steer (translator.steer_cond)")
+            residuals = sk["block_residuals"]
+            if len(residuals) != self.num_steered_blocks:
+                raise ValueError(f"{len(residuals)} steering residuals for {self.num_steered_blocks} steered blocks")
+            kwargs["cross_attention_kwargs"] = {"block_residuals": residuals, "steer_from_block": self.steer_from_block}
+        pred = self.dit(sample.x_noisy, timestep=sample.timesteps, **kwargs).sample
+        return DiffusionPrediction(pred=pred, pred_type=self.scheduler.config.prediction_type)

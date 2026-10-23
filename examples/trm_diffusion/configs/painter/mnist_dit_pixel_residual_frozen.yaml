@@ -1,0 +1,18 @@
+# The pixel-space MNIST DiT painter of mnist_thinker_dit_direct (a trained
+# mnist_dit_painter_pixel checkpoint), frozen and steered the way MMDiTPainter is:
+# PainterResidualTranslator residuals added after each block from steer_from_block
+# on (models/painter_base.py: ResidualSteeredDiTPainter). Lets our steering pipeline
+# run on the painter DiT-direct works with.
+# optim_cfg: for the condition encoder and translator, as mmdit_sudoku_frozen.
+_target_: models.painter_base.ResidualSteeredDiTPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: runs/mnist_dit_painter_pixel/checkpoint_final.pt
+dit: ${backbone}
+steer_from_block: 0
+painter_dtype: null
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 1e-4
+  weight_decay: 0.0
+  warmup_steps: 2000
+  lr_min_ratio: 0.1

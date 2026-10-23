@@ -1,0 +1,52 @@
+# @package _global_
+# Bisection: our MM-DiT steering pipeline on the working DiT-direct painter. The
+# thinker side and translator are those of the MM-DiT runs
+# (mnist_thinker_mmdit_cnn + translator.hidden_dim/with_timestep_emb: CNN over
+# puzzle + x_t, 81 tokens; IP-chain translator with timestep embedding, normalized
+# input; our encoder/translator optimizer), the painter is the frozen pixel DiT
+# of mnist_thinker_dit_direct steered by block residuals. Reaching DiT-direct's
+# accuracy = our pipeline is fine and the MM-DiT painter is the problem.
+#
+# Usage:
+#   python train_trm.py experiment=mnist_thinker_dit_residual \
+#     painter.checkpoint=runs/mnist_dit_painter_pixel/checkpoint_final.pt
+
+defaults:
+  - override /data: mnist_sudoku
+  - override /diffusion: ddpm
+  - override /backbone: mnist_dit_pixel
+  - override /painter: mnist_dit_pixel_residual_frozen
+  - override /thinker: mnist
+  - override /condition_encoder: spatial_image_v1
+  - override /translator: painter_residual
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: sudoku_thinker
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+  optim_cfg:
+    weight_decay: 0.3
+
+condition_encoder:
+  noisy_dropout_p_max: 0.0
+  with_timestep_emb: false
+
+translator:
+  painter_dim: 512   # the DiT's width (num_attention_heads 8 x attention_head_dim 64)
+  grid: 9
+  painter_grid: 9
+  num_blocks: 3      # 3 blocks - painter.steer_from_block
+  bridge_mode: normalized
+  hidden_dim: 512
+  with_timestep_emb: true
+  timestep_scale: 1  # DDPM steps, as the working translators
+
+run:
+  output_dir: "runs/mnist_thinker_dit_residual"

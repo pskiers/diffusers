@@ -365,3 +365,48 @@ def test_force_unconditional_painter(tmp_path):
         enc_null = model.condition_encoder(model.painter.fill_runtime_fields(model.painter.null_condition_sample(s)).painter_hidden).enc_emb
     assert torch.equal(steered, null) and not torch.allclose(steered, real)
     assert not torch.allclose(enc, enc_null)  # the thinker's input is still the real condition's
+
+
+@pytest.mark.parametrize("steer_from", [0, 1])
+def test_dit_residual_bisection_config(tmp_path, steer_from):
+    """Our steering pipeline on the DiT-direct painter (ResidualSteeredDiTPainter): builds from
+    the real painter config, starts as a no-op, gradients reach the thinker's output once the
+    translator moves, and residuals go exactly to blocks steer_from.. of the DiT."""
+    from models.interfaces import BlockResidualSteering
+
+    painter = _build(["experiment=mnist_dit_painter_pixel"])
+    ckpt = tmp_path / "dit.pt"
+    torch.save({"model_state": painter.state_dict()}, ckpt)
+    model = _build(["experiment=mnist_thinker_dit_residual", f"painter.checkpoint={ckpt}",
+                    f"painter.steer_from_block={steer_from}", f"translator.num_blocks={3 - steer_from}", *TINY_THINKER])
+    assert not any(p.requires_grad for p in model.painter.parameters())
+    [d] = model.prep_mb_data([SUDOKU], DEV)
+    s = d["sample"]
+    with torch.no_grad():
+        assert torch.equal(model(s).pred, model.painter(s).pred)  # zero-initialized translator
+
+    # residuals land on blocks steer_from.. only
+    outs = {}
+    hooks = [blk.register_forward_hook(lambda m, i, o, j=j: outs.__setitem__(j, o))  # block output incl. residual
+             for j, blk in enumerate(model.painter.dit.transformer_blocks)]
+    torch.manual_seed(0)
+    res = [torch.randn(2, 81, 512) for _ in range(3 - steer_from)]
+    with torch.no_grad():
+        plain = model.painter(s).pred
+        plain_outs = dict(outs)
+        steered = model.painter(s, BlockResidualSteering(block_residuals=res)).pred
+    for h in hooks:
+        h.remove()
+    assert not torch.allclose(steered, plain)
+    if steer_from == 1:  # block 0 is not steered: its output is unchanged
+        assert torch.equal(outs[0], plain_outs[0])
+    else:
+        assert not torch.equal(outs[0], plain_outs[0])
+
+    with torch.no_grad():  # move off the zero init, as after a few optimizer steps
+        for proj in model.thinker_painter_translator.projs:
+            proj[-1].weight.normal_(std=0.02)
+    noise_pred, logits, _, _ = model.reasoning_step(s, d["z_H"], d["z_L"])
+    model.loss_fn(noise_pred, logits, s)[0].backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.thinker_painter_translator.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.get_thinker_params())
