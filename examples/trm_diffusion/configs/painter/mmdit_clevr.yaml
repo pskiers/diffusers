@@ -20,6 +20,8 @@ net:
   qk_norm: true                # false: no RMSNorm on q and k (DiT)
   patch_embed: "bottleneck"    # "plain": one conv straight to the width (DiT)
   zero_init_output: true       # false: keep the output layer's xavier init
+  mlp: "swiglu"                # "gelu": DiT's MLP (4x, tanh-GELU, biases)
+  rope: true                   # false: no rotary embeddings (sin/cos positions only, DiT)
 cond_tokenizer:
   _target_: models.mmdit_painter.EmbeddingCondTokenizer
   in_dim: ${data.object_feat_dim}

@@ -160,8 +160,11 @@ def _apply_rope(x: torch.Tensor, kind: str, theta: float = 10000.0) -> torch.Ten
 
 class _FusedPlainTextTransformerBlock(mmdit.PlainTextTransformerBlock):
     cond_rope: str = "1d"
+    use_rope: bool = True
 
     def _rope(self, x):
+        if not self.use_rope:
+            return x
         if self.cond_rope == "1d":
             return _apply_rope(x, "text", self.rope.theta)
         if self.cond_rope == "2d":
@@ -182,8 +185,11 @@ class _FusedPlainTextTransformerBlock(mmdit.PlainTextTransformerBlock):
 
 class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
     cond_rope: str = "1d"
+    use_rope: bool = True
 
     def _rope(self, q_t, q_i):
+        if not self.use_rope:
+            return torch.cat([q_t, q_i], dim=1)
         q_i = _apply_rope(q_i, "vision", self.rope.vision_rope.theta)
         if self.cond_rope == "1d":
             q_t = _apply_rope(q_t, "text", self.rope.text_rope.theta)
@@ -281,6 +287,8 @@ def build_mmdit(
     qk_norm: bool = True,
     patch_embed: str = "bottleneck",
     zero_init_output: bool = True,
+    mlp: str = "swiglu",
+    rope: bool = True,
 ) -> mmdit.MMJiT:
     """A freshly initialized MMJiT of the given size, with fused attention.
 
@@ -299,8 +307,13 @@ def build_mmdit(
     norm: "rms" (MMJiT's RMSNorm) or "layer" (LayerNorm, eps 1e-6) for every
         pre-norm and the output norm; qk_norm: False drops the RMSNorm on q and k;
     patch_embed: "bottleneck" (MMJiT's) or "plain" (_PlainPatchEmbed);
-    zero_init_output: False keeps the output layer's xavier init.
+    zero_init_output: False keeps the output layer's xavier init;
+    mlp: "swiglu" (MMJiT's, hidden mlp_ratio x width) or "gelu" (DiT's: Linear 4x,
+        tanh-GELU, Linear, with biases); rope: False drops the rotary embeddings
+        (the absolute sin/cos position embedding of the image tokens stays).
     """
+    if mlp not in ("swiglu", "gelu"):
+        raise ValueError(f"mlp must be 'swiglu' or 'gelu', got {mlp!r}")
     if norm not in ("rms", "layer") or patch_embed not in ("bottleneck", "plain"):
         raise ValueError(f"norm must be 'rms'/'layer' and patch_embed 'bottleneck'/'plain', got {norm!r}, {patch_embed!r}")
     if image_size % patch_size:
@@ -335,6 +348,14 @@ def build_mmdit(
     if not qk_norm:
         for block in blocks:
             block.q_norm, block.k_norm = nn.Identity(), nn.Identity()
+    if mlp == "gelu":
+        def gelu_mlp():
+            return nn.Sequential(nn.Linear(hidden_size, 4 * hidden_size), nn.GELU(approximate="tanh"),
+                                 nn.Linear(4 * hidden_size, hidden_size))
+        for block in blocks:
+            for name in ("mlp", "img_mlp", "txt_mlp"):
+                if hasattr(block, name):
+                    setattr(block, name, gelu_mlp())
     if not time_cond:
         del net.t_embedder
     for m in net.modules():
@@ -345,6 +366,8 @@ def build_mmdit(
     if zero_init_output:
         nn.init.zeros_(net.final_layer.linear.weight)
     net.time_cond = time_cond
+    for block in blocks:
+        block.use_rope = rope
     if time_cond:
         for block in net.double_blocks:
             block.adaln = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 12 * hidden_size))

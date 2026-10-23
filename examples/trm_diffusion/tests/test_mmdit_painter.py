@@ -275,7 +275,8 @@ def test_null_cond_painter():
 
 
 @pytest.mark.parametrize("opts", [dict(norm="layer", qk_norm=False),
-                                  dict(patch_embed="plain", zero_init_output=False)])
+                                  dict(patch_embed="plain", zero_init_output=False),
+                                  dict(mlp="gelu", rope=False)])
 def test_dit_style_painter_options(opts):
     """build_mmdit's DiT-style options: no RMSNorm left / plain patch embedding, still trains."""
     from third_party.minit2i import mmdit as vendored
@@ -288,6 +289,12 @@ def test_dit_style_painter_options(opts):
     if opts.get("norm") == "layer":
         assert not any(isinstance(m, vendored.RMSNorm) for m in mods)
         assert all(isinstance(b.q_norm, torch.nn.Identity) for b in painter.net.double_blocks)
+    if opts.get("mlp") == "gelu":
+        assert not any(isinstance(m, vendored.SwiGLUMlp) for m in mods)
+    if opts.get("rope") is False:
+        blk = painter.net.double_blocks[0]
+        q_t, q_i = torch.randn(2, 16, 2, 32), torch.randn(2, 16, 2, 32)
+        assert not blk.use_rope and torch.equal(blk._rope(q_t, q_i), torch.cat([q_t, q_i], dim=1))
     if opts.get("patch_embed") == "plain":
         assert not any(isinstance(m, vendored.BottleneckPatchEmbed) for m in mods)
         assert painter.net.final_layer.linear.weight.abs().sum() > 0  # not zero-initialized
@@ -352,6 +359,11 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + ["painter.net.norm=layer", "painter.net.qk_norm=false"]),
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + [
             "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false"]),
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + ['painter.model_range="[0,1]"']),
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + [  # the DiT-ified MM-DiT
+            "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false",
+            "painter.net.norm=layer", "painter.net.qk_norm=false", "painter.net.mlp=gelu", "painter.net.rope=false",
+            "painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer", "painter.net.preamble_depth=0"]),
         # the most DiT-like combination: no condition stream, depth 3, every block steered, fp32 painter
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
             "painter.net.patch_size=16", "painter.net.depth=3", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",
@@ -449,3 +461,37 @@ def test_dit_residual_bisection_config(tmp_path, steer_from):
     model.loss_fn(noise_pred, logits, s)[0].backward()
     assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.thinker_painter_translator.parameters())
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.get_thinker_params())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the thinker's adam_atan2 optimizer is CUDA-only")
+@pytest.mark.parametrize("painter_exp, thinker_exp, extra", [
+    ("mnist_dit_painter_pixel", "mnist_thinker_dit_residual", []),
+    ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", P16 + [
+        "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg", "painter.objective=ddpm",
+        "painter.time_cond_scale=1", "translator.timestep_scale=1"]),
+])
+def test_act_training_with_new_painters(tmp_path, painter_exp, thinker_exp, extra):
+    """mode=thinker_act (persistent-carry ACT loop) runs with the residual-steered painters:
+    the per-sample merge of fresh samples handles their fields (painter_hidden, integer
+    DDPM timesteps, ...) and the losses stay finite."""
+    painter_side = [o for o in extra if o.startswith(("painter.net.", "painter.objective", "painter.time_cond_scale",
+                                                      "painter.cond_tokenizer", "painter.steer_from_block",
+                                                      "painter.model_range", "diffusion=", "sampling="))]
+    painter = _build([f"experiment={painter_exp}", *(TINY_PAINTER if "mmdit" in painter_exp else []), *painter_side])
+    ckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, ckpt)
+    model = _build([f"experiment={thinker_exp}", f"painter.checkpoint={ckpt}", "mode=thinker_act",
+                    "thinker.with_halt_head=true", "thinker.n_sup=3", *TINY_THINKER[:3], *TINY_THINKER[4:],
+                    *(TINY_PAINTER if "mmdit" in painter_exp else []), *extra])
+    assert type(model).__name__ == "ThinkerFrozenPainterACT"
+    dev = torch.device("cuda")
+    model = model.to(dev)
+    opts = model.build_optimizers(1, 100)
+    acc = SimpleNamespace(device=dev, backward=lambda l: l.backward(), clip_grad_norm_=torch.nn.utils.clip_grad_norm_)
+    step = 0
+    for _ in range(4):  # enough calls for samples to halt and be replaced (n_sup 3)
+        batch = DataSample(**{k: v.clone() for k, v in vars(SUDOKU).items() if v is not None},
+                           solution_mask=torch.rand(2, 81) < 0.3)
+        losses, _, step = model.train_step([batch], acc, opts, None, step)
+        assert all(torch.isfinite(torch.tensor(v)) for v in losses.values()), losses
+    assert step == 4
