@@ -191,9 +191,13 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
         # Kept as a separate mode/class (rather than modifying thinker_base)
         # so the existing sudoku/CLEVR thinker experiments are entirely
         # untouched. act_halt_threshold/act_halt_exploration_prob/
-        # act_continue_bias_init live under cfg.train (CLI-overridable via
-        # train.act_halt_threshold=... etc.) since they're specific to this
-        # training loop, not applicable to thinker_base.
+        # act_continue_bias_init/act_halt_label_margin live under cfg.train
+        # (CLI-overridable via train.act_halt_threshold=... etc.) since
+        # they're specific to this training loop, not applicable to
+        # thinker_base. act_halt_label_margin unset (the default) keeps the
+        # halt head's original MSE regression; set it to opt into the BCE
+        # classification formulation instead — see ThinkerFrozenPainterACT's
+        # own docstring for why that's opt-in rather than a default switch.
         from models.painter_thinkers import ThinkerFrozenPainterACT
 
         return ThinkerFrozenPainterACT(
@@ -210,6 +214,9 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
             halt_exploration_prob=float(cfg.train.get("act_halt_exploration_prob", 0.1)),
             continue_bias_init=float(cfg.train.get("act_continue_bias_init", 1.0)),
+            halt_label_margin=(
+                float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
+            ),
         )
 
     if mode == "action_thinker_base":

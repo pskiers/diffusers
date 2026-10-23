@@ -15,8 +15,11 @@ code paths to tolerate a checkpoint whose parameter set doesn't match them
 For every training example, this collects the real per-step diffusion loss
 across the checkpoint's own full n_sup reasoning trajectory (model.eval(),
 no_grad — cheap, no gradient needed through the frozen model) and trains
-halt_head to predict, from z_H at step t, the future loss reduction still
-available: loss_t - min(loss_{t+1..}). See SpatialTRM.train_halt_head.
+halt_head to predict, from z_H at step t, whether continuing still reduces
+loss at all: label = (loss_t - min(loss_{t+1..})) > label_margin, via
+BCE-with-logits (not a regression on the raw reduction magnitude — see
+SpatialTRM.train_halt_head's docstring for why). See that same docstring for
+the exact target/label definition.
 
 Usage:
     python experiments/train_halt_head.py experiment=mnist_thinker_v1_controlnet \\
@@ -28,10 +31,11 @@ Usage:
       +halt_train.num_steps=500
 
     # Options (all under +halt_train.*):
-    #   num_steps   — training iterations (default 500)
-    #   batch_size  — default cfg.train.batch_size
-    #   out         — output checkpoint path (default: alongside the input
-    #                 checkpoint, named checkpoint_with_halt_head.pt)
+    #   num_steps     — training iterations (default 500)
+    #   batch_size    — default cfg.train.batch_size
+    #   label_margin  — min achievable reduction to count as label=1 (default 0.0)
+    #   out           — output checkpoint path (default: alongside the input
+    #                   checkpoint, named checkpoint_with_halt_head.pt)
     # use_ema=false to continue from raw (non-EMA) weights instead of the
     # checkpoint's EMA weights (default true, matching eval.py/
     # ablate_trm_loop_budget.py's own default).
@@ -95,6 +99,7 @@ def main(cfg: DictConfig):
     num_steps: int = ht.get("num_steps", 500)
     batch_size: int = ht.get("batch_size", cfg.train.batch_size)
     log_every: int = ht.get("log_every", 50)
+    label_margin: float = ht.get("label_margin", 0.0)
     use_ema: bool = cfg.get("use_ema", True)
     out_path: str = ht.get("out", str(Path(checkpoint).parent / "checkpoint_with_halt_head.pt"))
 
@@ -145,6 +150,20 @@ def main(cfg: DictConfig):
             train_iter = iter(train_dl)
             return next(train_iter)
 
+    # Track an EMA of halt_head_loss and snapshot the halt_head's own weights
+    # (just a (1, hidden_size) Linear — cheap to keep in memory) whenever the
+    # EMA hits a new low. Adam on this tiny-scale regression target (true
+    # values are ~1e-3 to 1e-6, see experiments/diag_halt_target_by_timestep.py)
+    # can find a good fit mid-run and then drift away from it before
+    # num_steps is up — saving whatever the LAST step happens to land on then
+    # captures that drift, not the best fit actually found. EMA (not the raw
+    # per-step loss) smooths over ordinary batch-to-batch noise so a single
+    # unlucky high-target batch doesn't get mistaken for "no longer the best".
+    ema_momentum = 0.98
+    ema_loss: Optional[float] = None
+    best_ema = float("inf")
+    best_halt_head_state: Optional[dict] = None
+
     recent_losses: list[float] = []
     for step in tqdm(range(num_steps), desc="Training halt head"):
         batch = _next_batch()
@@ -158,15 +177,30 @@ def main(cfg: DictConfig):
                 z_H0_list.append(d["z_H"][:, 0].detach())
                 loss_list.append(per_sample_loss.detach())
 
-        halt_loss = model.thinker.train_halt_head(z_H0_list, loss_list)
+        halt_loss = model.thinker.train_halt_head(
+            z_H0_list, loss_list, timesteps=d["sample"].timesteps, label_margin=label_margin
+        )
         recent_losses.append(halt_loss)
+        ema_loss = halt_loss if ema_loss is None else ema_momentum * ema_loss + (1 - ema_momentum) * halt_loss
+        if ema_loss < best_ema:
+            best_ema = ema_loss
+            best_halt_head_state = {
+                k: v.detach().clone() for k, v in accelerator.unwrap_model(model).thinker.halt_head.state_dict().items()
+            }
         if step % log_every == 0:
             window = recent_losses[-log_every:]
-            logger.info(f"step={step}  halt_head_loss={halt_loss:.4f}  (last {len(window)} avg={sum(window)/len(window):.4f})")
+            logger.info(
+                f"step={step}  halt_head_loss={halt_loss:.4f}  (last {len(window)} avg={sum(window)/len(window):.4f})  "
+                f"ema={ema_loss:.4f}  best_ema={best_ema:.4f}"
+            )
 
     if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(model)
+        if best_halt_head_state is not None:
+            unwrapped.thinker.halt_head.load_state_dict(best_halt_head_state)
+            logger.info(f"Restored halt_head weights from best EMA loss={best_ema:.4f} (final EMA was {ema_loss:.4f})")
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"step": None, "model_state": accelerator.unwrap_model(model).state_dict()}, out_path)
+        torch.save({"step": None, "model_state": unwrapped.state_dict()}, out_path)
         tail = recent_losses[-log_every:]
         logger.info(f"Saved → {out_path} (last {len(tail)}-step avg halt_head_loss={sum(tail)/len(tail):.4f})")
 

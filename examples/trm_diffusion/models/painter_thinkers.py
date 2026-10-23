@@ -344,7 +344,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                     )
                     step_count += 1
                     if halt_preds_out is not None:
-                        halt_preds_out.append(self.thinker.predict_halt_value(z_H).detach())
+                        halt_preds_out.append(self.thinker.predict_halt_value(z_H, sample.timesteps).detach())
                     if logits_out is not None:
                         logits_out.append(logits.detach())
                     if zH_out is not None:
@@ -386,7 +386,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                         running_z_H[active_idx] = new_z_H
                         zH_out.append(running_z_H.detach().clone())
 
-                    pred = self.thinker.predict_halt_value(new_z_H)
+                    pred = self.thinker.predict_halt_value(new_z_H, cur_timesteps)
                     if halt_preds_out is not None:
                         halt_preds_out.append(pred.detach())
                     halt_now = pred <= halt_threshold
@@ -768,7 +768,24 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
 
     halt_threshold: the training-time halting threshold (distinct from
     eval_cfg.halt_threshold, which only governs inference-time forward()/
-    forward_with_carry() defaults).
+    forward_with_carry() defaults). Always a logit threshold on
+    predict_halt_value's raw output, regardless of halt_label_margin below:
+    0.0 is the 50% confidence boundary, sigmoid(halt_threshold) the implied
+    probability continuing still helps (see models.trm_wrappers.SpatialTRM.
+    predict_halt_value's docstring) — unaffected by which loss trained the
+    head, since both formulations share the same head/units.
+
+    halt_label_margin: None (the default) keeps train_halt_head_ragged's
+    original raw-magnitude MSE regression. A float switches it to the same
+    binary classification SpatialTRM.train_halt_head itself was moved to
+    (BCE on "does continuing reduce loss by more than this margin") — see
+    that method's docstring for why the regression target's scale ends up
+    dominated by whichever timesteps/tasks happen to produce the largest
+    raw reduction values, and experiments/diag_halt_target_by_timestep.py
+    for how the margin was calibrated for MNIST-Sudoku (plain 0.0 there
+    mostly measured floating-point jitter, not real signal). The right
+    value is dataset/loss-scale dependent, so this has no validated default
+    here — calibrate it the same way for whatever task uses this class.
     """
 
     def __init__(
@@ -777,6 +794,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         halt_threshold: float = 0.0,
         halt_exploration_prob: float = 0.1,
         continue_bias_init: float = 1.0,
+        halt_label_margin: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -784,6 +802,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             raise ValueError("ThinkerFrozenPainterACT requires thinker.with_halt_head=True.")
         self.halt_threshold = halt_threshold
         self.halt_exploration_prob = halt_exploration_prob
+        self.halt_label_margin = halt_label_margin
         with torch.no_grad():
             nn.init.constant_(self.thinker.halt_head.bias, continue_bias_init)
         self._act_carry: Optional[list[dict]] = None
@@ -899,7 +918,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         losses = {k: v / K for k, v in total_losses.items()}
         # Called even with no locally completed histories: its gradient sync is
         # a collective, and other ranks may have some this step.
-        halt_loss = self.thinker.train_halt_head_ragged(completed_histories)
+        halt_loss = self.thinker.train_halt_head_ragged(completed_histories, label_margin=self.halt_label_margin)
         if completed_histories:
             losses["halt_head_loss"] = halt_loss
             losses["act_steps_completed"] = float(len(completed_histories))

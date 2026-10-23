@@ -84,6 +84,8 @@ class SpatialTRM(BaseModel):
         with_timestep_emb: bool = False,
         with_halt_head: bool = False,
         halt_head_lr: float = 1e-3,
+        halt_timestep_emb: bool = False,
+        halt_timestep_emb_dim: int = 32,
     ):
         super().__init__()
         self.n_sup = n_sup
@@ -108,10 +110,32 @@ class SpatialTRM(BaseModel):
             # the main thinker optimizer/LR schedule/global_step — the aux
             # loss is only computable once per full n_sup trajectory, not
             # once per n_sup iteration like everything else.
-            self.halt_head = nn.Linear(hidden_size, 1)
+            #
+            # halt_timestep_emb: concatenate a small sinusoidal embedding of
+            # the current diffusion timestep to z_H[:, 0] before the head.
+            # z_H is otherwise the head's only input, and in configs where
+            # neither the thinker (with_timestep_emb) nor the condition
+            # encoder embeds the timestep explicitly (e.g. mnist_thinker_v1
+            # with the x0-hint's own with_timestep_emb disabled), the head
+            # has to infer "how noisy is this" purely from whatever leaks
+            # through the CNN-encoded tokens — see
+            # experiments/diag_halt_target_by_timestep.py, which measured
+            # exactly this gap. Own dedicated embedding (not the thinker's
+            # with_timestep_emb one) so this works without touching the
+            # already-trained, frozen base checkpoint.
+            self.halt_uses_timestep = halt_timestep_emb
+            halt_in_dim = hidden_size
+            halt_params = []
+            if halt_timestep_emb:
+                self.halt_timestep_mlp = TimestepMLP(sin_dim=halt_timestep_emb_dim, out_dim=halt_timestep_emb_dim)
+                halt_in_dim += halt_timestep_emb_dim
+                halt_params += list(self.halt_timestep_mlp.parameters())
+            self.halt_head = nn.Linear(halt_in_dim, 1)
             nn.init.zeros_(self.halt_head.weight)
             nn.init.zeros_(self.halt_head.bias)
-            self.halt_optimizer = torch.optim.Adam(self.halt_head.parameters(), lr=halt_head_lr)
+            halt_params += list(self.halt_head.parameters())
+            self._halt_params = halt_params  # also used by all_reduce_grads in train_halt_head(_ragged)
+            self.halt_optimizer = torch.optim.Adam(halt_params, lr=halt_head_lr)
 
         # puzzle_emb_len is only meaningful when puzzle_emb_ndim > 0
         effective_puzzle_emb_len = puzzle_emb_len if puzzle_emb_ndim > 0 else 0
@@ -260,21 +284,51 @@ class SpatialTRM(BaseModel):
 
         return logits, new_carry.z_H, new_carry.z_L
 
-    # ── Adaptive-halting head (continuous-space substitute for the vendored
-    #    q_head, which needs a binary correctness reward this codebase's
-    #    diffusion targets don't have) ─────────────────────────────────────
+    # ── Adaptive-halting head (binary "will continuing still help" classifier,
+    #    same spirit as the vendored q_head but supervised from loss-reduction
+    #    sign instead of a correctness reward this codebase's diffusion
+    #    targets don't have — see train_halt_head for why this is a
+    #    classification target rather than a regression one) ───────────────
 
-    def predict_halt_value(self, z_H: torch.Tensor) -> torch.Tensor:
-        """Predicted expected future loss reduction from continuing past the
-        reasoning step that produced this z_H (reads the same pooled token
-        the vendored q_head uses). Near/below zero → diminishing returns,
-        safe to halt; call sites decide the actual threshold.
+    def _halt_feat(self, z_H0: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Builds the halt head's input from a pooled z_H[:, 0] token, adding
+        a timestep embedding when halt_uses_timestep=True. z_H0: (..., hidden_size).
+        timesteps, when needed, must broadcast to z_H0's leading dims (see
+        train_halt_head's own broadcast for the (n_sup-1, B) case)."""
+        feat = z_H0.float()
+        if self.halt_uses_timestep:
+            if timesteps is None:
+                raise RuntimeError(
+                    "This halt head was built with halt_timestep_emb=True and requires `timesteps`."
+                )
+            temb = self.halt_timestep_mlp(timesteps).float()
+            temb = temb.expand(*feat.shape[:-1], temb.shape[-1])
+            feat = torch.cat([feat, temb], dim=-1)
+        return feat
+
+    def predict_halt_value(self, z_H: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Logit of P(continuing past the reasoning step that produced this
+        z_H would still reduce loss) (reads the same pooled token the
+        vendored q_head uses). Below/at zero → more likely than not that
+        continuing doesn't help, safe to halt; call sites decide the actual
+        threshold (0.0 = the 50% confidence boundary, matching this head's
+        zero-init "no opinion yet" prior — see train_halt_head).
+
+        timesteps: (B,) current diffusion timestep, required when this head
+        was built with halt_timestep_emb=True (see __init__), ignored
+        otherwise.
         """
         if not self.with_halt_head:
             raise RuntimeError("predict_halt_value requires with_halt_head=True at construction.")
-        return self.halt_head(z_H[:, 0].float()).squeeze(-1)
+        return self.halt_head(self._halt_feat(z_H[:, 0], timesteps)).squeeze(-1)
 
-    def train_halt_head(self, z_H0_list: list[torch.Tensor], loss_list: list[torch.Tensor]) -> float:
+    def train_halt_head(
+        self,
+        z_H0_list: list[torch.Tensor],
+        loss_list: list[torch.Tensor],
+        timesteps: Optional[torch.Tensor] = None,
+        label_margin: float = 0.0,
+    ) -> float:
         """Train the halt head on one micro-batch's full n_sup trajectory.
 
         z_H0_list / loss_list: length-n_sup lists of (B, hidden_size) / (B,)
@@ -283,11 +337,38 @@ class SpatialTRM(BaseModel):
         diffusion loss (both computed by the caller, e.g.
         ThinkerFrozenPainterBase.train_step).
 
-        Target for step t is the future loss reduction still available:
-        loss_t - min(loss_{t+1 .. n_sup-1}). The last step is skipped (no
-        future to compare against). Trained via its own optimizer
-        (self.halt_optimizer) — does not touch the main thinker optimizer or
-        global_step.
+        Label for step t is binary: does continuing past it ever still
+        reduce loss, i.e. loss_t - min(loss_{t+1 .. n_sup-1}) > label_margin?
+        The last step is skipped (no future to compare against). Trained via
+        BCE-with-logits against its own optimizer (self.halt_optimizer) —
+        does not touch the main thinker optimizer or global_step.
+
+        This used to regress the raw reduction magnitude directly, but that
+        value spans ~4 orders of magnitude across timesteps (see
+        experiments/diag_halt_target_by_timestep.py) — MSE pools squared
+        error across all of them, so gradient is dominated by whichever
+        timesteps happen to have the largest raw magnitude, and three
+        separate training attempts (different LR, +/- an explicit timestep
+        embedding) all converged to a badly-shaped fit as a result. Reducing
+        the label to its own SIGN turns this into an ordinary classification
+        problem: BCE weights every example by its own cross-entropy
+        regardless of the underlying regression target's scale, which is
+        exactly the invariance the regression loss was missing. It also
+        happens to match what every call site already does with the head's
+        output (threshold it), so no information actually needed for the
+        halting decision is lost.
+
+        timesteps: (B,) diffusion timestep, required when halt_uses_timestep
+        is True. The whole n_sup trajectory this method sees is collected at
+        one fixed timestep per sample (see experiments/train_halt_head.py),
+        so the same (B,) tensor is reused for every one of the n_sup-1 steps.
+
+        label_margin: a step only counts as "continuing helps" (label=1) if
+        the achievable reduction exceeds this margin, not just >0 — guards
+        against single-noise-realization measurement jitter being read as
+        signal. Default 0.0 (any reduction counts) since the near-converged
+        regime empirically has ~zero measured jitter (std=0 in the
+        diagnostic above); raise it if that turns out not to hold elsewhere.
         """
         n_sup = len(loss_list)
         if n_sup < 2:
@@ -297,18 +378,22 @@ class SpatialTRM(BaseModel):
         # suffix_min[t] = min(losses[t:]) via cummin on the reversed sequence
         suffix_min = torch.flip(torch.cummin(torch.flip(losses, dims=[0]), dim=0).values, dims=[0])
         future_min = suffix_min[1:]  # future_min[t] = min(losses[t+1:]), t = 0..n_sup-2
-        targets = (losses[:-1] - future_min).reshape(-1)  # ((n_sup-1)*B,)
+        reduction = (losses[:-1] - future_min).reshape(-1)  # ((n_sup-1)*B,)
+        labels = (reduction > label_margin).float()
 
         # z_H0_list entries come straight from the TRM's forward_dtype (bfloat16
         # in every real config) — halt_head is a plain fp32 Linear, same as
         # predict_halt_value's own cast.
         z_H0_stack = torch.stack(z_H0_list[:-1], dim=0).float()  # (n_sup-1, B, hidden_size)
-        preds = self.halt_head(z_H0_stack.reshape(-1, z_H0_stack.shape[-1])).squeeze(-1)
+        if self.halt_uses_timestep and timesteps is not None:
+            timesteps = timesteps.unsqueeze(0).expand(z_H0_stack.shape[0], -1).reshape(-1)
+        feat = self._halt_feat(z_H0_stack.reshape(-1, z_H0_stack.shape[-1]), timesteps)
+        preds = self.halt_head(feat).squeeze(-1)
 
-        loss = F.mse_loss(preds, targets)
+        loss = F.binary_cross_entropy_with_logits(preds, labels)
         self.halt_optimizer.zero_grad()
         loss.backward()
-        all_reduce_grads(self.halt_head.parameters())
+        all_reduce_grads(self._halt_params)
         self.halt_optimizer.step()
         return loss.item()
 
@@ -321,7 +406,9 @@ class SpatialTRM(BaseModel):
         suffix_min = torch.flip(torch.cummin(torch.flip(loss_seq, dims=[0]), dim=0).values, dims=[0])
         return loss_seq[:-1] - suffix_min[1:]
 
-    def train_halt_head_ragged(self, histories: list[tuple[torch.Tensor, torch.Tensor]]) -> float:
+    def train_halt_head_ragged(
+        self, histories: list[tuple[torch.Tensor, torch.Tensor]], label_margin: Optional[float] = None
+    ) -> float:
         """Like train_halt_head, but for a set of INDEPENDENT per-sample
         trajectories of possibly different lengths — used by
         ThinkerFrozenPainterACT's persistent-carry training, where different
@@ -332,8 +419,21 @@ class SpatialTRM(BaseModel):
         just halted — (L, hidden_size) / (L,) tensors, already detached, for
         THAT sample's own trajectory since its last reset. Histories with
         L < 2 are skipped (no future to compare against, same as
-        train_halt_head). All qualifying per-step (input, target) pairs are
-        pooled into ONE batched MSE update via self.halt_optimizer.
+        train_halt_head).
+
+        label_margin: None (the default) keeps the original behavior —
+        regress the raw loss_t - min(loss_{t+1:}) magnitude via MSE, pooled
+        into one batched update via self.halt_optimizer. A float switches to
+        the same binary classification train_halt_head itself was moved to:
+        BCE on "does continuing reduce loss by more than label_margin" (see
+        that method's docstring for why — the regression target's scale
+        varies by orders of magnitude depending on task/timestep, which
+        dominates a pooled MSE loss). This class is shared across several
+        very different tasks (CLEVR, Maze, Steiner, Ball Drop, TopoDiff,
+        Squares, Polygon, MNIST-Sudoku) with their own loss scales, so this
+        is opt-in rather than a default switch — calibrate label_margin per
+        task the way experiments/diag_halt_target_by_timestep.py did for
+        MNIST-Sudoku before relying on it.
 
         Must be called on every rank every step, even with no histories: under
         multi-GPU the gradient sync is a collective, and ranks complete
@@ -341,11 +441,18 @@ class SpatialTRM(BaseModel):
         each rank's (input, target) pair count — the mean over all pairs
         globally — and the step is skipped only when no rank had any.
         """
+        if self.halt_uses_timestep:
+            raise NotImplementedError(
+                "train_halt_head_ragged doesn't thread per-step timesteps through histories yet "
+                "(each history can span several denoising timesteps, unlike train_halt_head's "
+                "single-fixed-timestep trajectory) — only halt_timestep_emb=False is supported here."
+            )
         inputs, targets = [], []
         for z_H0_seq, loss_seq in histories:
             if loss_seq.shape[0] < 2:
                 continue
-            targets.append(self._future_min_targets(loss_seq))
+            raw = self._future_min_targets(loss_seq)
+            targets.append((raw > label_margin).float() if label_margin is not None else raw)
             inputs.append(z_H0_seq[:-1].float())
 
         self.halt_optimizer.zero_grad()
@@ -354,14 +461,18 @@ class SpatialTRM(BaseModel):
         if inputs:
             preds = self.halt_head(torch.cat(inputs, dim=0)).squeeze(-1)
             target = torch.cat(targets, dim=0)
-            loss = F.mse_loss(preds, target)
+            loss = (
+                F.binary_cross_entropy_with_logits(preds, target)
+                if label_margin is not None
+                else F.mse_loss(preds, target)
+            )
             loss.backward()
             n_local = target.numel()
         else:
-            for p in self.halt_head.parameters():
+            for p in self._halt_params:
                 p.grad = torch.zeros_like(p)
 
-        if all_reduce_grads(self.halt_head.parameters(), weight=n_local) > 0:
+        if all_reduce_grads(self._halt_params, weight=n_local) > 0:
             self.halt_optimizer.step()
         return loss.item() if loss is not None else 0.0
 
@@ -814,7 +925,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                     perm = torch.randperm(bsz, device=device)
                     z_H, z_L = z_H[perm], z_L[perm]
                 if halt_preds_out is not None:
-                    halt_preds_out.append(self.predict_halt_value(z_H).detach())
+                    halt_preds_out.append(self.predict_halt_value(z_H, sample.timesteps).detach())
             if steps_used is not None:
                 steps_used.append(step_count)
         else:
@@ -845,7 +956,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                     running_z_H[active_idx] = new_z_H
                     zH_out.append(running_z_H.detach().clone())
 
-                pred = self.predict_halt_value(new_z_H)
+                pred = self.predict_halt_value(new_z_H, cur_timesteps)
                 if halt_preds_out is not None:
                     halt_preds_out.append(pred.detach())
                 halt_now = pred <= halt_threshold
