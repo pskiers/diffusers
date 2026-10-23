@@ -364,6 +364,12 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
             "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false",
             "painter.net.norm=layer", "painter.net.qk_norm=false", "painter.net.mlp=gelu", "painter.net.rope=false",
             "painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer", "painter.net.preamble_depth=0"]),
+        # two-stream painter conditioned on the puzzle, which it keeps (no force_unconditional_painter)
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
+            o for o in P16 if "force_unconditional" not in o] + [
+            "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false",
+            "painter.net.norm=layer", "painter.net.qk_norm=false", "painter.net.mlp=gelu", "painter.net.rope=false",
+            "painter.label_drop_rate=0.0"]),
         # the most DiT-like combination: no condition stream, depth 3, every block steered, fp32 painter
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
             "painter.net.patch_size=16", "painter.net.depth=3", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",

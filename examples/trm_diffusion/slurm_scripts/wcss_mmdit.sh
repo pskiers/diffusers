@@ -52,7 +52,8 @@
 #   e.g. the DiT-ified MM-DiT: mnist_painter_p16_all_small_nocond_io_ln_gelu_norope
 #   thinker-only: _steer0 (steer every block, from block 0), _fp32 (painter in fp32 in stage 2),
 #           _ditopt (DiT-direct's encoder/translator optimizer: lr 3e-5, warmup 1000, eps 3.84e-6),
-#           _act (ACT training loop, mode=thinker_act + halt head, as DiT-direct)
+#           _act (ACT training loop, mode=thinker_act + halt head, as DiT-direct),
+#           _cond (the painter keeps its own condition instead of being blinded)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -157,6 +158,7 @@ case $RUN in
     # painter suffixes pick the painter checkpoint, thinker-only ones (_steer0, _fp32) do not
     DDPM="diffusion=ddpm sampling=cfg painter.objective=ddpm painter.time_cond_scale=1"
     PSIDE="painter.net.patch_size=16"; STAGE1=""; STAGE2=""; PV=""; TV=""; WIDTH=384; DEPTH=8; STEER=1
+    BLIND="+train.force_unconditional_painter=true"
     for tok in $(echo "${RUN##*_p16}" | tr '_' ' '); do
       case $tok in
         uncond) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PV="${PV}_$tok" ;;
@@ -180,6 +182,7 @@ case $RUN in
         ditopt) STAGE2="$STAGE2 painter.optim_cfg.lr=3e-5 painter.optim_cfg.warmup_steps=1000 +painter.optim_cfg.eps=3.84e-6"
                 TV="${TV}_$tok" ;;  # DiT-direct's encoder/translator optimizer
         act) STAGE2="$STAGE2 mode=thinker_act thinker.with_halt_head=true"; TV="${TV}_$tok" ;;  # ACT training loop, as DiT-direct
+        cond) BLIND=""; TV="${TV}_$tok" ;;  # the painter keeps its own condition (default: blinded)
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done
@@ -194,7 +197,7 @@ case $RUN in
       train experiment=mnist_thinker_mmdit_cnn painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
         painter.steer_from_block=$STEER translator.num_blocks=$((DEPTH - STEER)) translator.painter_grid=9 \
         translator.hidden_dim=$WIDTH translator.with_timestep_emb=true \
-        +train.force_unconditional_painter=true painter.label_drop_rate=0.0 $MNIST_EVAL
+        $BLIND painter.label_drop_rate=0.0 $MNIST_EVAL
     fi ;;
   mnist_thinker_dit_residual_*)
     # bisection: our steering pipeline on the working DiT-direct painter (ResidualSteeredDiTPainter);
