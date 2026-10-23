@@ -44,13 +44,16 @@
 #   _all    _uncond + _tcond + _ddpm: the closest MM-DiT replica of the working DiT-direct painter
 #   _small  painter depth 3, width 512, 8 heads (the working DiT painter's size)
 #   _nocond no condition stream at all (NullCondTokenizer): an unconditional, single-stream painter
+#   _ln     DiT normalization: LayerNorm instead of RMSNorm, no QK-norm
+#   _io     DiT input/output: plain patch embedding (no 128-dim bottleneck), [0,1] pixels, no zero-init output
 #   thinker-only: _steer0 (steer every block, from block 0), _fp32 (painter in fp32 in stage 2),
 #           _ditopt (DiT-direct's encoder/translator optimizer: lr 3e-5, warmup 1000, eps 3.84e-6)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
-# Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1} = our steering
-#   pipeline (CNN thinker, IP-chain translator with timestep embedding, our optimizer) on the frozen
-#   pixel DiT of mnist_thinker_dit_direct, steering blocks 0-2 or 1-2.
+# Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
+#   = our steering pipeline (CNN thinker, IP-chain translator with timestep embedding, our optimizer)
+#   on the frozen pixel DiT of mnist_thinker_dit_direct, steering blocks 0-2 or 1-2; _logits/_ditopt
+#   switch the translator input / encoder+translator optimizer to DiT-direct's.
 # Control on the working setup: clevr_unet_condpainter = the CLEVR centroid-mask run
 # (W&B 0il6x2cq) without force_unconditional_painter.
 # The thinker experiments use translator.bridge_mode=normalized and thinker weight
@@ -158,6 +161,9 @@ case $RUN in
                WIDTH=512; DEPTH=3; PV="${PV}_$tok" ;;
         nocond) PSIDE="$PSIDE painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer painter.net.preamble_depth=0"
                 PV="${PV}_$tok" ;;
+        ln) PSIDE="$PSIDE painter.net.norm=layer painter.net.qk_norm=false"; PV="${PV}_$tok" ;;
+        io) PSIDE="$PSIDE painter.net.patch_embed=plain painter.model_range=\"[0,1]\" painter.net.zero_init_output=false"
+            PV="${PV}_$tok" ;;
         steer0) STEER=0; TV="${TV}_$tok" ;;
         fp32) STAGE2="$STAGE2 painter.painter_dtype=null"; TV="${TV}_$tok" ;;
         ditopt) STAGE2="$STAGE2 painter.optim_cfg.lr=3e-5 painter.optim_cfg.warmup_steps=1000 +painter.optim_cfg.eps=3.84e-6"
@@ -178,12 +184,23 @@ case $RUN in
         translator.hidden_dim=$WIDTH translator.with_timestep_emb=true \
         +train.force_unconditional_painter=true painter.label_drop_rate=0.0 $MNIST_EVAL
     fi ;;
-  mnist_thinker_dit_residual_steer0|mnist_thinker_dit_residual_steer1)
-    # bisection: our steering pipeline on the working DiT-direct painter (ResidualSteeredDiTPainter)
-    STEER=${RUN##*_steer}
-    RUN=mnist_thinker_dit_residual_steer$STEER
+  mnist_thinker_dit_residual_*)
+    # bisection: our steering pipeline on the working DiT-direct painter (ResidualSteeredDiTPainter);
+    # suffixes: _steer0|_steer1 (required), _logits (raw translator input, as DiT-direct), _ditopt
+    # (DiT-direct's encoder/translator optimizer) — with both, the translator matches DiT-direct's
+    STEER=""; EXTRA=""
+    for tok in $(echo "${RUN#mnist_thinker_dit_residual_}" | tr '_' ' '); do
+      case $tok in
+        steer0) STEER=0 ;;
+        steer1) STEER=1 ;;
+        logits) EXTRA="$EXTRA translator.bridge_mode=logits" ;;
+        ditopt) EXTRA="$EXTRA painter.optim_cfg.lr=3e-5 painter.optim_cfg.warmup_steps=1000 +painter.optim_cfg.eps=3.84e-6" ;;
+        *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
+      esac
+    done
+    [[ -z $STEER ]] && { echo "$RUN: needs _steer0 or _steer1" >&2; exit 1; }
     train experiment=mnist_thinker_dit_residual painter.checkpoint=runs/mnist_dit_painter_pixel/checkpoint_final.pt \
-      painter.steer_from_block=$STEER translator.num_blocks=$((3 - STEER)) $MNIST_EVAL ;;
+      painter.steer_from_block=$STEER translator.num_blocks=$((3 - STEER)) $EXTRA $MNIST_EVAL ;;
   clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
     RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
     train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \

@@ -26,7 +26,8 @@ Objective and sampler (MiniT2I / Looped-DiT):
     x_t = t x0 + (1 - t) eps,  eps ~ N(0, noise_scale^2),  t ~ logit-normal
     v   = (x0 - x_t) / max(1 - t, velocity_clamp),  v_hat likewise from the predicted x0
     loss = mean (v_hat - v)^2;  Euler from t = 0 (noise) to 1 (image)
-The model works in [-1, 1]; pixel_range says what the dataset's images are in.
+The model works in model_range ([-1, 1] as MiniT2I by default); pixel_range says what the
+dataset's images are in.
 """
 
 from __future__ import annotations
@@ -250,6 +251,18 @@ def fuse_attention(net: mmdit.MMJiT, cond_rope: str = "1d") -> mmdit.MMJiT:
     return net
 
 
+class _PlainPatchEmbed(nn.Module):
+    """DiT's patch embedding: one conv from patch_size x patch_size pixels straight to
+    the width (MMJiT's BottleneckPatchEmbed goes through pca_channels first)."""
+
+    def __init__(self, patch_size: int, in_channels: int, hidden_size: int):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size, bias=True)
+
+    def forward(self, x):
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
 def build_mmdit(
     cond_dim: int,
     image_size: int,
@@ -264,6 +277,10 @@ def build_mmdit(
     pca_channels: int = 128,
     cond_rope: str = "1d",
     time_cond: bool = False,
+    norm: str = "rms",
+    qk_norm: bool = True,
+    patch_embed: str = "bottleneck",
+    zero_init_output: bool = True,
 ) -> mmdit.MMJiT:
     """A freshly initialized MMJiT of the given size, with fused attention.
 
@@ -277,7 +294,15 @@ def build_mmdit(
     zero-initialized SiLU+Linear producing shift/scale/gate for attention and MLP
     of both streams (block.adaln), and the output layer a shift/scale
     (net.final_adaln). Zero-initialized, so every block starts as the identity.
+
+    DiT-style alternatives to MMJiT's design choices (for ablations):
+    norm: "rms" (MMJiT's RMSNorm) or "layer" (LayerNorm, eps 1e-6) for every
+        pre-norm and the output norm; qk_norm: False drops the RMSNorm on q and k;
+    patch_embed: "bottleneck" (MMJiT's) or "plain" (_PlainPatchEmbed);
+    zero_init_output: False keeps the output layer's xavier init.
     """
+    if norm not in ("rms", "layer") or patch_embed not in ("bottleneck", "plain"):
+        raise ValueError(f"norm must be 'rms'/'layer' and patch_embed 'bottleneck'/'plain', got {norm!r}, {patch_embed!r}")
     if image_size % patch_size:
         raise ValueError(f"image_size {image_size} is not a multiple of patch_size {patch_size}")
     cfg = mmdit.MMJiTConfig(
@@ -297,6 +322,19 @@ def build_mmdit(
     )
     net = mmdit.MMJiT(cfg)
     del net.pooled_embedder
+    if patch_embed == "plain":
+        net.img_embedder = _PlainPatchEmbed(patch_size, in_channels, hidden_size)
+    blocks = [*net.txt_preamble_blocks, *net.double_blocks]
+    if norm == "layer":
+        names = ["norm1", "norm2", "img_norm1", "img_norm2", "txt_norm1", "txt_norm2"]
+        for block in blocks:
+            for name in names:
+                if hasattr(block, name):
+                    setattr(block, name, nn.LayerNorm(getattr(block, name).weight.shape[0], eps=1e-6))
+        net.final_layer.norm_final = nn.LayerNorm(hidden_size, eps=1e-6)
+    if not qk_norm:
+        for block in blocks:
+            block.q_norm, block.k_norm = nn.Identity(), nn.Identity()
     if not time_cond:
         del net.t_embedder
     for m in net.modules():
@@ -304,7 +342,8 @@ def build_mmdit(
             nn.init.xavier_uniform_(m.weight.view(m.weight.shape[0], -1))
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-    nn.init.zeros_(net.final_layer.linear.weight)
+    if zero_init_output:
+        nn.init.zeros_(net.final_layer.linear.weight)
     net.time_cond = time_cond
     if time_cond:
         for block in net.double_blocks:
@@ -427,8 +466,9 @@ class MMDiTPainter(PainterBase, BaseModel):
             (0: the thinker reads the embedded tokens and every block is steered).
         painter_dtype: autocast dtype for the painter's forward (None = fp32 /
             whatever the caller's autocast says).
-        pixel_range: range of the dataset's images, "[0,1]" or "[-1,1]"; the
-            model itself works in [-1, 1].
+        pixel_range: range of the dataset's images, "[0,1]" or "[-1,1]".
+        model_range: range the model works in, "[-1,1]" (MiniT2I) or "[0,1]"
+            (the working puzzle painters); images are mapped from pixel_range.
         noise_scale, velocity_clamp: training noise std and velocity clamp;
             None = the scheduler's (they must agree with it).
         t_logit_mean, t_logit_std: logit-normal training timestep distribution.
@@ -462,6 +502,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         steer_from_block: int = 1,
         painter_dtype: Optional[str] = None,
         pixel_range: str = "[-1,1]",
+        model_range: str = "[-1,1]",
         noise_scale: Optional[float] = None,
         velocity_clamp: Optional[float] = None,
         t_logit_mean: float = -0.8,
@@ -492,8 +533,9 @@ class MMDiTPainter(PainterBase, BaseModel):
 
         if not 0 <= steer_from_block < len(self.net.double_blocks):
             raise ValueError(f"steer_from_block must be in [0, {len(self.net.double_blocks) - 1}]")
-        if pixel_range not in ("[0,1]", "[-1,1]"):
-            raise ValueError(f"pixel_range must be '[0,1]' or '[-1,1]', got {pixel_range!r}")
+        if pixel_range not in ("[0,1]", "[-1,1]") or model_range not in ("[0,1]", "[-1,1]"):
+            raise ValueError(f"pixel_range / model_range must be '[0,1]' or '[-1,1]', got {pixel_range!r}, {model_range!r}")
+        self.model_range = model_range
         self.steer_from_block = steer_from_block
         self.painter_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[painter_dtype] if painter_dtype else None
         self.pixel_range = pixel_range
@@ -543,9 +585,14 @@ class MMDiTPainter(PainterBase, BaseModel):
 
     def to_model_range(self, images: torch.Tensor) -> torch.Tensor:
         images = images.float()
-        return images * 2.0 - 1.0 if self.pixel_range == "[0,1]" else images
+        if self.pixel_range == self.model_range:
+            return images
+        return images * 2.0 - 1.0 if self.pixel_range == "[0,1]" else (images + 1.0) / 2.0
 
     def decode_for_eval(self, x: torch.Tensor) -> torch.Tensor:
+        """Model-range output → [0, 1] for evaluation."""
+        if self.model_range == "[0,1]":
+            return x.float().clamp(0.0, 1.0)
         return ((x.float().clamp(-1.0, 1.0) + 1.0) / 2.0).clamp(0.0, 1.0)
 
     def images_to_log(self, images: torch.Tensor) -> torch.Tensor:

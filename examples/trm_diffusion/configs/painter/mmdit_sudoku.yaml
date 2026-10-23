@@ -17,6 +17,10 @@ net:
   mlp_ratio: 2.6667
   pca_channels: 128
   time_cond: false            # adaLN-Zero timestep conditioning (MiniT2I has none)
+  norm: "rms"                  # "layer": LayerNorm everywhere (DiT) instead of RMSNorm
+  qk_norm: true                # false: no RMSNorm on q and k (DiT)
+  patch_embed: "bottleneck"    # "plain": one conv straight to the width (DiT)
+  zero_init_output: true       # false: keep the output layer's xavier init
 cond_tokenizer:
   _target_: models.mmdit_painter.PatchCondTokenizer
   in_channels: 1
@@ -24,6 +28,7 @@ cond_tokenizer:
 steer_from_block: 4          # read after block 4, steer blocks 4-7
 painter_dtype: "bfloat16"
 pixel_range: "[0,1]"
+model_range: "[-1,1]"        # range the model works in; "[0,1]" as the working puzzle painters
 t_logit_mean: -0.8
 t_logit_std: 0.8
 label_drop_rate: 0.1         # condition dropped for 10% of samples (CFG), in both stages

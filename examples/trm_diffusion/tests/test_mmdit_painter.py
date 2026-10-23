@@ -274,6 +274,39 @@ def test_null_cond_painter():
     assert torch.equal(painter(painter.null_condition_sample(s)).pred, painter(s).pred)
 
 
+@pytest.mark.parametrize("opts", [dict(norm="layer", qk_norm=False),
+                                  dict(patch_embed="plain", zero_init_output=False)])
+def test_dit_style_painter_options(opts):
+    """build_mmdit's DiT-style options: no RMSNorm left / plain patch embedding, still trains."""
+    from third_party.minit2i import mmdit as vendored
+
+    painter = MMDiTPainter(
+        scheduler=FlowMatchingScheduler(noise_scale=1.0), train_cfg=SimpleNamespace(grad_clip=1.0), eval_cfg=None,
+        optim_cfg=OPTIM, cond_tokenizer=PatchCondTokenizer(1, 12), net={**NET, "time_cond": True, **opts},
+        steer_from_block=2, pixel_range="[0,1]", label_drop_rate=0.0)
+    mods = list(painter.net.modules())
+    if opts.get("norm") == "layer":
+        assert not any(isinstance(m, vendored.RMSNorm) for m in mods)
+        assert all(isinstance(b.q_norm, torch.nn.Identity) for b in painter.net.double_blocks)
+    if opts.get("patch_embed") == "plain":
+        assert not any(isinstance(m, vendored.BottleneckPatchEmbed) for m in mods)
+        assert painter.net.final_layer.linear.weight.abs().sum() > 0  # not zero-initialized
+    torch.manual_seed(10)
+    s = painter._prepare_training_sample(_batch("patch"), DEV)
+    loss = painter._loss(s)
+    loss.backward()
+    assert torch.isfinite(loss) and painter.net.double_blocks[0].img_qkv.weight.grad is not None
+
+
+def test_model_range_01():
+    """model_range [0,1] with [0,1] data: no remapping, and eval decoding stays in [0,1]."""
+    painter = _painter("patch", model_range="[0,1]")
+    x = torch.rand(2, 1, 48, 48)
+    assert torch.equal(painter.to_model_range(x), x)
+    assert torch.equal(painter.decode_for_eval(x), x) and torch.equal(painter.images_to_log(x), x)
+    assert torch.equal(_painter("patch").images_to_log(x), x)  # default [-1,1] model: round trip
+
+
 TINY_THINKER = ["thinker.hidden_size=64", "thinker.n_heads=2", "thinker.n_sup=1", "thinker.H_cycles=1",
                 "thinker.L_cycles=1", "thinker.L_layers=1", "thinker.forward_dtype=float32"]
 TINY_PAINTER = ["painter.net.hidden_size=64", "painter.net.num_heads=2", "painter.net.head_dim=32", "painter.painter_dtype=null"]
@@ -316,6 +349,9 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
             ["diffusion=ddpm", "sampling=cfg", "painter.objective=ddpm", "painter.time_cond_scale=1", "translator.timestep_scale=1"],
             ["painter.label_drop_rate=1.0", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",
              "painter.objective=ddpm", "painter.time_cond_scale=1", "translator.timestep_scale=1"])],
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + ["painter.net.norm=layer", "painter.net.qk_norm=false"]),
+        ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, P16 + [
+            "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false"]),
         # the most DiT-like combination: no condition stream, depth 3, every block steered, fp32 painter
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
             "painter.net.patch_size=16", "painter.net.depth=3", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",
@@ -330,7 +366,7 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
 def test_experiment_configs_build(tmp_path, painter_exp, thinker_exp, batch, extra):
     # stage 1 with the same painter-side overrides (architecture, objective) as stage 2
     painter_side = [o for o in extra if o.startswith(("painter.net.", "painter.objective", "painter.time_cond_scale",
-                                                      "painter.cond_tokenizer", "painter.steer_from_block", "diffusion=", "sampling="))]
+                                                      "painter.cond_tokenizer", "painter.steer_from_block", "painter.model_range", "diffusion=", "sampling="))]
     painter = _build([f"experiment={painter_exp}", *TINY_PAINTER, *painter_side])
     ckpt = tmp_path / "painter.pt"
     torch.save({"model_state": painter.state_dict()}, ckpt)
@@ -338,9 +374,12 @@ def test_experiment_configs_build(tmp_path, painter_exp, thinker_exp, batch, ext
     model = _build([f"experiment={thinker_exp}", f"painter.checkpoint={ckpt}", *TINY_PAINTER, *TINY_THINKER, *extra])
     assert not any(p.requires_grad for p in model.painter.parameters())
     [d] = model.prep_mb_data([batch], DEV)
+    s = d["sample"]
     with torch.no_grad():
-        steered = model(d["sample"]).pred
-        plain = model.painter(d["sample"]).pred
+        steered = model(s).pred
+        # the painter as the model runs it: from its null condition under force_unconditional_painter
+        painted = model.painter.null_condition_sample(s) if model.train_cfg.force_unconditional_painter else s
+        plain = model.painter(painted).pred
     assert torch.equal(steered, plain)  # zero-initialized translator
     noise_pred, logits, _, _ = model.reasoning_step(d["sample"], d["z_H"], d["z_L"])
     assert noise_pred.shape == batch.images.shape
