@@ -370,6 +370,16 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
             "painter.net.patch_embed=plain", 'painter.model_range="[0,1]"', "painter.net.zero_init_output=false",
             "painter.net.norm=layer", "painter.net.qk_norm=false", "painter.net.mlp=gelu", "painter.net.rope=false",
             "painter.label_drop_rate=0.0"]),
+        # thinker reads the painter's hidden states (as T2I): conditional two-stream painters, blinded or not
+        *[("mnist_mmdit_painter", "mnist_thinker_mmdit", SUDOKU, [
+            "painter.net.patch_size=16", "painter.steer_from_block=1", "translator.num_blocks=7", "translator.painter_grid=9",
+            "translator.hidden_dim=64", "translator.with_timestep_emb=true", "painter.label_drop_rate=0.0",
+            "condition_encoder.img_grid=9", "condition_encoder.pool=1", "thinker.seq_len=162", "translator.grid=9", *v])
+          for v in (["+train.force_unconditional_painter=true"], [],
+                    ["painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg", "painter.objective=ddpm",
+                     "painter.time_cond_scale=1", "translator.timestep_scale=1", "painter.net.patch_embed=plain",
+                     'painter.model_range="[0,1]"', "painter.net.norm=layer", "painter.net.qk_norm=false",
+                     "painter.net.mlp=gelu", "painter.net.rope=false"])],
         # the most DiT-like combination: no condition stream, depth 3, every block steered, fp32 painter
         ("mnist_mmdit_painter", "mnist_thinker_mmdit_cnn", SUDOKU, [
             "painter.net.patch_size=16", "painter.net.depth=3", "painter.net.time_cond=true", "diffusion=ddpm", "sampling=cfg",

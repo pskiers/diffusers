@@ -53,7 +53,9 @@
 #   thinker-only: _steer0 (steer every block, from block 0), _fp32 (painter in fp32 in stage 2),
 #           _ditopt (DiT-direct's encoder/translator optimizer: lr 3e-5, warmup 1000, eps 3.84e-6),
 #           _act (ACT training loop, mode=thinker_act + halt head, as DiT-direct),
-#           _cond (the painter keeps its own condition instead of being blinded)
+#           _cond (the painter keeps its own condition instead of being blinded),
+#           _hidden (the thinker reads the painter's hidden states after the read block, as in T2I,
+#                    instead of the CNN over puzzle + x_t; needs a painter with a condition stream)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -158,7 +160,8 @@ case $RUN in
     # painter suffixes pick the painter checkpoint, thinker-only ones (_steer0, _fp32) do not
     DDPM="diffusion=ddpm sampling=cfg painter.objective=ddpm painter.time_cond_scale=1"
     PSIDE="painter.net.patch_size=16"; STAGE1=""; STAGE2=""; PV=""; TV=""; WIDTH=384; DEPTH=8; STEER=1
-    BLIND="+train.force_unconditional_painter=true"
+    BLIND="+train.force_unconditional_painter=true"; NOCOND=0
+    THINKER_IN="experiment=mnist_thinker_mmdit_cnn"  # CNN over puzzle + x_t (as the working puzzle runs)
     for tok in $(echo "${RUN##*_p16}" | tr '_' ' '); do
       case $tok in
         uncond) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PV="${PV}_$tok" ;;
@@ -169,7 +172,8 @@ case $RUN in
         small) PSIDE="$PSIDE painter.net.depth=3 painter.net.hidden_size=512 painter.net.num_heads=8 painter.net.head_dim=64"
                STAGE1="$STAGE1 painter.steer_from_block=1"  # config default 4 is invalid for 3 blocks
                WIDTH=512; DEPTH=3; PV="${PV}_$tok" ;;
-        nocond) PSIDE="$PSIDE painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer painter.net.preamble_depth=0"
+        nocond) NOCOND=1
+                PSIDE="$PSIDE painter.cond_tokenizer._target_=models.mmdit_painter.NullCondTokenizer painter.net.preamble_depth=0"
                 PV="${PV}_$tok" ;;
         ln) PSIDE="$PSIDE painter.net.norm=layer painter.net.qk_norm=false"; PV="${PV}_$tok" ;;
         io) PSIDE="$PSIDE painter.net.patch_embed=plain painter.model_range=\"[0,1]\" painter.net.zero_init_output=false"
@@ -183,6 +187,8 @@ case $RUN in
                 TV="${TV}_$tok" ;;  # DiT-direct's encoder/translator optimizer
         act) STAGE2="$STAGE2 mode=thinker_act thinker.with_halt_head=true"; TV="${TV}_$tok" ;;  # ACT training loop, as DiT-direct
         cond) BLIND=""; TV="${TV}_$tok" ;;  # the painter keeps its own condition (default: blinded)
+        hidden) TV="${TV}_$tok"  # thinker reads the painter's hidden states, as in T2I: 9x9 image + 81 puzzle tokens
+                THINKER_IN="experiment=mnist_thinker_mmdit condition_encoder.img_grid=9 condition_encoder.pool=1 thinker.seq_len=162 translator.grid=9" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done
@@ -194,7 +200,9 @@ case $RUN in
     else
       # the thinker always sees the puzzle (no condition dropout); the painter is blinded instead
       RUN=mnist_thinker_mmdit_p16$PV${TV}_chain_temb
-      train experiment=mnist_thinker_mmdit_cnn painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
+      [[ $NOCOND == 1 && $TV == *_hidden* ]] && {
+        echo "$RUN: _hidden needs a painter with a condition stream (its hidden states carry the puzzle)" >&2; exit 1; }
+      train $THINKER_IN painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
         painter.steer_from_block=$STEER translator.num_blocks=$((DEPTH - STEER)) translator.painter_grid=9 \
         translator.hidden_dim=$WIDTH translator.with_timestep_emb=true \
         $BLIND painter.label_drop_rate=0.0 $MNIST_EVAL
