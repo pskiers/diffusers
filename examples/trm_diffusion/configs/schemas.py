@@ -75,6 +75,11 @@ class TrainConfig:
     # micro-batches or GPUs. Runs from before that had gradients 1/batch_size
     # smaller: configs/train/*.yaml's grad_clip = batch_size reproduces them.
     grad_clip: float = 1.0
+    # Thinker-frozen-painter models only: clip each sample's gradient reaching
+    # the thinker's output through the painter to steer_grad_clip x the
+    # micro-batch's median per-sample norm (None = off), so a few samples
+    # (e.g. the noisiest timesteps) cannot dominate the thinker's update.
+    steer_grad_clip: Optional[float] = None
 
 
 @dataclass

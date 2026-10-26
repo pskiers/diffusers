@@ -8,6 +8,8 @@ by tests/test_minit2i_thinker.py):
 - steering, image and condition stream: a no-op at initialization, and
   gradients reaching the thinker's output at both kinds of position; with
   bridge_mode "normalized", independent of the thinker output's scale;
+- steering through attention (PainterAttentionTranslator), the same;
+- the thinker-stage options train_t_max and steer_grad_clip;
 - every new experiment config builds, with consistent token counts.
 
 Run from examples/trm_diffusion:  pytest tests/test_mmdit_painter.py -s
@@ -35,7 +37,7 @@ from models.mmdit_painter import (  # noqa: E402
     PatchCondTokenizer,
     fuse_attention,
 )
-from models.translators import PainterResidualTranslator  # noqa: E402
+from models.translators import PainterAttentionTranslator, PainterResidualTranslator  # noqa: E402
 from third_party.minit2i import mmdit  # noqa: E402
 
 DEV = torch.device("cpu")
@@ -182,6 +184,50 @@ def test_translator_chain_and_timestep_emb(hidden_dim, temb):
     assert torch.equal(r1, r2) != temb
 
 
+def test_attention_steering():
+    """PainterAttentionTranslator: a no-op at initialization (zero values); once the
+    values move, the steering changes the output, gradients reach the thinker's
+    output and every translator part, and scaled(0) ablates it exactly."""
+    painter = _painter("patch", freeze=True)
+    torch.manual_seed(5)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    sample = painter._prepare_training_sample(_batch("patch"), DEV)
+    translator = PainterAttentionTranslator(in_dim=8, grid=2, painter_grid=4, num_blocks=2, num_heads=2, head_dim=32,
+                                            hidden_dim=32, bridge_mode="normalized", with_timestep_emb=True)
+    logits = torch.randn(3, 4, 8, requires_grad=True)
+    steer = lambda: translator(TRMOutput(logits=logits), timesteps=sample.timesteps)  # noqa: E731
+    plain = painter(sample).pred
+    assert torch.equal(painter(sample, steer()).pred, plain)
+
+    with torch.no_grad():
+        for v in translator.to_v:
+            v.weight.normal_(std=0.1)
+    out = painter(sample, steer()).pred
+    assert not torch.allclose(out, plain)
+    torch.nn.functional.mse_loss(out, sample.target).backward()
+    assert logits.grad.abs().sum() > 0
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in translator.parameters())
+    assert all(p.grad is None for p in painter.parameters())  # painter stays frozen
+    with torch.no_grad():
+        assert torch.equal(painter(sample, steer().scaled(0.0)).pred, plain)
+    with pytest.raises(ValueError):  # one key/value set per steered block
+        bad = PainterAttentionTranslator(in_dim=8, grid=2, painter_grid=4, num_blocks=3, num_heads=2, head_dim=32,
+                                         hidden_dim=32)
+        painter(sample, bad(TRMOutput(logits=logits)))
+
+
+def test_steer_grad_clip():
+    """Each sample's gradient is clipped to clip x the batch median norm; the rest pass unchanged."""
+    from models.painter_thinkers import _ClipPerSampleGrad
+
+    x = torch.randn(5, 4, 3, requires_grad=True)
+    g = torch.tensor([1.0, 2.0, 3.0, 10.0, 0.5]).view(5, 1, 1) * torch.randn(1, 4, 3)
+    (_ClipPerSampleGrad.apply(x, 1.0) * g).sum().backward()
+    norms, median = g.flatten(1).norm(dim=1), g.flatten(1).norm(dim=1).median()
+    assert torch.allclose(x.grad.flatten(1).norm(dim=1), norms.clamp(max=median))
+
+
 def test_x0_loss_weighting():
     """loss_weighting="x0": the thinker-stage MSE equals the x0 MSE (velocity MSE x (1 - t)^2)."""
     from models.losses import MSELoss
@@ -250,6 +296,9 @@ def test_ddpm_objective():
     assert torch.allclose(s.x_noisy, sched.add_noise(s.target, torch.randn_like(s.target), t))
     out = painter(s)
     assert out.pred_type == "sample" and out.pred.shape == s.target.shape
+    painter.train_t_max = 10
+    ts = torch.cat([painter._prepare_training_sample(batch, DEV).timesteps for _ in range(30)])
+    assert int(ts.max()) == 10 and int(ts.min()) == 0
     with pytest.raises(ValueError):
         MMDiTPainter(scheduler=FlowMatchingScheduler(), train_cfg=None, eval_cfg=None, optim_cfg=OPTIM,
                      cond_tokenizer=PatchCondTokenizer(1, 12), net=NET, objective="ddpm")

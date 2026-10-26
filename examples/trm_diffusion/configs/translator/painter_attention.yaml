@@ -1,0 +1,14 @@
+# Thinker's image-grid outputs -> per steered MMDiTPainter block, key/value tokens
+# the image tokens attend to without rotary embeddings (zero-init values), instead
+# of residuals added to the token stream (models/translators.py).
+_target_: models.translators.PainterAttentionTranslator
+in_dim: ${thinker.vocab_size}
+grid: ???          # thinker's image grid
+painter_grid: ???  # painter.net.image_size / painter.net.patch_size
+num_blocks: ???    # painter.net.depth - painter.steer_from_block
+num_heads: ${painter.net.num_heads}
+head_dim: ${painter.net.head_dim}
+hidden_dim: 384           # shared Linear width; the keys' 2D sin/cos positions are added at this width
+bridge_mode: normalized
+with_timestep_emb: false
+timestep_scale: 1000      # t * this into the timestep embedding: 1000 for flow t in [0, 1], 1 for DDPM steps

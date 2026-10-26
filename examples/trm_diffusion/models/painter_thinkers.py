@@ -20,6 +20,22 @@ from models.interfaces import TRMOutput, DiffusionPrediction
 from datasets.data_sample import DataSample
 
 
+class _ClipPerSampleGrad(torch.autograd.Function):
+    """Identity forward; backward clips each sample's gradient (dim 0) to
+    clip x the batch's median per-sample gradient norm."""
+
+    @staticmethod
+    def forward(ctx, x, clip):
+        ctx.clip = clip
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        norms = grad.flatten(1).norm(dim=1)
+        scale = (ctx.clip * norms.median() / norms.clamp_min(1e-12)).clamp(max=1.0)
+        return grad * scale.view(-1, *[1] * (grad.dim() - 1)), None
+
+
 class ThinkerFrozenPainterBase(BaseModel):
     """
     Base class for thinker models with a frozen pre-trained painter.
@@ -51,6 +67,11 @@ class ThinkerFrozenPainterBase(BaseModel):
         the translator/steering still sees the real one. Forces the steering pathway
         to supply all conditioning itself, rather than nudging an already-conditional
         painter. Default False is a no-op, fully backward compatible.
+
+    train_cfg.steer_grad_clip: if set, each sample's gradient reaching the thinker's
+        output through the painter is clipped to this multiple of the micro-batch's
+        median per-sample norm (see reasoning_step). The thinker's own losses on its
+        logits (e.g. CE) are unaffected.
     """
 
     token_input: bool = False
@@ -199,6 +220,8 @@ class ThinkerFrozenPainterBase(BaseModel):
         if self.training and self.train_cfg.cfg_prob > 0:
             drop = torch.rand(logits.shape[0], device=logits.device) < self.train_cfg.cfg_prob
             logits_for_tpt = logits_for_tpt * (~drop[:, None, None]).float()
+        if self.training and self.train_cfg.steer_grad_clip is not None and logits_for_tpt.requires_grad:
+            logits_for_tpt = _ClipPerSampleGrad.apply(logits_for_tpt, self.train_cfg.steer_grad_clip)
 
         noise_pred = self.run_painter(sample, logits_for_tpt)
         return noise_pred, logits, z_H_next, z_L_next

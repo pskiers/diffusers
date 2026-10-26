@@ -34,6 +34,7 @@ t_logit_std: 0.8
 label_drop_rate: 0.1
 objective: "flow"            # "ddpm": DDPM x0-prediction training (with diffusion=ddpm)
 time_cond_scale: 1000        # t * this into the timestep embedding: 1000 for flow t, 1 for DDPM steps
+train_t_max: null            # ddpm only: train on timesteps [0, train_t_max] (e.g. a thinker stage kept off the noisiest steps)
 loss_weighting: "velocity"   # "x0": train on the x0 MSE (velocity MSE x (1 - t)^2)
 freeze: false
 checkpoint: null

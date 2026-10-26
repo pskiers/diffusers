@@ -176,6 +176,29 @@ class BlockResidualSteering(ThinkerSteering):
         return kwargs
 
 
+@dataclass
+class AttentionKVSteering(ThinkerSteering):
+    """Steering produced by PainterAttentionTranslator for MMDiTPainter: per
+    steered block, extra key/value tokens its image tokens attend to, in a
+    decoupled attention without rotary embeddings (IP-Adapter style)."""
+
+    block_keys: list
+    """Per steered block, (B, M, num_heads, head_dim)."""
+
+    block_values: list
+    """Per steered block, (B, M, num_heads, head_dim)."""
+
+    def to_painter_kwargs(self) -> dict:
+        return {"block_kv": list(zip(self.block_keys, self.block_values))}
+
+    def scaled(self, scale: float) -> "AttentionKVSteering":
+        """Scales the values only: the steering's contribution is linear in
+        them, while scaling the keys would change where it attends instead."""
+        if scale == 1.0:
+            return self
+        return replace(self, block_values=[v * scale for v in self.block_values])
+
+
 # ── Painter output ────────────────────────────────────────────────────────────
 
 PredictionType = Literal["epsilon", "sample", "v_prediction"]

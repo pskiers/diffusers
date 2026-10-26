@@ -55,7 +55,12 @@
 #           _act (ACT training loop, mode=thinker_act + halt head, as DiT-direct),
 #           _cond (the painter keeps its own condition instead of being blinded),
 #           _hidden (the thinker reads the painter's hidden states after the read block, as in T2I,
-#                    instead of the CNN over puzzle + x_t; needs a painter with a condition stream)
+#                    instead of the CNN over puzzle + x_t; needs a painter with a condition stream),
+#           _kv (steer through attention: per steered block, key/value tokens from the thinker that the
+#                image tokens attend to without rotary embeddings, translator=painter_attention, instead
+#                of residuals added to the token stream),
+#           _gclip (clip each sample's gradient into the thinker's output to the micro-batch median),
+#           _tmax60 (thinker stage trained on DDPM steps 0-60 only, off the noisiest; needs a _ddpm/_all painter)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -160,15 +165,15 @@ case $RUN in
     # painter suffixes pick the painter checkpoint, thinker-only ones (_steer0, _fp32) do not
     DDPM="diffusion=ddpm sampling=cfg painter.objective=ddpm painter.time_cond_scale=1"
     PSIDE="painter.net.patch_size=16"; STAGE1=""; STAGE2=""; PV=""; TV=""; WIDTH=384; DEPTH=8; STEER=1
-    BLIND="+train.force_unconditional_painter=true"; NOCOND=0
+    BLIND="+train.force_unconditional_painter=true"; NOCOND=0; KV=0; ISDDPM=0
     THINKER_IN="experiment=mnist_thinker_mmdit_cnn"  # CNN over puzzle + x_t (as the working puzzle runs)
     for tok in $(echo "${RUN##*_p16}" | tr '_' ' '); do
       case $tok in
         uncond) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PV="${PV}_$tok" ;;
         tcond) PSIDE="$PSIDE painter.net.time_cond=true"; PV="${PV}_$tok" ;;
-        ddpm) PSIDE="$PSIDE $DDPM"; STAGE2="$STAGE2 translator.timestep_scale=1"; PV="${PV}_$tok" ;;
+        ddpm) PSIDE="$PSIDE $DDPM"; STAGE2="$STAGE2 translator.timestep_scale=1"; ISDDPM=1; PV="${PV}_$tok" ;;
         all) STAGE1="$STAGE1 painter.label_drop_rate=1.0"; PSIDE="$PSIDE painter.net.time_cond=true $DDPM"
-             STAGE2="$STAGE2 translator.timestep_scale=1"; PV="${PV}_$tok" ;;
+             STAGE2="$STAGE2 translator.timestep_scale=1"; ISDDPM=1; PV="${PV}_$tok" ;;
         small) PSIDE="$PSIDE painter.net.depth=3 painter.net.hidden_size=512 painter.net.num_heads=8 painter.net.head_dim=64"
                STAGE1="$STAGE1 painter.steer_from_block=1"  # config default 4 is invalid for 3 blocks
                WIDTH=512; DEPTH=3; PV="${PV}_$tok" ;;
@@ -189,6 +194,9 @@ case $RUN in
         cond) BLIND=""; TV="${TV}_$tok" ;;  # the painter keeps its own condition (default: blinded)
         hidden) TV="${TV}_$tok"  # thinker reads the painter's hidden states, as in T2I: 9x9 image + 81 puzzle tokens
                 THINKER_IN="experiment=mnist_thinker_mmdit condition_encoder.img_grid=9 condition_encoder.pool=1 thinker.seq_len=162 translator.grid=9" ;;
+        kv) KV=1; TV="${TV}_$tok" ;;
+        gclip) STAGE2="$STAGE2 +train.steer_grad_clip=1.0"; TV="${TV}_$tok" ;;
+        tmax60) STAGE2="$STAGE2 painter.train_t_max=60"; TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done
@@ -199,10 +207,12 @@ case $RUN in
       train experiment=mnist_mmdit_painter $PSIDE $STAGE1 eval.eval_every=10000 eval_callbacks.0.num_samples=1024
     else
       # the thinker always sees the puzzle (no condition dropout); the painter is blinded instead
-      RUN=mnist_thinker_mmdit_p16$PV${TV}_chain_temb
+      if [[ $KV == 1 ]]; then RUN=mnist_thinker_mmdit_p16$PV${TV}_temb; TRANS="translator=painter_attention"
+      else RUN=mnist_thinker_mmdit_p16$PV${TV}_chain_temb; TRANS=""; fi
       [[ $NOCOND == 1 && $TV == *_hidden* ]] && {
         echo "$RUN: _hidden needs a painter with a condition stream (its hidden states carry the puzzle)" >&2; exit 1; }
-      train $THINKER_IN painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
+      [[ $ISDDPM == 0 && $TV == *_tmax60* ]] && { echo "$RUN: _tmax60 needs a _ddpm or _all painter" >&2; exit 1; }
+      train $THINKER_IN $TRANS painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
         painter.steer_from_block=$STEER translator.num_blocks=$((DEPTH - STEER)) translator.painter_grid=9 \
         translator.hidden_dim=$WIDTH translator.with_timestep_emb=true \
         $BLIND painter.label_drop_rate=0.0 $MNIST_EVAL

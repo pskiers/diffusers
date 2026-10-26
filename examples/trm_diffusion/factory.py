@@ -115,6 +115,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         noisy_dropout_p_max=float(tr.get("noisy_dropout_p_max", 0.0)),
         minsnr_gamma=float(tr["minsnr_gamma"]) if tr.get("minsnr_gamma") is not None else None,
         grad_clip=float(tr.get("grad_clip", 1.0)),
+        steer_grad_clip=float(tr["steer_grad_clip"]) if tr.get("steer_grad_clip") is not None else None,
     )
 
 

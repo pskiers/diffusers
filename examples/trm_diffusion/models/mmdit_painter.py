@@ -197,10 +197,20 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
             q_t = _apply_rope(q_t, "vision", self.rope.vision_rope.theta)
         return torch.cat([q_t, q_i], dim=1)
 
-    def forward(self, x, txt, vec=None):
+    def _img_attn(self, out_img, q_i, steer_kv):
+        """The image tokens' joint-attention output (B, L_img, H, Dh), plus with
+        steer_kv = (keys, values), each (B, M, H, Dh), a decoupled attention from
+        the image queries — QK-normed, not rotated — to those steering tokens
+        (IP-Adapter's construction), summed before the output projection."""
+        if steer_kv is not None:
+            k_s, v_s = steer_kv
+            out_img = out_img + _attention(q_i, k_s.to(q_i.dtype), v_s.to(q_i.dtype))
+        return out_img.reshape(out_img.shape[0], out_img.shape[1], self.num_heads * self.head_dim)
+
+    def forward(self, x, txt, vec=None, steer_kv=None):
         adaln = getattr(self, "adaln", None)
         if adaln is not None and vec is not None:
-            return self._forward_adaln(x, txt, adaln(vec).chunk(12, dim=-1))
+            return self._forward_adaln(x, txt, adaln(vec).chunk(12, dim=-1), steer_kv)
         b, li, _ = x.shape
         lt = txt.shape[1]
         x_norm = self.img_norm1(x)
@@ -215,13 +225,13 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
         k = self._rope(k_t, k_i)
         v = torch.cat([v_t, v_i], dim=1)
         out = _attention(q, k, v)
-        x = x + self.img_attn_proj(out[:, lt:].reshape(b, li, self.num_heads * self.head_dim))
+        x = x + self.img_attn_proj(self._img_attn(out[:, lt:], q_i, steer_kv))
         txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
         x = x + self.img_mlp(self.img_norm2(x))
         txt = txt + self.txt_mlp(self.txt_norm2(txt))
         return x, txt
 
-    def _forward_adaln(self, x, txt, mods):
+    def _forward_adaln(self, x, txt, mods, steer_kv=None):
         """The block with DiT's adaLN-Zero timestep modulation on both streams
         (shift/scale before attention and MLP, gates on their outputs; see
         build_mmdit(time_cond=True))."""
@@ -237,7 +247,7 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
         q_i, k_i = self.q_norm(q_i), self.k_norm(k_i)
         q_t, k_t = self.q_norm(q_t), self.k_norm(k_t)
         out = _attention(self._rope(q_t, q_i), self._rope(k_t, k_i), torch.cat([v_t, v_i], dim=1))
-        x = x + g_ai[:, None] * self.img_attn_proj(out[:, lt:].reshape(b, li, self.num_heads * self.head_dim))
+        x = x + g_ai[:, None] * self.img_attn_proj(self._img_attn(out[:, lt:], q_i, steer_kv))
         txt = txt + g_at[:, None] * self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
         x = x + g_mi[:, None] * self.img_mlp(mmdit.modulate(self.img_norm2(x), sh_mi, sc_mi))
         txt = txt + g_mt[:, None] * self.txt_mlp(mmdit.modulate(self.txt_norm2(txt), sh_mt, sc_mt))
@@ -505,6 +515,10 @@ class MMDiTPainter(PainterBase, BaseModel):
             prediction_type "sample").
         time_cond_scale: the net's timestep embedding (net.time_cond) reads
             t * time_cond_scale — 1000 for flow t in [0, 1], 1 for DDPM steps.
+        train_t_max: objective "ddpm" only: draw training (and loss-eval)
+            timesteps uniformly from [0, train_t_max] instead of every step —
+            e.g. to keep the thinker stage off the noisiest steps. Sampling
+            still runs every step.
         loss_weighting: "velocity" (the velocity MSE, MiniT2I's objective) or
             "x0" (the x0 MSE: the velocity MSE weighted per sample by
             max(1 - t, velocity_clamp)^2, via DataSample.loss_weight). Only the
@@ -534,6 +548,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         loss_weighting: str = "velocity",
         objective: str = "flow",
         time_cond_scale: float = 1000.0,
+        train_t_max: Optional[int] = None,
         freeze: bool = False,
         checkpoint: Optional[str] = None,
         eval_callbacks=None,
@@ -576,6 +591,9 @@ class MMDiTPainter(PainterBase, BaseModel):
             raise ValueError("objective 'ddpm' needs a DDPM scheduler with prediction_type 'sample' (and no loss_weighting)")
         self.objective = objective
         self.time_cond_scale = time_cond_scale
+        if train_t_max is not None and objective != "ddpm":
+            raise ValueError("train_t_max needs objective 'ddpm'")
+        self.train_t_max = train_t_max
 
         if checkpoint is not None:
             _load_frozen_checkpoint(self, checkpoint)
@@ -669,11 +687,14 @@ class MMDiTPainter(PainterBase, BaseModel):
         block_residuals: Optional[list] = None,
         cond_block_residuals: Optional[list] = None,
         t: Optional[torch.Tensor] = None,
+        block_kv: Optional[list] = None,
     ) -> torch.Tensor:
         """Blocks [steer_from_block, depth) + output head → predicted clean image.
         block_residuals[j] is added to the image tokens after the j-th of them,
         cond_block_residuals[j] to the condition tokens (only the first
-        num_steered_blocks - 1 can matter: the output head reads image tokens)."""
+        num_steered_blocks - 1 can matter: the output head reads image tokens);
+        the image tokens of the j-th also attend to the steering tokens
+        block_kv[j] = (keys, values) (see _FusedDoubleStreamDiTBlock._img_attn)."""
         net = self.net
         n_img = net.latent_img_size**2
         txt, x = hidden[:, :-n_img], hidden[:, -n_img:]
@@ -682,7 +703,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         with self._autocast(hidden.device):
             vec = self._vec(t)
             for j, block in enumerate(net.double_blocks[self.steer_from_block :]):
-                x, txt = block(x, txt, vec)
+                x, txt = block(x, txt, vec, block_kv[j] if block_kv is not None else None)
                 if block_residuals is not None:
                     x = x + block_residuals[j].to(x.dtype)
                 if cond_block_residuals is not None and j < len(cond_block_residuals):
@@ -719,13 +740,16 @@ class MMDiTPainter(PainterBase, BaseModel):
         if hidden is None:
             hidden = self.encode_head(sample.x_noisy, *self._cond(sample), t=sample.timesteps)
         kwargs = steering.to_painter_kwargs() if steering is not None else {}
-        residuals = kwargs.get("block_residuals")
-        if residuals is not None and len(residuals) != self.num_steered_blocks:
-            raise ValueError(
-                f"{len(residuals)} steering residuals for {self.num_steered_blocks} steered blocks "
-                f"(steer_from_block={self.steer_from_block}) — set translator.num_blocks to match"
-            )
-        x0_hat = self.decode_tail(hidden, residuals, kwargs.get("cond_block_residuals"), t=sample.timesteps)
+        residuals, block_kv = kwargs.get("block_residuals"), kwargs.get("block_kv")
+        for name, per_block in (("residuals", residuals), ("key/value sets", block_kv)):
+            if per_block is not None and len(per_block) != self.num_steered_blocks:
+                raise ValueError(
+                    f"{len(per_block)} steering {name} for {self.num_steered_blocks} steered blocks "
+                    f"(steer_from_block={self.steer_from_block}) — set translator.num_blocks to match"
+                )
+        x0_hat = self.decode_tail(
+            hidden, residuals, kwargs.get("cond_block_residuals"), t=sample.timesteps, block_kv=block_kv
+        )
         if self.objective == "ddpm":
             return DiffusionPrediction(pred=x0_hat.float(), pred_type="sample")
         return DiffusionPrediction(
@@ -753,7 +777,8 @@ class MMDiTPainter(PainterBase, BaseModel):
                 v = fields[k]
                 fields[k] = torch.where(drop.view(-1, *[1] * (v.dim() - 1)), torch.zeros_like(v), v)
         if self.objective == "ddpm":
-            t = torch.randint(0, self.scheduler.config.num_train_timesteps, (b,), device=device, dtype=torch.long)
+            t_end = self.scheduler.config.num_train_timesteps if self.train_t_max is None else self.train_t_max + 1
+            t = torch.randint(0, t_end, (b,), device=device, dtype=torch.long)
             x_t = self.scheduler.add_noise(images, torch.randn_like(images), t)
             target, weight = images, None
         else:

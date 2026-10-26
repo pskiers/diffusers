@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.interfaces import (
+    AttentionKVSteering,
     BlockResidualSteering,
     ControlNetSteering,
     CrossAttnSteering,
@@ -32,6 +33,7 @@ from models.interfaces import (
     TRMOutput,
 )
 from models.utility_models import ConditioningPyramid, ConditioningPyramid1D, ConditioningPyramidPaperUNet, TimestepMLP
+from third_party.minit2i import mmdit
 
 
 class ThinkerPainterTranslatorBase(nn.Module):
@@ -492,4 +494,76 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
             cond_residuals = [proj(cond) for proj in self.cond_projs]
         return BlockResidualSteering(
             block_residuals=[proj(x) for proj in self.projs], cond_block_residuals=cond_residuals
+        )
+
+
+class PainterAttentionTranslator(ThinkerPainterTranslatorBase):
+    """
+    Thinker output → per steered MMDiTPainter block, key/value tokens its image
+    tokens attend to (AttentionKVSteering): steering through attention instead
+    of residuals added to the token stream, and outside the painter's rotary
+    embeddings — its image queries are taken QK-normed but not rotated, and the
+    keys carry no rotation (see _FusedDoubleStreamDiTBlock._img_attn).
+
+    Reads the first grid*grid output tokens (the image grid), applies the
+    bridge, a shared Linear(in_dim, hidden_dim), optionally a timestep
+    embedding (as PainterResidualTranslator), upsamples them bilinearly to the
+    painter's token grid, then adds fixed 2D sin/cos positions of that grid, so
+    image queries — which carry the painter's own sin/cos positions — can find
+    their patch's tokens. Per block: a bias-free
+    Linear to the keys (ordinary init) and one to the values (zero init), both
+    hidden_dim → num_heads * head_dim; the painter's own frozen attention output
+    projection then maps the attended values to its width. Zero values make the
+    steering an exact no-op at initialization.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        grid: int,
+        painter_grid: int,
+        num_blocks: int,
+        num_heads: int,
+        head_dim: int,
+        hidden_dim: int = 384,
+        bridge_mode: str = "logits",
+        with_timestep_emb: bool = False,
+        timestep_scale: float = 1000.0,
+    ):
+        super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
+        if hidden_dim % 4:
+            raise ValueError(f"hidden_dim must be a multiple of 4 (2D sin/cos positions), got {hidden_dim}")
+        self.painter_grid = painter_grid
+        self.num_heads, self.head_dim = num_heads, head_dim
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        pos = mmdit.get_2d_sincos_pos_embed(hidden_dim, painter_grid, torch.device("cpu"), torch.float32)
+        self.register_buffer("pos", pos, persistent=False)
+        self.to_k = nn.ModuleList(nn.Linear(hidden_dim, num_heads * head_dim, bias=False) for _ in range(num_blocks))
+        self.to_v = nn.ModuleList(nn.Linear(hidden_dim, num_heads * head_dim, bias=False) for _ in range(num_blocks))
+        for v in self.to_v:
+            nn.init.zeros_(v.weight)
+        self.with_timestep_emb = with_timestep_emb
+        self.timestep_scale = timestep_scale
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=hidden_dim)
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> AttentionKVSteering:
+        g = self._grid
+        x = self.in_proj(self._bridge_tokens(trm_output.logits)[:, : g * g])
+        if self.with_timestep_emb:
+            x = x + self.timestep_mlp(timesteps.float() * self.timestep_scale).unsqueeze(1)
+        b, _, c = x.shape
+        if self.painter_grid != g:
+            x = x.transpose(1, 2).reshape(b, c, g, g)
+            x = F.interpolate(x, size=self.painter_grid, mode="bilinear", align_corners=False)
+            x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos[None]
+        m = x.shape[1]
+        heads = lambda t: t.view(b, m, self.num_heads, self.head_dim)  # noqa: E731
+        return AttentionKVSteering(
+            block_keys=[heads(k(x)) for k in self.to_k], block_values=[heads(v(x)) for v in self.to_v]
         )
