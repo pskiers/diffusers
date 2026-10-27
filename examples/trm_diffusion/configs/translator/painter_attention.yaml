@@ -12,3 +12,4 @@ hidden_dim: 384           # shared Linear width; the keys' 2D sin/cos positions 
 bridge_mode: normalized
 with_timestep_emb: false
 timestep_scale: 1000      # t * this into the timestep embedding: 1000 for flow t in [0, 1], 1 for DDPM steps
+rope: false               # rotate the image queries and the keys with the painter's 2D RoPE (needs a RoPE painter)

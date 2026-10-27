@@ -184,7 +184,8 @@ def test_translator_chain_and_timestep_emb(hidden_dim, temb):
     assert torch.equal(r1, r2) != temb
 
 
-def test_attention_steering():
+@pytest.mark.parametrize("rope", [False, True])
+def test_attention_steering(rope):
     """PainterAttentionTranslator: a no-op at initialization (zero values); once the
     values move, the steering changes the output, gradients reach the thinker's
     output and every translator part, and scaled(0) ablates it exactly."""
@@ -194,7 +195,7 @@ def test_attention_steering():
         painter.net.final_layer.linear.weight.normal_(std=0.02)
     sample = painter._prepare_training_sample(_batch("patch"), DEV)
     translator = PainterAttentionTranslator(in_dim=8, grid=2, painter_grid=4, num_blocks=2, num_heads=2, head_dim=32,
-                                            hidden_dim=32, bridge_mode="normalized", with_timestep_emb=True)
+                                            hidden_dim=32, bridge_mode="normalized", with_timestep_emb=True, rope=rope)
     logits = torch.randn(3, 4, 8, requires_grad=True)
     steer = lambda: translator(TRMOutput(logits=logits), timesteps=sample.timesteps)  # noqa: E731
     plain = painter(sample).pred
@@ -211,10 +212,35 @@ def test_attention_steering():
     assert all(p.grad is None for p in painter.parameters())  # painter stays frozen
     with torch.no_grad():
         assert torch.equal(painter(sample, steer().scaled(0.0)).pred, plain)
+        flipped = dataclasses.replace(steer(), rope=not rope)  # the rotation changes the steering
+        assert not torch.allclose(painter(sample, flipped).pred, out)
     with pytest.raises(ValueError):  # one key/value set per steered block
         bad = PainterAttentionTranslator(in_dim=8, grid=2, painter_grid=4, num_blocks=3, num_heads=2, head_dim=32,
                                          hidden_dim=32)
         painter(sample, bad(TRMOutput(logits=logits)))
+
+
+def test_steer_to_block():
+    """steer_to_block: only blocks [steer_from_block, steer_to_block) are steered — the same
+    as steering them all with zero residuals after the last one; translator sizes must match."""
+    from models.interfaces import BlockResidualSteering
+
+    painter = _painter("patch", freeze=True, steer_to_block=3)  # steer_from_block 2: block 2 only
+    torch.manual_seed(9)
+    with torch.no_grad():
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    full = _painter("patch", freeze=True)
+    full.load_state_dict(painter.state_dict())
+    sample = painter._prepare_training_sample(_batch("patch"), DEV)
+    r = torch.randn(3, 16, 64)
+    assert painter.num_steered_blocks == 1 and full.num_steered_blocks == 2
+    out = painter(sample, BlockResidualSteering(block_residuals=[r])).pred
+    assert torch.allclose(out, full(sample, BlockResidualSteering(block_residuals=[r, torch.zeros_like(r)])).pred)
+    assert not torch.allclose(out, painter(sample).pred)
+    with pytest.raises(ValueError):
+        painter(sample, BlockResidualSteering(block_residuals=[r, r]))
+    with pytest.raises(ValueError):
+        _painter("patch", steer_to_block=2)  # empty range
 
 
 def test_steer_grad_clip():

@@ -68,6 +68,10 @@ class ThinkerFrozenPainterBase(BaseModel):
         to supply all conditioning itself, rather than nudging an already-conditional
         painter. Default False is a no-op, fully backward compatible.
 
+    train_cfg.translator_checkpoint / freeze_translator: start the translator from a
+        saved state_dict (e.g. one trained on the true solution) and optionally keep
+        it fixed, so only the thinker side (thinker, condition encoder) trains.
+
     train_cfg.steer_grad_clip: if set, each sample's gradient reaching the thinker's
         output through the painter is clipped to this multiple of the micro-batch's
         median per-sample norm (see reasoning_step). The thinker's own losses on its
@@ -116,6 +120,11 @@ class ThinkerFrozenPainterBase(BaseModel):
         self.condition_encoder.bind_painter(self.painter)
         self.loss_fn: LossBase = build_loss(train_cfg, self.painter.scheduler)
         self.thinker_painter_translator: ThinkerPainterTranslatorBase = instantiate(thinker_painter_translator)
+        if getattr(train_cfg, "translator_checkpoint", None):
+            state = torch.load(train_cfg.translator_checkpoint, map_location="cpu")
+            self.thinker_painter_translator.load_state_dict(state)
+        if getattr(train_cfg, "freeze_translator", False):
+            self.thinker_painter_translator.requires_grad_(False)
         self.eval_callbacks: list[EvalCallbackBase] = (
             [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
         )

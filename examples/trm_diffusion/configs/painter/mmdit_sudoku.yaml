@@ -28,6 +28,7 @@ cond_tokenizer:
   in_channels: 1
   patch_size: ${painter.net.patch_size}
 steer_from_block: 4          # read after block 4, steer blocks 4-7
+steer_to_block: null         # steer only blocks [steer_from_block, steer_to_block); null = to the last
 painter_dtype: "bfloat16"
 pixel_range: "[0,1]"
 model_range: "[-1,1]"        # range the model works in; "[0,1]" as the working puzzle painters

@@ -116,6 +116,8 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         minsnr_gamma=float(tr["minsnr_gamma"]) if tr.get("minsnr_gamma") is not None else None,
         grad_clip=float(tr.get("grad_clip", 1.0)),
         steer_grad_clip=float(tr["steer_grad_clip"]) if tr.get("steer_grad_clip") is not None else None,
+        translator_checkpoint=tr.get("translator_checkpoint"),
+        freeze_translator=bool(tr.get("freeze_translator", False)),
     )
 
 

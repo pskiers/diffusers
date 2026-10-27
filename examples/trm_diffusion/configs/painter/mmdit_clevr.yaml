@@ -26,6 +26,7 @@ cond_tokenizer:
   _target_: models.mmdit_painter.EmbeddingCondTokenizer
   in_dim: ${data.object_feat_dim}
 steer_from_block: 6          # read after block 6, steer blocks 6-11
+steer_to_block: null         # steer only blocks [steer_from_block, steer_to_block); null = to the last
 painter_dtype: "bfloat16"
 pixel_range: "[-1,1]"
 model_range: "[-1,1]"        # range the model works in; "[0,1]" as the working puzzle painters

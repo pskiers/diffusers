@@ -197,14 +197,22 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
             q_t = _apply_rope(q_t, "vision", self.rope.vision_rope.theta)
         return torch.cat([q_t, q_i], dim=1)
 
-    def _img_attn(self, out_img, q_i, steer_kv):
+    def _img_attn(self, out_img, q_i, q_i_rot, steer_kv):
         """The image tokens' joint-attention output (B, L_img, H, Dh), plus with
-        steer_kv = (keys, values), each (B, M, H, Dh), a decoupled attention from
-        the image queries — QK-normed, not rotated — to those steering tokens
-        (IP-Adapter's construction), summed before the output projection."""
+        steer_kv = (keys, values, rope), keys and values (B, M, H, Dh), a
+        decoupled attention from the image queries to those steering tokens
+        (IP-Adapter's construction), summed before the output projection. The
+        queries are QK-normed; rope=False: not rotated, keys as given; rope=True:
+        the block's rotated queries, and keys rotated with the same 2D RoPE (M
+        must then be the image token count: key m sits at image position m)."""
         if steer_kv is not None:
-            k_s, v_s = steer_kv
-            out_img = out_img + _attention(q_i, k_s.to(q_i.dtype), v_s.to(q_i.dtype))
+            k_s, v_s, rope = steer_kv
+            q, k_s = q_i, k_s.to(q_i.dtype)
+            if rope:
+                if not self.use_rope:
+                    raise ValueError("rotated steering attention needs a painter with rotary embeddings")
+                q, k_s = q_i_rot, _apply_rope(k_s, "vision", self.rope.vision_rope.theta)
+            out_img = out_img + _attention(q, k_s, v_s.to(q_i.dtype))
         return out_img.reshape(out_img.shape[0], out_img.shape[1], self.num_heads * self.head_dim)
 
     def forward(self, x, txt, vec=None, steer_kv=None):
@@ -225,7 +233,7 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
         k = self._rope(k_t, k_i)
         v = torch.cat([v_t, v_i], dim=1)
         out = _attention(q, k, v)
-        x = x + self.img_attn_proj(self._img_attn(out[:, lt:], q_i, steer_kv))
+        x = x + self.img_attn_proj(self._img_attn(out[:, lt:], q_i, q[:, lt:], steer_kv))
         txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
         x = x + self.img_mlp(self.img_norm2(x))
         txt = txt + self.txt_mlp(self.txt_norm2(txt))
@@ -246,8 +254,9 @@ class _FusedDoubleStreamDiTBlock(mmdit.DoubleStreamDiTBlock):
         q_t, k_t, v_t = qkv_t[:, :, 0], qkv_t[:, :, 1], qkv_t[:, :, 2]
         q_i, k_i = self.q_norm(q_i), self.k_norm(k_i)
         q_t, k_t = self.q_norm(q_t), self.k_norm(k_t)
-        out = _attention(self._rope(q_t, q_i), self._rope(k_t, k_i), torch.cat([v_t, v_i], dim=1))
-        x = x + g_ai[:, None] * self.img_attn_proj(self._img_attn(out[:, lt:], q_i, steer_kv))
+        q = self._rope(q_t, q_i)
+        out = _attention(q, self._rope(k_t, k_i), torch.cat([v_t, v_i], dim=1))
+        x = x + g_ai[:, None] * self.img_attn_proj(self._img_attn(out[:, lt:], q_i, q[:, lt:], steer_kv))
         txt = txt + g_at[:, None] * self.txt_attn_proj(out[:, :lt].reshape(b, lt, self.num_heads * self.head_dim))
         x = x + g_mi[:, None] * self.img_mlp(mmdit.modulate(self.img_norm2(x), sh_mi, sc_mi))
         txt = txt + g_mt[:, None] * self.txt_mlp(mmdit.modulate(self.txt_norm2(txt), sh_mt, sc_mt))
@@ -497,6 +506,8 @@ class MMDiTPainter(PainterBase, BaseModel):
         cond_rope: condition-stream rotary embedding; None = the tokenizer's.
         steer_from_block: blocks [0, steer_from_block) form the read-only head
             (0: the thinker reads the embedded tokens and every block is steered).
+        steer_to_block: steer only blocks [steer_from_block, steer_to_block);
+            the later ones run unsteered (None = steer through the last block).
         painter_dtype: autocast dtype for the painter's forward (None = fp32 /
             whatever the caller's autocast says).
         pixel_range: range of the dataset's images, "[0,1]" or "[-1,1]".
@@ -537,6 +548,7 @@ class MMDiTPainter(PainterBase, BaseModel):
         net,
         cond_rope: Optional[str] = None,
         steer_from_block: int = 1,
+        steer_to_block: Optional[int] = None,
         painter_dtype: Optional[str] = None,
         pixel_range: str = "[-1,1]",
         model_range: str = "[-1,1]",
@@ -571,6 +583,10 @@ class MMDiTPainter(PainterBase, BaseModel):
 
         if not 0 <= steer_from_block < len(self.net.double_blocks):
             raise ValueError(f"steer_from_block must be in [0, {len(self.net.double_blocks) - 1}]")
+        steer_to_block = len(self.net.double_blocks) if steer_to_block is None else steer_to_block
+        if not steer_from_block < steer_to_block <= len(self.net.double_blocks):
+            raise ValueError(f"steer_to_block must be in ({steer_from_block}, {len(self.net.double_blocks)}]")
+        self.steer_to_block = steer_to_block
         if pixel_range not in ("[0,1]", "[-1,1]") or model_range not in ("[0,1]", "[-1,1]"):
             raise ValueError(f"pixel_range / model_range must be '[0,1]' or '[-1,1]', got {pixel_range!r}, {model_range!r}")
         self.model_range = model_range
@@ -613,7 +629,7 @@ class MMDiTPainter(PainterBase, BaseModel):
 
     @property
     def num_steered_blocks(self) -> int:
-        return len(self.net.double_blocks) - self.steer_from_block
+        return self.steer_to_block - self.steer_from_block
 
     @property
     def img_grid(self) -> int:
@@ -689,12 +705,13 @@ class MMDiTPainter(PainterBase, BaseModel):
         t: Optional[torch.Tensor] = None,
         block_kv: Optional[list] = None,
     ) -> torch.Tensor:
-        """Blocks [steer_from_block, depth) + output head → predicted clean image.
+        """Blocks [steer_from_block, depth) + output head → predicted clean image;
+        the first num_steered_blocks of them (up to steer_to_block) are steered:
         block_residuals[j] is added to the image tokens after the j-th of them,
         cond_block_residuals[j] to the condition tokens (only the first
         num_steered_blocks - 1 can matter: the output head reads image tokens);
         the image tokens of the j-th also attend to the steering tokens
-        block_kv[j] = (keys, values) (see _FusedDoubleStreamDiTBlock._img_attn)."""
+        block_kv[j] = (keys, values, rope) (see _FusedDoubleStreamDiTBlock._img_attn)."""
         net = self.net
         n_img = net.latent_img_size**2
         txt, x = hidden[:, :-n_img], hidden[:, -n_img:]
@@ -702,9 +719,10 @@ class MMDiTPainter(PainterBase, BaseModel):
             raise ValueError(f"{len(cond_block_residuals)} condition residuals for {self.num_steered_blocks} steered blocks")
         with self._autocast(hidden.device):
             vec = self._vec(t)
+            n = self.num_steered_blocks
             for j, block in enumerate(net.double_blocks[self.steer_from_block :]):
-                x, txt = block(x, txt, vec, block_kv[j] if block_kv is not None else None)
-                if block_residuals is not None:
+                x, txt = block(x, txt, vec, block_kv[j] if block_kv is not None and j < n else None)
+                if block_residuals is not None and j < n:
                     x = x + block_residuals[j].to(x.dtype)
                 if cond_block_residuals is not None and j < len(cond_block_residuals):
                     txt = txt + cond_block_residuals[j].to(txt.dtype)

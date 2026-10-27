@@ -225,6 +225,12 @@ def main(cfg: DictConfig):
         if load_opt and ckpt.get("optimizer_states"):
             for opt, sd in zip(optimizers, ckpt["optimizer_states"]):
                 opt.load_state_dict(sd)
+                if type(opt.optimizer).__name__ == "AdamATan2":
+                    # load_state_dict puts step counters on the CPU (where torch's own
+                    # optimizers keep them); AdamATan2's kernel reads them on the GPU.
+                    for p, st in opt.optimizer.state.items():
+                        if torch.is_tensor(st.get("step")):
+                            st["step"] = st["step"].to(p.device)
         global_step = int(ckpt["step"])
         if ema_helper is not None:
             if load_opt and ckpt.get("ema_state") is not None:

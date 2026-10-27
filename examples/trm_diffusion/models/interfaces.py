@@ -180,7 +180,7 @@ class BlockResidualSteering(ThinkerSteering):
 class AttentionKVSteering(ThinkerSteering):
     """Steering produced by PainterAttentionTranslator for MMDiTPainter: per
     steered block, extra key/value tokens its image tokens attend to, in a
-    decoupled attention without rotary embeddings (IP-Adapter style)."""
+    decoupled attention (IP-Adapter style), with or without rotary embeddings."""
 
     block_keys: list
     """Per steered block, (B, M, num_heads, head_dim)."""
@@ -188,8 +188,12 @@ class AttentionKVSteering(ThinkerSteering):
     block_values: list
     """Per steered block, (B, M, num_heads, head_dim)."""
 
+    rope: bool = False
+    """Rotate the image queries and the keys with the painter's 2D RoPE (key m
+    at image position m) instead of attending without rotation."""
+
     def to_painter_kwargs(self) -> dict:
-        return {"block_kv": list(zip(self.block_keys, self.block_values))}
+        return {"block_kv": [(k, v, self.rope) for k, v in zip(self.block_keys, self.block_values)]}
 
     def scaled(self, scale: float) -> "AttentionKVSteering":
         """Scales the values only: the steering's contribution is linear in

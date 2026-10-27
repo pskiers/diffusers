@@ -80,6 +80,11 @@ class TrainConfig:
     # micro-batch's median per-sample norm (None = off), so a few samples
     # (e.g. the noisiest timesteps) cannot dominate the thinker's update.
     steer_grad_clip: Optional[float] = None
+    # Thinker-frozen-painter models only: load the translator from this file (a
+    # translator state_dict, e.g. one trained on the true solution) and, with
+    # freeze_translator, keep it fixed so only the thinker side trains.
+    translator_checkpoint: Optional[str] = None
+    freeze_translator: bool = False
 
 
 @dataclass

@@ -515,6 +515,10 @@ class PainterAttentionTranslator(ThinkerPainterTranslatorBase):
     hidden_dim → num_heads * head_dim; the painter's own frozen attention output
     projection then maps the attended values to its width. Zero values make the
     steering an exact no-op at initialization.
+
+    rope: instead, the steering attention uses the painter's rotated image
+    queries and rotates the keys with the same 2D RoPE at their patch positions,
+    so it attends by relative position, as the painter's own attention does.
     """
 
     def __init__(
@@ -529,8 +533,10 @@ class PainterAttentionTranslator(ThinkerPainterTranslatorBase):
         bridge_mode: str = "logits",
         with_timestep_emb: bool = False,
         timestep_scale: float = 1000.0,
+        rope: bool = False,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
+        self.rope = rope
         if hidden_dim % 4:
             raise ValueError(f"hidden_dim must be a multiple of 4 (2D sin/cos positions), got {hidden_dim}")
         self.painter_grid = painter_grid
@@ -565,5 +571,5 @@ class PainterAttentionTranslator(ThinkerPainterTranslatorBase):
         m = x.shape[1]
         heads = lambda t: t.view(b, m, self.num_heads, self.head_dim)  # noqa: E731
         return AttentionKVSteering(
-            block_keys=[heads(k(x)) for k in self.to_k], block_values=[heads(v(x)) for v in self.to_v]
+            block_keys=[heads(k(x)) for k in self.to_k], block_values=[heads(v(x)) for v in self.to_v], rope=self.rope
         )
