@@ -435,6 +435,12 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     with hidden_dim, as IPAdapterTranslator), so the steering can depend on the
     noise level. timestep_scale 1000 maps flow-matching t in [0, 1] to the
     DDPM-step range the sinusoidal embedding was built for.
+
+    input_noise_std: in training only, add Gaussian noise of this std to the
+    tokens right after the bridge (with "normalized", in units of the
+    normalized channels, so the thinker cannot outscale it). A faint cue in the
+    thinker output then no longer steers the painter well, so the painter's
+    gradient keeps asking for a clearer one.
     """
 
     def __init__(
@@ -449,8 +455,10 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         hidden_dim: Optional[int] = None,
         with_timestep_emb: bool = False,
         timestep_scale: float = 1000.0,
+        input_noise_std: float = 0.0,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
+        self.input_noise_std = input_noise_std
         self.painter_grid = painter_grid
         self.in_proj = nn.Linear(in_dim, hidden_dim) if hidden_dim is not None else None
         feat = hidden_dim if hidden_dim is not None else in_dim
@@ -478,6 +486,8 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> BlockResidualSteering:
         g = self._grid
         tokens = self._bridge_tokens(trm_output.logits)
+        if self.training and self.input_noise_std > 0:
+            tokens = tokens + self.input_noise_std * torch.randn_like(tokens)
         if self.in_proj is not None:
             tokens = self.in_proj(tokens)
         if self.with_timestep_emb:

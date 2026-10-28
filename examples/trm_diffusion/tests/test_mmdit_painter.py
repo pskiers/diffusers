@@ -9,6 +9,7 @@ by tests/test_minit2i_thinker.py):
   gradients reaching the thinker's output at both kinds of position; with
   bridge_mode "normalized", independent of the thinker output's scale;
 - steering through attention (PainterAttentionTranslator), the same;
+- the residual translator's training-only input noise;
 - the thinker-stage options train_t_max, steer_grad_clip, steer_grad_t_min, thinker_checkpoint and the thinker's SGD option;
 - every new experiment config builds, with consistent token counts.
 
@@ -182,6 +183,28 @@ def test_translator_chain_and_timestep_emb(hidden_dim, temb):
         r1 = steer(torch.full((3,), 0.1)).block_residuals[0]
         r2 = steer(torch.full((3,), 0.7)).block_residuals[0]
     assert torch.equal(r1, r2) != temb
+
+
+def test_translator_input_noise():
+    """input_noise_std: the steering is random in training (gradients still flow to the
+    thinker's output) and deterministic and unchanged in eval."""
+    torch.manual_seed(5)
+    kw = dict(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=2, bridge_mode="normalized")
+    noisy, clean = PainterResidualTranslator(**kw, input_noise_std=0.5), PainterResidualTranslator(**kw)
+    with torch.no_grad():
+        for proj in noisy.projs:
+            proj.weight.normal_(std=0.1)
+    logits = torch.randn(3, 4, 8, requires_grad=True)
+    noisy.train()
+    a, b = (noisy(TRMOutput(logits=logits)).block_residuals[0] for _ in range(2))
+    assert not torch.allclose(a, b)
+    a.sum().backward()
+    assert logits.grad.abs().sum() > 0
+    clean.load_state_dict(noisy.state_dict())  # incl. the BatchNorm statistics the training passes updated
+    noisy.eval(), clean.eval()
+    with torch.no_grad():
+        assert torch.equal(noisy(TRMOutput(logits=logits)).block_residuals[0],
+                           clean(TRMOutput(logits=logits)).block_residuals[0])
 
 
 @pytest.mark.parametrize("rope", [False, True])
