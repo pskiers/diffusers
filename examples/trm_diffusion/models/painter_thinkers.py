@@ -795,15 +795,27 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
     budget, though not exactly, since compute is reallocated rather than
     uniform).
 
+    One-step halt lookahead: a sample never physically halts the instant
+    the head first says to — it always runs exactly one more step first
+    (slot["pending_halt"] in train_step), unless n_sup is already
+    exhausted. That extra step's own (loss before, loss after) pair is
+    what gets labeled and fed to train_halt_head_ragged for the step
+    where the head wanted to stop, so every completed history is >=2
+    steps long and every sample contributes real, state-grounded signal
+    about whether one more step actually helped — not just the samples
+    halt_exploration_prob happens to pick. This also means train_step's
+    minimum possible episode length is 2, not 1.
+
     halt_exploration_prob: with this probability (per sample, per step),
     force a random minimum step count in [2, n_sup] before that sample is
-    allowed to halt, regardless of what the halt head says — ports over
-    the real TRM/HRM training recipe's exploration mechanism
-    (halt_exploration_prob=0.1 in every real training run in both papers).
-    Without this, a sample the head starts (possibly wrongly) halting
-    early never generates the longer trajectory that would let the head's
-    own training correct that mistake — it only ever sees the short
-    trajectories its own decisions produce.
+    allowed to halt, regardless of what the halt head (or the one-step
+    lookahead above) says — ports over the real TRM/HRM training recipe's
+    exploration mechanism (halt_exploration_prob=0.1 in every real
+    training run in both papers). The one-step lookahead on its own only
+    ever looks one step past wherever the head currently wants to stop;
+    this is what still lets a sample reach a much longer trajectory than
+    that, which the head's own training can then use to correct a halt
+    decision that's wrong beyond a 1-step horizon.
 
     continue_bias_init: at construction, the halt head's bias is set to
     this value (rather than the with_halt_head default of 0 — fine for
@@ -892,6 +904,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                     "z_L": z_L.to(device),
                     "steps": torch.zeros(bsz, dtype=torch.long, device=device),
                     "halted": None,
+                    "pending_halt": torch.zeros(bsz, dtype=torch.bool, device=device),
                     "hist_z": [[] for _ in range(bsz)],
                     "hist_loss": [[] for _ in range(bsz)],
                 })
@@ -912,6 +925,9 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 slot["z_H"] = torch.where(m, fresh_z_H, slot["z_H"])
                 slot["z_L"] = torch.where(m, fresh_z_L, slot["z_L"])
                 slot["steps"] = torch.where(prev_halted, torch.zeros_like(slot["steps"]), slot["steps"])
+                slot["pending_halt"] = torch.where(
+                    prev_halted, torch.zeros_like(slot["pending_halt"]), slot["pending_halt"]
+                )
                 for j in prev_halted.nonzero(as_tuple=True)[0].tolist():
                     slot["hist_z"][j] = []
                     slot["hist_loss"][j] = []
@@ -936,7 +952,18 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
 
             pred = self.thinker.predict_halt_value(slot["z_H"])
             is_last_step = slot["steps"] >= n_sup
-            halted = is_last_step | (pred <= self.halt_threshold)
+            head_wants_halt = pred <= self.halt_threshold
+
+            # One-step lookahead: a sample only physically halts once it has
+            # run one step *past* the step where the head first wanted to
+            # stop (slot["pending_halt"], set below) — or once the n_sup
+            # budget is exhausted outright (no step left to spend on a
+            # lookahead probe). This guarantees every completed history is
+            # >=2 steps long, so every sample feeds train_halt_head_ragged a
+            # real (did one more step help, from THIS state) label every
+            # time, instead of only the ones lucky enough to be hit by
+            # halt_exploration_prob below — see the class docstring.
+            halted = is_last_step | slot["pending_halt"]
 
             if self.halt_exploration_prob > 0 and n_sup > 1:
                 bsz = halted.shape[0]
@@ -948,6 +975,9 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 )
                 halted = halted & (slot["steps"] >= min_steps)
 
+            # A fresh head-halt decision becomes the next call's lookahead
+            # probe, for samples not already halting this step.
+            slot["pending_halt"] = head_wants_halt & ~halted
             slot["halted"] = halted
 
             for j in halted.nonzero(as_tuple=True)[0].tolist():
