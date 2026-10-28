@@ -9,7 +9,7 @@ by tests/test_minit2i_thinker.py):
   gradients reaching the thinker's output at both kinds of position; with
   bridge_mode "normalized", independent of the thinker output's scale;
 - steering through attention (PainterAttentionTranslator), the same;
-- the thinker-stage options train_t_max and steer_grad_clip;
+- the thinker-stage options train_t_max, steer_grad_clip, steer_grad_t_min, thinker_checkpoint and the thinker's SGD option;
 - every new experiment config builds, with consistent token counts.
 
 Run from examples/trm_diffusion:  pytest tests/test_mmdit_painter.py -s
@@ -507,6 +507,64 @@ def test_force_unconditional_painter(tmp_path):
         enc_null = model.condition_encoder(model.painter.fill_runtime_fields(model.painter.null_condition_sample(s)).painter_hidden).enc_emb
     assert torch.equal(steered, null) and not torch.allclose(steered, real)
     assert not torch.allclose(enc, enc_null)  # the thinker's input is still the real condition's
+
+
+def test_steer_grad_t_min(tmp_path):
+    """Samples below steer_grad_t_min send no gradient to the thinker's output; the others still do."""
+    painter = _build(["experiment=mnist_mmdit_painter", *TINY_PAINTER])
+    with torch.no_grad():  # as after stage 1: the zero-initialized output layer has moved
+        painter.net.final_layer.linear.weight.normal_(std=0.02)
+    ckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, ckpt)
+    model = _build(["experiment=mnist_thinker_mmdit", f"painter.checkpoint={ckpt}", "painter.steer_from_block=1",
+                    "translator.num_blocks=7", "+train.steer_grad_t_min=30", *TINY_PAINTER, *TINY_THINKER]).train()
+    with torch.no_grad():  # a trained translator: its zero-initialized output would block every gradient
+        for prm in model.thinker_painter_translator.parameters():
+            prm.add_(0.02 * torch.randn_like(prm))
+    [d] = model.prep_mb_data([SUDOKU], DEV)
+    s = d["sample"]
+    s.timesteps = torch.tensor([10, 70], device=s.timesteps.device, dtype=s.timesteps.dtype)
+    pred, logits, _, _ = model.reasoning_step(s, d["z_H"], d["z_L"])
+    [g] = torch.autograd.grad((pred.float() - s.target.float()).pow(2).mean(), logits)
+    assert g[0].abs().max() == 0 and g[1].abs().max() > 0
+
+
+def test_thinker_checkpoint(tmp_path):
+    """thinker_checkpoint loads the thinker and condition encoder (also from compiled runs), nothing else."""
+    painter = _build(["experiment=mnist_mmdit_painter", *TINY_PAINTER])
+    pckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, pckpt)
+    base = ["experiment=mnist_thinker_mmdit", f"painter.checkpoint={pckpt}", "painter.steer_from_block=1",
+            "translator.num_blocks=7", *TINY_PAINTER, *TINY_THINKER]
+    torch.manual_seed(1)
+    src = _build(base)
+    with torch.no_grad():
+        for prm in src.parameters():
+            prm.add_(0.1)
+    sd = {k.replace("condition_encoder.", "condition_encoder._orig_mod.", 1): v for k, v in src.state_dict().items()}
+    tckpt = tmp_path / "thinker.pt"
+    torch.save({"model_state": sd}, tckpt)
+    torch.manual_seed(2)
+    dst = _build(base + [f"+train.thinker_checkpoint={tckpt}"])
+    for name in ("thinker", "condition_encoder", "thinker_painter_translator", "painter"):
+        same = all(torch.equal(a, b) for a, b in zip(getattr(src, name).state_dict().values(),
+                                                     getattr(dst, name).state_dict().values()))
+        assert same == (name in ("thinker", "condition_encoder")), name
+
+
+def test_thinker_sgd_optimizer(tmp_path):
+    """thinker.optim_cfg.optimizer=sgd: the thinker trains with SGD (momentum = beta1), the rest unchanged."""
+    painter = _build(["experiment=mnist_mmdit_painter", *TINY_PAINTER])
+    pckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, pckpt)
+    model = _build(["experiment=mnist_thinker_mmdit", f"painter.checkpoint={pckpt}", "painter.steer_from_block=1",
+                    "translator.num_blocks=7", "+thinker.optim_cfg.optimizer=sgd", *TINY_PAINTER, *TINY_THINKER])
+    opts = [o.optimizer for o in model.build_optimizers(1, 10)]
+    sgd = [o for o in opts if isinstance(o, torch.optim.SGD)]
+    assert len(sgd) == 1 and sgd[0].defaults["momentum"] == 0.9
+    thinker_ids = {id(p) for p in model.thinker.parameters()}
+    assert {id(p) for g in sgd[0].param_groups for p in g["params"]} <= thinker_ids
+    assert any(type(o).__name__ != "SGD" for o in opts)  # translator / encoder keep their optimizer
 
 
 @pytest.mark.parametrize("steer_from", [0, 1])

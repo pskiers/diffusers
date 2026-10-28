@@ -80,11 +80,18 @@ class TrainConfig:
     # micro-batch's median per-sample norm (None = off), so a few samples
     # (e.g. the noisiest timesteps) cannot dominate the thinker's update.
     steer_grad_clip: Optional[float] = None
+    # Thinker-frozen-painter models only: samples with timestep below this give
+    # no gradient to the thinker through the painter (None = off); steering and
+    # the translator's training are unchanged.
+    steer_grad_t_min: Optional[float] = None
     # Thinker-frozen-painter models only: load the translator from this file (a
     # translator state_dict, e.g. one trained on the true solution) and, with
     # freeze_translator, keep it fixed so only the thinker side trains.
     translator_checkpoint: Optional[str] = None
     freeze_translator: bool = False
+    # Thinker-frozen-painter models only: load the thinker and condition encoder
+    # from this full thinker-stage checkpoint (painter and translator are not).
+    thinker_checkpoint: Optional[str] = None
 
 
 @dataclass
@@ -126,6 +133,9 @@ class ThinkerOptimConfig:
     warmup_steps: int
     lr_min_ratio: float = 0.0
     puzzle_emb: Optional[PuzzleEmbOptimConfig] = None
+    # "adam_atan2" (default) or "sgd" (momentum = beta1; weight_decay is then the
+    # coupled L2 coefficient: per-step decay ~ lr x weight_decay / (1 - beta1))
+    optimizer: str = "adam_atan2"
 
 
 @dataclass

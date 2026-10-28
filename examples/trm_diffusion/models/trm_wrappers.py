@@ -202,12 +202,21 @@ class SpatialTRM(BaseModel):
                 exclude_ids.add(id(buf))
 
         if not self.freeze_weights:
-            optim = AdamATan2(
-                [p for p in self.parameters() if id(p) not in exclude_ids],
-                lr=0,  # set per-step by scheduler
-                weight_decay=self.optim_cfg.weight_decay,
-                betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
-            )
+            params = [p for p in self.parameters() if id(p) not in exclude_ids]
+            kind = getattr(self.optim_cfg, "optimizer", "adam_atan2")
+            if kind == "sgd":
+                optim = torch.optim.SGD(
+                    params, lr=0, momentum=self.optim_cfg.beta1, weight_decay=self.optim_cfg.weight_decay
+                )
+            elif kind == "adam_atan2":
+                optim = AdamATan2(
+                    params,
+                    lr=0,  # set per-step by scheduler
+                    weight_decay=self.optim_cfg.weight_decay,
+                    betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+                )
+            else:
+                raise ValueError(f"unknown thinker optimizer {kind!r}")
             optims.append(
                 ScheduledOptimizer(
                     optim,

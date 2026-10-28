@@ -62,7 +62,10 @@
 #           _kvrope (as _kv, but the steering attention uses the painter's 2D RoPE on queries and keys),
 #           _to<k> (steer only blocks [steer start, k), e.g. _to4 with the default start 1: blocks 1-3),
 #           _gclip (clip each sample's gradient into the thinker's output to the micro-batch median),
-#           _tmax60 (thinker stage trained on DDPM steps 0-60 only, off the noisiest; needs a _ddpm/_all painter)
+#           _tmax60 (thinker stage trained on DDPM steps 0-60 only, off the noisiest; needs a _ddpm/_all painter),
+#           _gtmin<k> (samples with DDPM step < k send no gradient to the thinker; steering stays on),
+#           _bsx<k> (effective thinker batch x k via gradient accumulation, 768 -> 768k; each step k x slower,
+#                    so pass a smaller train.num_steps for the same number of samples)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -202,6 +205,8 @@ case $RUN in
         to[0-9]*) STEER_TO=${tok#to}; TV="${TV}_$tok" ;;
         gclip) STAGE2="$STAGE2 +train.steer_grad_clip=1.0"; TV="${TV}_$tok" ;;
         tmax60) STAGE2="$STAGE2 painter.train_t_max=60"; TV="${TV}_$tok" ;;
+        gtmin[0-9]*) STAGE2="$STAGE2 +train.steer_grad_t_min=${tok#gtmin}"; TV="${TV}_$tok" ;;  # no thinker grad from t < k
+        bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 2 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;  # batch 384 x 2k
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done

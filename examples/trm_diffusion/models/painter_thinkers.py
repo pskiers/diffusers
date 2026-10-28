@@ -14,6 +14,7 @@ from configs.schemas import (
 )
 from models.base import BaseModel
 from models.losses import LossBase, build_loss
+from models.utility_models import strip_compiled_prefix
 from models.translators import ThinkerPainterTranslatorBase
 from models.condition_encoders import ConditionEncoderBase
 from models.interfaces import TRMOutput, DiffusionPrediction
@@ -72,10 +73,18 @@ class ThinkerFrozenPainterBase(BaseModel):
         saved state_dict (e.g. one trained on the true solution) and optionally keep
         it fixed, so only the thinker side (thinker, condition encoder) trains.
 
+    train_cfg.thinker_checkpoint: start the thinker and condition encoder from a full
+        thinker-stage checkpoint (e.g. one trained against another painter); the painter
+        and translator are not taken from it.
+
     train_cfg.steer_grad_clip: if set, each sample's gradient reaching the thinker's
         output through the painter is clipped to this multiple of the micro-batch's
         median per-sample norm (see reasoning_step). The thinker's own losses on its
         logits (e.g. CE) are unaffected.
+
+    train_cfg.steer_grad_t_min: if set, samples with timestep below it give no gradient
+        to the thinker through the painter (steering stays on and the translator still
+        trains on them).
     """
 
     token_input: bool = False
@@ -125,6 +134,12 @@ class ThinkerFrozenPainterBase(BaseModel):
             self.thinker_painter_translator.load_state_dict(state)
         if getattr(train_cfg, "freeze_translator", False):
             self.thinker_painter_translator.requires_grad_(False)
+        if getattr(train_cfg, "thinker_checkpoint", None):
+            sd = strip_compiled_prefix(
+                torch.load(train_cfg.thinker_checkpoint, map_location="cpu", weights_only=True)["model_state"]
+            )
+            for name in ("thinker", "condition_encoder"):
+                getattr(self, name).load_state_dict({k[len(name) + 1:]: v for k, v in sd.items() if k.startswith(name + ".")})
         self.eval_callbacks: list[EvalCallbackBase] = (
             [instantiate(cb) for cb in eval_callbacks] if eval_callbacks else []
         )
@@ -231,6 +246,9 @@ class ThinkerFrozenPainterBase(BaseModel):
             logits_for_tpt = logits_for_tpt * (~drop[:, None, None]).float()
         if self.training and self.train_cfg.steer_grad_clip is not None and logits_for_tpt.requires_grad:
             logits_for_tpt = _ClipPerSampleGrad.apply(logits_for_tpt, self.train_cfg.steer_grad_clip)
+        if self.training and self.train_cfg.steer_grad_t_min is not None:
+            keep = (sample.timesteps >= self.train_cfg.steer_grad_t_min).view(-1, *[1] * (logits_for_tpt.dim() - 1))
+            logits_for_tpt = torch.where(keep, logits_for_tpt, logits_for_tpt.detach())
 
         noise_pred = self.run_painter(sample, logits_for_tpt)
         return noise_pred, logits, z_H_next, z_L_next
