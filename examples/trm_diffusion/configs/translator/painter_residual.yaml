@@ -12,3 +12,4 @@ hidden_dim: null          # set: shared Linear -> per-block to_v -> zero-init to
 with_timestep_emb: false  # add a timestep embedding to the tokens before the per-block projections
 timestep_scale: 1000      # t * this into that embedding: 1000 for flow t in [0, 1], 1 for DDPM steps
 input_noise_std: 0.0      # training only: Gaussian noise on the tokens after the bridge, so faint cues don't suffice
+block_keep_prob: 1.0      # training only: keep each block's residual with this probability, per sample

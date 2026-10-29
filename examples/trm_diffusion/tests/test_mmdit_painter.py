@@ -9,7 +9,7 @@ by tests/test_minit2i_thinker.py):
   gradients reaching the thinker's output at both kinds of position; with
   bridge_mode "normalized", independent of the thinker output's scale;
 - steering through attention (PainterAttentionTranslator), the same;
-- the residual translator's training-only input noise;
+- the residual translator's training-only input noise and block dropout;
 - the thinker-stage options train_t_max, steer_grad_clip, steer_grad_t_min, thinker_checkpoint and the thinker's SGD option;
 - every new experiment config builds, with consistent token counts.
 
@@ -205,6 +205,32 @@ def test_translator_input_noise():
     with torch.no_grad():
         assert torch.equal(noisy(TRMOutput(logits=logits)).block_residuals[0],
                            clean(TRMOutput(logits=logits)).block_residuals[0])
+
+
+def test_translator_block_dropout():
+    """block_keep_prob: in training each sample's block residuals are kept whole or
+    zeroed, independently per sample and block (gradients still flow through the kept
+    ones); in eval every block steers, as without dropout."""
+    torch.manual_seed(5)
+    kw = dict(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=4, bridge_mode="normalized")
+    drop, full = PainterResidualTranslator(**kw, block_keep_prob=0.5), PainterResidualTranslator(**kw)
+    with torch.no_grad():
+        for proj in drop.projs:
+            proj.weight.normal_(std=0.1)
+    full.load_state_dict(drop.state_dict())
+    logits = torch.randn(16, 4, 8, requires_grad=True)
+    drop.train(), full.train()
+    dropped, kept = drop(TRMOutput(logits=logits)).block_residuals, full(TRMOutput(logits=logits)).block_residuals
+    on = torch.stack([d.abs().flatten(1).sum(1) > 0 for d in dropped], 1)  # (sample, block)
+    for d, k, m in zip(dropped, kept, on.T):
+        assert torch.equal(d[m], k[m]) and torch.equal(d[~m], torch.zeros_like(d[~m]))
+    assert 0 < on.float().mean() < 1 and len({tuple(r) for r in on.tolist()}) > 1  # differs between samples
+    sum(d.sum() for d in dropped).backward()
+    assert logits.grad.abs().sum() > 0
+    drop.eval(), full.eval()
+    with torch.no_grad():
+        for d, k in zip(drop(TRMOutput(logits=logits)).block_residuals, full(TRMOutput(logits=logits)).block_residuals):
+            assert torch.equal(d, k)
 
 
 @pytest.mark.parametrize("rope", [False, True])

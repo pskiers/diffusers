@@ -67,7 +67,9 @@
 #           _bsx<k> (effective thinker batch x k via gradient accumulation, 768 -> 768k; each step k x slower,
 #                    so pass a smaller train.num_steps for the same number of samples),
 #           _tn<std> (training-only Gaussian noise of std <std> on the residual translator's input, after the
-#                    normalizing bridge, so a faint cue in the thinker output doesn't suffice; e.g. _tn0.3, _tn1)
+#                    normalizing bridge, so a faint cue in the thinker output doesn't suffice; e.g. _tn0.3, _tn1),
+#           _bd<keep> (training-only block dropout: each steered block's residual kept with probability <keep>,
+#                    per sample, unscaled; all blocks steer in eval; e.g. _bd0.5)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -210,6 +212,7 @@ case $RUN in
         gtmin[0-9]*) STAGE2="$STAGE2 +train.steer_grad_t_min=${tok#gtmin}"; TV="${TV}_$tok" ;;  # no thinker grad from t < k
         bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 2 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;  # batch 384 x 2k
         tn[0-9]*) STAGE2="$STAGE2 translator.input_noise_std=${tok#tn}"; TV="${TV}_$tok" ;;  # noise on the translator input
+        bd[0-9]*) STAGE2="$STAGE2 translator.block_keep_prob=${tok#bd}"; TV="${TV}_$tok" ;;  # per-sample block dropout
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done

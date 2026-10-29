@@ -441,6 +441,13 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     normalized channels, so the thinker cannot outscale it). A faint cue in the
     thinker output then no longer steers the painter well, so the painter's
     gradient keeps asking for a clearer one.
+
+    block_keep_prob: in training only, keep each steered block's residual with
+    this probability, drawn per sample (dropped blocks get no residual, kept ones
+    are not rescaled); in eval every block steers. A translator that has to steer
+    well through any subset of blocks can't rely on amplifying a faint cue through
+    all of them, so — as input_noise_std — the painter's gradient keeps asking for
+    a clearer one.
     """
 
     def __init__(
@@ -456,9 +463,11 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         with_timestep_emb: bool = False,
         timestep_scale: float = 1000.0,
         input_noise_std: float = 0.0,
+        block_keep_prob: float = 1.0,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
         self.input_noise_std = input_noise_std
+        self.block_keep_prob = block_keep_prob
         self.painter_grid = painter_grid
         self.in_proj = nn.Linear(in_dim, hidden_dim) if hidden_dim is not None else None
         feat = hidden_dim if hidden_dim is not None else in_dim
@@ -498,13 +507,17 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         if self.painter_grid != g:
             x = F.interpolate(x, size=self.painter_grid, mode="bilinear", align_corners=False)
         x = x.flatten(2).transpose(1, 2)  # (B, painter_grid², C)
+        residuals = [proj(x) for proj in self.projs]
         cond_residuals = None
         if self.cond_projs is not None:
             cond = tokens[:, g * g :]
             cond_residuals = [proj(cond) for proj in self.cond_projs]
-        return BlockResidualSteering(
-            block_residuals=[proj(x) for proj in self.projs], cond_block_residuals=cond_residuals
-        )
+        if self.training and self.block_keep_prob < 1:
+            keep = (torch.rand(b, len(self.projs), 1, 1, device=x.device) < self.block_keep_prob).to(x.dtype)
+            residuals = [r * keep[:, i] for i, r in enumerate(residuals)]
+            if cond_residuals is not None:
+                cond_residuals = [r * keep[:, i] for i, r in enumerate(cond_residuals)]
+        return BlockResidualSteering(block_residuals=residuals, cond_block_residuals=cond_residuals)
 
 
 class PainterAttentionTranslator(ThinkerPainterTranslatorBase):
