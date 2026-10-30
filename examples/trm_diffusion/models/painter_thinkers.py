@@ -394,6 +394,7 @@ class ThinkerFrozenPainterBase(BaseModel):
             if not use_halt_head:
                 logits = None
                 step_count = 0
+                z_H0_prev = z_H[:, 0].clone()
                 for _ in range(n_sup):
                     logits, z_H, z_L = self.thinker.reasoning_step(
                         enc_emb, z_H, z_L, puzzle_ids, timesteps=sample.timesteps,
@@ -401,7 +402,8 @@ class ThinkerFrozenPainterBase(BaseModel):
                     )
                     step_count += 1
                     if halt_preds_out is not None:
-                        halt_preds_out.append(self.thinker.predict_halt_value(z_H, sample.timesteps).detach())
+                        halt_preds_out.append(self.thinker.predict_halt_value(z_H, z_H0_prev, sample.timesteps).detach())
+                    z_H0_prev = z_H[:, 0].detach().clone()
                     if logits_out is not None:
                         logits_out.append(logits.detach())
                     if zH_out is not None:
@@ -416,6 +418,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                 active_idx = torch.arange(bsz, device=device)
                 cur_enc_emb, cur_puzzle_ids, cur_timesteps = enc_emb, puzzle_ids, sample.timesteps
                 cur_z_H, cur_z_L, cur_logits = z_H, z_L, None
+                cur_z_H0_prev = z_H[:, 0].clone()
                 # running_z_H: (bsz, ...) "current best known z_H per sample"
                 # snapshot for zH_out, accounting for early halting — a
                 # halted sample's slot stops updating (frozen at its last
@@ -443,7 +446,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                         running_z_H[active_idx] = new_z_H
                         zH_out.append(running_z_H.detach().clone())
 
-                    pred = self.thinker.predict_halt_value(new_z_H, cur_timesteps)
+                    pred = self.thinker.predict_halt_value(new_z_H, cur_z_H0_prev, cur_timesteps)
                     if halt_preds_out is not None:
                         halt_preds_out.append(pred.detach())
                     halt_now = pred <= halt_threshold
@@ -462,6 +465,7 @@ class ThinkerFrozenPainterBase(BaseModel):
                     cur_puzzle_ids = cur_puzzle_ids[keep] if cur_puzzle_ids is not None else None
                     cur_timesteps = cur_timesteps[keep] if cur_timesteps is not None else None
                     cur_z_H, cur_z_L, cur_logits = new_z_H[keep], new_z_L[keep], new_logits[keep]
+                    cur_z_H0_prev = new_z_H[keep][:, 0]
 
                 if active_idx.numel() > 0:
                     # n_sup exhausted with some samples never individually
@@ -636,8 +640,14 @@ class ThinkerFrozenPainterBase(BaseModel):
         # per reasoning step, per micro-batch. Only the pooled token is kept
         # (not the full z_H), and everything is detached: this rides on
         # tensors already produced by the main loop, no extra graph/compute.
+        # z_H0_init: the pre-reasoning pooled state, captured before the loop
+        # below ever calls reasoning_step — train_halt_head's "previous
+        # state" comparison point for step 0 (see its docstring).
         use_halt_head = getattr(self.thinker, "with_halt_head", False)
-        halt_histories = [{"z_H0": [], "loss": []} for _ in mb_data] if use_halt_head else None
+        halt_histories = (
+            [{"z_H0": [], "loss": [], "z_H0_init": d["z_H"][:, 0].detach().clone()} for d in mb_data]
+            if use_halt_head else None
+        )
 
         for _ in range(self.n_sup):
             for i, d in enumerate(mb_data):
@@ -672,7 +682,7 @@ class ThinkerFrozenPainterBase(BaseModel):
 
         if halt_histories is not None:
             halt_loss_sum = sum(
-                self.thinker.train_halt_head(h["z_H0"], h["loss"]) for h in halt_histories
+                self.thinker.train_halt_head(h["z_H0"], h["loss"], h["z_H0_init"]) for h in halt_histories
             )
             losses["halt_head_loss"] = halt_loss_sum / K
 
@@ -858,6 +868,17 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
 
     halt_lookahead: False halts a sample the instant the head says so (the
     schedule before the one-step lookahead above was added).
+
+    The halt head itself reads a PAIR of pooled z_H[:, 0] tokens — this
+    step's and the one right before it (slot["z_prev"]/slot["z_init"]
+    above) — not a single snapshot; see SpatialTRM.predict_halt_value /
+    _halt_feat. A bare single-token linear probe was found to extrapolate a
+    frozen early-step prior past a few steps deep into a trajectory
+    (predicting ~85-98% "keep going" regardless of timestep, when the true
+    rate was 0-17%), which is what actually drove samples to burn their
+    full n_sup budget regardless of whether continuing was still helping —
+    comparing consecutive states instead recovers correct calibration with
+    no architecture change elsewhere.
     """
 
     def __init__(
@@ -910,19 +931,29 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 sample = self.painter._prepare_training_sample(mb, device)
                 bsz = sample.x_noisy.shape[0]
                 z_H, z_L = self.get_initial_states(bsz)
+                z_H, z_L = z_H.to(device), z_L.to(device)
+                z_H0_init = z_H[:, 0].detach().clone()
                 self._act_carry.append({
                     "sample": sample,
-                    "z_H": z_H.to(device),
-                    "z_L": z_L.to(device),
+                    "z_H": z_H,
+                    "z_L": z_L,
                     "steps": torch.zeros(bsz, dtype=torch.long, device=device),
                     "halted": None,
                     "pending_halt": torch.zeros(bsz, dtype=torch.bool, device=device),
+                    # z_prev: running "state before the most recent reasoning
+                    # step" — the halt head's comparison point for its live
+                    # decision (see SpatialTRM.predict_halt_value). z_init:
+                    # fixed for the whole episode — supplies the leading
+                    # "previous state" once the episode completes and its
+                    # history is handed to train_halt_head_ragged.
+                    "z_prev": z_H0_init.clone(),
+                    "z_init": z_H0_init.clone(),
                     "hist_z": [[] for _ in range(bsz)],
                     "hist_loss": [[] for _ in range(bsz)],
                 })
 
         total_losses: dict[str, float] = {}
-        completed_histories: list[tuple[torch.Tensor, torch.Tensor]] = []
+        completed_histories: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
         for i, slot in enumerate(self._act_carry):
             prev_halted = slot["halted"]
@@ -940,6 +971,10 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 slot["pending_halt"] = torch.where(
                     prev_halted, torch.zeros_like(slot["pending_halt"]), slot["pending_halt"]
                 )
+                m2 = prev_halted.view(-1, 1)
+                fresh_z_H0 = fresh_z_H[:, 0].detach()
+                slot["z_prev"] = torch.where(m2, fresh_z_H0, slot["z_prev"])
+                slot["z_init"] = torch.where(m2, fresh_z_H0, slot["z_init"])
                 for j in prev_halted.nonzero(as_tuple=True)[0].tolist():
                     slot["hist_z"][j] = []
                     slot["hist_loss"][j] = []
@@ -962,7 +997,8 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
                 slot["hist_z"][j].append(z_H0[j])
                 slot["hist_loss"][j].append(loss_detached[j])
 
-            pred = self.thinker.predict_halt_value(slot["z_H"])
+            pred = self.thinker.predict_halt_value(slot["z_H"], slot["z_prev"])
+            slot["z_prev"] = z_H0
             is_last_step = slot["steps"] >= n_sup
             head_wants_halt = pred <= self.halt_threshold
 
@@ -995,7 +1031,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             for j in halted.nonzero(as_tuple=True)[0].tolist():
                 z_seq = torch.stack(slot["hist_z"][j], dim=0)
                 l_seq = torch.stack(slot["hist_loss"][j], dim=0)
-                completed_histories.append((z_seq, l_seq))
+                completed_histories.append((slot["z_init"][j], z_seq, l_seq))
 
         enc_params = self.get_encoder_params()
         all_reduce_grads(self.get_thinker_params() + enc_params + self.get_painter_params())

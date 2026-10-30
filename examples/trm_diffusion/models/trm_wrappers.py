@@ -112,19 +112,32 @@ class SpatialTRM(BaseModel):
             # once per n_sup iteration like everything else.
             #
             # halt_timestep_emb: concatenate a small sinusoidal embedding of
-            # the current diffusion timestep to z_H[:, 0] before the head.
-            # z_H is otherwise the head's only input, and in configs where
-            # neither the thinker (with_timestep_emb) nor the condition
-            # encoder embeds the timestep explicitly (e.g. mnist_thinker_v1
-            # with the x0-hint's own with_timestep_emb disabled), the head
-            # has to infer "how noisy is this" purely from whatever leaks
-            # through the CNN-encoded tokens — see
+            # the current diffusion timestep to the head's input before the
+            # head. In configs where neither the thinker (with_timestep_emb)
+            # nor the condition encoder embeds the timestep explicitly (e.g.
+            # mnist_thinker_v1 with the x0-hint's own with_timestep_emb
+            # disabled), the head has to infer "how noisy is this" purely
+            # from whatever leaks through the CNN-encoded tokens — see
             # experiments/diag_halt_target_by_timestep.py, which measured
             # exactly this gap. Own dedicated embedding (not the thinker's
             # with_timestep_emb one) so this works without touching the
             # already-trained, frozen base checkpoint.
+            #
+            # halt_in_dim is 2*hidden_size, not hidden_size: the head reads a
+            # PAIR of pooled z_H[:, 0] tokens (this step's and the one right
+            # before it — see _halt_feat), not a single snapshot. A single
+            # snapshot turned out to carry almost no usable signal a few
+            # steps deep into a trajectory: offline comparison showed the
+            # deployed single-token head predicting ~85-98% "keep going" at
+            # every depth-4+ step regardless of timestep, when the true rate
+            # was 0-17% there — it was extrapolating a frozen early-step
+            # prior instead of reading the state. A plain linear probe on
+            # the CONSECUTIVE-STATE PAIR recovered correct calibration at
+            # those depths with no architecture change elsewhere (see
+            # conversation / commit history for the offline head comparison
+            # that motivated this).
             self.halt_uses_timestep = halt_timestep_emb
-            halt_in_dim = hidden_size
+            halt_in_dim = hidden_size * 2
             halt_params = []
             if halt_timestep_emb:
                 self.halt_timestep_mlp = TimestepMLP(sin_dim=halt_timestep_emb_dim, out_dim=halt_timestep_emb_dim)
@@ -307,12 +320,20 @@ class SpatialTRM(BaseModel):
     #    targets don't have — see train_halt_head for why this is a
     #    classification target rather than a regression one) ───────────────
 
-    def _halt_feat(self, z_H0: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Builds the halt head's input from a pooled z_H[:, 0] token, adding
-        a timestep embedding when halt_uses_timestep=True. z_H0: (..., hidden_size).
-        timesteps, when needed, must broadcast to z_H0's leading dims (see
-        train_halt_head's own broadcast for the (n_sup-1, B) case)."""
-        feat = z_H0.float()
+    def _halt_feat(
+        self, z_H0: torch.Tensor, z_H0_prev: torch.Tensor, timesteps: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Builds the halt head's input by concatenating the current step's
+        pooled z_H[:, 0] token with the PREVIOUS one — z_H0/z_H0_prev:
+        (..., hidden_size) each, same leading dims — adding a timestep
+        embedding when halt_uses_timestep=True. timesteps, when needed, must
+        broadcast to z_H0's leading dims (see train_halt_head's own
+        broadcast for the (n_sup-1, B) case).
+
+        Comparing consecutive states (rather than reading one in isolation)
+        is what actually lets the head tell "converged" from "stuck, no
+        longer moving" apart — see __init__'s halt_in_dim comment."""
+        feat = torch.cat([z_H0_prev.float(), z_H0.float()], dim=-1)
         if self.halt_uses_timestep:
             if timesteps is None:
                 raise RuntimeError(
@@ -323,13 +344,24 @@ class SpatialTRM(BaseModel):
             feat = torch.cat([feat, temb], dim=-1)
         return feat
 
-    def predict_halt_value(self, z_H: torch.Tensor, timesteps: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def predict_halt_value(
+        self, z_H: torch.Tensor, z_H0_prev: torch.Tensor, timesteps: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Logit of P(continuing past the reasoning step that produced this
-        z_H would still reduce loss) (reads the same pooled token the
-        vendored q_head uses). Below/at zero → more likely than not that
+        z_H would still reduce loss). Reads a PAIR of pooled z_H[:, 0]
+        tokens — this step's and the one right before it, not a single
+        snapshot (see _halt_feat). Below/at zero → more likely than not that
         continuing doesn't help, safe to halt; call sites decide the actual
         threshold (0.0 = the 50% confidence boundary, matching this head's
         zero-init "no opinion yet" prior — see train_halt_head).
+
+        z_H0_prev: (B, hidden_size) pooled z_H[:, 0] from the reasoning step
+        immediately before this one — or, for a sample's very first
+        reasoning step, its PRE-REASONING initial z_H[:, 0] (this model's
+        own get_initial_states() output, before any reasoning_step call) —
+        so every step, including the first, has a well-defined comparison
+        point and no special-casing is needed. Callers own this bookkeeping
+        (see ThinkerFrozenPainterACT.train_step's slot["z_prev"]).
 
         timesteps: (B,) current diffusion timestep, required when this head
         was built with halt_timestep_emb=True (see __init__), ignored
@@ -337,12 +369,13 @@ class SpatialTRM(BaseModel):
         """
         if not self.with_halt_head:
             raise RuntimeError("predict_halt_value requires with_halt_head=True at construction.")
-        return self.halt_head(self._halt_feat(z_H[:, 0], timesteps)).squeeze(-1)
+        return self.halt_head(self._halt_feat(z_H[:, 0], z_H0_prev, timesteps)).squeeze(-1)
 
     def train_halt_head(
         self,
         z_H0_list: list[torch.Tensor],
         loss_list: list[torch.Tensor],
+        z_H0_init: torch.Tensor,
         timesteps: Optional[torch.Tensor] = None,
         label_margin: float = 0.0,
     ) -> float:
@@ -353,6 +386,11 @@ class SpatialTRM(BaseModel):
         z_H[:, 0] right after step t, loss_list[t] is that step's per-sample
         diffusion loss (both computed by the caller, e.g.
         ThinkerFrozenPainterBase.train_step).
+
+        z_H0_init: (B, hidden_size) pooled z_H[:, 0] from BEFORE the first
+        reasoning step (get_initial_states()'s own output) — the "previous
+        state" comparison point for step 0's pair, same convention as
+        predict_halt_value (see its docstring).
 
         Label for step t is binary: does continuing past it ever still
         reduce loss, i.e. loss_t - min(loss_{t+1 .. n_sup-1}) > label_margin?
@@ -401,10 +439,16 @@ class SpatialTRM(BaseModel):
         # z_H0_list entries come straight from the TRM's forward_dtype (bfloat16
         # in every real config) — halt_head is a plain fp32 Linear, same as
         # predict_halt_value's own cast.
-        z_H0_stack = torch.stack(z_H0_list[:-1], dim=0).float()  # (n_sup-1, B, hidden_size)
+        z_H0_curr_stack = torch.stack(z_H0_list[:-1], dim=0).float()  # (n_sup-1, B, hidden_size)
+        # prev[0] = pre-reasoning initial state; prev[t] = z_H0_list[t-1] for t>0.
+        z_H0_prev_stack = torch.stack([z_H0_init] + z_H0_list[:-2], dim=0).float()  # (n_sup-1, B, hidden_size)
         if self.halt_uses_timestep and timesteps is not None:
-            timesteps = timesteps.unsqueeze(0).expand(z_H0_stack.shape[0], -1).reshape(-1)
-        feat = self._halt_feat(z_H0_stack.reshape(-1, z_H0_stack.shape[-1]), timesteps)
+            timesteps = timesteps.unsqueeze(0).expand(z_H0_curr_stack.shape[0], -1).reshape(-1)
+        feat = self._halt_feat(
+            z_H0_curr_stack.reshape(-1, z_H0_curr_stack.shape[-1]),
+            z_H0_prev_stack.reshape(-1, z_H0_prev_stack.shape[-1]),
+            timesteps,
+        )
         preds = self.halt_head(feat).squeeze(-1)
 
         loss = F.binary_cross_entropy_with_logits(preds, labels)
@@ -424,7 +468,9 @@ class SpatialTRM(BaseModel):
         return loss_seq[:-1] - suffix_min[1:]
 
     def train_halt_head_ragged(
-        self, histories: list[tuple[torch.Tensor, torch.Tensor]], label_margin: Optional[float] = None
+        self,
+        histories: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        label_margin: Optional[float] = None,
     ) -> float:
         """Like train_halt_head, but for a set of INDEPENDENT per-sample
         trajectories of possibly different lengths — used by
@@ -432,11 +478,14 @@ class SpatialTRM(BaseModel):
         samples halt (and so flush their own history) at different calls,
         rather than one shared n_sup-length trajectory for the whole batch.
 
-        histories: list of (z_H0_seq, loss_seq) pairs, one per sample that
-        just halted — (L, hidden_size) / (L,) tensors, already detached, for
-        THAT sample's own trajectory since its last reset. Histories with
-        L < 2 are skipped (no future to compare against, same as
-        train_halt_head).
+        histories: list of (z_H0_init, z_H0_seq, loss_seq) tuples, one per
+        sample that just halted — z_H0_init: (hidden_size,) pooled z_H[:, 0]
+        from BEFORE that sample's first reasoning step since its last reset
+        (same "previous state" convention as predict_halt_value/
+        train_halt_head); z_H0_seq/loss_seq: (L, hidden_size)/(L,), already
+        detached, for THAT sample's own trajectory since its last reset.
+        Histories with L < 2 are skipped (no future to compare against, same
+        as train_halt_head).
 
         label_margin: None (the default) keeps the original behavior —
         regress the raw loss_t - min(loss_{t+1:}) magnitude via MSE, pooled
@@ -465,12 +514,15 @@ class SpatialTRM(BaseModel):
                 "single-fixed-timestep trajectory) — only halt_timestep_emb=False is supported here."
             )
         inputs, targets = [], []
-        for z_H0_seq, loss_seq in histories:
+        for z_H0_init, z_H0_seq, loss_seq in histories:
             if loss_seq.shape[0] < 2:
                 continue
             raw = self._future_min_targets(loss_seq)
             targets.append((raw > label_margin).float() if label_margin is not None else raw)
-            inputs.append(z_H0_seq[:-1].float())
+            curr = z_H0_seq[:-1].float()
+            # prev[0] = pre-reasoning initial state; prev[t] = z_H0_seq[t-1] for t>0.
+            prev = torch.cat([z_H0_init.unsqueeze(0), z_H0_seq[:-2]], dim=0).float()
+            inputs.append(self._halt_feat(curr, prev))
 
         self.halt_optimizer.zero_grad()
         loss = None
@@ -929,6 +981,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         if not use_halt_head:
             logits = None
             step_count = 0
+            z_H0_prev = z_H[:, 0].clone()
             for _ in range(n_sup):
                 logits, z_H, z_L = self.reasoning_step(
                     tokens, z_H, z_L, timesteps=sample.timesteps, H_cycles=H_cycles, L_cycles=L_cycles
@@ -941,8 +994,10 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                 if shuffle_state:
                     perm = torch.randperm(bsz, device=device)
                     z_H, z_L = z_H[perm], z_L[perm]
+                    z_H0_prev = z_H0_prev[perm]
                 if halt_preds_out is not None:
-                    halt_preds_out.append(self.predict_halt_value(z_H, sample.timesteps).detach())
+                    halt_preds_out.append(self.predict_halt_value(z_H, z_H0_prev, sample.timesteps).detach())
+                z_H0_prev = z_H[:, 0].detach().clone()
             if steps_used is not None:
                 steps_used.append(step_count)
         else:
@@ -951,6 +1006,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
             active_idx = torch.arange(bsz, device=device)
             cur_tokens, cur_timesteps = tokens, sample.timesteps
             cur_z_H, cur_z_L, cur_logits = z_H, z_L, None
+            cur_z_H0_prev = z_H[:, 0].clone()
             # running_z_H: (bsz, ...) "current best known z_H per sample"
             # snapshot for zH_out, accounting for early halting — see
             # ThinkerFrozenPainterBase.forward_with_carry's identical logic.
@@ -973,7 +1029,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                     running_z_H[active_idx] = new_z_H
                     zH_out.append(running_z_H.detach().clone())
 
-                pred = self.predict_halt_value(new_z_H, cur_timesteps)
+                pred = self.predict_halt_value(new_z_H, cur_z_H0_prev, cur_timesteps)
                 if halt_preds_out is not None:
                     halt_preds_out.append(pred.detach())
                 halt_now = pred <= halt_threshold
@@ -991,6 +1047,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
                 cur_tokens = cur_tokens[keep]
                 cur_timesteps = cur_timesteps[keep] if cur_timesteps is not None else None
                 cur_z_H, cur_z_L, cur_logits = new_z_H[keep], new_z_L[keep], new_logits[keep]
+                cur_z_H0_prev = new_z_H[keep][:, 0]
 
             if active_idx.numel() > 0:
                 # n_sup exhausted with some samples never individually
