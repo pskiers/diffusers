@@ -85,6 +85,11 @@ class ThinkerFrozenPainterBase(BaseModel):
     train_cfg.steer_grad_t_min: if set, samples with timestep below it give no gradient
         to the thinker through the painter (steering stays on and the translator still
         trains on them).
+
+    train_cfg.steer_grad_unweighted: the thinker's gradient through the painter undoes
+        sample.loss_weight, so only the translator trains on the weighted loss
+        (PainterResidualTranslator only: the rescale sits after its bridge, whose
+        BatchNorm couples samples).
     """
 
     token_input: bool = False
@@ -225,6 +230,8 @@ class ThinkerFrozenPainterBase(BaseModel):
         )
         with ctx:
             translator_extra = {k: getattr(sample, k) for k in self.thinker_painter_translator.condition_keys}
+            if self.training and self.train_cfg.steer_grad_unweighted and sample.loss_weight is not None:
+                translator_extra["thinker_grad_scale"] = 1.0 / sample.loss_weight.float()
             steering = self.thinker_painter_translator(TRMOutput(logits=logits), **translator_extra)
             return self.painter(painter_sample, steering).pred
 
@@ -848,6 +855,9 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
     mostly measured floating-point jitter, not real signal). The right
     value is dataset/loss-scale dependent, so this has no validated default
     here — calibrate it the same way for whatever task uses this class.
+
+    halt_lookahead: False halts a sample the instant the head says so (the
+    schedule before the one-step lookahead above was added).
     """
 
     def __init__(
@@ -857,6 +867,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         halt_exploration_prob: float = 0.1,
         continue_bias_init: float = 1.0,
         halt_label_margin: Optional[float] = None,
+        halt_lookahead: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -865,6 +876,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         self.halt_threshold = halt_threshold
         self.halt_exploration_prob = halt_exploration_prob
         self.halt_label_margin = halt_label_margin
+        self.halt_lookahead = halt_lookahead
         with torch.no_grad():
             nn.init.constant_(self.thinker.halt_head.bias, continue_bias_init)
         self._act_carry: Optional[list[dict]] = None
@@ -963,7 +975,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
             # real (did one more step help, from THIS state) label every
             # time, instead of only the ones lucky enough to be hit by
             # halt_exploration_prob below — see the class docstring.
-            halted = is_last_step | slot["pending_halt"]
+            halted = is_last_step | (slot["pending_halt"] if self.halt_lookahead else head_wants_halt)
 
             if self.halt_exploration_prob > 0 and n_sup > 1:
                 bsz = halted.shape[0]
@@ -977,7 +989,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
 
             # A fresh head-halt decision becomes the next call's lookahead
             # probe, for samples not already halting this step.
-            slot["pending_halt"] = head_wants_halt & ~halted
+            slot["pending_halt"] = head_wants_halt & ~halted & self.halt_lookahead
             slot["halted"] = halted
 
             for j in halted.nonzero(as_tuple=True)[0].tolist():

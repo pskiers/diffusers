@@ -208,6 +208,14 @@ class SpatialTRM(BaseModel):
                 optim = torch.optim.SGD(
                     params, lr=0, momentum=self.optim_cfg.beta1, weight_decay=self.optim_cfg.weight_decay
                 )
+            elif kind == "adamw":
+                optim = torch.optim.AdamW(
+                    params,
+                    lr=0,  # set per-step by scheduler
+                    weight_decay=self.optim_cfg.weight_decay,
+                    betas=(self.optim_cfg.beta1, self.optim_cfg.beta2),
+                    eps=getattr(self.optim_cfg, "eps", 1e-8),
+                )
             elif kind == "adam_atan2":
                 optim = AdamATan2(
                     params,

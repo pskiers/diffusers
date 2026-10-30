@@ -448,6 +448,11 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     well through any subset of blocks can't rely on amplifying a faint cue through
     all of them, so — as input_noise_std — the painter's gradient keeps asking for
     a clearer one.
+
+    forward's thinker_grad_scale: (B,) per-sample factors on the gradient
+    leaving the bridge's output (i.e. into the bridge and the thinker), with the
+    forward unchanged; downstream of that point everything is per sample, so e.g.
+    1 / loss_weight gives the thinker the unweighted loss's gradient exactly.
     """
 
     def __init__(
@@ -492,9 +497,13 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     def condition_keys(self) -> list[str]:
         return ["timesteps"] if self.with_timestep_emb else []
 
-    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> BlockResidualSteering:
+    def forward(
+        self, trm_output: TRMOutput, timesteps=None, thinker_grad_scale=None, **_
+    ) -> BlockResidualSteering:
         g = self._grid
         tokens = self._bridge_tokens(trm_output.logits)
+        if thinker_grad_scale is not None and tokens.requires_grad:
+            tokens = _ScalePerSampleGrad.apply(tokens, thinker_grad_scale)
         if self.training and self.input_noise_std > 0:
             tokens = tokens + self.input_noise_std * torch.randn_like(tokens)
         if self.in_proj is not None:
@@ -518,6 +527,20 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
             if cond_residuals is not None:
                 cond_residuals = [r * keep[:, i] for i, r in enumerate(cond_residuals)]
         return BlockResidualSteering(block_residuals=residuals, cond_block_residuals=cond_residuals)
+
+
+class _ScalePerSampleGrad(torch.autograd.Function):
+    """Identity forward; backward multiplies each sample's gradient (dim 0) by scale."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.save_for_backward(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (scale,) = ctx.saved_tensors
+        return grad * scale.view(-1, *[1] * (grad.dim() - 1)).to(grad.dtype), None
 
 
 class PainterAttentionTranslator(ThinkerPainterTranslatorBase):

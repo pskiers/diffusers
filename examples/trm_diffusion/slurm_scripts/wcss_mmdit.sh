@@ -70,6 +70,11 @@
 #                    normalizing bridge, so a faint cue in the thinker output doesn't suffice; e.g. _tn0.3, _tn1),
 #           _bd<keep> (training-only block dropout: each steered block's residual kept with probability <keep>,
 #                    per sample, unscaled; all blocks steer in eval; e.g. _bd0.5)
+#           _vw (thinker objective: the x0 MSE weighted by SNR(t) + 1, v-prediction-like; needs a _ddpm/_all painter),
+#           _vws (as _vw for the translator only: the thinker's gradient stays the plain x0 MSE's),
+#           _adamw (thinker optimizer AdamW with eps 1e-12 instead of AdamATan2),
+#           _nhh (the halt head of mnist_painter_halt_newhalthead_thr_1: BCE labels with margin 1e-4, threshold -1,
+#                 halting the step the head says so; needs _act)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -213,6 +218,11 @@ case $RUN in
         bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 2 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;  # batch 384 x 2k
         tn[0-9]*) STAGE2="$STAGE2 translator.input_noise_std=${tok#tn}"; TV="${TV}_$tok" ;;  # noise on the translator input
         bd[0-9]*) STAGE2="$STAGE2 translator.block_keep_prob=${tok#bd}"; TV="${TV}_$tok" ;;  # per-sample block dropout
+        vw) STAGE2="$STAGE2 painter.loss_weighting=v"; TV="${TV}_$tok" ;;
+        vws) STAGE2="$STAGE2 painter.loss_weighting=v +train.steer_grad_unweighted=true"; TV="${TV}_$tok" ;;
+        adamw) STAGE2="$STAGE2 +thinker.optim_cfg.optimizer=adamw +thinker.optim_cfg.eps=1e-12"; TV="${TV}_$tok" ;;
+        nhh) STAGE2="$STAGE2 +train.act_halt_label_margin=1e-4 train.act_halt_threshold=-1 +train.act_halt_lookahead=false"
+             TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done

@@ -84,6 +84,10 @@ class TrainConfig:
     # no gradient to the thinker through the painter (None = off); steering and
     # the translator's training are unchanged.
     steer_grad_t_min: Optional[float] = None
+    # Thinker-frozen-painter models only: the thinker's gradient through the painter
+    # undoes the per-sample loss weight (e.g. painter.loss_weighting=v), so the
+    # translator trains on the weighted loss and the thinker on the plain one.
+    steer_grad_unweighted: bool = False
     # Thinker-frozen-painter models only: load the translator from this file (a
     # translator state_dict, e.g. one trained on the true solution) and, with
     # freeze_translator, keep it fixed so only the thinker side trains.
@@ -133,9 +137,11 @@ class ThinkerOptimConfig:
     warmup_steps: int
     lr_min_ratio: float = 0.0
     puzzle_emb: Optional[PuzzleEmbOptimConfig] = None
-    # "adam_atan2" (default) or "sgd" (momentum = beta1; weight_decay is then the
+    # "adam_atan2" (default), "adamw", or "sgd" (momentum = beta1; weight_decay is then the
     # coupled L2 coefficient: per-step decay ~ lr x weight_decay / (1 - beta1))
     optimizer: str = "adam_atan2"
+    # adamw only. Thinker sqrt(v) can sit near 1e-8 (true-mean loss), where this damps the step
+    eps: float = 1e-8
 
 
 @dataclass

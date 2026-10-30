@@ -117,6 +117,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         grad_clip=float(tr.get("grad_clip", 1.0)),
         steer_grad_clip=float(tr["steer_grad_clip"]) if tr.get("steer_grad_clip") is not None else None,
         steer_grad_t_min=float(tr["steer_grad_t_min"]) if tr.get("steer_grad_t_min") is not None else None,
+        steer_grad_unweighted=bool(tr.get("steer_grad_unweighted", False)),
         translator_checkpoint=tr.get("translator_checkpoint"),
         freeze_translator=bool(tr.get("freeze_translator", False)),
         thinker_checkpoint=tr.get("thinker_checkpoint"),
@@ -222,6 +223,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             halt_label_margin=(
                 float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
             ),
+            halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
         )
 
     if mode == "action_thinker_base":

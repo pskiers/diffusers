@@ -533,7 +533,10 @@ class MMDiTPainter(PainterBase, BaseModel):
         loss_weighting: "velocity" (the velocity MSE, MiniT2I's objective) or
             "x0" (the x0 MSE: the velocity MSE weighted per sample by
             max(1 - t, velocity_clamp)^2, via DataSample.loss_weight). Only the
-            loss changes; the prediction and sampling stay the same.
+            loss changes; the prediction and sampling stay the same. For
+            objective "ddpm": "velocity" = the plain x0 MSE, "v" = the x0 MSE
+            weighted by SNR(t) + 1 (v-prediction-like), normalized to mean 1
+            over the training timesteps.
         freeze: freeze every parameter (the thinker stage).
         checkpoint: train_trm.py checkpoint of this painter to load (stage 1's).
     """
@@ -598,13 +601,15 @@ class MMDiTPainter(PainterBase, BaseModel):
         self.t_logit_mean = t_logit_mean
         self.t_logit_std = t_logit_std
         self.label_drop_rate = label_drop_rate
-        if loss_weighting not in ("velocity", "x0"):
+        if loss_weighting not in ("velocity", "x0", "v"):
             raise ValueError(f"loss_weighting must be 'velocity' or 'x0', got {loss_weighting!r}")
         self.loss_weighting = loss_weighting
         if objective not in ("flow", "ddpm"):
             raise ValueError(f"objective must be 'flow' or 'ddpm', got {objective!r}")
-        if objective == "ddpm" and (getattr(scheduler.config, "prediction_type", None) != "sample" or loss_weighting != "velocity"):
-            raise ValueError("objective 'ddpm' needs a DDPM scheduler with prediction_type 'sample' (and no loss_weighting)")
+        if objective == "ddpm" and (getattr(scheduler.config, "prediction_type", None) != "sample" or loss_weighting == "x0"):
+            raise ValueError("objective 'ddpm' needs a DDPM scheduler with prediction_type 'sample' (and loss_weighting 'velocity' or 'v')")
+        if objective == "flow" and loss_weighting == "v":
+            raise ValueError("loss_weighting 'v' needs objective 'ddpm'")
         self.objective = objective
         self.time_cond_scale = time_cond_scale
         if train_t_max is not None and objective != "ddpm":
@@ -799,6 +804,10 @@ class MMDiTPainter(PainterBase, BaseModel):
             t = torch.randint(0, t_end, (b,), device=device, dtype=torch.long)
             x_t = self.scheduler.add_noise(images, torch.randn_like(images), t)
             target, weight = images, None
+            if self.loss_weighting == "v":
+                abar = self.scheduler.alphas_cumprod.to(device)[:t_end].float()
+                w = 1.0 / (1.0 - abar)  # SNR + 1
+                weight = w[t] / w.mean()
         else:
             t = torch.sigmoid(torch.randn(b, device=device) * self.t_logit_std + self.t_logit_mean).clamp(1e-5, 1 - 1e-5)
             t4 = t[:, None, None, None]
