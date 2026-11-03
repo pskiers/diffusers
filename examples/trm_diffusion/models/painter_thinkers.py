@@ -869,6 +869,14 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
     halt_lookahead: False halts a sample the instant the head says so (the
     schedule before the one-step lookahead above was added).
 
+    halt_label_clean: True labels the halt head from each step's loss with the
+    translator's training-only regularizers (input_noise_std, block_keep_prob)
+    off, as at eval, via one extra no-grad translator + painter pass per step.
+    They redraw their noise / dropped blocks every reasoning step, so the
+    training-pass loss jitters from step to step and "continuing still lowers
+    the loss" fires on that jitter alone (experiments/diagnostics/
+    halt_label_rates.py). The thinker's own training is unchanged.
+
     The halt head itself reads a PAIR of pooled z_H[:, 0] tokens — this
     step's and the one right before it (slot["z_prev"]/slot["z_init"]
     above) — not a single snapshot; see SpatialTRM.predict_halt_value /
@@ -889,15 +897,19 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         continue_bias_init: float = 1.0,
         halt_label_margin: Optional[float] = None,
         halt_lookahead: bool = True,
+        halt_label_clean: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         if not getattr(self.thinker, "with_halt_head", False):
             raise ValueError("ThinkerFrozenPainterACT requires thinker.with_halt_head=True.")
+        if halt_label_clean and not hasattr(self.thinker_painter_translator, "input_noise_std"):
+            raise ValueError("halt_label_clean needs a translator with input_noise_std / block_keep_prob")
         self.halt_threshold = halt_threshold
         self.halt_exploration_prob = halt_exploration_prob
         self.halt_label_margin = halt_label_margin
         self.halt_lookahead = halt_lookahead
+        self.halt_label_clean = halt_label_clean
         with torch.no_grad():
             nn.init.constant_(self.thinker.halt_head.bias, continue_bias_init)
         self._act_carry: Optional[list[dict]] = None
@@ -911,6 +923,25 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         mean the real per-trajectory reasoning cap for train_step's own use
         and for inherited inference methods (forward_with_carry)."""
         return 1
+
+    @torch.no_grad()
+    def _clean_step_loss(self, sample: DataSample, logits: torch.Tensor) -> torch.Tensor:
+        """(B,) per-sample loss of this step's thinker logits with the translator's
+        training-only regularizers off (see halt_label_clean). The translator's
+        buffers (its bridge BatchNorm's running statistics) are restored, so the
+        extra pass leaves training exactly as without it."""
+        tr = self.thinker_painter_translator
+        saved = (tr.input_noise_std, tr.block_keep_prob)
+        buffers = {k: v.clone() for k, v in tr.named_buffers()}
+        tr.input_noise_std, tr.block_keep_prob = 0.0, 1.0
+        try:
+            scale_fn = getattr(self.loss_fn, "scale_logits_for_painter", None)
+            pred = self.run_painter(sample, scale_fn(logits) if scale_fn is not None else logits)
+        finally:
+            tr.input_noise_std, tr.block_keep_prob = saved
+            for k, v in tr.named_buffers():
+                v.copy_(buffers[k])
+        return (pred.float() - sample.target.float()).pow(2).flatten(1).mean(1)
 
     def train_step(
         self,
@@ -990,7 +1021,10 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
 
             slot["steps"] = slot["steps"] + 1
 
-            per_sample_loss = (noise_pred.float() - slot["sample"].target.float()).pow(2).flatten(1).mean(1)
+            if self.halt_label_clean:
+                per_sample_loss = self._clean_step_loss(slot["sample"], logits)
+            else:
+                per_sample_loss = (noise_pred.float() - slot["sample"].target.float()).pow(2).flatten(1).mean(1)
             z_H0 = slot["z_H"][:, 0].detach()
             loss_detached = per_sample_loss.detach()
             for j in range(z_H0.shape[0]):

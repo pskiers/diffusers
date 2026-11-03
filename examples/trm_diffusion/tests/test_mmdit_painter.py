@@ -693,3 +693,43 @@ def test_act_training_with_new_painters(tmp_path, painter_exp, thinker_exp, extr
         losses, _, step = model.train_step([batch], acc, opts, None, step)
         assert all(torch.isfinite(torch.tensor(v)) for v in losses.values()), losses
     assert step == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the thinker's adam_atan2 optimizer is CUDA-only")
+def test_act_halt_label_clean(tmp_path):
+    """+train.act_halt_label_clean: the halt head's per-step losses come from the translator with its
+    input noise / block dropout off (so they equal the training-pass losses when those are off), while
+    the thinker, translator and encoder train exactly as without the flag."""
+    live = ["painter.net.zero_init_output=false"]  # an untrained zero-init output layer ignores all steering
+    painter = _build(["experiment=mnist_mmdit_painter", *TINY_PAINTER, "painter.net.patch_size=16", *live])
+    ckpt = tmp_path / "painter.pt"
+    torch.save({"model_state": painter.state_dict()}, ckpt)
+    dev = torch.device("cuda")
+    acc = SimpleNamespace(device=dev, backward=lambda l: l.backward(), clip_grad_norm_=torch.nn.utils.clip_grad_norm_)
+    batch = DataSample(**{k: v.clone() for k, v in vars(SUDOKU).items() if v is not None},
+                       solution_mask=torch.rand(2, 81, generator=torch.Generator().manual_seed(0)) < 0.3)
+
+    def one_step(clean, regularized):
+        torch.manual_seed(0)
+        model = _build(["experiment=mnist_thinker_mmdit_cnn", f"painter.checkpoint={ckpt}", "mode=thinker_act",
+                        "thinker.with_halt_head=true", "thinker.n_sup=3", *TINY_THINKER[:3], *TINY_THINKER[4:],
+                        *TINY_PAINTER, *P16, *live, f"+train.act_halt_label_clean={str(clean).lower()}",
+                        f"translator.input_noise_std={1.0 if regularized else 0.0}",
+                        f"translator.block_keep_prob={0.5 if regularized else 1.0}"]).to(dev)
+        with torch.no_grad():  # off the zero init, so the regularizers change the painter's output
+            for proj in model.thinker_painter_translator.projs:
+                proj[-1].weight.normal_(std=0.02)
+        model.train_step([batch], acc, model.build_optimizers(1, 100), None, 0)
+        hist = torch.stack([h[0] for h in model._act_carry[0]["hist_loss"]])
+        trained = {k: v for k, v in model.state_dict().items() if not k.startswith(("painter.", "thinker.halt_head"))}
+        return hist, trained
+
+    hist_c, trained_c = one_step(clean=True, regularized=True)
+    hist_n, trained_n = one_step(clean=False, regularized=True)
+    assert not torch.allclose(hist_c, hist_n)
+    assert trained_c.keys() == trained_n.keys()
+    assert all(torch.equal(trained_c[k], trained_n[k]) for k in trained_c), \
+        [k for k in trained_c if not torch.equal(trained_c[k], trained_n[k])]
+    hist_c0, _ = one_step(clean=True, regularized=False)
+    hist_n0, _ = one_step(clean=False, regularized=False)
+    assert torch.allclose(hist_c0, hist_n0, atol=1e-6)

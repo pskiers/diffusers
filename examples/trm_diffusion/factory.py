@@ -224,6 +224,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
                 float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
             ),
             halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
+            halt_label_clean=bool(cfg.train.get("act_halt_label_clean", False)),
         )
 
     if mode == "action_thinker_base":
