@@ -51,6 +51,11 @@ class MNISTSudokuDataset(Dataset):
         same_digit_images: if True, a given cell's condition render and its
                      solution render use the literal same MNIST bitmap
                      (same drawn instance), not just the same digit class.
+        condition_is_solution: if True, the condition image is the solved
+                     image itself (``images``), so a reader of the condition
+                     sees the answer; solution_mask still marks the puzzle's
+                     givens. For probing whether the painter's gradient can
+                     teach a steering code when the answer is trivial to read.
     """
 
     # Digit 1..9 → class index 0..8
@@ -66,8 +71,10 @@ class MNISTSudokuDataset(Dataset):
         seed: int = 0,
         num_givens: Optional[int] = None,
         same_digit_images: bool = False,
+        condition_is_solution: bool = False,
     ):
         super().__init__()
+        self.condition_is_solution = condition_is_solution
         self.cell_size  = cell_size
         self.mask_given = mask_given
         self.num_givens = num_givens
@@ -206,6 +213,8 @@ class MNISTSudokuDataset(Dataset):
             cond_grid = self._render_grid(inputs_tok, given_mask=blank, chosen_indices=chosen_indices)
         else:
             cond_grid = self._render_grid(inputs_tok, given_mask=None, chosen_indices=chosen_indices)
+        if self.condition_is_solution:
+            cond_grid = image_grid
 
         # ── Solution class labels (0-based) ──────────────────────────────────
         # Tokens 2-10 → class 0-8; blank/pad cells → -100 (ignored in loss).

@@ -78,6 +78,9 @@
 #           _phh (the pair-head recipe of mnist_painter_halt_pairhead_singlestage_nsup16, W&B y86cr9av: BCE labels
 #                 with margin 1e-4, continue bias -1, threshold 0, one-step lookahead; labels from the loss with
 #                 translator noise / block dropout off, train.act_halt_label_clean; needs _act)
+#           _seex0 (the thinker's condition image is the solved image instead of the puzzle, in training and eval:
+#                   can the painter's gradient teach a steering code when the answer is trivial to read?
+#                   painter must stay blinded, so not with _cond)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -228,6 +231,8 @@ case $RUN in
              TV="${TV}_$tok" ;;
         phh) STAGE2="$STAGE2 +train.act_halt_label_margin=1e-4 train.act_continue_bias_init=-1.0 +train.act_halt_label_clean=true"
              TV="${TV}_$tok" ;;
+        seex0) STAGE2="$STAGE2 +data.train_dataset.condition_is_solution=true +data.val_dataset.condition_is_solution=true"
+               TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done
@@ -243,6 +248,7 @@ case $RUN in
       [[ $NOCOND == 1 && $TV == *_hidden* ]] && {
         echo "$RUN: _hidden needs a painter with a condition stream (its hidden states carry the puzzle)" >&2; exit 1; }
       [[ $ISDDPM == 0 && $TV == *_tmax60* ]] && { echo "$RUN: _tmax60 needs a _ddpm or _all painter" >&2; exit 1; }
+      [[ $TV == *_seex0* && -z $BLIND ]] && { echo "$RUN: _seex0 with _cond would show the painter the answer" >&2; exit 1; }
       train $THINKER_IN $TRANS painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
         painter.steer_from_block=$STEER painter.steer_to_block=${STEER_TO:-null} \
         translator.num_blocks=$(( ${STEER_TO:-$DEPTH} - STEER )) translator.painter_grid=9 \
