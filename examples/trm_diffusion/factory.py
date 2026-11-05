@@ -190,6 +190,62 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             sampling_pipeline=sampling,
         )
 
+    if mode == "thinker_act_gram":
+        # thinker_act wiring with a GRAM stochastic thinker (thinker._target_=models.gram_thinkers.GramSpatialTRM):
+        # posterior on the solved image in training, prior otherwise; loss + train.gram_beta * KL. See
+        # models/gram_thinkers.py.
+        from models.gram_thinkers import GramThinkerFrozenPainterACT
+
+        return GramThinkerFrozenPainterACT(
+            thinker=cfg.thinker,
+            painter=cfg.painter,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            condition_encoder=cfg.condition_encoder,
+            loss=cfg.loss,
+            thinker_painter_translator=cfg.translator,
+            eval_callbacks=_eval_callback_cfgs(cfg),
+            scheduler=scheduler,
+            sampling_pipeline=sampling,
+            halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
+            halt_exploration_prob=float(cfg.train.get("act_halt_exploration_prob", 0.1)),
+            continue_bias_init=float(cfg.train.get("act_continue_bias_init", 1.0)),
+            halt_label_margin=(
+                float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
+            ),
+            halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
+            halt_label_clean=bool(cfg.train.get("act_halt_label_clean", False)),
+            gram_beta=float(cfg.train.gram_beta),
+            gram_kl_balance=float(cfg.train.get("gram_kl_balance", 0.8)),
+            gram_free_bits=float(cfg.train.get("gram_free_bits", 0.5)),
+        )
+
+    if mode == "thinker_act_distill":
+        # thinker_act wiring, trained only to reproduce a frozen teacher thinker's steering code
+        # (train.distill_teacher_checkpoint: a `_seex0` run's checkpoint) — see models/distill_thinkers.py.
+        from models.distill_thinkers import ThinkerFrozenPainterDistillACT
+
+        return ThinkerFrozenPainterDistillACT(
+            thinker=cfg.thinker,
+            painter=cfg.painter,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            condition_encoder=cfg.condition_encoder,
+            loss=cfg.loss,
+            thinker_painter_translator=cfg.translator,
+            eval_callbacks=_eval_callback_cfgs(cfg),
+            scheduler=scheduler,
+            sampling_pipeline=sampling,
+            halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
+            halt_exploration_prob=float(cfg.train.get("act_halt_exploration_prob", 0.1)),
+            continue_bias_init=float(cfg.train.get("act_continue_bias_init", 1.0)),
+            halt_label_margin=(
+                float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
+            ),
+            halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
+            teacher_checkpoint=str(cfg.train.distill_teacher_checkpoint),
+        )
+
     if mode == "thinker_act":
         # Same wiring as thinker_base, but ThinkerFrozenPainterACT replaces
         # the fixed-n_sup deep-supervision loop with real ACT-style

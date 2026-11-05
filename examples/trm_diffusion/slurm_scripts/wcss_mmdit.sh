@@ -81,6 +81,14 @@
 #           _seex0 (the thinker's condition image is the solved image instead of the puzzle, in training and eval:
 #                   can the painter's gradient teach a steering code when the answer is trivial to read?
 #                   painter must stay blinded, so not with _cond)
+#           _distA / _distB (mode=thinker_act_distill: trained only to reproduce a frozen `_seex0` teacher's
+#                   steering code through its frozen translator, no painter in training; A = the no-lever seex0
+#                   run @20k, B = the tn2 seex0 run @5k; needs _act before it and the p16_all painter)
+#           _gram<beta> (mode=thinker_act_gram: GRAM stochastic thinker, z_H = u + eps after every H-cycle; posterior
+#                   on the solved image in training, prior in eval (logged as prior samples and, suffix _pmean, prior
+#                   mean); loss + beta * KL with balancing 0.8 and 0.5 free nats per token; halt labels from the
+#                   prior-mean pass; needs _act before it). _gramch: one std per channel instead of per token
+#           _lr<x>, _wd<x> (thinker lr / weight decay; defaults 1e-4 / 0.3)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
@@ -112,6 +120,8 @@ source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin
 
 ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 export SCRATCH=$TMPDIR
+DIST_A=runs/mnist_thinker_mmdit_p16_all_fp32_act_seex0_chain_temb/checkpoint_step-20000.pt
+DIST_B=runs/mnist_thinker_mmdit_p16_all_fp32_act_tn2_seex0_chain_temb/checkpoint_step-5000.pt
 export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
 export TOKENIZERS_PARALLELISM=false
 cd $ROOT/examples/trm_diffusion
@@ -223,6 +233,13 @@ case $RUN in
         gtmin[0-9]*) STAGE2="$STAGE2 +train.steer_grad_t_min=${tok#gtmin}"; TV="${TV}_$tok" ;;  # no thinker grad from t < k
         bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 2 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;  # batch 384 x 2k
         tn[0-9]*) STAGE2="$STAGE2 translator.input_noise_std=${tok#tn}"; TV="${TV}_$tok" ;;  # noise on the translator input
+        distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
+        distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
+        gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
+        gram[0-9]*) STAGE2="$STAGE2 mode=thinker_act_gram thinker._target_=models.gram_thinkers.GramSpatialTRM"
+                    STAGE2="$STAGE2 +train.gram_beta=${tok#gram} +train.act_halt_label_clean=true"; TV="${TV}_$tok" ;;
+        lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
+        wd[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.weight_decay=${tok#wd}"; TV="${TV}_$tok" ;;
         bd[0-9]*) STAGE2="$STAGE2 translator.block_keep_prob=${tok#bd}"; TV="${TV}_$tok" ;;  # per-sample block dropout
         vw) STAGE2="$STAGE2 painter.loss_weighting=v"; TV="${TV}_$tok" ;;
         vws) STAGE2="$STAGE2 painter.loss_weighting=v +train.steer_grad_unweighted=true"; TV="${TV}_$tok" ;;
@@ -232,6 +249,10 @@ case $RUN in
         phh) STAGE2="$STAGE2 +train.act_halt_label_margin=1e-4 train.act_continue_bias_init=-1.0 +train.act_halt_label_clean=true"
              TV="${TV}_$tok" ;;
         seex0) STAGE2="$STAGE2 +data.train_dataset.condition_is_solution=true +data.val_dataset.condition_is_solution=true"
+      [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
+      [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
+      [[ $TV == *_dist* && ( $TV != *_act_*dist* || $PV != _all ) ]] && {
+        echo "$RUN: _distA/_distB need _act before them and the p16_all painter (the teachers' painter)" >&2; exit 1; }
                TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
