@@ -95,6 +95,12 @@
 #                   prior-mean pass; needs _act before it). _gramch: one std per channel instead of per token
 #           _lr<x>, _wd<x> (thinker lr / weight decay; defaults 1e-4 / 0.3)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
+#   Thinkers on a _ddpm/_all painter are evaluated with DDPM, 5 steps, `trailing` timestep spacing (the first step
+#   at t=99) and CFG 2: on 10 reference checkpoints this beat the earlier 20 steps with diffusers' default `leading`
+#   spacing (first step t=95) by 0 to +0.08 puzzle acc (2026-11-05, results/thinker_steering_seex0/). Runs before
+#   then used the old setting; add sampling.num_inference_steps=20 ++diffusion.timestep_spacing=leading to match them.
+#   Thinkers on flow painters are evaluated with 5 Euler steps instead of 50: same puzzle acc (.467 vs .469), cell
+#   acc .699 vs .728, ~10x faster; add sampling.num_inference_steps=50 to match runs before 2026-11-05.
 # Measured (A100, freshly initialized painter): thinker batch 384 fits, peak 30.6 GB.
 # Bisection on the working DiT-direct painter: mnist_thinker_dit_residual_steer{0,1}[_logits][_ditopt]
 #   = our steering pipeline (CNN thinker, IP-chain translator with timestep embedding, our optimizer)
@@ -125,8 +131,6 @@ source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin
 
 ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 export SCRATCH=$TMPDIR
-DIST_A=runs/mnist_thinker_mmdit_p16_all_fp32_act_seex0_chain_temb/checkpoint_step-20000.pt
-DIST_B=runs/mnist_thinker_mmdit_p16_all_fp32_act_tn2_seex0_chain_temb/checkpoint_step-5000.pt
 export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
 export TOKENIZERS_PARALLELISM=false
 cd $ROOT/examples/trm_diffusion
@@ -135,6 +139,8 @@ RUN=$1
 XARGS=("${@:2}")  # extra train_trm.py overrides, e.g. run.resume_from_checkpoint=runs/<run>/checkpoint_step-10000.pt
 MNIST_PAINTER=runs/mnist_mmdit_painter/checkpoint_final.pt
 CLEVR_PAINTER=runs/clevr_mmdit_painter/checkpoint_final.pt
+DIST_A=runs/mnist_thinker_mmdit_p16_all_fp32_act_seex0_chain_temb/checkpoint_step-20000.pt
+DIST_B=runs/mnist_thinker_mmdit_p16_all_fp32_act_tn2_seex0_chain_temb/checkpoint_step-5000.pt
 MNIST_EVAL="eval.eval_every=5000 eval_callbacks.0.num_samples=1024"
 CLEVR_EVAL="eval.eval_every=5000 eval_callbacks.1.n_samples=1024"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
@@ -238,13 +244,6 @@ case $RUN in
         gtmin[0-9]*) STAGE2="$STAGE2 +train.steer_grad_t_min=${tok#gtmin}"; TV="${TV}_$tok" ;;  # no thinker grad from t < k
         bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 2 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;  # batch 384 x 2k
         tn[0-9]*) STAGE2="$STAGE2 translator.input_noise_std=${tok#tn}"; TV="${TV}_$tok" ;;  # noise on the translator input
-        distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
-        distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
-        gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
-        gram[0-9]*) STAGE2="$STAGE2 mode=thinker_act_gram thinker._target_=models.gram_thinkers.GramSpatialTRM"
-                    STAGE2="$STAGE2 +train.gram_beta=${tok#gram} +train.act_halt_label_clean=true"; TV="${TV}_$tok" ;;
-        lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
-        wd[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.weight_decay=${tok#wd}"; TV="${TV}_$tok" ;;
         bd[0-9]*) STAGE2="$STAGE2 translator.block_keep_prob=${tok#bd}"; TV="${TV}_$tok" ;;  # per-sample block dropout
         vw) STAGE2="$STAGE2 painter.loss_weighting=v"; TV="${TV}_$tok" ;;
         vws) STAGE2="$STAGE2 painter.loss_weighting=v +train.steer_grad_unweighted=true"; TV="${TV}_$tok" ;;
@@ -254,11 +253,14 @@ case $RUN in
         phh) STAGE2="$STAGE2 +train.act_halt_label_margin=1e-4 train.act_continue_bias_init=-1.0 +train.act_halt_label_clean=true"
              TV="${TV}_$tok" ;;
         seex0) STAGE2="$STAGE2 +data.train_dataset.condition_is_solution=true +data.val_dataset.condition_is_solution=true"
-      [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
-      [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
-      [[ $TV == *_dist* && ( $TV != *_act_*dist* || $PV != _all ) ]] && {
-        echo "$RUN: _distA/_distB need _act before them and the p16_all painter (the teachers' painter)" >&2; exit 1; }
                TV="${TV}_$tok" ;;
+        distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
+        distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
+        gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
+        gram[0-9]*) STAGE2="$STAGE2 mode=thinker_act_gram thinker._target_=models.gram_thinkers.GramSpatialTRM"
+                    STAGE2="$STAGE2 +train.gram_beta=${tok#gram} +train.act_halt_label_clean=true"; TV="${TV}_$tok" ;;
+        lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
+        wd[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.weight_decay=${tok#wd}"; TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done
@@ -275,6 +277,13 @@ case $RUN in
         echo "$RUN: _hidden needs a painter with a condition stream (its hidden states carry the puzzle)" >&2; exit 1; }
       [[ $ISDDPM == 0 && $TV == *_tmax60* ]] && { echo "$RUN: _tmax60 needs a _ddpm or _all painter" >&2; exit 1; }
       [[ $TV == *_seex0* && -z $BLIND ]] && { echo "$RUN: _seex0 with _cond would show the painter the answer" >&2; exit 1; }
+      [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
+      [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
+      [[ $TV == *_dist* && ( $TV != *_act_*dist* || $PV != _all ) ]] && {
+        echo "$RUN: _distA/_distB need _act before them and the p16_all painter (the teachers' painter)" >&2; exit 1; }
+      # eval samples with 5 steps; DDPM painters also start at t=99 (see the header)
+      if [[ $ISDDPM == 1 ]]; then STAGE2="$STAGE2 sampling.num_inference_steps=5 +diffusion.timestep_spacing=trailing"
+      else STAGE2="$STAGE2 sampling.num_inference_steps=5"; fi
       train $THINKER_IN $TRANS painter.checkpoint=$PAINTER_CKPT $PSIDE $STAGE2 \
         painter.steer_from_block=$STEER painter.steer_to_block=${STEER_TO:-null} \
         translator.num_blocks=$(( ${STEER_TO:-$DEPTH} - STEER )) translator.painter_grid=9 \
