@@ -1,0 +1,63 @@
+# @package _global_
+# Stage 2, the Sudoku MM-DiT recipe's thinker side (mnist_thinker_mmdit_cnn) on the
+# frozen MM-DiT CLEVR painter: the thinker reads the scene's objects and x_t through
+# ObjectFeatureEncoderV1 with the puzzle runs' CNN (16x16 x_t tokens after the 10
+# object tokens) instead of the painter's hidden states, and outputs 16 channels per
+# token (the centroid-mask channels of experiments/diagnostics/clevr_saturation_screen.py).
+# The residual translator drops the object tokens (slice_start) and steers every
+# painter block through the IP chain with a timestep embedding. Blinding, batch,
+# translator noise and dtype come from slurm_scripts/wcss_mmdit.sh (clevr_thinker_cnn*).
+#
+# Usage:
+#   python train_trm.py experiment=clevr_thinker_mmdit_cnn \
+#     painter.checkpoint=runs/clevr_mmdit_painter/checkpoint_final.pt data.clevr_root=/path/to/clevr
+
+defaults:
+  - override /data: clevr
+  - override /diffusion: flow
+  - override /painter: mmdit_clevr_frozen
+  - override /thinker: clevr_v1
+  - override /condition_encoder: object_feature_v1
+  - override /translator: painter_residual
+  - override /train: clevr_thinker
+  - override /eval: clevr_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: clevr
+  - override /sampling: flow_cfg
+  - _self_
+
+mode: "thinker_base"
+
+thinker:
+  seq_len: 266       # 10 object tokens + 16x16 x_t tokens
+  vocab_size: 16
+  optim_cfg:
+    weight_decay: 0.3  # 1.0 shrinks the thinker's output while the zero-init translator grows
+
+condition_encoder:
+  latent_channels: 3                         # pixel-space x_t
+  grid_size: 16
+  latent_hidden_channels: [64, 128, 256, 256]  # 256 -> 16: one 2x max-pool each
+  latent_enc_channels: 256
+  noisy_dropout_p_max: 0.0
+  with_timestep_emb: false
+
+painter:
+  steer_from_block: 0
+  label_drop_rate: 0.0
+
+translator:
+  grid: 16
+  painter_grid: 16
+  num_blocks: 12
+  slice_start: ${data.max_objects}
+  hidden_dim: ${painter.net.hidden_size}
+  with_timestep_emb: true
+  timestep_scale: 1000
+  bridge_mode: normalized
+
+run:
+  output_dir: "runs/clevr_thinker_mmdit_cnn"
+
+data:
+  mode: "reduced"

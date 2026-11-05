@@ -19,6 +19,11 @@
 # Stage 2 (thinkers, once the painter's checkpoint_final.pt exists):
 #   mnist_thinker  mnist_thinker_steer1  mnist_thinker_cnn  mnist_thinker_steercond
 #   clevr_thinker  clevr_thinker_steercond
+#   clevr_thinker_cnn[_steer<k>][_tn<std>][_bsx<k>][_fp32][_act][_cond]: the Sudoku MM-DiT recipe on the CLEVR
+#     painter (experiment=clevr_thinker_mmdit_cnn: objects + x_t through a CNN, every block 0-11 steered, painter
+#     blinded, bf16); _steer<k> steers blocks k-11 only, _bsx<k> = batch 768 -> 768k (256 x 3k), _cond keeps the
+#     painter's own condition; _lr<x> / _wd<x> set the thinker's lr / weight decay (default 1e-4 / 0.3);
+#     _tn/_fp32/_act as for the p16 thinkers below
 # Oracle-screen follow-ups (Sudoku, steering from block 1):
 #   mnist_thinker_uncond_tshift  painter conditioning nulled + training t shifted noisy
 #   mnist_thinker_tshift         training t shifted noisy only
@@ -312,6 +317,24 @@ case $RUN in
   clevr_thinker_steercond)
     RUN=clevr_thinker_mmdit_norm_steercond
     train experiment=clevr_thinker_mmdit translator.steer_cond=true painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
+  clevr_thinker_cnn*)
+    STAGE2=""; TV=""; BLIND="+train.force_unconditional_painter=true"
+    for tok in $(echo "${RUN#clevr_thinker_cnn}" | tr '_' ' '); do
+      case $tok in
+        steer[0-9]*) STAGE2="$STAGE2 painter.steer_from_block=${tok#steer} translator.num_blocks=$(( 12 - ${tok#steer} ))"
+                     TV="${TV}_$tok" ;;
+        tn[0-9]*) STAGE2="$STAGE2 translator.input_noise_std=${tok#tn}"; TV="${TV}_$tok" ;;
+        bsx[0-9]*) STAGE2="$STAGE2 train.gradient_accumulation_steps=$(( 3 * ${tok#bsx} ))"; TV="${TV}_$tok" ;;
+        fp32) STAGE2="$STAGE2 painter.painter_dtype=null"; TV="${TV}_$tok" ;;
+        act) STAGE2="$STAGE2 mode=thinker_act thinker.with_halt_head=true"; TV="${TV}_$tok" ;;
+        cond) BLIND=""; TV="${TV}_$tok" ;;
+        lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
+        wd[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.weight_decay=${tok#wd}"; TV="${TV}_$tok" ;;
+        *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
+      esac
+    done
+    RUN=clevr_thinker_mmdit_cnn$TV
+    train experiment=clevr_thinker_mmdit_cnn painter.checkpoint=$CLEVR_PAINTER $BLIND $STAGE2 $CLEVR_EVAL ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;
 esac

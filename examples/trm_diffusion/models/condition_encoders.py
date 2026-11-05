@@ -414,6 +414,29 @@ class ClevrLatentEncoder(nn.Module):
         return feat.flatten(2).transpose(1, 2)  # (B, G², hidden)
 
 
+class CNNLatentEncoder(nn.Module):
+    """
+    ClevrLatentEncoder's interface on the puzzle runs' CNN (SpatialEncoder + 1x1
+    projection, _build_spatial_enc): one 3x3 conv + SiLU + 2x max-pool per
+    hidden_channels entry, a conv to enc_channels, then a 1x1 conv to hidden_size.
+
+    Input:  (B, in_channels, H, W) with H = W = grid_size * 2**len(hidden_channels)
+    Output: (B, G², hidden_size)
+    """
+
+    def __init__(self, in_channels: int, hidden_size: int, grid_size: int, enc_channels: int, hidden_channels: list):
+        super().__init__()
+        self.grid_size = grid_size
+        self.enc, self.proj = _build_spatial_enc(
+            in_channels, enc_channels, hidden_channels, hidden_size, factor=2 ** len(hidden_channels)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.enc(x)
+        assert feat.shape[-1] == self.grid_size, (tuple(x.shape), tuple(feat.shape), self.grid_size)
+        return self.proj(feat).flatten(2).transpose(1, 2)  # (B, G², hidden)
+
+
 class ObjectFeatureEncoderV1(ConditionEncoderBase):
     """
     V1 encoder: per-object tokens concatenated with noisy-latent tokens.
@@ -430,6 +453,9 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
             noisy-latent tokens during training (linearly scaled by 1 - t/T).
             0.0 disables dropout.
         num_train_timesteps: total diffusion steps (for computing dropout prob).
+        latent_hidden_channels: if set, encode the noisy input with CNNLatentEncoder
+            (these hidden channels, latent_enc_channels output channels) instead
+            of ClevrLatentEncoder's two strided convs, e.g. for 256x256 pixels.
     """
 
     condition_keys: list[str] = ["embedding_conditions", "x_noisy"]
@@ -445,10 +471,17 @@ class ObjectFeatureEncoderV1(ConditionEncoderBase):
         noisy_dropout_p_max: float = 0.0,
         num_train_timesteps: int = 1000,
         with_timestep_emb: bool = False,
+        latent_hidden_channels: Optional[list] = None,
+        latent_enc_channels: int = 256,
     ):
         super().__init__()
         self.object_encoder = ObjectFeatureEncoder(in_dim, hidden_dim, out_dim, with_timestep_emb=False)
-        self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
+        if latent_hidden_channels is None:
+            self.latent_encoder = ClevrLatentEncoder(latent_channels, hidden_size, grid_size)
+        else:
+            self.latent_encoder = CNNLatentEncoder(
+                latent_channels, hidden_size, grid_size, latent_enc_channels, list(latent_hidden_channels)
+            )
         self.noisy_dropout_p_max = noisy_dropout_p_max
         self.num_train_timesteps = num_train_timesteps
         self.with_timestep_emb = with_timestep_emb

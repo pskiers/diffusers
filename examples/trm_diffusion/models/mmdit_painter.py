@@ -73,6 +73,12 @@ class FlowMatchingScheduler:
 
     The painter takes its training noise scale and velocity clamp from here, so
     training and sampling cannot disagree on them.
+
+    eta > 0 makes each step stochastic, the flow analogue of DDIM's eta: from the
+    step's x0 estimate and the noise it implies, eps_hat = (x_t - t x0) / ((1 - t)
+    noise_scale), the next state is t1 x0 + (1 - t1) noise_scale (sqrt(1 - eta²)
+    eps_hat + eta * fresh standard-normal noise). eta 0 is the deterministic Euler
+    step (the same update up to the velocity clamp); eta 1 redraws all the noise.
     """
 
     def __init__(
@@ -81,6 +87,7 @@ class FlowMatchingScheduler:
         train_velocity_clamp: float = 0.05,
         sample_velocity_clamp: float = 0.05,
         num_train_timesteps: int = 1000,
+        eta: float = 0.0,
     ):
         # num_train_timesteps: only read by SamplingPipeline as the `T` its
         # guidance schedules receive; continuous-time training doesn't use it.
@@ -88,6 +95,7 @@ class FlowMatchingScheduler:
         self.init_noise_sigma = noise_scale
         self.train_velocity_clamp = train_velocity_clamp
         self.sample_velocity_clamp = sample_velocity_clamp
+        self.eta = eta
         self.timesteps: Optional[torch.Tensor] = None
 
     def set_timesteps(self, num_inference_steps: int, device=None) -> None:
@@ -101,6 +109,11 @@ class FlowMatchingScheduler:
             raise ValueError(f"step() called with t={float(timestep)}, expected t={float(t0)} (step {self._index})")
         self._index += 1
         v = model_output.float()
+        if self.eta > 0:
+            x0 = sample + v * (1.0 - t0).clamp_min(self.train_velocity_clamp)
+            eps_hat = (sample - t0 * x0) / ((1.0 - t0) * self.init_noise_sigma)
+            noise = (1 - self.eta**2) ** 0.5 * eps_hat + self.eta * torch.randn_like(eps_hat)
+            return SimpleNamespace(prev_sample=t1 * x0 + (1.0 - t1) * self.init_noise_sigma * noise)
         if self.sample_velocity_clamp != self.train_velocity_clamp:
             x0 = sample + v * (1.0 - t0).clamp_min(self.train_velocity_clamp)
             v = (x0 - sample) / (1.0 - t0).clamp_min(self.sample_velocity_clamp)

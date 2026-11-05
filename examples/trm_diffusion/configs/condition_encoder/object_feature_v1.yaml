@@ -9,3 +9,5 @@ grid_size: 8          # G=8 → G²=64 latent tokens
 noisy_dropout_p_max: 0.7
 num_train_timesteps: ${diffusion.num_train_timesteps}
 with_timestep_emb: true
+latent_hidden_channels: null  # set (e.g. [64, 128, 256, 256]): the puzzle runs' conv + max-pool CNN over x_t instead of two strided convs
+latent_enc_channels: 256      # that CNN's output channels (only with latent_hidden_channels)

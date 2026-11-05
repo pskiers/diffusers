@@ -453,6 +453,10 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
     leaving the bridge's output (i.e. into the bridge and the thinker), with the
     forward unchanged; downstream of that point everything is per sample, so e.g.
     1 / loss_weight gives the thinker the unweighted loss's gradient exactly.
+
+    slice_start: drop this many leading output tokens before the bridge, as
+    SlicedControlNetTranslator does, for thinkers whose image grid does not come
+    first (ObjectFeatureEncoderV1: max_objects object tokens, then the grid).
     """
 
     def __init__(
@@ -469,8 +473,12 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         timestep_scale: float = 1000.0,
         input_noise_std: float = 0.0,
         block_keep_prob: float = 1.0,
+        slice_start: int = 0,
     ):
         super().__init__(grid=grid, bridge_mode=bridge_mode, bridge_channels=in_dim)
+        if steer_cond and slice_start:
+            raise ValueError("steer_cond reads the tokens after the image grid; slice_start drops leading tokens")
+        self.slice_start = slice_start
         self.input_noise_std = input_noise_std
         self.block_keep_prob = block_keep_prob
         self.painter_grid = painter_grid
@@ -501,7 +509,7 @@ class PainterResidualTranslator(ThinkerPainterTranslatorBase):
         self, trm_output: TRMOutput, timesteps=None, thinker_grad_scale=None, **_
     ) -> BlockResidualSteering:
         g = self._grid
-        tokens = self._bridge_tokens(trm_output.logits)
+        tokens = self._bridge_tokens(trm_output.logits[:, self.slice_start :])
         if thinker_grad_scale is not None and tokens.requires_grad:
             tokens = _ScalePerSampleGrad.apply(tokens, thinker_grad_scale)
         if self.training and self.input_noise_std > 0:

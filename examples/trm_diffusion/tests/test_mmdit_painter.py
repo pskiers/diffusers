@@ -9,7 +9,9 @@ by tests/test_minit2i_thinker.py):
   gradients reaching the thinker's output at both kinds of position; with
   bridge_mode "normalized", independent of the thinker output's scale;
 - steering through attention (PainterAttentionTranslator), the same;
-- the residual translator's training-only input noise and block dropout;
+- the flow scheduler's stochastic steps (eta);
+- the residual translator's training-only input noise, block dropout and slice_start;
+- ObjectFeatureEncoderV1's CNN latent encoder;
 - the thinker-stage options train_t_max, steer_grad_clip, steer_grad_t_min, thinker_checkpoint and the thinker's SGD option;
 - every new experiment config builds, with consistent token counts.
 
@@ -231,6 +233,66 @@ def test_translator_block_dropout():
     with torch.no_grad():
         for d, k in zip(drop(TRMOutput(logits=logits)).block_residuals, full(TRMOutput(logits=logits)).block_residuals):
             assert torch.equal(d, k)
+
+
+def test_flow_scheduler_eta():
+    """eta: a tiny eta gives the deterministic Euler update (away from the velocity clamp), eta > 0 depends
+    on the fresh noise draw, and every eta ends on the step's x0 estimate at t = 1."""
+    torch.manual_seed(0)
+    x, v = torch.randn(2, 3, 8, 8), torch.randn(2, 3, 8, 8)
+
+    def run(eta, seed=0):
+        sch = FlowMatchingScheduler(noise_scale=2.0, eta=eta)
+        sch.set_timesteps(10)  # 1 - t >= 0.1 everywhere: the clamp (0.05) never acts
+        torch.manual_seed(seed)
+        return [sch.step(v, t, x).prev_sample for t in sch.timesteps]
+
+    euler, tiny = run(0.0), run(1e-6)
+    assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(euler, tiny))
+    noisy, noisy2 = run(1.0, seed=0), run(1.0, seed=1)
+    assert not torch.allclose(noisy[0], noisy2[0]) and not torch.allclose(noisy[0], euler[0])
+    x0 = x + v * 0.1  # last step: t0 = 0.9, t1 = 1
+    for out in (euler, tiny, noisy, run(0.5)):
+        assert torch.allclose(out[-1], x0, atol=1e-5)
+
+
+def test_translator_slice_start():
+    """slice_start k steers exactly as the same translator on the output tokens after the first k
+    (the bridge's BatchNorm statistics included); it cannot be combined with steer_cond."""
+    torch.manual_seed(5)
+    kw = dict(in_dim=8, painter_dim=64, grid=2, painter_grid=4, num_blocks=2, bridge_mode="normalized")
+    sliced, plain = PainterResidualTranslator(**kw, slice_start=3), PainterResidualTranslator(**kw)
+    with torch.no_grad():
+        for proj in sliced.projs:
+            proj.weight.normal_(std=0.1)
+    plain.load_state_dict(sliced.state_dict())
+    logits = torch.randn(3, 3 + 4, 8, requires_grad=True)
+    sliced.train(), plain.train()
+    a = sliced(TRMOutput(logits=logits)).block_residuals
+    b = plain(TRMOutput(logits=logits[:, 3:])).block_residuals
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+    assert torch.equal(sliced._norm.running_mean, plain._norm.running_mean)
+    a[0].sum().backward()
+    assert logits.grad[:, :3].abs().sum() == 0 and logits.grad[:, 3:].abs().sum() > 0
+    with pytest.raises(ValueError):
+        PainterResidualTranslator(**kw, slice_start=3, steer_cond=True)
+
+
+def test_object_feature_encoder_cnn():
+    """ObjectFeatureEncoderV1 with latent_hidden_channels: object tokens then a GxG grid of x_t tokens
+    from the conv + max-pool CNN, gradients reaching the CNN; without it, the two strided convs as before."""
+    from models.condition_encoders import ClevrLatentEncoder, CNNLatentEncoder, ObjectFeatureEncoderV1
+
+    kw = dict(in_dim=55, hidden_dim=32, out_dim=32, latent_channels=3, hidden_size=32, grid_size=4)
+    assert isinstance(ObjectFeatureEncoderV1(**kw).latent_encoder, ClevrLatentEncoder)
+    enc = ObjectFeatureEncoderV1(**kw, latent_hidden_channels=[8, 16, 16], latent_enc_channels=16)
+    assert isinstance(enc.latent_encoder, CNNLatentEncoder)
+    with torch.no_grad():  # off the zero-initialized object MLP output
+        enc.object_encoder.net[-1].weight.normal_(std=0.1)
+    emb = enc(torch.randn(2, 10, 55), torch.randn(2, 3, 32, 32)).enc_emb
+    assert emb.shape == (2, 10 + 16, 32)
+    emb[:, 10:].sum().backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in enc.latent_encoder.parameters())
 
 
 @pytest.mark.parametrize("rope", [False, True])
@@ -513,6 +575,10 @@ CLEVR = DataSample(images=torch.rand(2, 3, 256, 256) * 2 - 1, embedding_conditio
             "translator.with_timestep_emb=true", "+train.force_unconditional_painter=true", "painter.painter_dtype=null",
             "painter.label_drop_rate=0.0"]),
         ("clevr_mmdit_painter", "clevr_thinker_mmdit", CLEVR, ["translator.steer_cond=true"]),
+        # objects + x_t through the CNN, the 10 object tokens sliced off before the translator, every block steered
+        ("clevr_mmdit_painter", "clevr_thinker_mmdit_cnn", CLEVR, [
+            "painter.net.depth=4", "painter.steer_from_block=0", "translator.num_blocks=4", "translator.hidden_dim=64",
+            "+train.force_unconditional_painter=true", "translator.input_noise_std=1.0"]),
     ],
 )
 def test_experiment_configs_build(tmp_path, painter_exp, thinker_exp, batch, extra):
