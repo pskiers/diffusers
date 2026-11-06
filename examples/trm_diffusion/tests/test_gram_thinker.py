@@ -82,9 +82,9 @@ def test_zero_noise_equals_plain_thinker(sigma):
 
 
 @needs_gpu
-@pytest.mark.parametrize("free_bits", [0.5, 0.0])
-def test_train_step_gradient_flow(free_bits):
-    model, cfg = _build(GRAM + [f"+train.gram_free_bits={free_bits}"])
+@pytest.mark.parametrize("free_bits,state", [(0.5, "q"), (0.0, "q"), (0.0, "p")])
+def test_train_step_gradient_flow(free_bits, state):
+    model, cfg = _build(GRAM + [f"+train.gram_free_bits={free_bits}", f"+thinker.gram_state={state}"])
     with torch.no_grad():  # off the zero-init output layers (translator, heads), which pass no gradient back
         for proj in model.thinker_painter_translator.projs:
             proj[-1].weight.normal_(std=0.02)
@@ -117,6 +117,38 @@ def test_train_step_gradient_flow(free_bits):
     if free_bits == 0.0:
         # KL 0 at init is under any positive free-bits floor; with none, the prior gets the KL gradient
         assert got("thinker.prior_head") > 0
+
+
+@needs_gpu
+def test_p_state_keeps_the_posterior_out_of_the_carry():
+    """gram_state=p: in training the carried state is the inference (prior-only) state, whatever the posterior
+    sees; only the read-out (logits) and the KL use the posterior."""
+    model, _ = _build(GRAM + ["+thinker.gram_state=p"])
+    th = model.thinker
+    with torch.no_grad():  # nonzero means, so the posterior's input matters
+        th.prior_head.down.weight.normal_(std=0.02)
+        th.posterior_head.down.weight.normal_(std=0.02)
+    th.eval()
+    h = th.inner.config.hidden_size
+    enc = torch.randn(4, 81, h, device="cuda")
+    z_H, z_L = (z.cuda() for z in th.get_initial_states(4))
+    t = torch.randint(0, 100, (4,), device="cuda")
+
+    def step(post):
+        th._posterior_emb = post
+        torch.manual_seed(0)
+        try:
+            with torch.no_grad():
+                return th.reasoning_step(enc, z_H, z_L, None, timesteps=t), th._kl_terms
+        finally:
+            th._posterior_emb, th._kl_terms = None, None
+
+    (lg_a, zh_a, zl_a), kl_a = step(torch.randn(4, 81, h, device="cuda"))
+    (lg_b, zh_b, zl_b), _ = step(torch.zeros(4, 81, h, device="cuda"))
+    (lg_i, zh_i, zl_i), kl_i = step(None)  # inference
+    assert kl_a is not None and kl_i is None
+    assert torch.equal(zh_a, zh_b) and torch.equal(zh_a, zh_i) and torch.equal(zl_a, zl_i)
+    assert not torch.equal(lg_a, lg_b) and not torch.equal(lg_a, lg_i)
 
 
 @needs_gpu

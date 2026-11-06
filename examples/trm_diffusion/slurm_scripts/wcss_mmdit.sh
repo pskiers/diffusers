@@ -93,6 +93,8 @@
 #                   on the solved image in training, prior in eval (logged as prior samples and, suffix _pmean, prior
 #                   mean); loss + beta * KL with balancing 0.8 and 0.5 free nats per token; halt labels from the
 #                   prior-mean pass; needs _act before it). _gramch: one std per channel instead of per token
+#                   _pstate: the training trajectory carries the prior's noise, as at inference; the posterior only
+#                   shapes the last transition's read-out and the KL (no answer leaks into the state)
 #           _lr<x>, _wd<x> (thinker lr / weight decay; defaults 1e-4 / 0.3)
 #   suffixes compose, e.g. mnist_painter_p16_all_small_nocond -> mnist_thinker_p16_all_small_nocond_steer0_fp32
 #   Thinkers on a _ddpm/_all painter are evaluated with DDPM, 5 steps, `trailing` timestep spacing (the first step
@@ -266,6 +268,7 @@ case $RUN in
         distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
         distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
         gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
+        pstate) STAGE2="$STAGE2 +thinker.gram_state=p"; TV="${TV}_$tok" ;;
         gram[0-9]*) STAGE2="$STAGE2 mode=thinker_act_gram thinker._target_=models.gram_thinkers.GramSpatialTRM"
                     STAGE2="$STAGE2 +train.gram_beta=${tok#gram} +train.act_halt_label_clean=true"; TV="${TV}_$tok" ;;
         lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
@@ -288,6 +291,7 @@ case $RUN in
       [[ $TV == *_seex0* && -z $BLIND ]] && { echo "$RUN: _seex0 with _cond would show the painter the answer" >&2; exit 1; }
       [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
       [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
+      [[ $TV == *_pstate* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _pstate needs _gram<beta>" >&2; exit 1; }
       [[ $TV == *_dist* && ( $TV != *_act_*dist* || $PV != _all ) ]] && {
         echo "$RUN: _distA/_distB need _act before them and the p16_all painter (the teachers' painter)" >&2; exit 1; }
       # eval samples with 5 steps; DDPM painters also start at t=99 (see the header)

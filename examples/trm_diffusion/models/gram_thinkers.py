@@ -51,7 +51,8 @@ class GramSpatialTRMInner(SpatialTRMInner):
     def forward(self, carry, batch):
         seq_info = {"cos_sin": self.rotary_emb() if hasattr(self, "rotary_emb") else None}
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
-        transition = getattr(self, "_h_transition", None) or (lambda u, last: u)
+        # transition(u, last): the next z_H; for the last one a (read-out state, carried state) pair
+        transition = getattr(self, "_h_transition", None) or (lambda u, last: (u, u) if last else u)
         z_H, z_L = carry.z_H, carry.z_L
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
@@ -60,13 +61,13 @@ class GramSpatialTRMInner(SpatialTRMInner):
                 z_H = transition(self.L_level(z_H, z_L, **seq_info), False)
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = transition(self.L_level(z_H, z_L, **seq_info), True)
+        z_read, z_H = transition(self.L_level(z_H, z_L, **seq_info), True)
         if getattr(self, "_keep_carry_grad", False):
             new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H, z_L=z_L)
         else:
             new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        output = self.lm_head(z_read)[:, self.puzzle_emb_len :]
+        q_logits = self.q_head(z_read[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
@@ -78,6 +79,11 @@ class GramSpatialTRM(SpatialTRM):
     the KL loss; the earlier, no-grad transitions are sampled the same way, as in GRAM's Algorithm 1.
 
     gram_sigma: "token" (one std per token, as GRAM) or "channel" (one per token and channel).
+    gram_state: which noise the training trajectory carries. "q" (GRAM): every transition adds the posterior's
+        eps, so its answer enters the state and later transitions can read it back. "p": every transition adds the
+        prior's eps, as at inference; the posterior is only used for the last transition's read-out (u + eps_q,
+        which the painter's loss sees) and the KL at that same u, while the state carries u + eps_p. The prior then
+        only ever sees states inference produces and must predict the posterior's eps from them.
     prior_mode: "sample" or "mean" (eps = the prior mean), for inference.
     """
 
@@ -85,6 +91,7 @@ class GramSpatialTRM(SpatialTRM):
         self,
         *args,
         gram_sigma: str = "token",
+        gram_state: str = "q",
         gram_init_std: float = 0.1,
         gram_min_std: float = 1e-3,
         gram_head_expansion: float = 2.0,
@@ -93,6 +100,9 @@ class GramSpatialTRM(SpatialTRM):
         super().__init__(*args, **kwargs)
         if gram_sigma not in ("token", "channel"):
             raise ValueError(f"gram_sigma must be 'token' or 'channel', got {gram_sigma!r}")
+        if gram_state not in ("q", "p"):
+            raise ValueError(f"gram_state must be 'q' or 'p', got {gram_state!r}")
+        self.gram_state = gram_state
         self.inner = GramSpatialTRMInner(self.inner.config)
         h = self.inner.config.hidden_size
         per_channel = gram_sigma == "channel"
@@ -102,20 +112,30 @@ class GramSpatialTRM(SpatialTRM):
         self._posterior_emb = None
         self._kl_terms = None
 
-    def _transition(self, u: torch.Tensor, last: bool) -> torch.Tensor:
+    def _transition(self, u: torch.Tensor, last: bool):
+        """The next z_H from the update u; for the last transition a (read-out state, carried state) pair."""
         uf = u.float()
         post = self._posterior_emb
-        if post is not None:
+        if post is None or self.gram_state == "p":
+            mu_p, sd_p = self.prior_head(uf)
+            mean_only = post is None and self.prior_mode == "mean"
+            z_p = u + (mu_p if mean_only else mu_p + sd_p * torch.randn_like(mu_p)).to(u.dtype)
+            if not last:
+                return z_p
+            if post is None:
+                return z_p, z_p
             assert post.shape == uf.shape, (post.shape, uf.shape)
             mu_q, sd_q = self.posterior_head(torch.cat([uf, post.float()], dim=-1))
-            eps = mu_q + sd_q * torch.randn_like(mu_q)
-            if last:
-                mu_p, sd_p = self.prior_head(uf)
-                self._kl_terms = (mu_q, sd_q, mu_p, sd_p)
-        else:
-            mu_p, sd_p = self.prior_head(uf)
-            eps = mu_p if self.prior_mode == "mean" else mu_p + sd_p * torch.randn_like(mu_p)
-        return u + eps.to(u.dtype)
+            self._kl_terms = (mu_q, sd_q, mu_p, sd_p)
+            return u + (mu_q + sd_q * torch.randn_like(mu_q)).to(u.dtype), z_p
+        assert post.shape == uf.shape, (post.shape, uf.shape)
+        mu_q, sd_q = self.posterior_head(torch.cat([uf, post.float()], dim=-1))
+        z_q = u + (mu_q + sd_q * torch.randn_like(mu_q)).to(u.dtype)
+        if not last:
+            return z_q
+        mu_p, sd_p = self.prior_head(uf)
+        self._kl_terms = (mu_q, sd_q, mu_p, sd_p)
+        return z_q, z_q
 
     def reasoning_step(self, *args, **kwargs):
         self.inner._h_transition = self._transition
