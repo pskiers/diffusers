@@ -146,6 +146,15 @@ CLEVR_EVAL="eval.eval_every=5000 eval_callbacks.1.n_samples=1024"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
 MNIST_CNN12="condition_encoder.factor=12 translator.grid=12 thinker.seq_len=144 train.batch_size=192 train.gradient_accumulation_steps=4"
 train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@" "${XARGS[@]}"; }
+# CLEVR runs read the dataset from the job's $TMPDIR, not lustre: images/train, images/val and scenes (~16 GB; not
+# the zip or the questions)
+clevr_train() {
+  local src=data/clevr/CLEVR_v1.0 dst=$SCRATCH/clevr/CLEVR_v1.0 t0=$SECONDS
+  mkdir -p $dst/images && cp -r $src/scenes $dst/ && cp -r $src/images/train $src/images/val $dst/images/ \
+    || { echo "CLEVR copy to $dst failed" >&2; exit 1; }
+  echo "CLEVR copied to $dst in $(( SECONDS - t0 )) s"
+  train data.clevr_root=$SCRATCH/clevr "$@"
+}
 
 case $RUN in
   mnist_painter)
@@ -153,7 +162,7 @@ case $RUN in
     train experiment=mnist_mmdit_painter eval.eval_every=10000 eval_callbacks.0.num_samples=1024 ;;
   clevr_painter)
     RUN=clevr_mmdit_painter
-    train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=1024 ;;
+    clevr_train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=1024 ;;
   mnist_thinker)  # as T2I: reads the painter's hidden states after block 4, steers the image stream of blocks 4-7
     RUN=mnist_thinker_mmdit_norm
     train experiment=mnist_thinker_mmdit painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
@@ -316,16 +325,16 @@ case $RUN in
       condition_encoder.inner.with_timestep_emb=false thinker.optim_cfg.weight_decay=0.3 train.seed=1 $MNIST_EVAL ;;
   clevr_unet_condpainter)  # exactly W&B 0il6x2cq's config, but the painter keeps its object conditioning
     RUN=clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_condpainter
-    train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \
+    clevr_train experiment=clevr_thinker_v1_controlnet painter.checkpoint=runs/clevr_unet_big/checkpoint_step-80000.pt \
       "backbone.block_out_channels=[128,256,512]" condition_encoder=object_feature_v1_centroidmask_presence_fused_x0hint \
       condition_encoder.threshold=80 translator=controlnet_clevr_v1_sliced "translator.painter_channels=[128,256,512]" \
       thinker.seq_len=266 data.include_centroid_mask=true data.centroid_mask_presence_only=true ;;
   clevr_thinker)
     RUN=clevr_thinker_mmdit_norm
-    train experiment=clevr_thinker_mmdit painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
+    clevr_train experiment=clevr_thinker_mmdit painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
   clevr_thinker_steercond)
     RUN=clevr_thinker_mmdit_norm_steercond
-    train experiment=clevr_thinker_mmdit translator.steer_cond=true painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
+    clevr_train experiment=clevr_thinker_mmdit translator.steer_cond=true painter.checkpoint=$CLEVR_PAINTER $CLEVR_EVAL ;;
   clevr_thinker_cnn*)
     STAGE2=""; TV=""; BLIND="+train.force_unconditional_painter=true"
     for tok in $(echo "${RUN#clevr_thinker_cnn}" | tr '_' ' '); do
@@ -343,7 +352,7 @@ case $RUN in
       esac
     done
     RUN=clevr_thinker_mmdit_cnn$TV
-    train experiment=clevr_thinker_mmdit_cnn painter.checkpoint=$CLEVR_PAINTER $BLIND $STAGE2 $CLEVR_EVAL ;;
+    clevr_train experiment=clevr_thinker_mmdit_cnn painter.checkpoint=$CLEVR_PAINTER $BLIND $STAGE2 $CLEVR_EVAL ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;
 esac

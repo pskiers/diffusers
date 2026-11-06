@@ -171,6 +171,10 @@ for ck in ckpts:
                   flush=True)
         baseline_done = True
     for lv in LEVELS:
-        r = probe(feats[lv]["thinker"], lab)
-        print(f"  step {step} level {lv:4.0f} | occ {r['occ']:.3f} color {r['color']:.3f} shape {r['shape']:.3f}",
-              flush=True)
+        f = feats[lv]["thinker"]
+        r = probe(f, lab)
+        # control: each scene's mean token at every position carries scene composition (which colors / shapes /
+        # how many objects) but no location; layout is what the per-token probe adds beyond it
+        rm = probe(f.mean(1, keepdim=True).expand_as(f), lab)
+        print(f"  step {step} level {lv:4.0f} | occ {r['occ']:.3f} color {r['color']:.3f} shape {r['shape']:.3f}"
+              f" | scene-mean occ {rm['occ']:.3f} color {rm['color']:.3f} shape {rm['shape']:.3f}", flush=True)
