@@ -49,6 +49,7 @@ import hydra
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
+from accelerate.utils import set_seed
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -114,6 +115,12 @@ def main(cfg: DictConfig):
     metrics_path: str = cfg.get("metrics_path", default_metrics_path)
 
     torch.set_float32_matmul_precision("high")
+
+    # +eval_seed=N seeds python/numpy/torch (eval subsets drawn with random.sample, sampling noise), so sweeps over
+    # sampler settings compare the same scenes and noise; unset (default) leaves the RNGs unseeded as before.
+    eval_seed = cfg.get("eval_seed", None)
+    if eval_seed is not None:
+        set_seed(int(eval_seed))
 
     accelerator = Accelerator(
         mixed_precision=cfg.precision.mixed_precision,

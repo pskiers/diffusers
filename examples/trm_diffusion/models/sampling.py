@@ -181,6 +181,84 @@ class LinearSchedule:
         return self.noisy_end + (self.clean_end - self.noisy_end) * (1.0 - t / T)
 
 
+# ── Correctors (predictor-corrector sampling) ─────────────────────────────────
+
+
+def _alpha_bar(scheduler, t: int, device: torch.device) -> Tensor:
+    """ᾱ_t of the training schedule; 1.0 below t=0 (DDPMScheduler.step's own convention for the final step)."""
+    return scheduler.alphas_cumprod[t].to(device) if t >= 0 else torch.tensor(1.0, device=device)
+
+
+def _pred_to_x0(scheduler, pred: Tensor, x: Tensor, t: int) -> Tensor:
+    """The model output (prediction_type sample or epsilon) as an x0 prediction."""
+    kind = scheduler.config.prediction_type
+    if kind == "sample":
+        return pred
+    assert kind == "epsilon", f"corrector supports prediction_type sample/epsilon, got {kind}"
+    a = _alpha_bar(scheduler, t, x.device)
+    return (x - (1 - a).sqrt() * pred) / a.sqrt()
+
+
+class Corrector(ABC):
+    """K extra model evaluations per predictor step (predictor-corrector sampling). `step` replaces one predictor
+    step t -> previous timestep; `predict(x, t)` returns the (guided) model output at x, t."""
+
+    def __init__(self, n_steps: int):
+        assert n_steps >= 1, n_steps
+        self.n_steps = n_steps
+
+    @abstractmethod
+    def step(self, predict: Callable[[Tensor, Tensor], Tensor], scheduler, x: Tensor, t: Tensor) -> Tensor:
+        """One predictor step from x_t plus n_steps corrector steps; returns x at the previous timestep."""
+
+
+class LangevinCorrector(Corrector):
+    """Song et al. 2021's LangevinCorrector for the VP SDE (score_sde `sampling.py`), run n_steps times at t before
+    the predictor step, as in their PC sampler:
+
+        grad = score(x, t);  noise ~ N(0, I)
+        step = 2 * alpha_t * (snr * mean_b ||noise_b|| / mean_b ||grad_b||)^2       (alpha_t = 1 - beta_t)
+        x <- x + step * grad + sqrt(2 * step) * noise
+
+    with the score from the x0 prediction: score = -(x - sqrt(ᾱ_t) x0) / (1 - ᾱ_t).
+    """
+
+    def __init__(self, n_steps: int, snr: float):
+        super().__init__(n_steps)
+        self.snr = snr
+
+    def step(self, predict, scheduler, x: Tensor, t: Tensor) -> Tensor:
+        ti = int(t.item())
+        a_bar = _alpha_bar(scheduler, ti, x.device)
+        alpha = scheduler.alphas[ti].to(x.device)
+        B = x.shape[0]
+        for _ in range(self.n_steps):
+            x0 = _pred_to_x0(scheduler, predict(x, t), x, ti)
+            grad = -(x - a_bar.sqrt() * x0) / (1 - a_bar)
+            noise = torch.randn_like(x)
+            grad_norm = torch.norm(grad.reshape(B, -1), dim=-1).mean()
+            noise_norm = torch.norm(noise.reshape(B, -1), dim=-1).mean()
+            step_size = (self.snr * noise_norm / grad_norm) ** 2 * 2 * alpha
+            x = x + step_size * grad + torch.sqrt(step_size * 2) * noise
+        return scheduler.step(predict(x, t), t, x).prev_sample
+
+
+class RestartCorrector(Corrector):
+    """Per-step Restart (Xu et al. 2023) / RePaint resampling: after the predictor step t -> t', re-noise x_t' back to
+    t with the forward process, x_t = sqrt(ᾱ_t / ᾱ_t') x_t' + sqrt(1 - ᾱ_t / ᾱ_t') z, and redo the step; n_steps
+    times."""
+
+    def step(self, predict, scheduler, x: Tensor, t: Tensor) -> Tensor:
+        ti = int(t.item())
+        t_prev = int(scheduler.previous_timestep(ti))
+        ratio = _alpha_bar(scheduler, ti, x.device) / _alpha_bar(scheduler, t_prev, x.device)
+        x_prev = scheduler.step(predict(x, t), t, x).prev_sample
+        for _ in range(self.n_steps):
+            x = ratio.sqrt() * x_prev + (1 - ratio).sqrt() * torch.randn_like(x_prev)
+            x_prev = scheduler.step(predict(x, t), t, x).prev_sample
+        return x_prev
+
+
 # ── SamplingPipeline ──────────────────────────────────────────────────────────
 
 
@@ -217,10 +295,12 @@ class SamplingPipeline:
         num_inference_steps: int = 20,
         batch_size: int = 8,
         predictor: Optional[NoisePredictor] = None,
+        corrector: Optional[Corrector] = None,
     ):
         self.num_inference_steps = num_inference_steps
         self.batch_size = batch_size
         self.predictor = predictor if predictor is not None else DirectPredictor()
+        self.corrector = corrector  # None: plain predictor steps (default)
 
     @property
     def cfg_scale(self) -> float:
@@ -268,11 +348,15 @@ class SamplingPipeline:
             # MiniT2IFlowScheduler (noise ~ N(0, 4I)).
             x = torch.randn(shape, device=device, generator=generator) * getattr(model.scheduler, "init_noise_sigma", 1.0)
 
+        def predict(x_t: Tensor, t: Tensor) -> Tensor:
+            step_sample = dataclasses.replace(conditions, x_noisy=x_t, timesteps=t.expand(B).to(device))
+            return self.predictor.predict(model, step_sample, int(t.item()), T)
+
         for t in model.scheduler.timesteps:
-            t_batch = t.expand(B).to(device)
-            step_sample = dataclasses.replace(conditions, x_noisy=x, timesteps=t_batch)
-            noise_pred = self.predictor.predict(model, step_sample, int(t.item()), T)
-            x = model.scheduler.step(noise_pred, t, x).prev_sample
+            if self.corrector is None:
+                x = model.scheduler.step(predict(x, t), t, x).prev_sample
+            else:
+                x = self.corrector.step(predict, model.scheduler, x, t)
 
         return x
 
