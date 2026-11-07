@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import torch
@@ -118,6 +118,46 @@ class SteeringCFGPredictor(NoisePredictor):
         return pred_unsteered + self.scale * (pred_steered - pred_unsteered)
 
 
+class SteeringReusePredictor(NoisePredictor):
+    """PaTh with reasoning stopped after the first `reason_frac` of the denoising steps (paper Fig. 20, "reuse"):
+    on those steps it is the plain (CFG) predictor; on every later step the thinker is not run and the painter is
+    run on the last reasoning step's logits (`model.run_painter`, both CFG branches), as experiments/
+    ablate_trm_loop_budget.py's reuse axis. reason_frac=1.0 is identical to DirectPredictor / CFGPredictor(scale).
+
+    Needs a ThinkerFrozenPainterBase-style model (forward returns the thinker logits, run_painter(sample, logits))
+    that reasons from a fresh state at every step (model.forward; no carry across steps).
+    """
+
+    def __init__(self, reason_frac: float, scale: float = 1.0):
+        assert 0.0 < reason_frac <= 1.0, reason_frac
+        self.reason_frac = reason_frac
+        self.scale = scale
+        self._logits: dict[str, Tensor] = {}
+
+    def n_reason_steps(self, num_steps: int) -> int:
+        return max(1, round(self.reason_frac * num_steps))
+
+    def predict(self, model, sample: DataSample, t: int, T: int) -> Tensor:
+        timesteps = model.scheduler.timesteps
+        step_idx = int((timesteps == t).nonzero()[0])
+        if step_idx == 0:
+            self._logits = {}
+        reason = step_idx < self.n_reason_steps(len(timesteps))
+
+        def branch(s: DataSample, key: str) -> Tensor:
+            if reason:
+                p = model(s)
+                self._logits[key] = p.logits
+                return p.pred
+            return model.run_painter(s, self._logits[key])
+
+        pred_c = branch(sample, "cond")
+        if self.scale == 1.0:
+            return pred_c
+        pred_u = branch(model.null_condition_sample(sample), "uncond")
+        return pred_u + self.scale * (pred_c - pred_u)
+
+
 class NoisyGuidancePredictor(NoisePredictor):
     """Noisy-image guidance wrapping any inner predictor.
 
@@ -179,6 +219,29 @@ class LinearSchedule:
 
     def __call__(self, t: int, T: int) -> float:
         return self.noisy_end + (self.clean_end - self.noisy_end) * (1.0 - t / T)
+
+
+# ── Trajectory capture ────────────────────────────────────────────────────────
+
+
+@dataclass
+class TrajectoryRecorder:
+    """Opt-in capture of intermediate denoising states during sampling (from origin/amaze/interpretability).
+
+    steps:      inference-step indices (0-based, in scheduler order) to record;
+                None records every step.
+    capture_xt: also store the noisy latent x_t (prev_sample), not just the
+                running x0 estimate (pred_original_sample).
+    records:    filled during sampling — one dict per captured step with keys
+                {"step", "t", "x0_pred"[, "x_t"]}; tensors are (B, C, H, W) on CPU.
+    """
+
+    steps: Optional[set] = None
+    capture_xt: bool = False
+    records: list = field(default_factory=list)
+
+    def wants(self, i: int) -> bool:
+        return self.steps is None or i in self.steps
 
 
 # ── Correctors (predictor-corrector sampling) ─────────────────────────────────
@@ -318,6 +381,7 @@ class SamplingPipeline:
         device: torch.device,
         generator: Optional[torch.Generator] = None,
         initial_noise: Optional[Tensor] = None,
+        recorder: Optional[TrajectoryRecorder] = None,
     ) -> Tensor:
         """Denoise one pre-batched DataSample using the model's scheduler.
 
@@ -332,6 +396,9 @@ class SamplingPipeline:
                         the scheduler's noise scale — e.g. per-sample seeded
                         noise that must not depend on how samples are batched.
                         Overrides `generator`.
+            recorder:   optional TrajectoryRecorder; when given, intermediate
+                        denoising states are appended to recorder.records
+                        (not with a corrector).
 
         Returns:
             (B, C, H, W) denoised output tensor on device.
@@ -352,9 +419,19 @@ class SamplingPipeline:
             step_sample = dataclasses.replace(conditions, x_noisy=x_t, timesteps=t.expand(B).to(device))
             return self.predictor.predict(model, step_sample, int(t.item()), T)
 
-        for t in model.scheduler.timesteps:
+        assert recorder is None or self.corrector is None, "TrajectoryRecorder is not supported with a corrector"
+        for i, t in enumerate(model.scheduler.timesteps):
             if self.corrector is None:
-                x = model.scheduler.step(predict(x, t), t, x).prev_sample
+                step_out = model.scheduler.step(predict(x, t), t, x)
+                x = step_out.prev_sample
+                if recorder is not None and recorder.wants(i):
+                    x0_pred = getattr(step_out, "pred_original_sample", None)
+                    recorder.records.append({
+                        "step": i,
+                        "t": int(t.item()),
+                        "x0_pred": (x0_pred if x0_pred is not None else x).detach().cpu(),
+                        **({"x_t": x.detach().cpu()} if recorder.capture_xt else {}),
+                    })
             else:
                 x = self.corrector.step(predict, model.scheduler, x, t)
 

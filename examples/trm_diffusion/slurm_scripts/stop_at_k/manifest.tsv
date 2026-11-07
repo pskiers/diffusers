@@ -1,0 +1,22 @@
+# Rebuttal exp 07 analysis 2: task reason_frac  (sbatch --array=1-21 slurm_scripts/wcss_stop_at_k.sh slurm_scripts/stop_at_k/manifest.tsv)
+maze 0.05
+maze 0.1
+maze 0.2
+maze 0.3
+maze 0.5
+maze 0.75
+maze 1.0
+queens 0.05
+queens 0.1
+queens 0.2
+queens 0.3
+queens 0.5
+queens 0.75
+queens 1.0
+clevr 0.05
+clevr 0.1
+clevr 0.2
+clevr 0.3
+clevr 0.5
+clevr 0.75
+clevr 1.0

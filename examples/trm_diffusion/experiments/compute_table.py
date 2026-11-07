@@ -187,8 +187,8 @@ def main() -> None:
                        compile_model=bool(cfg.train.get("compile", False)) and not args.no_compile)}
         r["params_total_M"] = sum(g["total_M"] for g in r["params"].values())
         results[key] = r
-        print(f"[{key}] {r['run']}: params {r['params_total_M']:.1f}M "
-              f"({', '.join(f'{k} {v['total_M']:.1f}M' for k, v in r['params'].items())}), "
+        mods = ", ".join(f"{k} {v['total_M']:.1f}M" for k, v in r["params"].items())
+        print(f"[{key}] {r['run']}: params {r['params_total_M']:.1f}M ({mods}), "
               f"{r['sampler_gflops']:.0f} GFLOPs/sample (+{r['decode_gflops']:.0f} decode), "
               + ", ".join(f"B={b}: {v['ms_per_sample']:.1f} ms/sample" for b, v in r["latency"].items())
               + f" ({time.time() - t0:.0f} s)", flush=True)
