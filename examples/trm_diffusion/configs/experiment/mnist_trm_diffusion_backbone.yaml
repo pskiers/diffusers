@@ -21,7 +21,7 @@ mode: "painter_base"
 
 train:
   sudoku_loss_weight: 0.0  # pure diffusion -- no separate thinker logits to attach a CE loss to
-  cfg_prob: 0.0            # CFG training dropout isn't implemented in TRMDiffusionBackbone.train_step yet
+  cfg_prob: 0.0            # vu78kfn4 trained without CFG dropout
 
 run:
   output_dir: "runs/mnist_trm_diffusion_backbone"

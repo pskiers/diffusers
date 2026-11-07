@@ -1,0 +1,41 @@
+# @package _global_
+# TRM as the diffusion backbone itself on AMAZE (Maze / Queens): the recipe of
+# mnist_trm_diffusion_backbone (W&B vu78kfn4, the paper's Table 1 "TRM" row on EXTREME) with RGB images,
+# the puzzle image channel-concatenated onto x_t and patch-tokenized at cell_size 12 (144 tokens, as the
+# AMAZE thinker). Pure diffusion loss, no separate painter.
+#
+# Usage:
+#   python train_trm.py experiment=amaze_trm_diffusion_backbone data.amaze_root=data/amaze/maze eval_callbacks=amaze
+#   python train_trm.py experiment=amaze_trm_diffusion_backbone data.amaze_root=data/amaze/queens \
+#     eval_callbacks=amaze_queens
+
+defaults:
+  - override /data: amaze
+  - override /painter: mnist_trm_diffusion_backbone
+  - override /train: mnist
+  - override /eval_callbacks: amaze
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+data:
+  cell_size: 12
+
+painter:
+  out_channels: 3
+  cond_channels: 3
+
+train:
+  batch_size: 256  # vu78kfn4's batch
+  gradient_accumulation_steps: 1
+  # vu78kfn4 predates the true-mean loss: its gradients were 1/batch_size smaller with clip 1.0
+  grad_clip: 256.0
+  sudoku_loss_weight: 0.0  # pure diffusion -- no separate thinker logits to attach a CE loss to
+  cfg_prob: 0.1            # CFG dropout, as the painters; sampled with CFG 2 (sampling/cfg)
+
+eval:
+  batch_size: 128
+
+run:
+  output_dir: "runs/amaze_trm_diffusion_backbone"

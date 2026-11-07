@@ -1116,6 +1116,12 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         mb_data = []
         for mb in micro_batches:
             sample = self._prepare_training_sample(mb, device)
+            if self.train_cfg.cfg_prob > 0 and sample.spatial_conditions is not None:
+                # CFG dropout: the zeroed condition is what null_condition_sample feeds the unconditional pass.
+                # Drawn once per micro-batch, so a dropped sample stays unconditional for all n_sup steps.
+                drop = torch.rand(sample.x_noisy.shape[0], device=device) < self.train_cfg.cfg_prob
+                keep = (~drop).view(-1, 1, 1, 1).to(sample.spatial_conditions.dtype)
+                sample.spatial_conditions = sample.spatial_conditions * keep
             bsz = sample.x_noisy.shape[0]
             z_H, z_L = self.get_initial_states(bsz)
             mb_data.append({"sample": sample, "z_H": z_H.to(device), "z_L": z_L.to(device)})
