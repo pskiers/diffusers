@@ -1,0 +1,18 @@
+# Same architecture as mnist_unet, but RGB (3ch) instead of grayscale (1ch):
+# Amaze's maze solution is a blue path and Queen boards have coloured regions,
+# both of which the paper's evaluation metrics read from RGB pixels.
+_target_: diffusers.UNet2DModel
+sample_size: 144
+in_channels: 3
+out_channels: 3
+block_out_channels: [32, 64, 64]
+down_block_types:
+  - "DownBlock2D"
+  - "DownBlock2D"
+  - "DownBlock2D"
+up_block_types:
+  - "UpBlock2D"
+  - "UpBlock2D"
+  - "UpBlock2D"
+norm_num_groups: 32
+layers_per_block: 2

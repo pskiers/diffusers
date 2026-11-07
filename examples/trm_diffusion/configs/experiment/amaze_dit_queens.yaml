@@ -1,0 +1,33 @@
+# @package _global_
+# Standalone (no-TRM) diffusion baseline for QUEENS.
+# Pixel-space pure DiT conditioned on the puzzle image by channel concat, trained on the multi-scale queens mix (n=4..10).
+# Usage:
+#   python train_trm.py experiment=amaze_dit_queens \
+#     data.amaze_root=data/amaze/queens
+defaults:
+  - override /data: amaze
+  - override /backbone: amaze_dit
+  - override /painter: amaze_dit
+  - override /train: mnist
+  - override /eval_callbacks: amaze_queens
+  - override /sampling: direct
+  - _self_
+
+data:
+  amaze_root: data/amaze/queens
+mode: "painter_base"
+
+train:
+  batch_size: 128
+  gradient_accumulation_steps: 6
+  cfg_prob: 0.0
+  max_seconds: 0 # (0 = no limit)
+  # Runs from before train_steps backpropped the true mean loss had gradients
+  # 1/batch_size smaller; grad_clip = batch_size reproduces their clipping.
+  grad_clip: 128.0
+
+eval:
+  batch_size: 128
+
+run:
+  output_dir: "runs/amaze_dit_queens"

@@ -1,0 +1,17 @@
+# Frozen RGB UNetPainter for ControlNet thinker steering.
+# Loads a trained amaze_unet_painter checkpoint and freezes the UNet.
+# No trainable painter params — only the thinker and translator train.
+_target_: models.painter_base.ControlNetSteeredUNetPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to amaze_unet_painter checkpoint
+unet: ${backbone}
+# bf16 for the frozen-painter forward, which the thinker runs n_sup*K times per
+# step — the dominant thinker cost. Set to null for fp32.
+painter_dtype: bfloat16
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1
+  eps: 1.92e-6  # 1e-8 * train.batch_size 192: reproduces pre-true-mean-loss runs
