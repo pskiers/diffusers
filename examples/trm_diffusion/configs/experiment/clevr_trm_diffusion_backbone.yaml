@@ -1,0 +1,33 @@
+# @package _global_
+# TRM as the diffusion backbone itself on CLEVR (reduced relations + presence-only centroid mask, the conditioning
+# of the CLEVR thinker and DM baselines): no separate painter, pure diffusion loss in SDXL-VAE latent space.
+#
+# Usage:
+#   python train_trm.py experiment=clevr_trm_diffusion_backbone data.clevr_root=$SCRATCH/clevr
+
+defaults:
+  - override /data: clevr
+  - override /painter: clevr_trm_diffusion_backbone
+  - override /vae: sdxl
+  - override /train: clevr
+  - override /eval: clevr
+  - override /eval_callbacks: clevr
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+data:
+  mode: "reduced"
+  include_centroid_mask: true
+  centroid_mask_presence_only: true
+
+train:
+  batch_size: 256  # mnist_trm_diffusion_backbone's batch
+  gradient_accumulation_steps: 1
+  grad_clip: 256.0
+  sudoku_loss_weight: 0.0  # pure diffusion -- no separate thinker logits to attach a CE loss to
+  cfg_prob: 0.1            # CFG dropout (objects and mask zeroed); sampled with CFG 2 (sampling/cfg)
+
+run:
+  output_dir: "runs/clevr_trm_diffusion_backbone"

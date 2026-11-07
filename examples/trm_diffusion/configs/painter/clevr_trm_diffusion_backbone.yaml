@@ -1,0 +1,53 @@
+# TRMLatentObjectDiffusionBackbone: the TRM itself as the CLEVR diffusion backbone, in SDXL-VAE latent space,
+# instead of a thinker steering a frozen painter. Its input tokens are the CLEVR thinker's (object/relation tokens
+# + a 16x16 grid of [x_t, centroid mask] tokens = 266, as in
+# clevr_thinker_v1_centroidmaskfused_x0hint_t80_sliced_biggrid_forceuncond (0il6x2cq), without the painter x0 hint);
+# the grid tokens are read out as 2x2x4 latent patches. TRM hyperparameters as mnist_trm_diffusion_backbone.
+_target_: models.trm_wrappers.TRMLatentObjectDiffusionBackbone
+_recursive_: false
+
+vae: ${vae}
+num_object_tokens: ${data.max_objects}
+latent_channels: 4
+latent_size: 32  # data.image_size 256 / the VAE's 8
+patch_size: 2    # 16 x 16 grid of latent patches
+
+condition_encoder:
+  _target_: models.condition_encoders.ObjectFeatureEncoderV1CentroidMaskFused
+  in_dim: ${data.object_feat_dim}
+  hidden_dim: 512
+  out_dim: 512
+  latent_channels: 4
+  hidden_size: 512
+  grid_size: 16
+  mask_channels: 1
+  noisy_dropout_p_max: 0.0
+  num_train_timesteps: ${diffusion.num_train_timesteps}
+  with_timestep_emb: false  # the TRM embeds the timestep itself
+
+hidden_size: 512
+n_heads: 8
+L_layers: 2
+L_cycles: 6
+H_cycles: 3
+n_sup: 16
+expansion: 4.0
+forward_dtype: "bfloat16"
+pos_encodings: "rope"
+mlp_t: false
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
+num_puzzle_identifiers: 1
+halt_exploration_prob: 0.0
+batch_size: ${train.batch_size}
+
+eval_callbacks: ${eval_callbacks}
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 0.3
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

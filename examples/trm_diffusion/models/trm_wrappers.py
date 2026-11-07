@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import torch
@@ -846,6 +847,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         enc_channels: int = 128,
         enc_hidden_channels: tuple = (128, 256, 256),
         image_size: int = 144,
+        extra_tokens: int = 0,
         eval_callbacks=None,
         sampling_pipeline=None,
         **trm_kwargs,
@@ -856,7 +858,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
             self,
             optim_cfg=optim_cfg,
             vocab_size=patch_pixels,
-            seq_len=grid * grid,
+            seq_len=grid * grid + extra_tokens,
             with_timestep_emb=True,
             **trm_kwargs,
         )
@@ -888,6 +890,10 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
 
     # ── Patchify / unpatchify ────────────────────────────────────────────────
 
+    def _tokens(self, sample: DataSample) -> torch.Tensor:
+        """The TRM's input tokens for a sample at its x_noisy (subclasses read other condition fields)."""
+        return self._tokens_from_image(sample.x_noisy, sample.spatial_conditions)
+
     def _tokens_from_image(self, x_noisy: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         x = torch.cat([x_noisy, cond], dim=1) if cond is not None else x_noisy
         feat = self.patch_proj(self.patch_enc(x))
@@ -896,7 +902,8 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
     def _image_from_patches(self, patches: torch.Tensor) -> torch.Tensor:
         B = patches.shape[0]
         p, g, c = self.patch_size, self.grid, self.out_channels
-        patches = patches.view(B, g, g, c, p, p)
+        # The image is read from the trailing grid tokens; leading extra_tokens (e.g. object tokens) are dropped.
+        patches = patches[:, -g * g :].reshape(B, g, g, c, p, p)
         patches = patches.permute(0, 3, 1, 4, 2, 5)  # (B, C, g, p, g, p)
         return patches.reshape(B, c, g * p, g * p)
 
@@ -969,7 +976,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         Returns: (DiffusionPrediction, z_H_next, z_L_next).
         """
         bsz = sample.x_noisy.shape[0]
-        tokens = self._tokens_from_image(sample.x_noisy, sample.spatial_conditions)
+        tokens = self._tokens(sample)
         device = sample.x_noisy.device
 
         if z_H is None or z_L is None:
@@ -1116,12 +1123,15 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         mb_data = []
         for mb in micro_batches:
             sample = self._prepare_training_sample(mb, device)
-            if self.train_cfg.cfg_prob > 0 and sample.spatial_conditions is not None:
-                # CFG dropout: the zeroed condition is what null_condition_sample feeds the unconditional pass.
+            if self.train_cfg.cfg_prob > 0:
+                # CFG dropout: the zeroed conditions are what null_condition_sample feeds the unconditional pass.
                 # Drawn once per micro-batch, so a dropped sample stays unconditional for all n_sup steps.
                 drop = torch.rand(sample.x_noisy.shape[0], device=device) < self.train_cfg.cfg_prob
-                keep = (~drop).view(-1, 1, 1, 1).to(sample.spatial_conditions.dtype)
-                sample.spatial_conditions = sample.spatial_conditions * keep
+                for k in self.condition_keys:
+                    val = getattr(sample, k)
+                    if val is not None:
+                        keep = (~drop).view((-1,) + (1,) * (val.ndim - 1)).to(val.dtype)
+                        setattr(sample, k, val * keep)
             bsz = sample.x_noisy.shape[0]
             z_H, z_L = self.get_initial_states(bsz)
             mb_data.append({"sample": sample, "z_H": z_H.to(device), "z_L": z_L.to(device)})
@@ -1130,7 +1140,7 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
         lr = 0.0
         for _ in range(self.n_sup):
             for d in mb_data:
-                tokens = self._tokens_from_image(d["sample"].x_noisy, d["sample"].spatial_conditions)
+                tokens = self._tokens(d["sample"])
                 logits, d["z_H"], d["z_L"] = self.reasoning_step(
                     tokens, d["z_H"], d["z_L"], timesteps=d["sample"].timesteps
                 )
@@ -1176,6 +1186,67 @@ class TRMDiffusionBackbone(PainterBase, SpatialTRM):
             result.update(cb(self, dataloader, accelerator, **kwargs))
         self.train()
         return result
+
+
+class TRMLatentObjectDiffusionBackbone(TRMDiffusionBackbone):
+    """TRMDiffusionBackbone on CLEVR: the TRM itself denoises SDXL-VAE latents, with no separate painter.
+
+    The input tokens come from a condition encoder (the CLEVR thinker's ObjectFeatureEncoderV1CentroidMaskFused:
+    one token per object slot, then a grid of [x_t, centroid mask] patch tokens) instead of the base class's patch
+    CNN; only the trailing grid tokens are read out, each as one latent patch. Images are encoded with a frozen VAE
+    and decoded for eval as in UNetPainter (dataset images in [-1, 1]).
+    """
+
+    condition_keys: list[str] = ["embedding_conditions", "spatial_conditions"]
+
+    def __init__(
+        self,
+        *args,
+        condition_encoder,
+        vae,
+        num_object_tokens: int,
+        latent_channels: int = 4,
+        latent_size: int = 32,
+        patch_size: int = 2,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            patch_size=patch_size,
+            out_channels=latent_channels,
+            cond_channels=0,
+            image_size=latent_size,
+            extra_tokens=num_object_tokens,
+            **kwargs,
+        )
+        del self.patch_enc, self.patch_proj  # the condition encoder builds the tokens
+        self.condition_encoder = instantiate(condition_encoder)
+        self.vae = instantiate(vae)
+        self.scaling_factor = self.vae.config.scaling_factor
+
+    def _tokens(self, sample: DataSample) -> torch.Tensor:
+        tokens = self.condition_encoder(
+            sample.embedding_conditions, sample.x_noisy, sample.spatial_conditions, sample.timesteps
+        ).enc_emb
+        assert tokens.shape[1] == self.inner.config.seq_len, (tokens.shape, self.inner.config.seq_len)
+        return tokens
+
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.vae.encode(images).latent_dist.sample() * self.scaling_factor
+
+    def decode_for_eval(self, latents: torch.Tensor) -> torch.Tensor:
+        imgs = self.vae.decode(latents / self.scaling_factor).sample
+        return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
+
+    def images_to_log(self, images: torch.Tensor) -> torch.Tensor:
+        return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
+
+    def _prepare_training_sample(self, mb: DataSample, device: torch.device) -> DataSample:
+        latents = self.encode(mb.images.to(device))
+        sample = super()._prepare_training_sample(dataclasses.replace(mb, images=latents), device)
+        sample.embedding_conditions = mb.embedding_conditions.to(device)
+        return sample
 
 
 def compute_depth_matched_layers(n_sup: int, H_cycles: int, L_cycles: int, L_layers: int) -> int:

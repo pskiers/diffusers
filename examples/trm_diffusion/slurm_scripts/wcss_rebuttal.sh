@@ -31,11 +31,15 @@
 #   hard_trm         (03_trm_baselines) the same TRM denoiser on Sudoku HARD, trained on 0-26 givens like PaTh HARD
 #                    (sudoku_hard_trm_0_26_x0_hint_repro, pvpx8kbs), CFG dropout 0.1; 1 GPU, batch 256.
 #                    Output/W&B name: mnist_trm_diffusion_backbone_hard.
-#                    The TRM denoiser runs on 1 GPU: on 2 GPUs one rank skips the DDP wrap and the job hangs
-#                    (LOG.md, 2026-11-07).
+#                    The TRM denoiser runs on 1 GPU, as vu78kfn4 did.
+#   clevr_trm        (03_trm_baselines) the TRM denoiser on CLEVR (SDXL-VAE latents; the CLEVR thinker's object +
+#                    [x_t, centroid mask] tokens), CFG dropout 0.1; 1 GPU, batch 256. num_steps 400k is a ceiling:
+#                    the run is meant to go until the 72 h limit (checkpoints every 20k), evals every 20k.
+#                    Copies CLEVR (~16 GB) to the job's $TMPDIR first. Output/W&B name: clevr_trm_diffusion_backbone.
 
 RUN=$1
 NGPU=2
+CLEVR=0  # 1: copy the CLEVR dataset to $TMPDIR and train from there
 XARGS=("${@:2}")  # extra train_trm.py overrides
 
 case $RUN in
@@ -60,6 +64,11 @@ case $RUN in
     ARGS=(experiment=mnist_trm_diffusion_backbone data=mnist_sudoku_srm "data.train_dataset.given_cells_range=[0,26]"
           train.batch_size=256 train.gradient_accumulation_steps=1 train.grad_clip=256 train.cfg_prob=0.1)
     NGPU=1 ;;
+  clevr_trm)
+    OUT=clevr_trm_diffusion_backbone
+    ARGS=(experiment=clevr_trm_diffusion_backbone data.clevr_root=\$SCRATCH/clevr data.num_workers=8
+          train.num_steps=400000 eval.eval_every=20000)
+    NGPU=1; CLEVR=1 ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;
 esac
@@ -77,4 +86,12 @@ ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 export SCRATCH=$TMPDIR
 cd $ROOT/examples/trm_diffusion
 echo "$(date -Is) $SLURM_JOB_ID $(hostname) git $(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l): ${CMD[*]}"
+if (( CLEVR )); then
+  # As wcss_mmdit.sh: images/train, images/val and scenes (~16 GB; not the zip or the questions)
+  src=data/clevr/CLEVR_v1.0 dst=$SCRATCH/clevr/CLEVR_v1.0 t0=$SECONDS
+  mkdir -p $dst/images && cp -r $src/scenes $dst/ && cp -r $src/images/train $src/images/val $dst/images/ \
+    || { echo "CLEVR copy to $dst failed" >&2; exit 1; }
+  echo "CLEVR copied to $dst in $(( SECONDS - t0 )) s"
+  CMD=("${CMD[@]//\$SCRATCH/$SCRATCH}")
+fi
 "${CMD[@]}"
