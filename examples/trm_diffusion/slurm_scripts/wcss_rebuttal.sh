@@ -36,10 +36,16 @@
 #                    [x_t, centroid mask] tokens), CFG dropout 0.1; 1 GPU, batch 256. num_steps 400k is a ceiling:
 #                    the run is meant to go until the 72 h limit (checkpoints every 20k), evals every 20k.
 #                    Copies CLEVR (~16 GB) to the job's $TMPDIR first. Output/W&B name: clevr_trm_diffusion_backbone.
+#   srm_<task>       (01_ipr_srm_baselines) SRM on AMAZE <task> = maze | queens, examples/srm_sudoku (env_srm, Python
+#                    3.12): the Sudoku SRM recipe, 12 px patches (144 variables), puzzle image concatenated onto the
+#                    UNet input; 1 GPU, batch 64 (128 does not fit an H100), 450k steps (~0.5 s/step: ~63 h),
+#                    persistent checkpoints every 50k (1.4 GB each). Output: srm_sudoku/outputs/srm_amaze_<task>,
+#                    W&B name srm_amaze_<task>. SRM/IPR scoring: srm_sudoku/amaze_srm_eval.py.
 
 RUN=$1
 NGPU=2
 CLEVR=0  # 1: copy the CLEVR dataset to $TMPDIR and train from there
+SRM=0    # 1: run examples/srm_sudoku/training.py in env_srm instead of train_trm.py
 XARGS=("${@:2}")  # extra train_trm.py overrides
 
 case $RUN in
@@ -69,22 +75,34 @@ case $RUN in
     ARGS=(experiment=clevr_trm_diffusion_backbone data.clevr_root=\$SCRATCH/clevr data.num_workers=8
           train.num_steps=400000 eval.eval_every=20000)
     NGPU=1; CLEVR=1 ;;
+  srm_maze|srm_queens)
+    TASK=${RUN#srm_}
+    OUT=srm_amaze_$TASK
+    ARGS=(experiment=amaze dataset=amaze_$TASK +manual_output_dir=outputs/$OUT data_loader.train.batch_size=64
+          trainer.max_steps=450000 checkpointing.every_n_train_steps_persistently=50000
+          wandb.activated=true wandb.mode=online wandb.project=small-llm-diffusion wandb.entity=pawel269)
+    NGPU=1; SRM=1 ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;
 esac
 
 if (( NGPU > 1 )); then LAUNCH=(accelerate launch --multi_gpu --num_processes $NGPU); else LAUNCH=(python); fi
 CMD=("${LAUNCH[@]}" train_trm.py "${ARGS[@]}" run.output_dir=runs/$OUT "${XARGS[@]}")
+if (( SRM )); then CMD=(env_srm/bin/python training.py "${ARGS[@]}" "${XARGS[@]}"); fi
 if [[ -n $DRY_RUN ]]; then echo "${CMD[@]}"; exit 0; fi
 
 source /usr/local/sbin/modules.sh
-module load Python/3.10.4-GCCcore-11.3.0
-module load CUDA/12.4.0
-source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin/activate
-
 ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
 export SCRATCH=$TMPDIR
-cd $ROOT/examples/trm_diffusion
+if (( SRM )); then
+  module load Python/3.12.3-GCCcore-13.3.0  # env_srm's python links into this module
+  cd $ROOT/examples/srm_sudoku
+else
+  module load Python/3.10.4-GCCcore-11.3.0
+  module load CUDA/12.4.0
+  source $ROOT/trm_torch26_env/bin/activate
+  cd $ROOT/examples/trm_diffusion
+fi
 echo "$(date -Is) $SLURM_JOB_ID $(hostname) git $(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l): ${CMD[*]}"
 if (( CLEVR )); then
   # As wcss_mmdit.sh: images/train, images/val and scenes (~16 GB; not the zip or the questions)
