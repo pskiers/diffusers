@@ -41,6 +41,12 @@
 #                    UNet input; 1 GPU, batch 64 (128 does not fit an H100), 450k steps (~0.5 s/step: ~63 h),
 #                    persistent checkpoints every 50k (1.4 GB each). Output: srm_sudoku/outputs/srm_amaze_<task>,
 #                    W&B name srm_amaze_<task>. SRM/IPR scoring: srm_sudoku/amaze_srm_eval.py.
+#   srm_clevr        (01_ipr_srm_baselines) SRM on CLEVR (srm_sudoku experiment=clevr, src/clevr.py): SDXL-VAE latents,
+#                    2x2 latent patches (256 variables), conditioning of the 101M CLEVR DM (presence mask concatenated,
+#                    object cross-attention at every level, 117M params), CFG dropout 0.1; 1 GPU, batch 256 (as the
+#                    DMs; 49 GB, ~0.94 s/step: ~270k steps in 72 h), max_steps 300k is a ceiling, persistent
+#                    checkpoints every 50k. Copies CLEVR to $TMPDIR. Output: srm_sudoku/outputs/srm_clevr, W&B
+#                    name srm_clevr. Scoring: srm_sudoku/clevr_srm_eval.py then clevr_score_samples.py (trm env).
 
 RUN=$1
 NGPU=2
@@ -82,6 +88,12 @@ case $RUN in
           trainer.max_steps=450000 checkpointing.every_n_train_steps_persistently=50000
           wandb.activated=true wandb.mode=online wandb.project=small-llm-diffusion wandb.entity=pawel269)
     NGPU=1; SRM=1 ;;
+  srm_clevr)
+    OUT=srm_clevr
+    ARGS=(experiment=clevr dataset.root=\$SCRATCH/clevr +manual_output_dir=outputs/$OUT data_loader.train.batch_size=256
+          trainer.max_steps=300000 checkpointing.every_n_train_steps_persistently=50000
+          wandb.activated=true wandb.mode=online wandb.project=small-llm-diffusion wandb.entity=pawel269)
+    NGPU=1; SRM=1; CLEVR=1 ;;
   *)
     echo "unknown run '$RUN' (see the header of $0)" >&2; exit 1 ;;
 esac
@@ -106,7 +118,7 @@ fi
 echo "$(date -Is) $SLURM_JOB_ID $(hostname) git $(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l): ${CMD[*]}"
 if (( CLEVR )); then
   # As wcss_mmdit.sh: images/train, images/val and scenes (~16 GB; not the zip or the questions)
-  src=data/clevr/CLEVR_v1.0 dst=$SCRATCH/clevr/CLEVR_v1.0 t0=$SECONDS
+  src=$ROOT/examples/trm_diffusion/data/clevr/CLEVR_v1.0 dst=$SCRATCH/clevr/CLEVR_v1.0 t0=$SECONDS
   mkdir -p $dst/images && cp -r $src/scenes $dst/ && cp -r $src/images/train $src/images/val $dst/images/ \
     || { echo "CLEVR copy to $dst failed" >&2; exit 1; }
   echo "CLEVR copied to $dst in $(( SECONDS - t0 )) s"
