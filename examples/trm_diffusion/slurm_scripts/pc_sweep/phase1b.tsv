@@ -1,0 +1,14 @@
+# Rebuttal exp 02, phase 1b: Langevin r grid extended upwards where phase 1's best (0.32) sat on the edge; CLEVR phase 2
+# (its tune differences were within noise; best r 0.01).  sbatch --array=1-12 slurm_scripts/wcss_pc_sweep.sh slurm_scripts/pc_sweep/phase1b.tsv
+extreme langevin 1 0.64 tune
+extreme langevin 1 1.28 tune
+hard langevin 1 0.64 tune
+hard langevin 1 1.28 tune
+maze langevin 1 0.64 tune
+maze langevin 1 1.28 tune
+queens langevin 1 0.64 tune
+queens langevin 1 1.28 tune
+clevr langevin 1 0.01 full
+clevr langevin 2 0.01 full
+clevr langevin 4 0.01 full
+clevr langevin 8 0.01 full

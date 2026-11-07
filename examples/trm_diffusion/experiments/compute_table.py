@@ -121,12 +121,24 @@ def conditions(model, eval_ds, n: int, device: torch.device):
 
 
 def param_groups(model) -> dict:
+    """Parameters per top-level module, each parameter counted once: under the first module that holds it. Modules
+    that only reference another's parameters (e.g. the x0-hint condition encoder holding the frozen painter) list
+    those under `shared_M` / `shared_with`, not in their total."""
+    owner: dict[int, str] = {}
     out = {}
     for name, child in model.named_children():
         params = list(child.parameters())
-        if params:
-            out[name] = {"total_M": sum(p.numel() for p in params) / 1e6,
-                         "trainable_M": sum(p.numel() for p in params if p.requires_grad) / 1e6}
+        if not params:
+            continue
+        own = [p for p in params if id(p) not in owner]
+        shared = [p for p in params if id(p) in owner]
+        out[name] = {"total_M": sum(p.numel() for p in own) / 1e6,
+                     "trainable_M": sum(p.numel() for p in own if p.requires_grad) / 1e6}
+        if shared:
+            out[name]["shared_M"] = sum(p.numel() for p in shared) / 1e6
+            out[name]["shared_with"] = sorted({owner[id(p)] for p in shared})
+        for p_ in own:
+            owner[id(p_)] = name
     return out
 
 
@@ -205,6 +217,7 @@ def main() -> None:
     for key, r in results.items():
         task, model_name = key.split("/")
         mods = ", ".join(f"{k} {v['total_M']:.1f}" + ("" if v["trainable_M"] else " (frozen)")
+                         + (f" (+{v['shared_M']:.1f} of {'/'.join(v['shared_with'])})" if "shared_M" in v else "")
                          for k, v in r["params"].items())
         lines.append(f"| {task} | {model_name} | {r['run']} | {r['acc']} | {r['params_total_M']:.1f} | {mods} | "
                      f"{r['steps']} | {r['cfg_scale']:g} | {r['sampler_gflops']:.0f} | {r['decode_gflops']:.0f} | "
