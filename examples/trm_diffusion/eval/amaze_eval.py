@@ -668,3 +668,46 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
         combined = {**result["per_scale"], **result["per_scale_ood"]}
         rows = [(f"{s}x{s}", combined[s], samples.get(queens_sample_key(s))) for s in combined]
         run.log({f"{prefix}/per_scale_table": _img_table(rows)})
+
+
+# ── Crop-back for scaled/translated targets (datasets.amaze_dataset.AmazeScaledDataset) ──
+
+
+def crop_to_content(
+    images: torch.Tensor,
+    canvas_color: Sequence[float] = (0.0, 0.0, 0.0),
+    threshold: float = 0.05,
+    min_frac: float = 0.1,
+) -> torch.Tensor:
+    """Crop each image to the bounding box of pixels that differ from the canvas
+    colour, and resize it back to the full (H, W).
+
+    For models trained on AmazeScaledDataset the solution is painted at an unknown
+    scale and position, so it is located from the image itself before scoring
+    against the untransformed GT. A row/column counts as content only if at least
+    `min_frac` of its pixels differ from the canvas by more than `threshold`
+    (max over channels), so sparse speckle on the canvas does not inflate the
+    box. Falls back to the full image when nothing qualifies.
+
+    images: (B, C, H, W) or (B, K, C, H, W) in [0, 1]. Returns the same shape.
+    """
+    if images.dim() == 5:
+        B, K = images.shape[:2]
+        return crop_to_content(images.flatten(0, 1), canvas_color, threshold, min_frac).unflatten(0, (B, K))
+    B, C, H, W = images.shape
+    canvas = torch.tensor(list(canvas_color), dtype=images.dtype, device=images.device).view(1, -1, 1, 1)
+    content = (images - canvas).abs().amax(dim=1) > threshold          # (B, H, W)
+    row_ok = content.float().mean(dim=2) >= min_frac                   # (B, H)
+    col_ok = content.float().mean(dim=1) >= min_frac                   # (B, W)
+    out = torch.empty_like(images)
+    for i in range(B):
+        rows = row_ok[i].nonzero(as_tuple=True)[0]
+        cols = col_ok[i].nonzero(as_tuple=True)[0]
+        if rows.numel() == 0 or cols.numel() == 0:
+            out[i] = images[i]
+            continue
+        crop = images[i, :, rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+        out[i] = torch.nn.functional.interpolate(
+            crop.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
+        )[0].clamp(0.0, 1.0)
+    return out

@@ -1,0 +1,11 @@
+# Queens eval for AmazeScaledDataset targets (data=amaze_scaled): each generation is
+# cropped to its content bounding box (vs the black canvas) and resized back before
+# scoring against the untransformed GT. Panels show the raw generation.
+- _target_: models.amaze_eval_callbacks.QueenEvalCallback
+  num_samples: 256
+  num_log_images: 8
+  num_attempts: 1
+  crop_to_content: true
+  canvas_color: ${data.canvas_color}
+  bbox_threshold: 0.05
+  bbox_min_frac: 0.1

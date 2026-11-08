@@ -65,6 +65,7 @@ def sample_and_score(
     model, ds: AmazeDataset, task: str, device, samples_per_puzzle: int, base_seed: int, batch_size: int,
     combo_name: str, samples_dir: Path, is_main_process: bool = True,
     generations_dir: Path | None = None, gen_prefix: str = "",
+    crop: dict | None = None,
 ) -> tuple[list[dict], dict | None]:
     """Sample `samples_per_puzzle` attempts per puzzle and score them with the AmazeMetrics evaluator.
 
@@ -73,6 +74,11 @@ def sample_and_score(
     - Pass@K (exact solve within K attempts / best-of-K).
     ``sample_pair`` is one representative {'generated', 'condition'} image pair
     (first puzzle, first attempt) for the summary table, or None if empty.
+
+    crop: kwargs for eval.amaze_eval.crop_to_content (canvas_color, threshold,
+    min_frac) — for models trained on AmazeScaledDataset, whose solution is painted
+    at a random scale/position. Every generation is cropped to its content box and
+    resized back BEFORE scoring and saving; None (default) leaves them untouched.
     """
     from eval.amaze_eval import AmazeMetrics
 
@@ -104,6 +110,9 @@ def sample_and_score(
         generator = torch.Generator(device=device).manual_seed(base_seed + start)
         generated = pipeline.sample_one_batch(model, conditions, device, generator=generator)
         decoded = model.decode_for_eval(generated).cpu()                 # (P*K, C, H, W) in [0, 1]
+        if crop is not None:
+            from eval.amaze_eval import crop_to_content
+            decoded = crop_to_content(decoded, **crop)
 
         P = len(puzzles)
         inputs = decoded.reshape(P, K, *decoded.shape[1:])               # (P, K, C, H, W)
@@ -252,6 +261,16 @@ def main(cfg: DictConfig):
     data_root = Path(cfg.get("data_root", str(TRM_ROOT / "data" / "amaze")))
     samples_per_puzzle = int(cfg.get("samples_per_puzzle", 5))
     seed = int(cfg.get("sample_seed", 0))
+    # +crop_to_content=true for AmazeScaledDataset-trained models (canvas colour
+    # from data.canvas_color, as in the *_scaled eval-callback configs).
+    crop = None
+    if cfg.get("crop_to_content", False):
+        crop = {
+            "canvas_color": tuple(cfg.data.get("canvas_color", (0.0, 0.0, 0.0))),
+            "threshold": float(cfg.get("bbox_threshold", 0.05)),
+            "min_frac": float(cfg.get("bbox_min_frac", 0.1)),
+        }
+        logger.info(f"Cropping generations to content before scoring: {crop}")
     out_path = cfg.get("out_json", None) or str(Path(checkpoint).parent / f"amaze_metrics_{task}.json")
 
     torch.set_float32_matmul_precision("high")
@@ -302,6 +321,7 @@ def main(cfg: DictConfig):
                         # size's combo picks out the ids present in its own parquet.
                         generations_dir=(generations_root / "maze" / geometry) if generations_root else None,
                         gen_prefix=f"{scale}x{scale}",
+                        crop=crop,
                     )
 
                     per_combo[combo_name] = rows
@@ -343,6 +363,7 @@ def main(cfg: DictConfig):
                     # id — hence one flat dir for every scale, prefixed like infer_janus.
                     generations_dir=(generations_root / "queens") if generations_root else None,
                     gen_prefix="0x0",
+                    crop=crop,
                 )
 
                 per_scale_rows[str(scale)] = rows

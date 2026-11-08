@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import os
 from typing import Optional
@@ -159,6 +160,80 @@ class AmazeDataset(Dataset):
             prompt=row.get('instruction') or row.get('text') or None,
             puzzle_id=torch.tensor(idx, dtype=torch.long),
         )
+
+
+def scale_and_paste(
+    image: torch.Tensor, scale: float, off_y: int, off_x: int, canvas_color=(0.0, 0.0, 0.0)
+) -> torch.Tensor:
+    """Shrink a (C, H, W) image by `scale` and paste it at (off_y, off_x) on a
+    same-size canvas of `canvas_color`."""
+    C, H, W = image.shape
+    new_h, new_w = max(1, round(H * scale)), max(1, round(W * scale))
+    resized = torch.nn.functional.interpolate(
+        image.unsqueeze(0), size=(new_h, new_w), mode="bilinear", antialias=True, align_corners=False
+    )[0].clamp(0.0, 1.0)
+    canvas = torch.tensor(canvas_color, dtype=image.dtype).view(-1, 1, 1).expand(C, H, W).clone()
+    canvas[:, off_y : off_y + new_h, off_x : off_x + new_w] = resized
+    return canvas
+
+
+def sample_scale_and_offset(size: int, scale_min: float, scale_max: float) -> tuple[float, int, int]:
+    """Random (scale, off_y, off_x) for a square `size` image. Uses torch's RNG,
+    which the DataLoader seeds differently per worker."""
+    scale = scale_min + (scale_max - scale_min) * torch.rand(()).item()
+    new = max(1, round(size * scale))
+    off_y = int(torch.randint(0, size - new + 1, ()).item())
+    off_x = int(torch.randint(0, size - new + 1, ()).item())
+    return scale, off_y, off_x
+
+
+class AmazeScaledDataset(AmazeDataset):
+    """AmazeDataset whose diffusion TARGET (`images`, the solved puzzle) is shrunk
+    to a random fraction of its size and pasted at a random offset on a plain
+    canvas, while the condition (`spatial_conditions`, the unsolved puzzle) is
+    left untransformed — the Amaze counterpart of MNISTSudokuScaledDataset.
+
+    The model therefore has to paint the solution at an unknown scale and
+    position, and the correspondence between condition positions and target
+    positions is broken. Generated images are cropped back to their content
+    bounding box before scoring (eval.amaze_eval.crop_to_content, enabled by the
+    *_scaled eval-callback configs and +crop_to_content=true in the metrics
+    script). Metadata (the GT used for scoring) is untouched.
+
+    Args (in addition to AmazeDataset's):
+        scale_min, scale_max: target scale drawn uniformly from this range.
+        canvas_color: RGB in [0, 1]; must not occur along the puzzle image's own
+            border, so the bounding box recovers the pasted image exactly
+            (black works for queens, whose board has a dark-grey frame; mazes
+            have a black background and need another colour).
+        transform_condition: also apply the SAME transform to the condition
+            (the aligned control: scale/position variety without mismatch).
+    """
+
+    def __init__(
+        self,
+        *args,
+        scale_min: float = 0.8,
+        scale_max: float = 0.9,
+        canvas_color=(0.0, 0.0, 0.0),
+        transform_condition: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
+        self.canvas_color = tuple(float(c) for c in canvas_color)
+        self.transform_condition = bool(transform_condition)
+
+    def __getitem__(self, idx: int) -> DataSample:
+        sample = super().__getitem__(idx)
+        scale, off_y, off_x = sample_scale_and_offset(sample.images.shape[-1], self.scale_min, self.scale_max)
+        updates = {"images": scale_and_paste(sample.images, scale, off_y, off_x, self.canvas_color)}
+        if self.transform_condition and sample.spatial_conditions is not None:
+            updates["spatial_conditions"] = scale_and_paste(
+                sample.spatial_conditions, scale, off_y, off_x, self.canvas_color
+            )
+        return dataclasses.replace(sample, **updates)
 
 
 def test_dataset():

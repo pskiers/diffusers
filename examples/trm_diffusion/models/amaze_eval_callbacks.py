@@ -28,10 +28,26 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
     _task: str = ""
     _log_caption: str = "Amaze sample"
 
-    def __init__(self, num_samples: int = 1000, num_log_images: int = 8, num_attempts: int = 1):
+    def __init__(
+        self,
+        num_samples: int = 1000,
+        num_log_images: int = 8,
+        num_attempts: int = 1,
+        crop_to_content: bool = False,
+        canvas_color=(0.0, 0.0, 0.0),
+        bbox_threshold: float = 0.05,
+        bbox_min_frac: float = 0.1,
+    ):
         self.num_samples = num_samples
         self.num_log_images = num_log_images
         self.num_attempts = num_attempts  # >1 enables Pass@{num_attempts} (best-of-K, K× sampling cost)
+        # crop_to_content: for AmazeScaledDataset targets (solution painted at a random
+        # scale/position) — crop each generation to its content bounding box and resize
+        # it back before scoring (eval.amaze_eval.crop_to_content). Panels stay raw.
+        self.crop_to_content = crop_to_content
+        self.canvas_color = tuple(canvas_color)
+        self.bbox_threshold = bbox_threshold
+        self.bbox_min_frac = bbox_min_frac
         self._scorer_unavailable = False
 
     def _make_scorer(self, device):
@@ -98,6 +114,9 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
                 metadata = [x or {} for x in batch.get("metadata", [{}])[:B]]
 
             if scorer is not None:
+                if self.crop_to_content:
+                    from eval.amaze_eval import crop_to_content
+                    inputs = crop_to_content(inputs, self.canvas_color, self.bbox_threshold, self.bbox_min_frac)
                 scorer.compute_and_accumulate_metrics(inputs, metadata)
 
             if _wandb is not None and len(panels) < self.num_log_images:
