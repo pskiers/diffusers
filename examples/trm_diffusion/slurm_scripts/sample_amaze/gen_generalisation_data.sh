@@ -23,7 +23,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
 source "${PROJECT_ROOT}/slurm_scripts/sample_amaze/generalisation_subsets.sh"
 
 SUBSET="${1:?usage: sbatch gen_generalisation_data.sh <subset: ${GEN_SUBSETS[*]}>}"
@@ -31,17 +30,18 @@ SHAPES="$(subset_shapes "${SUBSET}")"
 SAMPLES="$(subset_samples "${SUBSET}")"
 OUT_ROOT="${GEN_ROOT}/${SUBSET}"
 
-module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}" GCCcore/14.3.0 nodejs/22.17.1
-source "${VENV}/bin/activate"
+source "${PROJECT_ROOT}/slurm_scripts/cluster_env.sh"
+cluster_activate --node          # Python venv + nodejs (cluster_env.sh: NODE_MODULES)
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
-export PYTHONUNBUFFERED=1
+command -v node >/dev/null || { echo "ERROR: no 'node' on PATH (set NODE_MODULES for ${CLUSTER})" >&2; exit 1; }
+echo ">> node $(node --version) on $(uname -m)"
 
 if [[ ! -d third_party/ear_amaze/mazes-generator/node_modules ]]; then
   echo "ERROR: third_party/ear_amaze/mazes-generator/node_modules is missing." >&2
-  echo "The Helios login node is x86_64 and cannot run the nodejs module; build the" >&2
-  echo "packages for the aarch64 compute nodes on any machine with npm and copy them over:" >&2
-  echo "  (cd third_party/ear_amaze/mazes-generator && npm ci --os=linux --cpu=arm64 --libc=glibc)" >&2
+  echo "Install the generator's packages for THIS cluster's architecture, e.g. on a machine" >&2
+  echo "with npm:  (cd third_party/ear_amaze/mazes-generator && npm ci --os=linux --cpu=<arm64|x64> --libc=glibc)" >&2
+  echo "(Helios compute nodes are arm64, lem is x64.)" >&2
   exit 1
 fi
 

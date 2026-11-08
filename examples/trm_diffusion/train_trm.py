@@ -133,6 +133,9 @@ def main(cfg: DictConfig):
             "wandb": {
                 "name": run_name,
                 "id": wandb_id,
+                "group": cfg.run.get("wandb_group", None),
+                "job_type": cfg.run.get("wandb_job_type", None),
+                "tags": list(cfg.run.get("wandb_tags", None) or []) or None,
                 "resume": "allow" if resume_existing else None,
                 "settings": wandb.Settings(init_timeout=init_timeout),
             }

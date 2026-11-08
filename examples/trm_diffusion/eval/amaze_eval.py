@@ -567,6 +567,29 @@ def build_maze_result(per_combo: dict, ood_combo: dict) -> dict:
     }
 
 
+def generalisation_summary(per_combo: dict, seen_cells: Sequence[str]) -> dict:
+    """Seen vs unseen split of a maze evaluation, for the generalisation experiments.
+
+    ``seen_cells`` lists the "<geometry>_<scale>" cells of the training subset (e.g.
+    "square_8"). Every other in-distribution test cell (MAZE_SCALES) is "unseen"; the
+    OOD scales stay in "overall_ood" and are in neither group. Each group is the
+    pooled per-puzzle mean, exactly like "overall" (every cell has the same number of
+    test mazes, so this equals the mean over cells).
+    """
+    seen = set(seen_cells)
+    unknown = sorted(seen - set(per_combo))
+    if unknown:
+        raise ValueError(f"seen cells not in the evaluated combos: {unknown}")
+    seen_list = sorted(c for c in per_combo if c in seen)
+    unseen_list = sorted(c for c in per_combo if c not in seen)
+    return {
+        "seen_cells": seen_list,
+        "unseen_cells": unseen_list,
+        "seen": aggregate([r for c in seen_list for r in per_combo[c]]),
+        "unseen": aggregate([r for c in unseen_list for r in per_combo[c]]) if unseen_list else {},
+    }
+
+
 def build_queens_result(per_scale_rows: dict, ood_scale_rows: dict) -> dict:
     """Canonical queens ``result`` dict from per-size rows.
 
@@ -614,9 +637,11 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
     for key, val in result.get("overall_ood", {}).items():
         run.summary[f"{prefix}/overall_ood/{key}"] = val
 
-    img_cols = ["group", "generated", "condition",
-                "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
-    metric_cols = ["group", "violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5"]
+    # Exact match (exact1 = first attempt, exact5 = best of K) is the headline metric,
+    # so it is in every table next to the continuous Pass.
+    table_keys = ["violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5", "exact1", "exact5"]
+    img_cols = ["group", "generated", "condition"] + table_keys
+    metric_cols = ["group"] + table_keys
 
     def _img_table(named_pairs):
         t = wandb.Table(columns=img_cols)
@@ -624,16 +649,23 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
             pair = pair or {}
             t.add_data(name, make_wandb_image(pair.get("generated")),
                        make_wandb_image(pair.get("condition")),
-                       agg["violation"], agg["coverage"], agg["mse_inside"],
-                       agg["mse_outside"], agg["pass1"], agg["pass5"])
+                       *[agg.get(k) for k in table_keys])
         return t
 
     def _metric_table(named_aggs):
         t = wandb.Table(columns=metric_cols)
         for name, agg in named_aggs:
-            t.add_data(name, agg["violation"], agg["coverage"], agg["mse_inside"],
-                       agg["mse_outside"], agg["pass1"], agg["pass5"])
+            t.add_data(name, *[agg.get(k) for k in table_keys])
         return t
+
+    # Generalisation runs: mean over the cells the model was trained on vs the
+    # in-distribution test cells it never saw (see generalisation_summary).
+    for part in ("seen", "unseen"):
+        for key, val in (result.get("generalisation", {}).get(part) or {}).items():
+            run.summary[f"gen/{part}/{key}"] = val
+    if "generalisation" in result:
+        run.summary["gen/seen_cells"] = ",".join(result["generalisation"]["seen_cells"])
+        run.summary["gen/unseen_cells"] = ",".join(result["generalisation"]["unseen_cells"])
 
     if task == "maze":
         # A single-geometry invocation carries a subset of MAZE_GEOMETRIES; drive
@@ -641,6 +673,13 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
         # "overall" is not read as an all-shapes number.
         geometries = result.get("geometries", MAZE_GEOMETRIES)
         run.summary[f"{prefix}/geometries"] = ",".join(geometries)
+
+        # One scalar per (shape, size) cell, so cells can be compared across runs.
+        for part in ("per_shape", "per_shape_ood"):
+            for g, by_scale in result.get(part, {}).items():
+                for s, agg in by_scale.items():
+                    for key, val in agg.items():
+                        run.summary[f"{prefix}/{part}/{g}/{s}/{key}"] = val
 
         for g, by_scale in result["per_shape"].items():
             rows = [(f"{s}x{s}", by_scale[str(s)], samples.get(maze_sample_key(g, s)))

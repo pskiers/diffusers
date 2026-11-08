@@ -332,6 +332,17 @@ def main(cfg: DictConfig):
         ood_combo, ood_samples = _score_maze(MAZE_OOD_SCALES)
         result = build_maze_result(per_combo, ood_combo)
 
+        # +seen_cells="square_5,square_8,..." (generalisation runs): add the seen vs
+        # unseen split of the in-distribution cells to the JSON and to wandb (gen/*).
+        seen_cells = [c.strip() for c in str(cfg.get("seen_cells", "") or "").split(",") if c.strip()]
+        if seen_cells:
+            from eval.amaze_eval import generalisation_summary
+            result["generalisation"] = generalisation_summary(per_combo, seen_cells)
+            for part in ("seen", "unseen"):
+                if result["generalisation"][part]:
+                    _print_metrics_row(f"Maze — {part} cells ({len(result['generalisation'][part + '_cells'])})",
+                                       result["generalisation"][part])
+
         for g in MAZE_GEOMETRIES:
             _print_metrics_table(
                 f"Maze — {g} (per scale)",

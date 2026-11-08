@@ -37,3 +37,18 @@ subset_samples() {   # rows PER SHAPE for each size
 subset_train_parquet() {
   echo "${GEN_ROOT}/$1/maze/maze_dataset_train_144.parquet"
 }
+
+# The test cells ("<shape>_<size>") a subset trains on -> +seen_cells for the metrics
+# script (wandb gen/seen/* vs gen/unseen/*). Must match subset_shapes/subset_samples.
+subset_seen_cells() {
+  local shapes sizes cells=() g s
+  case "$1" in
+    sizes_5_8_13) shapes="square hexagon triangle circle"; sizes="5 8 13" ;;
+    circle_only)  shapes="circle";  sizes="5 7 8 9 11 13 16" ;;
+    hexagon_only) shapes="hexagon"; sizes="5 7 8 9 11 13 16" ;;
+    square_8)     shapes="square";  sizes="8" ;;
+    *) echo "unknown subset '$1' (use: ${GEN_SUBSETS[*]})" >&2; return 1 ;;
+  esac
+  for g in ${shapes}; do for s in ${sizes}; do cells+=("${g}_${s}"); done; done
+  (IFS=,; echo "${cells[*]}")
+}

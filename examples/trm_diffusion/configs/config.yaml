@@ -27,6 +27,10 @@ run:
   output_dir: "runs/new"
   resume_from_checkpoint: null
   wandb_project: small-llm-diffusion
+  # Optional wandb organisation (null/[] = none). The workspace comes from WANDB_ENTITY.
+  wandb_group: null      # e.g. the experiment: generalisation | diffusion_needed | flops | latent
+  wandb_job_type: null   # train | eval | sweep | analysis
+  wandb_tags: []
 
 ema:
   enabled: true
