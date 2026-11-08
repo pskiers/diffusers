@@ -1,0 +1,16 @@
+# Thinker-side condition encoder: the CNN over [puzzle, x_t] of the working puzzle runs (spatial_image_v1), with x_t
+# replaced by the frozen MM-DiT painter's hidden image tokens after its read-only head (painter.steer_from_block),
+# projected to hidden_channels_in and upsampled to the puzzle's resolution
+# (models.condition_encoders.PainterHiddenSpatialConditionEncoder). img_grid / painter_dim must match the painter.
+_target_: models.condition_encoders.PainterHiddenSpatialConditionEncoder
+painter_dim: 384
+img_grid: 9
+hidden_channels_in: 32
+in_channels: 33          # 1 puzzle channel + hidden_channels_in
+enc_channels: 128
+hidden_channels: [128, 256, 256]
+output_dim: ${thinker.hidden_size}
+factor: ${data.cell_size}
+noisy_dropout_p_max: 0.7
+num_train_timesteps: ${diffusion.num_train_timesteps}
+with_timestep_emb: true

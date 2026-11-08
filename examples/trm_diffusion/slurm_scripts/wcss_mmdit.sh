@@ -61,6 +61,12 @@
 #           _cond (the painter keeps its own condition instead of being blinded),
 #           _hidden (the thinker reads the painter's hidden states after the read block, as in T2I,
 #                    instead of the CNN over puzzle + x_t; needs a painter with a condition stream),
+#           _steer<k> (k = 1..9: the painter's first k blocks are the read-only head, blocks k..depth-1 are steered;
+#                    default 1),
+#           _hcnn (the thinker's CNN reads the puzzle and the painter's hidden image tokens after the read-only head
+#                  (painter_hidden, projected to 32 channels and upsampled) in place of x_t; the puzzle still enters
+#                  through the CNN, unlike _hidden, so it works on _nocond painters; condition_encoder=
+#                  painter_hidden_spatial),
 #           _kv (steer through attention: per steered block, key/value tokens from the thinker that the
 #                image tokens attend to without rotary embeddings, translator=painter_attention, instead
 #                of residuals added to the token stream),
@@ -126,16 +132,19 @@
 # 256) per Euler step, so evals use fewer samples than the defaults (thinkers: 1024
 # samples every 5k steps, ~5 min each).
 
-source /usr/local/sbin/modules.sh
-module load Python/3.10.4-GCCcore-11.3.0
-module load CUDA/12.4.0
-source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin/activate
-
+# DRY_RUN=1 bash slurm_scripts/wcss_mmdit.sh <run>: print the train_trm.py command and exit (no environment setup,
+# no data copy, no training).
 ROOT=/lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers
-export SCRATCH=$TMPDIR
-export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
-export TOKENIZERS_PARALLELISM=false
-cd $ROOT/examples/trm_diffusion
+if [[ -z $DRY_RUN ]]; then
+  source /usr/local/sbin/modules.sh
+  module load Python/3.10.4-GCCcore-11.3.0
+  module load CUDA/12.4.0
+  source /lustre/pd03/hpc-kamildeja-1773916679/pawel/diffusers/trm_torch26_env/bin/activate
+  export SCRATCH=$TMPDIR
+  export HF_HOME=$ROOT/examples/trm_diffusion/cache_dir
+  export TOKENIZERS_PARALLELISM=false
+  cd $ROOT/examples/trm_diffusion
+fi
 
 RUN=$1
 XARGS=("${@:2}")  # extra train_trm.py overrides, e.g. run.resume_from_checkpoint=runs/<run>/checkpoint_step-10000.pt
@@ -147,10 +156,14 @@ MNIST_EVAL="eval.eval_every=5000 eval_callbacks.0.num_samples=1024"
 CLEVR_EVAL="eval.eval_every=5000 eval_callbacks.1.n_samples=1024"
 MNIST_S1="painter.steer_from_block=1 translator.num_blocks=7"
 MNIST_CNN12="condition_encoder.factor=12 translator.grid=12 thinker.seq_len=144 train.batch_size=192 train.gradient_accumulation_steps=4"
-train() { python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@" "${XARGS[@]}"; }
+train() {
+  if [[ -n $DRY_RUN ]]; then echo python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@" "${XARGS[@]}"; exit 0; fi
+  python train_trm.py data.num_workers=8 run.output_dir=runs/$RUN "$@" "${XARGS[@]}"
+}
 # CLEVR runs read the dataset from the job's $TMPDIR, not lustre: images/train, images/val and scenes (~16 GB; not
 # the zip or the questions)
 clevr_train() {
+  [[ -n $DRY_RUN ]] && train data.clevr_root=\$SCRATCH/clevr "$@"
   local src=data/clevr/CLEVR_v1.0 dst=$SCRATCH/clevr/CLEVR_v1.0 t0=$SECONDS
   mkdir -p $dst/images && cp -r $src/scenes $dst/ && cp -r $src/images/train $src/images/val $dst/images/ \
     || { echo "CLEVR copy to $dst failed" >&2; exit 1; }
@@ -240,6 +253,9 @@ case $RUN in
         gelu) PSIDE="$PSIDE painter.net.mlp=gelu"; PV="${PV}_$tok" ;;
         norope) PSIDE="$PSIDE painter.net.rope=false"; PV="${PV}_$tok" ;;
         steer0) STEER=0; TV="${TV}_$tok" ;;
+        steer[1-9]) STEER=${tok#steer}; TV="${TV}_$tok" ;;  # read after blocks [0, k), steer blocks k..depth-1
+        hcnn) STAGE2="$STAGE2 condition_encoder=painter_hidden_spatial condition_encoder.painter_dim=$WIDTH"
+              TV="${TV}_$tok" ;;  # the CNN reads the puzzle + the painter's hidden image tokens instead of x_t
         fp32) STAGE2="$STAGE2 painter.painter_dtype=null"; TV="${TV}_$tok" ;;
         ditopt) STAGE2="$STAGE2 painter.optim_cfg.lr=3e-5 painter.optim_cfg.warmup_steps=1000 +painter.optim_cfg.eps=3.84e-6"
                 TV="${TV}_$tok" ;;  # DiT-direct's encoder/translator optimizer

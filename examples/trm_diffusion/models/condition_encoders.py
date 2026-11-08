@@ -168,6 +168,50 @@ class NoisySpatialConditionEncoder(ConditionEncoderBase):
         return TRMInput(enc_emb=emb)
 
 
+class PainterHiddenSpatialConditionEncoder(NoisySpatialConditionEncoder):
+    """NoisySpatialConditionEncoder with the painter's own hidden image tokens in place of x_t: the thinker reads the
+    puzzle image and what the frozen painter computed from x_t in its read-only head (MMDiTPainter blocks
+    [0, steer_from_block), DataSample.painter_hidden, filled by the painter once per thinker call), instead of x_t.
+
+    The image tokens (painter grid g x g, painter_dim each) are LayerNorm'ed, projected to `hidden_channels_in`
+    channels, upsampled (nearest) to the condition image's resolution and concatenated where x_t was; the CNN is
+    NoisySpatialConditionEncoder's, so in_channels = condition channels + hidden_channels_in.
+
+    Wherever the encoder's x_t view is overridden (DataSample.enc_x_noisy, all zeros: the CFG null branch), the hidden
+    map is zeroed too, as x_t is for the x_t-reading encoder.
+    """
+
+    condition_keys: list[str] = ["spatial_conditions", "x_noisy"]
+    needs_sample = True
+
+    def __init__(self, painter_dim: int, img_grid: int, hidden_channels_in: int, **kwargs):
+        super().__init__(**kwargs)
+        self.painter_dim = painter_dim
+        self.img_grid = img_grid
+        self.hidden_channels_in = hidden_channels_in
+        self.hidden_norm = nn.LayerNorm(painter_dim, elementwise_affine=False)
+        self.hidden_proj = nn.Linear(painter_dim, hidden_channels_in)
+
+    def bind_painter(self, painter) -> None:
+        net = painter.net
+        if net.cfg.hidden_size != self.painter_dim:
+            raise ValueError(f"condition_encoder.painter_dim {self.painter_dim} != painter width {net.cfg.hidden_size}")
+        if net.latent_img_size != self.img_grid:
+            raise ValueError(f"condition_encoder.img_grid {self.img_grid} != painter token grid {net.latent_img_size}")
+
+    def forward(self, condition: torch.Tensor, x_noisy: torch.Tensor, timesteps=None, sample=None, **_) -> TRMInput:
+        assert sample is not None and sample.painter_hidden is not None, "painter_hidden must be filled by the painter"
+        h = sample.painter_hidden.float()[:, -self.img_grid**2:]  # image tokens (after any condition tokens)
+        b = h.shape[0]
+        assert h.shape == (b, self.img_grid**2, self.painter_dim), h.shape
+        h = self.hidden_proj(self.hidden_norm(h)).transpose(1, 2).reshape(b, -1, self.img_grid, self.img_grid)
+        h = F.interpolate(h, size=condition.shape[-2:], mode="nearest")
+        if sample.enc_x_noisy is not None:  # the x_t view is overridden: the encoder sees no x_t information
+            assert not sample.enc_x_noisy.any(), "enc_x_noisy other than zeros has no hidden-state counterpart"
+            h = torch.zeros_like(h)
+        return super().forward(condition, h, timesteps=timesteps)
+
+
 class NoisySpatialConditionEncoderV2(ConditionEncoderBase):
     """
     CNN encoder for a spatial condition and the noisy image, encoded through
