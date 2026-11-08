@@ -75,8 +75,14 @@ SMALL_LEM_SBATCH=( ${CLUSTER_CPU_SBATCH[@]+"${CLUSTER_CPU_SBATCH[@]}"} --cpus-pe
 declare -A DEP_OF
 declare -A SKIP_SUBSET
 SMALL_MISSING=()
+wanted_subset() {   # with ONLY set, only subsets that have a selected run get data
+  [[ -z "${ONLY}" ]] && return 0
+  local k; for k in ${RUN_KINDS[$1]}; do [[ " ${ONLY} " == *" gen_$1_${k} "* ]] && return 0; done; return 1
+}
 for SUBSET in "${GEN_SUBSETS[@]}"; do
-  if [[ -f "$(subset_train_parquet "${SUBSET}")" ]]; then
+  if ! wanted_subset "${SUBSET}"; then
+    echo "[data ] ${SUBSET}: no selected runs (ONLY), skipped"; SKIP_SUBSET[${SUBSET}]=1
+  elif [[ -f "$(subset_train_parquet "${SUBSET}")" ]]; then
     echo "[data ] ${SUBSET}: exists, not regenerated"
   elif [[ "${CLUSTER}" == athena ]]; then
     echo "[data ] ${SUBSET}: MISSING on Athena (generate elsewhere and copy) — its runs are skipped"
