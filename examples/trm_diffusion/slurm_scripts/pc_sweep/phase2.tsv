@@ -1,0 +1,18 @@
+# Rebuttal exp 02, phase 2: Langevin K sweep at the best r from phases 1/1b (EXTREME 0.32; HARD, Maze, Queens 0.64; CLEVR done in 1b).
+# sbatch --array=1-16 slurm_scripts/wcss_pc_sweep.sh slurm_scripts/pc_sweep/phase2.tsv
+extreme langevin 1 0.32 full
+extreme langevin 2 0.32 full
+extreme langevin 4 0.32 full
+extreme langevin 8 0.32 full
+hard langevin 1 0.64 full
+hard langevin 2 0.64 full
+hard langevin 4 0.64 full
+hard langevin 8 0.64 full
+maze langevin 1 0.64 full
+maze langevin 2 0.64 full
+maze langevin 4 0.64 full
+maze langevin 8 0.64 full
+queens langevin 1 0.64 full
+queens langevin 2 0.64 full
+queens langevin 4 0.64 full
+queens langevin 8 0.64 full
