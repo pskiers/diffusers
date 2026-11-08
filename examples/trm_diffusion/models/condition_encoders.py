@@ -20,6 +20,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
+import weakref
 from typing import Optional
 
 import torch
@@ -343,9 +344,13 @@ class LatentCrossAttnConditionEncoder(ConditionEncoderBase):
         self.__dict__["_painter"] = painter
 
     def _encode_condition_latent(self, condition: torch.Tensor) -> torch.Tensor:
+        # Entries hold a WEAK reference to the condition tensor: a strong one would
+        # keep up to cache_size full-resolution image batches alive on the GPU
+        # (~4 GB at 255x3x288x288 during sampling). A dead ref (tensor freed, id
+        # possibly reused) simply misses.
         cache = self._cache
         hit = cache.get(id(condition))
-        if hit is not None and hit[0] is condition:
+        if hit is not None and hit[0] is not None and hit[0]() is condition:
             cache.move_to_end(id(condition))
             return hit[1]
         # The CFG null pass builds a fresh all-zero condition every call; share one
@@ -357,7 +362,7 @@ class LatentCrossAttnConditionEncoder(ConditionEncoderBase):
             cache.move_to_end(zero_key)
             return cache[zero_key][1]
         latent = self._painter.encode(condition, sample=False)
-        cache[id(condition)] = (condition, latent)
+        cache[id(condition)] = (weakref.ref(condition), latent)
         while len(cache) > self.cache_size:
             cache.popitem(last=False)
         return latent
