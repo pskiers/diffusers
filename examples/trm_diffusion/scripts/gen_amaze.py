@@ -84,8 +84,8 @@ class AmazeDatasetGenerator:
         self.task = task
         self.task_cfg = cfg[task]
 
-        self.maze_gen = TRM_ROOT / "third_party" / "amaze" / "mazes-generator"
-        self.queen_gen = TRM_ROOT / "third_party" / "amaze" / "queen-generator"
+        self.maze_gen = TRM_ROOT / "third_party" / "ear_amaze" / "mazes-generator"
+        self.queen_gen = TRM_ROOT / "third_party" / "ear_amaze" / "queen-generator"
 
         root = Path(str(cfg.output_root))
         self.out_root = root if root.is_absolute() else TRM_ROOT / root

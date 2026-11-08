@@ -1,4 +1,6 @@
 # Initially taken from GitHub's Python gitignore file
+export/
+exports/
 examples/**/*.jsonl
 examples/**/*.jpg
 examples/**/*.jpeg

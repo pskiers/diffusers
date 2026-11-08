@@ -294,6 +294,71 @@ class SlicedControlNetTranslator(ControlNetTranslator):
         return super().forward(TRMOutput(logits=sliced), timesteps=timesteps)
 
 
+class LatentControlNetTranslator(ThinkerPainterTranslatorBase):
+    """
+    ControlNet translator for a thinker whose tokens already sit on the latent
+    painter's grid (one token per patch_size x patch_size latent patch — see
+    LatentCrossAttnConditionEncoder).
+
+    Unlike ControlNetTranslator there is no bilinear upsampling of a coarse,
+    unrelated grid: each token is linearly unpatchified into its own
+    patch_size x patch_size block of a blueprint map (DiT's final-layer
+    unpatchify), which is therefore exactly registered with the painter's
+    latent input, then fed to the zero-initialised ConditioningPyramid.
+
+    Steps:
+      1. _logits_to_spatial: (B, N, C) -> (B, C, g, g), g = latent_size // patch_size
+      2. per-token Linear(C -> blueprint_channels * p * p) + pixel_shuffle
+         -> (B, blueprint_channels, latent_size, latent_size)
+      3. ConditioningPyramid -> ControlNetSteering
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        painter_channels: tuple[int, ...],
+        layers_per_block: int,
+        latent_size: int,
+        patch_size: int = 2,
+        blueprint_channels: int = 64,
+        bridge_mode: str = "normalized",
+        with_timestep_emb: bool = True,
+    ):
+        if latent_size % patch_size != 0:
+            raise ValueError(f"latent_size {latent_size} not divisible by patch_size {patch_size}")
+        super().__init__(
+            grid=latent_size // patch_size,
+            bridge_mode=bridge_mode,
+            bridge_channels=in_channels if bridge_mode == "normalized" else None,
+        )
+        self.patch_size = patch_size
+        self.unpatchify = nn.Linear(in_channels, blueprint_channels * patch_size * patch_size)
+        self.control_pyramid = ConditioningPyramid(
+            in_channels=blueprint_channels,
+            block_out_channels=painter_channels,
+            layers_per_block=layers_per_block,
+        )
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=painter_channels[-1])
+
+    @property
+    def condition_keys(self) -> list[str]:
+        return ["timesteps"] if self.with_timestep_emb else []
+
+    def forward(self, trm_output: TRMOutput, timesteps=None, **_) -> ControlNetSteering:
+        spatial = self._logits_to_spatial(trm_output.logits)              # (B, C, g, g)
+        blocks = self.unpatchify(spatial.permute(0, 2, 3, 1))             # (B, g, g, Cb*p*p)
+        blueprint = F.pixel_shuffle(blocks.permute(0, 3, 1, 2), self.patch_size)  # (B, Cb, g*p, g*p)
+        down_res, mid_res = self.control_pyramid(blueprint)
+        if self.with_timestep_emb and timesteps is not None:
+            mid_res = mid_res + self.timestep_mlp(timesteps).unsqueeze(-1).unsqueeze(-1)
+        return ControlNetSteering(
+            down_block_additional_residuals=down_res,
+            mid_block_additional_residual=mid_res,
+        )
+
+
 class ControlNetTranslator1D(ThinkerPainterTranslatorBase):
     """
     Translates thinker logits into 1D ControlNet residuals for

@@ -310,8 +310,12 @@ class ThinkerFrozenPainterBase(BaseModel):
         bsz = sample.x_noisy.shape[0]
 
         if null_steering:
+            # SpatialTRM keeps seq_len in its inner config; other thinkers (e.g.
+            # LinearHeadThinker) expose it directly.
+            seq_len = (self.thinker.inner.config.seq_len if hasattr(self.thinker, "inner")
+                       else self.thinker.seq_len)
             logits = torch.zeros(
-                bsz, self.thinker.inner.config.seq_len, self.thinker.vocab_size,
+                bsz, seq_len, self.thinker.vocab_size,
                 device=sample.x_noisy.device,
             )
         else:
@@ -653,7 +657,10 @@ class ThinkerFrozenPainterBase(BaseModel):
     # ── Compilation ───────────────────────────────────────────────────────────
 
     def compile_submodules(self):
-        self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False, dynamic=False)
+        # Only SpatialTRM has a recurrent L_level worth compiling; thinkers without
+        # one (e.g. LinearHeadThinker) are left as they are.
+        if hasattr(self.thinker, "inner"):
+            self.thinker.inner.L_level = torch.compile(self.thinker.inner.L_level, fullgraph=False, dynamic=False)
         if hasattr(self.painter, "compile_submodules"):
             self.painter.compile_submodules()
         if hasattr(self.condition_encoder, "compile_submodules"):

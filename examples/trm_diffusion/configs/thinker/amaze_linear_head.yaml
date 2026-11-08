@@ -1,0 +1,20 @@
+# Encoder + linear head: the no-reasoning control for the Amaze TRM thinker
+# (configs/thinker/amaze.yaml). Same encoder width, output vocabulary, n_sup and
+# optimizer settings as the TRM, so the two runs differ only in the recursive
+# transformer. See models/linear_head_thinker.py.
+_target_: models.linear_head_thinker.LinearHeadThinker
+vocab_size: 11
+seq_len: 144
+hidden_size: 512
+# Kept equal to the TRM's n_sup: one optimizer step per reasoning step, so this
+# gives the control the same number of optimizer updates as the TRM run.
+n_sup: 16
+
+optim_cfg:
+  _target_: configs.schemas.ThinkerOptimConfig
+  lr: 1e-4
+  weight_decay: 0.3
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000
+  lr_min_ratio: 1.0

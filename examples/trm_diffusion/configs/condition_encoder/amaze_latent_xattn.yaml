@@ -1,0 +1,15 @@
+# Latent thinker input: z_t (queries) cross-attends to the VAE-encoded condition
+# (keys/values) — no channel concat, no assumed pixel alignment between the two.
+# Tokens = (36/2)^2 = 324, one per 2x2 latent patch -> thinker.seq_len = 324.
+_target_: models.condition_encoders.LatentCrossAttnConditionEncoder
+latent_channels: 4
+patch_size: 2
+cond_patch_size: 2
+hidden_dim: ${thinker.hidden_size}
+output_dim: ${thinker.hidden_size}
+n_heads: 8
+n_layers: 2
+mlp_ratio: 4.0
+with_timestep_emb: true
+# Condition latents cached per micro-batch tensor; must be >= gradient_accumulation_steps.
+cache_size: 16

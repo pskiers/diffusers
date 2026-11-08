@@ -147,6 +147,9 @@ class UNetPainter(PainterBase, BaseModel):
         pixel_range: str = "[0,1]",
         mean_reduced_loss: bool = False,
         min_train_timestep: int = 0,
+        data_pixel_range: Optional[str] = None,
+        latent_shift: Optional[list] = None,
+        latent_scale: Optional[list] = None,
     ):
         super().__init__()
         self.unet: nn.Module = instantiate(unet)
@@ -160,6 +163,33 @@ class UNetPainter(PainterBase, BaseModel):
         # "[-1,1]": VAE was trained on images in [-1,1] (standard SD convention).
         # "[0,1]":  VAE was trained on images in [0,1] (custom MNIST VAE).
         self._vae_tanh = vae_pixel_range == "[-1,1]"
+        # data_pixel_range: range the DATASET delivers images in, when it differs
+        # from the VAE's own (vae_pixel_range). None = the dataset already matches
+        # the VAE (the CLEVR convention, which normalises in the dataset). "[0,1]"
+        # with an SD VAE (vae_pixel_range="[-1,1]") rescales inside encode(), so
+        # [0,1] datasets like Amaze can feed a pretrained SD VAE unchanged.
+        self._rescale_to_vae = (
+            self.vae is not None and data_pixel_range == "[0,1]" and self._vae_tanh
+        )
+        # Per-channel latent normalisation, z = (E(x) - shift) / scale, applied
+        # instead of the VAE's single global scaling_factor when given. SD's
+        # scaling_factor was fitted to natural images; mostly-white puzzle images
+        # give latents with a large per-channel mean and a very different spread,
+        # which skews the noise schedule's SNR. The values come from config
+        # (measured by experiments/amaze_vae_ceiling.py), and the buffers are
+        # non-persistent so checkpoints stay loadable with or without them.
+        if (latent_shift is None) != (latent_scale is None):
+            raise ValueError("latent_shift and latent_scale must be given together")
+        self._per_channel_latent = latent_shift is not None
+        if self._per_channel_latent:
+            self.register_buffer(
+                "latent_shift", torch.tensor(list(latent_shift), dtype=torch.float32).view(1, -1, 1, 1),
+                persistent=False,
+            )
+            self.register_buffer(
+                "latent_scale", torch.tensor(list(latent_scale), dtype=torch.float32).view(1, -1, 1, 1),
+                persistent=False,
+            )
         # Same idea as vae_pixel_range, but for pixel-space painters (no VAE),
         # where the dataset's own native range may not be [0,1] — e.g. Steiner
         # Tree's 3-level background/vertex/edge scheme is in [-1,1]. Unused
@@ -229,7 +259,7 @@ class UNetPainter(PainterBase, BaseModel):
         defined directly in [-1, 1].
         """
         if self.vae is not None:
-            imgs = self.vae.decode(latents / self.scaling_factor).sample
+            imgs = self.vae.decode(self._unnormalize_latents(latents)).sample
             if self._vae_tanh:
                 return ((imgs + 1.0) / 2.0).clamp(0.0, 1.0)
             return imgs.clamp(0.0, 1.0)
@@ -246,19 +276,37 @@ class UNetPainter(PainterBase, BaseModel):
         unless pixel_range="[-1,1]" was set (see decode_for_eval).
         """
         if self.vae is not None:
-            if self._vae_tanh:
+            if self._vae_tanh and not self._rescale_to_vae:
                 return ((images + 1.0) / 2.0).clamp(0.0, 1.0)
             return images.clamp(0.0, 1.0)
         if self._pixel_tanh:
             return images.clamp(-1.0, 1.0)
         return images.clamp(0.0, 1.0)
 
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode pixel images to scaled latents. Requires VAE."""
+    def _normalize_latents(self, raw: torch.Tensor) -> torch.Tensor:
+        if self._per_channel_latent:
+            return (raw - self.latent_shift) / self.latent_scale
+        return raw * self.scaling_factor
+
+    def _unnormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        if self._per_channel_latent:
+            return latents * self.latent_scale + self.latent_shift
+        return latents / self.scaling_factor
+
+    def encode(self, images: torch.Tensor, sample: bool = True) -> torch.Tensor:
+        """Encode pixel images to normalised latents. Requires VAE.
+
+        sample=True draws from the posterior (the usual LDM training target);
+        sample=False takes its mean — deterministic, for encoding conditions.
+        """
         if self.vae is None:
             raise RuntimeError("encode() requires a VAE")
         with torch.no_grad():
-            return self.vae.encode(images).latent_dist.sample() * self.scaling_factor
+            if self._rescale_to_vae:
+                images = images * 2.0 - 1.0
+            dist = self.vae.encode(images).latent_dist
+            raw = dist.sample() if sample else dist.mode()
+            return self._normalize_latents(raw)
 
     # ── Forward ─────────────────────────────────────────────────────────────
 

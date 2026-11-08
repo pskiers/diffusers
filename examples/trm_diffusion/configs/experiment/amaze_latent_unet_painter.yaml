@@ -1,0 +1,34 @@
+# @package _global_
+# Stage 1 of the LATENT painter-thinker: unconditional latent-diffusion painter
+# on solved Amaze images, through a frozen pretrained SD VAE.
+# Usage: python train_trm.py experiment=amaze_latent_unet_painter data.amaze_root=data/amaze/maze
+#   (needs data/amaze/<task>/maze_dataset_train_288.parquet:
+#    python scripts/gen_amaze.py --task <task> --stage train -o 'scaled_image_sizes=[144,288]')
+
+defaults:
+  - override /data: amaze
+  - override /backbone: amaze_latent_unet
+  - override /vae: sd_ft_mse
+  - override /painter: amaze_latent_unet
+  - override /train: mnist
+  - override /eval_callbacks: amaze
+  - override /sampling: cfg
+  - _self_
+
+mode: "painter_base"
+
+# 288 px -> 36x36 latent (f=8). 144 px would give 18x18, too coarse for 16x16 mazes.
+data:
+  image_size: 288
+  painter_size: 288
+
+train:
+  batch_size: 192
+  gradient_accumulation_steps: 4
+  max_seconds: 0
+
+eval:
+  batch_size: 128
+
+run:
+  output_dir: "runs/amaze_latent_unet_painter"

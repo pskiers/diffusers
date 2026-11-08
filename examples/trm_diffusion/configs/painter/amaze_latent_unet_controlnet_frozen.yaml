@@ -1,0 +1,19 @@
+# Frozen latent-space Amaze UNetPainter for ControlNet thinker steering.
+# Must be built exactly like the stage-1 painter (configs/painter/amaze_latent_unet.yaml),
+# including the SAME latent_shift/latent_scale overrides — they are config, not
+# checkpoint state.
+_target_: models.painter_base.ControlNetSteeredUNetPainter
+_recursive_: false
+checkpoint: ???  # REQUIRED: path to an amaze_latent_unet_painter checkpoint
+unet: ${backbone}
+vae: ${vae}
+data_pixel_range: "[0,1]"
+latent_shift: null
+latent_scale: null
+painter_dtype: bfloat16
+optim_cfg:
+  _target_: configs.schemas.PainterOptimConfig
+  lr: 3e-5
+  weight_decay: 0.0
+  warmup_steps: 1000
+  lr_min_ratio: 0.1

@@ -28,6 +28,12 @@ third_party/ear_amaze/wandb/
 third_party/ear_amaze/assets/
 third_party/ear_amaze/assets.zip
 third_party/ear_amaze/*.jpg
+# The generator (scripts/gen_amaze.py) runs from here now; re-include what the
+# root rules (`examples/**/*.json`, `lib/`) would drop, as for third_party/amaze.
+!third_party/ear_amaze/mazes-generator/package.json
+!third_party/ear_amaze/mazes-generator/package-lock.json
+!third_party/ear_amaze/mazes-generator/js/lib/
+!third_party/ear_amaze/mazes-generator/js/lib/*.js
 **/node_modules/
 **/__pycache__/
 **/.DS_Store

@@ -1,0 +1,22 @@
+# Latent-space Amaze painter UNet: diffusion runs on SD-VAE latents, not pixels.
+# 288x288 RGB -> sd-vae-ft-mse (f=8) -> 4x36x36. sample_size MUST equal
+# data.image_size / 8 (36 for the 288 data used by the amaze_latent_* experiments).
+# 36 -> 18 -> 9: two downsamples, so sample_size must be divisible by 4.
+# Self-attention at the 18x18 and 9x9 levels gives the (unconditional) painter
+# global context over the maze.
+_target_: diffusers.UNet2DModel
+sample_size: 36
+in_channels: 4
+out_channels: 4
+block_out_channels: [128, 256, 256]
+down_block_types:
+  - "DownBlock2D"
+  - "AttnDownBlock2D"
+  - "AttnDownBlock2D"
+up_block_types:
+  - "AttnUpBlock2D"
+  - "AttnUpBlock2D"
+  - "UpBlock2D"
+attention_head_dim: 32
+norm_num_groups: 32
+layers_per_block: 2

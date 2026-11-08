@@ -1,0 +1,11 @@
+# Thinker tokens (on the 18x18 patch grid of the 36x36 latent) -> unpatchify ->
+# exactly-registered 36x36 blueprint -> ControlNet residuals for the latent UNet.
+_target_: models.translators.LatentControlNetTranslator
+in_channels: ${thinker.vocab_size}
+painter_channels: ${backbone.block_out_channels}
+layers_per_block: ${backbone.layers_per_block}
+latent_size: ${backbone.sample_size}
+patch_size: ${condition_encoder.patch_size}
+blueprint_channels: 64
+bridge_mode: "normalized"
+with_timestep_emb: true

@@ -17,6 +17,7 @@ encoders use noisy to produce additional latent tokens.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
 from typing import Optional
@@ -233,6 +234,159 @@ class NoisySpatialConditionEncoderV2(ConditionEncoderBase):
         if self.with_timestep_emb and timesteps is not None:
             emb = emb + self.timestep_mlp(timesteps).unsqueeze(1)
         return TRMInput(enc_emb=emb)
+
+
+# ── Latent-space cross-attention encoder (latent painter-thinker) ────────────
+
+
+def _sincos_2d(h: int, w: int, dim: int, device, dtype) -> torch.Tensor:
+    """(h*w, dim) fixed 2D sin-cos position table (MAE/DiT style), row-major."""
+    if dim % 4 != 0:
+        raise ValueError(f"2D sin-cos embedding needs dim % 4 == 0, got {dim}")
+    quarter = dim // 4
+    omega = 1.0 / (10000 ** (torch.arange(quarter, device=device, dtype=torch.float32) / quarter))
+    gy, gx = torch.meshgrid(
+        torch.arange(h, device=device, dtype=torch.float32),
+        torch.arange(w, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    ax = gx.flatten()[:, None] * omega[None]
+    ay = gy.flatten()[:, None] * omega[None]
+    return torch.cat([ax.sin(), ax.cos(), ay.sin(), ay.cos()], dim=1).to(dtype)
+
+
+class _CrossAttnBlock(nn.Module):
+    """Pre-norm block: queries attend to a key/value stream, then an MLP."""
+
+    def __init__(self, dim: int, n_heads: int, mlp_ratio: float):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm_mlp = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        kv = self.norm_kv(kv)
+        x = x + self.attn(self.norm_q(x), kv, kv, need_weights=False)[0]
+        return x + self.mlp(self.norm_mlp(x))
+
+
+class LatentCrossAttnConditionEncoder(ConditionEncoderBase):
+    """
+    Latent-space thinker input: the noisy latent z_t cross-attends to the
+    VAE-encoded condition, instead of the two being concatenated channel-wise.
+
+    - z_t (already a latent — the painter does diffusion in VAE latent space) is
+      patchified into the QUERY tokens, so there is exactly one output token per
+      z_t patch: the thinker's sequence lives on the painter's own latent grid,
+      and its output can be unpatchified straight back onto it
+      (LatentControlNetTranslator) with no interpolation.
+    - The condition image is encoded by the painter's own frozen VAE (posterior
+      mean, so deterministic) and patchified into the KEY/VALUE tokens.
+
+    Each stream gets its own 2D sin-cos position table over its OWN grid. That
+    tells a token where it sits inside its image, but makes no assumption that
+    condition position (i, j) corresponds to z_t position (i, j) — the
+    correspondence is learned by the attention, so the condition may have a
+    different layout, scale or resolution than the target.
+
+    The VAE comes from the painter via bind_painter (kept as a plain attribute,
+    not a submodule, so its weights are neither duplicated in the state dict nor
+    handed to the encoder's optimizer). Condition latents are cached by tensor
+    identity: the training loop re-encodes the same micro-batch condition at
+    every one of the n_sup reasoning steps, and sampling at every denoising step.
+
+    Reads ``spatial_conditions`` (pixels, painter data range) and ``x_noisy``
+    (normalised latent, (B, C, H, W)).
+    Output: TRMInput with enc_emb (B, (H/p)*(W/p), output_dim).
+    """
+
+    condition_keys: list[str] = ["spatial_conditions", "x_noisy"]
+
+    def __init__(
+        self,
+        latent_channels: int = 4,
+        patch_size: int = 2,
+        cond_patch_size: Optional[int] = None,
+        hidden_dim: int = 512,
+        output_dim: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 2,
+        mlp_ratio: float = 4.0,
+        with_timestep_emb: bool = True,
+        cache_size: int = 16,
+    ):
+        super().__init__()
+        cond_patch_size = cond_patch_size or patch_size
+        self.patch_size = patch_size
+        self.cache_size = cache_size
+        self.q_embed = nn.Conv2d(latent_channels, hidden_dim, patch_size, stride=patch_size)
+        self.kv_embed = nn.Conv2d(latent_channels, hidden_dim, cond_patch_size, stride=cond_patch_size)
+        self.blocks = nn.ModuleList(_CrossAttnBlock(hidden_dim, n_heads, mlp_ratio) for _ in range(n_layers))
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, output_dim)
+        # The TRM multiplies float inputs by sqrt(hidden); keep the post-scale
+        # embedding at ~unit variance, like _build_spatial_enc's projection.
+        nn.init.normal_(self.proj.weight, std=1.0 / hidden_dim)
+        nn.init.zeros_(self.proj.bias)
+        self.with_timestep_emb = with_timestep_emb
+        if with_timestep_emb:
+            self.timestep_mlp = TimestepMLP(sin_dim=128, out_dim=hidden_dim)
+        self.__dict__["_painter"] = None
+        self.__dict__["_cache"] = collections.OrderedDict()
+
+    def bind_painter(self, painter) -> None:
+        if getattr(painter, "vae", None) is None:
+            raise ValueError("LatentCrossAttnConditionEncoder needs a latent painter (painter.vae is None)")
+        self.__dict__["_painter"] = painter
+
+    def _encode_condition_latent(self, condition: torch.Tensor) -> torch.Tensor:
+        cache = self._cache
+        hit = cache.get(id(condition))
+        if hit is not None and hit[0] is condition:
+            cache.move_to_end(id(condition))
+            return hit[1]
+        # The CFG null pass builds a fresh all-zero condition every call; share one
+        # encoding per shape for those instead of re-running the VAE each time.
+        zero_key = ("zeros", tuple(condition.shape), condition.device)
+        if not condition.any():
+            if zero_key not in cache:
+                cache[zero_key] = (None, self._painter.encode(condition, sample=False))
+            cache.move_to_end(zero_key)
+            return cache[zero_key][1]
+        latent = self._painter.encode(condition, sample=False)
+        cache[id(condition)] = (condition, latent)
+        while len(cache) > self.cache_size:
+            cache.popitem(last=False)
+        return latent
+
+    @staticmethod
+    def _tokens(x: torch.Tensor) -> torch.Tensor:
+        B, D, h, w = x.shape
+        return x.flatten(2).transpose(1, 2) + _sincos_2d(h, w, D, x.device, x.dtype)[None]
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        x_noisy: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+        **_,
+    ) -> TRMInput:
+        z_cond = self._encode_condition_latent(condition).to(x_noisy.dtype)
+        q = self._tokens(self.q_embed(x_noisy))
+        kv = self._tokens(self.kv_embed(z_cond))
+        if self.with_timestep_emb and timesteps is not None:
+            q = q + self.timestep_mlp(timesteps).unsqueeze(1)
+        for block in self.blocks:
+            q = block(q, kv)
+        return TRMInput(enc_emb=self.proj(self.out_norm(q)))
+
+    def compile_submodules(self):
+        # Only the attention stack: the VAE call and the cache are plain Python.
+        for i, block in enumerate(self.blocks):
+            self.blocks[i] = torch.compile(block, fullgraph=False, dynamic=False)
 
 
 class X0PredHintConditionEncoder(ConditionEncoderBase):

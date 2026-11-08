@@ -117,7 +117,15 @@ def main(cfg: DictConfig):
         run_name = Path(cfg.run.output_dir).name
         id_file = Path(cfg.run.output_dir) / "wandb_run_id.txt"
         resume_existing = id_file.exists()
-        wandb_id = id_file.read_text().strip() if resume_existing else wandb.util.generate_id()
+        if resume_existing:
+            wandb_id = id_file.read_text().strip()
+        else:
+            # wandb.util.generate_id was removed in newer wandb (0.28 has only the sdk one).
+            try:
+                from wandb.sdk.lib.runid import generate_id
+            except ImportError:
+                generate_id = wandb.util.generate_id
+            wandb_id = generate_id()
 
         init_timeout = float(os.environ.get("WANDB_INIT_TIMEOUT", "300"))
         wandb_config = OmegaConf.to_container(cfg, resolve=True)

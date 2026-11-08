@@ -1,0 +1,50 @@
+# @package _global_
+# Stage 2 of the LATENT painter-thinker: TRM thinker steering a frozen latent painter.
+#   condition --VAE--> z_cond ┐
+#   z_t (latent) ─────────────┴─ cross-attn (Q=z_t, K/V=z_cond) -> 324 tokens
+#   -> TRM -> unpatchify onto the 36x36 latent grid -> ControlNet -> frozen latent UNet
+#   -> x0-prediction (latent) -> MSE vs VAE(x0)
+# Usage:
+#   python train_trm.py experiment=amaze_latent_thinker_xattn data.amaze_root=data/amaze/maze \
+#     painter.checkpoint=runs/<latent painter>/checkpoint_final.pt \
+#     painter.latent_shift=[...] painter.latent_scale=[...]   # same as stage 1
+
+defaults:
+  - override /data: amaze
+  - override /backbone: amaze_latent_unet
+  - override /vae: sd_ft_mse
+  - override /painter: amaze_latent_unet_controlnet_frozen
+  - override /thinker: amaze
+  - override /translator: controlnet_latent
+  - override /condition_encoder: amaze_latent_xattn
+  - override /train: mnist_thinker
+  - override /eval: mnist_thinker
+  - override /loss: combined_mse
+  - override /eval_callbacks: amaze
+  - override /sampling: cfg
+  - _self_
+
+mode: "thinker_base"
+
+data:
+  image_size: 288
+  painter_size: 288
+
+# 324 tokens (~2.3x v2's 144): batch halved vs v2 so it fits a 40GB A100,
+# accumulation doubled to keep the effective batch at 768.
+train:
+  batch_size: 96
+  gradient_accumulation_steps: 8
+  max_seconds: 0
+
+eval:
+  batch_size: 128
+
+thinker:
+  puzzle_emb_ndim: 0
+  puzzle_emb_len: 0
+  seq_len: 324      # (backbone.sample_size / condition_encoder.patch_size)^2
+  vocab_size: 64    # per-token output channels; no CE target on Amaze, it is a free code
+
+run:
+  output_dir: "runs/amaze_latent_thinker_xattn"
