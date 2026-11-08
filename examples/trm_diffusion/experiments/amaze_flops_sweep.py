@@ -428,8 +428,13 @@ def _wandb_log(sw, name: str, config: dict, points: list, x_key: str, label_key:
     except Exception as e:  # pragma: no cover
         logger.warning(f"wandb not importable ({e!r}); skipping.")
         return
-    kw = dict(project=sw.get("wandb_project", "amaze_flops"), name=name, config=config,
-              group=sw.get("wandb_group", None), tags=[sw["task"], sw["mode"], "flops"])
+    # +sweep.wandb_name overrides the run name (e.g. one dm run per DiT size); phase-1
+    # modes are analyses of the trained thinker, the rest are FLOPs sweeps.
+    job_type = sw.get("wandb_job_type", None) or (
+        "analysis" if sw["mode"] in ("profile", "cut_at_k", "converge", "carry") else "sweep")
+    kw = dict(project=sw.get("wandb_project", "amaze_flops"), name=sw.get("wandb_name", None) or name, config=config,
+              group=sw.get("wandb_group", None), job_type=job_type,
+              tags=[sw["task"], sw["mode"], "flops"] + list(sw.get("wandb_tags", None) or []))
     try:
         run = wandb.init(settings=wandb.Settings(init_timeout=int(sw.get("wandb_init_timeout", 90))), **kw)
     except Exception as e:

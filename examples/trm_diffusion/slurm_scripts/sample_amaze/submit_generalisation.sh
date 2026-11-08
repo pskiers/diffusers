@@ -57,7 +57,7 @@ mkdir -p slurm_outputs
 TRAIN_SBATCH=( ${CLUSTER_GPU_SBATCH[@]+"${CLUSTER_GPU_SBATCH[@]}"} )
 case "${CLUSTER}" in
   athena) TRAIN_SBATCH+=( --time="${TRAIN_TIME:-48:00:00}" ) ;;
-  lem)    TRAIN_SBATCH+=( --time="${TRAIN_TIME:-48:00:00}" --cpus-per-task=8 --mem=64G ) ;;
+  lem)    TRAIN_SBATCH+=( --time="${TRAIN_TIME:-30:00:00}" --cpus-per-task=8 --mem=64G ) ;;   # H100: ~14 h per run
 esac
 echo " train sbatch: ${TRAIN_SBATCH[*]}"
 ONLY="${ONLY:-}"   # optional: space-separated run names (gen_<subset>_<kind>) to submit; default all

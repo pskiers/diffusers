@@ -235,7 +235,7 @@ def main():
     if not a.no_wandb:
         try:
             import wandb
-            kw = dict(project=a.wandb_project, name="report_" + "_".join(a.tasks), group=a.wandb_group,
+            kw = dict(project=a.wandb_project, name="flops_report_" + "_".join(a.tasks), group=a.wandb_group, job_type="analysis",
                       tags=["report", "flops"])
             try:
                 run = wandb.init(settings=wandb.Settings(init_timeout=90), **kw)

@@ -26,7 +26,7 @@
 #
 # Usage (from the trm_diffusion dir):
 #   sbatch slurm_scripts/train_amaze/train_amaze_scaled.sh <queens> <latent|pixel> [painter=false ...]
-# Env: PAINTER_STEPS/THINKER_STEPS (40000), SAMPLES (Pass@K, 5), WANDB_PROJECT (amaze_scaled),
+# Env: PAINTER_STEPS/THINKER_STEPS (40000), SAMPLES (Pass@K, 5), WANDB_PROJECT (PaTh-rebuttal, group latent),
 #      RUN_NAME, VAE_PATH, STATS_JSON, PAINTER_CKPT/THINKER_CKPT, THINKER_BS/THINKER_ACCUM,
 #      VENV + MODULES (space-separated) on a cluster other than Helios/Athena.
 set -euo pipefail
@@ -51,23 +51,8 @@ for arg in "$@"; do
 done
 is_true() { case "${1,,}" in true|1|yes|y|on) return 0 ;; *) return 1 ;; esac; }
 
-case "${SCRATCH:-}" in
-  /net/tscratch/*)                  # Athena (x86_64, A100)
-    CLUSTER=athena; VENV="${VENV:-${SCRATCH}/trm_athena_venv}"
-    module load ${MODULES:-Python/3.10.4 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0}
-    ;;
-  /net/scratch/hscra/*)             # Helios (aarch64, GH200)
-    CLUSTER=helios; VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
-    module load ${MODULES:-Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0}
-    export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
-    ;;
-  *)                                # anything else: say how via VENV / MODULES
-    CLUSTER=other
-    : "${VENV:?set VENV (and MODULES if needed) on this cluster}"
-    [[ -n "${MODULES:-}" ]] && module load ${MODULES}
-    ;;
-esac
-source "${VENV}/bin/activate"
+source "${PROJECT_ROOT}/slurm_scripts/cluster_env.sh"
+cluster_activate
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs runs
 export PYTHONUNBUFFERED=1 MPLBACKEND=Agg HF_HUB_OFFLINE=1
@@ -75,9 +60,9 @@ echo ">> cluster=${CLUSTER} host=$(hostname) job=${SLURM_JOB_ID:-none} task=${TA
 
 PAINTER_STEPS=${PAINTER_STEPS:-40000}
 THINKER_STEPS=${THINKER_STEPS:-40000}
-WANDB_PROJECT="${WANDB_PROJECT:-amaze_scaled}"
-RUN_NAME="${RUN_NAME:-scaled_${PIPELINE}_${TASK}${SLURM_JOB_ID:+_${SLURM_JOB_ID}}}"
-VAE_PATH="${VAE_PATH:-${SCRATCH}/models/sd-vae-ft-mse}"
+WANDB_PROJECT="${WANDB_PROJECT:-PaTh-rebuttal}"
+RUN_NAME="${RUN_NAME:-scaled_${PIPELINE}_${TASK}}"   # fixed, so stages can run as separate jobs
+VAE_PATH="${VAE_PATH:-${CLUSTER_MODELS_DIR}/sd-vae-ft-mse}"
 STATS_JSON="${STATS_JSON:-runs/${RUN_NAME}_ceiling.json}"
 PAINTER_CKPT="${PAINTER_CKPT:-runs/${RUN_NAME}_painter/checkpoint_final.pt}"
 THINKER_CKPT="${THINKER_CKPT:-runs/${RUN_NAME}_thinker/checkpoint_final.pt}"
@@ -104,7 +89,7 @@ if is_true "${CEILING}"; then
 fi
 
 COMMON=( data=amaze_scaled data.amaze_root="${DATA_DIR}" eval_callbacks="${EVAL_CB}"
-         run.wandb_project="${WANDB_PROJECT}" )
+         run.wandb_project="${WANDB_PROJECT}" run.wandb_group=latent )
 if [[ "${PIPELINE}" == "latent" ]]; then
   [[ -f "${STATS_JSON}" ]] || { echo "ERROR: latent stats not found: ${STATS_JSON} (run ceiling=true)" >&2; exit 1; }
   read -r SHIFT SCALE < <(python -c "
@@ -121,7 +106,8 @@ THINKER_EXTRA=()
 
 if is_true "${PAINTER}"; then
   srun python train_trm.py experiment=${PAINTER_EXP} "${COMMON[@]}" \
-    train.num_steps=${PAINTER_STEPS} run.output_dir="runs/${RUN_NAME}_painter"
+    train.num_steps=${PAINTER_STEPS} run.output_dir="runs/${RUN_NAME}_painter" \
+    run.wandb_job_type=train "run.wandb_tags=[latent,scaled,${PIPELINE},painter,${TASK},${CLUSTER}]"
   echo "painter complete -> ${PAINTER_CKPT}"
 fi
 
@@ -129,12 +115,15 @@ if is_true "${THINKER}"; then
   [[ -f "${PAINTER_CKPT}" ]] || { echo "ERROR: painter checkpoint not found: ${PAINTER_CKPT}" >&2; exit 1; }
   srun python train_trm.py experiment=${THINKER_EXP} "${COMMON[@]}" "${THINKER_EXTRA[@]}" \
     painter.checkpoint="${PAINTER_CKPT}" \
-    train.num_steps=${THINKER_STEPS} run.output_dir="runs/${RUN_NAME}_thinker"
+    train.num_steps=${THINKER_STEPS} run.output_dir="runs/${RUN_NAME}_thinker" \
+    run.wandb_job_type=train "run.wandb_tags=[latent,scaled,${PIPELINE},thinker,${TASK},${CLUSTER}]"
   echo "thinker complete -> ${THINKER_CKPT}"
 fi
 
 if is_true "${SAMPLE}"; then
   [[ -f "${THINKER_CKPT}" ]] || { echo "ERROR: thinker checkpoint not found: ${THINKER_CKPT}" >&2; exit 1; }
+  # Test sets on disk: queens n4..n10 (no OOD size staged), maze + size 10.
+  export QUEEN_OOD_SCALES="${QUEEN_OOD_SCALES-}" MAZE_OOD_SCALES="${MAZE_OOD_SCALES-10}"
   srun python experiments/amaze_generate_and_calculate_metrics.py \
     experiment=${THINKER_EXP} "${COMMON[@]}" \
     painter.checkpoint="${PAINTER_CKPT}" \

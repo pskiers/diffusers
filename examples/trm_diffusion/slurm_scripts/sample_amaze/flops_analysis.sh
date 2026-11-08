@@ -28,39 +28,26 @@
 # Usage (from the trm_diffusion dir; slurm_scripts/submit.sh swaps account/partition for Athena):
 #   bash slurm_scripts/submit.sh slurm_scripts/sample_amaze/flops_analysis.sh maze
 #   bash slurm_scripts/sample_amaze/submit_flops_both.sh maze      # both clusters, cancels the loser
-# Env: STAGES, OUT_DIR (runs/flops_analysis/<task>), TUNE_N (16) REPORT_OFFSET (16) REPORT_N (32), WANDB_PROJECT (amaze_flops),
-#      DIT_CKPTS ("base=runs/dit_maze_final/checkpoint_final.pt ..."), TRM_CKPT PAINTER_CKPT,
+# Env: STAGES, OUT_DIR (runs/flops_analysis/<task>), TUNE_N (16) REPORT_OFFSET (16) REPORT_N (32), WANDB_PROJECT (PaTh-rebuttal), WANDB_GROUP (flops),
+#      DIT_CKPTS ("base=runs/dit_maze_final/checkpoint_final.pt 20m=runs/dit_maze_20m/... 200m=..."), TRM_CKPT PAINTER_CKPT,
 #      SMOKE=1 (tiny grids/boards, no wandb -- a plumbing check only)
 set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 TASK="${1:?usage: flops_analysis.sh <maze|queens>}"
 [[ "${TASK}" == "maze" || "${TASK}" == "queens" ]] || { echo "TASK must be maze|queens" >&2; exit 1; }
 
-# Cluster detection from the scratch filesystem (the compute-node hostname is not reliable).
-case "${SCRATCH:-}" in
-  /net/tscratch/*)   # Athena (x86_64, A100)
-    CLUSTER=athena
-    VENV="${VENV:-${SCRATCH}/trm_athena_venv}"
-    module load "${PY_MODULE:-Python/3.10.4}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
-    ;;
-  *)                 # Helios (aarch64, GH200)
-    CLUSTER=helios
-    VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
-    module load "${PY_MODULE:-Python/3.11.5}" "${CUDA_MODULE:-CUDA/12.4.0}" "${CUDNN_MODULE:-cuDNN/9.2.1.18-CUDA-12.4.0}"
-    export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
-    ;;
-esac
-source "${VENV}/bin/activate"
+source "${PROJECT_ROOT}/slurm_scripts/cluster_env.sh"
+cluster_activate
 cd "${PROJECT_ROOT}"
 mkdir -p slurm_outputs
-export PYTHONUNBUFFERED=1 MPLBACKEND=Agg PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-echo ">> cluster=${CLUSTER} host=$(hostname) job=${SLURM_JOB_ID:-none} task=${TASK} python=$(python -V 2>&1)"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+echo ">> task=${TASK}"
 
 STAGES="${STAGES:-dm trm_flat profile cut_at_k converge carry report}"
 OUT_DIR="${OUT_DIR:-runs/flops_analysis/${TASK}}"
 TUNE_N="${TUNE_N:-16}"; REPORT_OFFSET="${REPORT_OFFSET:-16}"; REPORT_N="${REPORT_N:-32}"
-WANDB_PROJECT="${WANDB_PROJECT:-amaze_flops}"
-WANDB_GROUP="${WANDB_GROUP:-flops_${TASK}}"
+WANDB_PROJECT="${WANDB_PROJECT:-PaTh-rebuttal}"
+WANDB_GROUP="${WANDB_GROUP:-flops}"
 DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/amaze}"
 [[ "${TASK}" == "maze" ]] || { echo "only maze is set up for now (agreed: mazes first)" >&2; exit 1; }
 
@@ -100,7 +87,8 @@ trm_stage() {  # trm_stage <mode> <split: tune|report> [extra overrides...]
   local mode="$1" split="$2"; shift 2
   local SPLIT_ARGS=( "${TUNE[@]}" ); [[ "${split}" == "report" ]] && SPLIT_ARGS=( "${REPORT[@]}" )
   run_stage "${mode}" srun python experiments/amaze_flops_sweep.py "${TRM_ARGS[@]}" "${COMMON[@]}" "${SPLIT_ARGS[@]}" \
-    "${SMOKE_ARGS[@]}" "$@" +sweep.mode="${mode}" +sweep.out="${OUT_DIR}/${split}_split/${TASK}_${mode}.json"
+    ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} "$@" +sweep.mode="${mode}" +sweep.out="${OUT_DIR}/${split}_split/${TASK}_${mode}.json" \
+    +sweep.wandb_name="flops_${TASK}_${mode}"
 }
 
 if want dm || want trm_flat || want trm_wise || want alloc || want profile || want cut_at_k || want converge || want carry; then
@@ -112,9 +100,19 @@ if want dm; then
   for entry in ${DIT_CKPTS}; do
     label="${entry%%=*}"; ck="${entry#*=}"
     [[ -s "${ck}" ]] || { echo "missing DiT checkpoint ${ck}" >&2; exit 1; }
+    # The checkpoints hold weights only: rebuild each DiT at its own size (train_dit_sized.sh).
+    case "${label}" in
+      base)   DIT_ARCH=() ;;
+      20m)    DIT_ARCH=( backbone.num_layers=12 backbone.num_attention_heads=6 backbone.attention_head_dim=48 ) ;;
+      medium) DIT_ARCH=( backbone.num_layers=16 backbone.num_attention_heads=12 ) ;;
+      200m)   DIT_ARCH=( backbone.num_layers=18 backbone.num_attention_heads=12 ) ;;
+      large)  DIT_ARCH=( backbone.num_layers=24 backbone.num_attention_heads=16 ) ;;
+      *) echo "unknown DiT label '${label}' (base|20m|medium|200m|large)" >&2; exit 1 ;;
+    esac
     run_stage "dm_${label}" srun python experiments/amaze_flops_sweep.py experiment="amaze_dit_${TASK}" \
-      +checkpoint="${ck}" "${COMMON[@]}" "${REPORT[@]}" "${SMOKE_ARGS[@]}" \
-      +sweep.mode=dm +sweep.out="${OUT_DIR}/report_split/${TASK}_dm_${label}.json"
+      ${DIT_ARCH[@]+"${DIT_ARCH[@]}"} +checkpoint="${ck}" "${COMMON[@]}" "${REPORT[@]}" ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} \
+      +sweep.mode=dm +sweep.out="${OUT_DIR}/report_split/${TASK}_dm_${label}.json" \
+      +sweep.wandb_name="flops_${TASK}_dm_${label}" "+sweep.wandb_tags=[dit_${label}]"
   done
 fi
 want trm_flat && trm_stage trm_flat report

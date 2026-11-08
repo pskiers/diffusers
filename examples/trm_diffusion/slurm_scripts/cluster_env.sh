@@ -1,6 +1,6 @@
 # Cluster detection + environment for the AMAZE / PaTh-rebuttal jobs (sourced, not run).
 #
-#   source slurm_scripts/cluster_env.sh            # sets CLUSTER, VENV, CLUSTER_GPU_SBATCH, CLUSTER_CPU_SBATCH
+#   source slurm_scripts/cluster_env.sh            # sets CLUSTER, VENV, CLUSTER_MODELS_DIR, CLUSTER_GPU_SBATCH, CLUSTER_CPU_SBATCH
 #   cluster_activate                               # inside a job: modules + venv + PYTHONPATH
 #
 # Detection (override with CLUSTER=helios|athena|lem):
@@ -25,6 +25,7 @@ case "${CLUSTER}" in
     VENV="${VENV:-${SCRATCH}/trm_helios_venv}"
     CLUSTER_MODULES="${MODULES:-Python/3.11.5 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0}"
     CLUSTER_NODE_MODULES="${NODE_MODULES:-GCCcore/14.3.0 nodejs/22.17.1}"
+    CLUSTER_MODELS_DIR="${MODELS_DIR:-${SCRATCH}/models}"
     CLUSTER_GPU_SBATCH=( --account=plgdiffusion3-gpu-gh200 --partition=plgrid-gpu-gh200 )
     CLUSTER_CPU_SBATCH=( "${CLUSTER_GPU_SBATCH[@]}" )      # Helios has GPU partitions only
     ;;
@@ -32,6 +33,7 @@ case "${CLUSTER}" in
     VENV="${VENV:-${SCRATCH}/trm_athena_venv}"
     CLUSTER_MODULES="${MODULES:-Python/3.10.4 CUDA/12.4.0 cuDNN/9.2.1.18-CUDA-12.4.0}"
     CLUSTER_NODE_MODULES="${NODE_MODULES:-}"
+    CLUSTER_MODELS_DIR="${MODELS_DIR:-${SCRATCH}/models}"
     CLUSTER_GPU_SBATCH=( --account=plgdiffusion3-gpu-a100 --partition=plgrid-gpu-a100 )
     CLUSTER_CPU_SBATCH=( "${CLUSTER_GPU_SBATCH[@]}" )
     ;;
@@ -42,6 +44,7 @@ case "${CLUSTER}" in
     VENV="${VENV:-${LEM_PROJECT}/mgrzanka/trm_lem_venv}"
     CLUSTER_MODULES="${MODULES:-Python/3.11.3-GCCcore-12.3.0}"
     CLUSTER_NODE_MODULES="${NODE_MODULES:-}"
+    CLUSTER_MODELS_DIR="${MODELS_DIR:-${LEM_PROJECT}/mgrzanka/models}"
     CLUSTER_GPU_SBATCH=( --account=hpc-kamildeja-1773916679 --partition="${LEM_GPU_PARTITION:-lem-gpu-short}"
                          --gres=gpu:hopper:1 )
     CLUSTER_CPU_SBATCH=( --account=hpc-kamildeja-1773916679 --partition="${LEM_CPU_PARTITION:-lem-cpu-short}"
@@ -49,6 +52,7 @@ case "${CLUSTER}" in
     ;;
   *)
     VENV="${VENV:-}"; CLUSTER_MODULES="${MODULES:-}"; CLUSTER_NODE_MODULES="${NODE_MODULES:-}"
+    CLUSTER_MODELS_DIR="${MODELS_DIR:-}"
     CLUSTER_GPU_SBATCH=(); CLUSTER_CPU_SBATCH=()
     ;;
 esac
@@ -68,6 +72,10 @@ cluster_activate() {   # cluster_activate [--node]  (--node also loads the nodej
   # shellcheck disable=SC2086
   [[ "${1:-}" == --node && -n "${CLUSTER_NODE_MODULES}" ]] && module load ${CLUSTER_NODE_MODULES}
   [[ "${CLUSTER}" == helios ]] && export LD_LIBRARY_PATH="/net/software/aarch64/el9/GCCcore/14.3.0/lib64:${LD_LIBRARY_PATH:-}"
+  # lem has no nodejs module: the official Node.js build lives in the project dir (used by the maze generator).
+  if [[ "${CLUSTER}" == lem && -x "${LEM_NODE_DIR:-${LEM_PROJECT}/mgrzanka/tools/node}/bin/node" ]]; then
+    export PATH="${LEM_NODE_DIR:-${LEM_PROJECT}/mgrzanka/tools/node}/bin:${PATH}"
+  fi
   source "${VENV}/bin/activate"
   # The diffusers of THIS checkout (<repo>/src), not whatever the venv's editable install points at.
   local src
