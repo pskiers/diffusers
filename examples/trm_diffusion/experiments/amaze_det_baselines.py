@@ -275,7 +275,7 @@ def main():
                         rec = {"step": step, "square8_exact1": quick["exact1"], "square8_pass1": quick["pass1"]}
                         log.write(json.dumps(rec) + "\n"); log.flush(); print(rec, flush=True)
                         if run is not None:
-                            run.log({"val/square8_exact1": quick["exact1"], "val/square8_pass1": quick["pass1"]}, step=step)
+                            run.log({"val/square8_exact1": quick["exact1"], "val/square8_pass": quick["pass1"]}, step=step)
                         save(ck)
                     if step >= a.steps or (time.time() - t0) / 60 > a.max_minutes:
                         done = True

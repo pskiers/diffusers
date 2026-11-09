@@ -494,6 +494,18 @@ METRIC_KEYS = ("violation", "coverage", "mse_inside", "mse_outside",
                "pass1", "pass5", "exact1", "exact5")
 
 
+# What goes to wandb (the JSON results keep every METRIC_KEYS entry): coverage,
+# violation and pass are first-attempt values, exact1 / exact5 = solved in 1 / within
+# K attempts. "pass" is the paper's continuous Pass of the first attempt (pass1).
+WANDB_METRICS = {"coverage": "coverage", "violation": "violation", "pass": "pass1",
+                 "exact1": "exact1", "exact5": "exact5"}
+
+
+def wandb_metrics(agg: dict) -> dict:
+    """The WANDB_METRICS view of an aggregate() dict (missing keys are skipped)."""
+    return {name: agg[src] for name, src in WANDB_METRICS.items() if src in agg}
+
+
 def aggregate(rows: list[dict]) -> dict:
     """Reduce per-puzzle rows to the mean of each metric (0.0 for every key if empty)."""
     if not rows:
@@ -632,14 +644,14 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
 
     samples = samples or {}
     prefix = f"amaze_eval/{task}"
-    for key, val in result["overall"].items():
+    for key, val in wandb_metrics(result["overall"]).items():
         run.summary[f"{prefix}/overall/{key}"] = val
-    for key, val in result.get("overall_ood", {}).items():
+    for key, val in wandb_metrics(result.get("overall_ood", {})).items():
         run.summary[f"{prefix}/overall_ood/{key}"] = val
 
-    # Exact match (exact1 = first attempt, exact5 = best of K) is the headline metric,
-    # so it is in every table next to the continuous Pass.
-    table_keys = ["violation", "coverage", "mse_inside", "mse_outside", "pass1", "pass5", "exact1", "exact5"]
+    # Every table and scalar carries the WANDB_METRICS set (coverage, violation,
+    # pass, exact1, exact5); exact match is the headline metric.
+    table_keys = list(WANDB_METRICS)
     img_cols = ["group", "generated", "condition"] + table_keys
     metric_cols = ["group"] + table_keys
 
@@ -649,19 +661,19 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
             pair = pair or {}
             t.add_data(name, make_wandb_image(pair.get("generated")),
                        make_wandb_image(pair.get("condition")),
-                       *[agg.get(k) for k in table_keys])
+                       *[wandb_metrics(agg).get(k) for k in table_keys])
         return t
 
     def _metric_table(named_aggs):
         t = wandb.Table(columns=metric_cols)
         for name, agg in named_aggs:
-            t.add_data(name, *[agg.get(k) for k in table_keys])
+            t.add_data(name, *[wandb_metrics(agg).get(k) for k in table_keys])
         return t
 
     # Generalisation runs: mean over the cells the model was trained on vs the
     # in-distribution test cells it never saw (see generalisation_summary).
     for part in ("seen", "unseen"):
-        for key, val in (result.get("generalisation", {}).get(part) or {}).items():
+        for key, val in wandb_metrics(result.get("generalisation", {}).get(part) or {}).items():
             run.summary[f"gen/{part}/{key}"] = val
     if "generalisation" in result:
         run.summary["gen/seen_cells"] = ",".join(result["generalisation"]["seen_cells"])
@@ -678,7 +690,7 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
         for part in ("per_shape", "per_shape_ood"):
             for g, by_scale in result.get(part, {}).items():
                 for s, agg in by_scale.items():
-                    for key, val in agg.items():
+                    for key, val in wandb_metrics(agg).items():
                         run.summary[f"{prefix}/{part}/{g}/{s}/{key}"] = val
 
         for g, by_scale in result["per_shape"].items():
@@ -692,14 +704,14 @@ def log_tables(run, task: str, result: dict, samples: dict | None = None) -> Non
 
         per_geometry = result["per_geometry"]
         for g, agg in per_geometry.items():
-            for key, val in agg.items():
+            for key, val in wandb_metrics(agg).items():
                 run.summary[f"{prefix}/per_geometry/{g}/{key}"] = val
         run.log({f"{prefix}/per_geometry_table":
                  _metric_table([(g, per_geometry[g]) for g in geometries if g in per_geometry])})
 
         per_geometry_ood = result["per_geometry_ood"]
         for g, agg in per_geometry_ood.items():
-            for key, val in agg.items():
+            for key, val in wandb_metrics(agg).items():
                 run.summary[f"{prefix}/per_geometry_ood/{g}/{key}"] = val
         run.log({f"{prefix}/per_geometry_ood_table":
                  _metric_table([(g, per_geometry_ood[g]) for g in geometries if g in per_geometry_ood])})

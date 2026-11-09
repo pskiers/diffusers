@@ -36,9 +36,15 @@ mkdir -p "${VERIFY_DIR}"
 export WANDB_MODE=disabled
 # The reference JSON has no OOD table (it predates size 10), so skip OOD here.
 export MAZE_OOD_SCALES=""
-RUN_NAME="$(basename "${VERIFY_DIR}")" KIND=trm \
-  bash slurm_scripts/sample_amaze/train_generalisation.sh square_8 trm train=false eval=true
+# SKIP_EVAL=true: only redo the comparison below on an existing ${VERIFY_DIR}.
+if [[ "${SKIP_EVAL:-false}" != true ]]; then
+  RUN_NAME="$(basename "${VERIFY_DIR}")" KIND=trm \
+    bash slurm_scripts/sample_amaze/train_generalisation.sh square_8 trm train=false eval=true
+fi
 
+# The evaluation activates the venv in its own shell; the comparison needs it here too.
+source slurm_scripts/cluster_env.sh
+cluster_activate
 python - "${REF_DIR}" "${VERIFY_DIR}" <<'EOF'
 import json, sys
 from pathlib import Path

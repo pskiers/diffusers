@@ -23,6 +23,7 @@
 # Usage (from the trm_diffusion dir):
 #   sbatch slurm_scripts/sample_amaze/train_generalisation.sh <subset> <trm|linear_head> [train=<bool>] [eval=<bool>]
 # Env: PAINTER_CKPT (runs/pt_maze_final_painter/checkpoint_final.pt), THINKER_STEPS (40000),
+#      RESUME_FROM (a checkpoint_step-N.pt of this run: continue training from it, optimizer + EMA included),
 #      SAMPLES (5), MAZE_OOD_SCALES (10), WANDB_PROJECT (PaTh-rebuttal), RUN_NAME, GEN_ROOT,
 #      CLUSTER/VENV/MODULES, WANDB_ENTITY, WANDB_KEY_FILE (see slurm_scripts/cluster_env.sh).
 # Submit through submit_generalisation.sh, which adds the cluster's account/partition/GPU type.
@@ -110,6 +111,7 @@ if is_true "${TRAIN}"; then
     run.wandb_job_type=train \
     "run.wandb_tags=[generalisation,${SUBSET},${KIND},${CLUSTER}]" \
     run.output_dir="runs/${RUN_NAME}" \
+    ${RESUME_FROM:+run.resume_from_checkpoint="${RESUME_FROM}"} \
     ${CLUSTER_TRAIN_ARGS[@]+"${CLUSTER_TRAIN_ARGS[@]}"}
   echo "${RUN_NAME} training complete -> ${THINKER_CKPT}"
 else
