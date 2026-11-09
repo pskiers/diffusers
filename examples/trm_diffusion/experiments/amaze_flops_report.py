@@ -137,9 +137,9 @@ def fig_cosine(d: Path, task: str, out: Path):
     if not r or "profile" not in r or "cos_raw" not in r["profile"]:
         return None
     pr = r["profile"]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
-    for ax, key, title in ((axes[0], "cos_raw", "raw final z_H"),
-                           (axes[1], "cos_centered", "board-specific part (mean over boards removed)")):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
+    for ax, key, title in ((axes[0], "cos_raw", "raw"),
+                           (axes[1], "cos_centered", "board-specific part (board mean removed)")):
         C = np.array(pr[key])
         lab = _ts_labels(r, len(C))
         im = ax.imshow(C, cmap="Blues", vmin=float(np.floor(np.nanmin(C) * 20) / 20), vmax=1.0)
@@ -148,7 +148,7 @@ def fig_cosine(d: Path, task: str, out: Path):
         ax.set_yticks(range(len(C)), lab, fontsize=7)
         ax.set_xlabel("denoising timestep t")
         ax.set_ylabel("denoising timestep t")
-        ax.set_title(f"Same-board cosine similarity of {title}")
+        ax.set_title(f"Final z_H, same-board cosine: {title}", fontsize=10)
         fig.colorbar(im, ax=ax).set_label("cosine similarity (1 = identical)")
     return _save(fig, out)
 
@@ -276,14 +276,14 @@ def fig_alloc(d: Path, task: str, out: Path):
             if q:
                 draw(ax, q)
         ax.axhline(1.0, color="0.4", ls=":", lw=1)
-        ax.set_ylim(bottom=0)
+        ax.set_ylim(0, max(ax.get_ylim()[1], 1.0) * 1.18)
         ax.set_ylabel("budget (x uniform)")
         ax.text(0.99, 0.92, f"width = {w:g}", transform=ax.transAxes, ha="right", va="top", fontsize=9)
     if prof:
         ax = axes[-1]
         draw(ax, prof)
         ax.axhline(1.0, color="0.4", ls=":", lw=1)
-        ax.set_ylim(bottom=0)
+        ax.set_ylim(0, max(ax.get_ylim()[1], 1.0) * 1.18)
         ax.set_ylabel("budget (x uniform)")
         ax.text(0.99, 0.92, f"from z_H change (eps = {r.get('alloc_profile_eps', '?')})", transform=ax.transAxes,
                 ha="right", va="top", fontsize=9)
