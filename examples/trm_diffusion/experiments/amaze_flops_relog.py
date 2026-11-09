@@ -22,6 +22,11 @@ from pathlib import Path
 
 SPLITS = {"tune_split": "tuning (boards 0-15 per cell)", "report_split": "report (boards 16-47 per cell)"}
 
+
+def split_of(d) -> str:
+    """tune_split / report_split from a sweep result's board offset."""
+    return "tune_split" if int(d.get("offset", 0)) == 0 else "report_split"
+
 DESCRIPTIONS = {
     "dm": "DiT baseline: accuracy vs number of DDPM sampling steps (FLOPs = steps x passes x F_model).",
     "trm_flat": "PaTh default inference: the same n_sup at every denoising step, fresh thinker state each step; "
@@ -31,6 +36,10 @@ DESCRIPTIONS = {
     "cut_at_k": "Run the thinker only on the first k of the denoising steps, then reuse its last steering.",
     "converge": "Stop reasoning per maze once the relative z_H change < eps (fresh state, or carried within a regime).",
     "carry": "n_sup x thinker state policy: fresh each step / carried across all steps / carried within a regime.",
+    "trm_wise": "PaTh 'wise' inference: a budget-matched schedule of n_sup over the denoising steps, carried state, "
+                "steering frozen after freeze_frac of the trajectory.",
+    "alloc": "Where reasoning is needed: the same total reasoning budget moved over the denoising trajectory "
+             "(flat vs bump/dip at several peaks/widths, front, back).",
 }
 
 
@@ -54,11 +63,31 @@ def _series_and_setting(mode, p):
             "eps": p["eps"], "variant": p["variant"], "mean_iters_per_step": sum(it) / len(it) if it else None}
     if mode == "carry":
         return p["variant"], f"n_sup={p['n_sup']} {p['variant']}", {"n_sup": p["n_sup"], "variant": p["variant"]}
-    raise ValueError(mode)
+    if mode == "trm_wise":
+        hl = "" if "H_cycles" not in p else f" H={p['H_cycles']} L={p['L_cycles']}"
+        return "PaTh wise", f"budget = flat n_sup {p['flat_n']}{hl}", {
+            "flat_n": p["flat_n"], "H_cycles": p.get("H_cycles"), "L_cycles": p.get("L_cycles"),
+            "freeze_step": p.get("freeze_step")}
+    if mode == "alloc":
+        shape = p["direction"] + ("" if p.get("peak") is None else f" peak={p['peak']} width={p.get('width')}")
+        return f"budget n_sup {p['flat_n']}", f"n_sup {p['flat_n']}: {shape}", {
+            "flat_n": p["flat_n"], "direction": p["direction"], "peak": p.get("peak"), "width": p.get("width")}
+    # Unknown mode: still log it, labelled by its scalar knobs.
+    knobs = {k: v for k, v in p.items() if isinstance(v, (int, float, str)) and k not in (
+        "flops", "exact", "pass", "violation", "coverage", "n", "wall_time_sec")}
+    return mode, " ".join(f"{k}={v}" for k, v in knobs.items()) or mode, knobs
 
 
 def log_mode(wandb, path, split, args):
+    """Re-log one sweep JSON (run name flops_<task>_<mode>[_<suffix>])."""
     d = json.loads(path.read_text())
+    name = f"flops_{args.task}_{d['mode']}" + (f"_{args.suffix}" if args.suffix else "")
+    log_points(wandb, d, split, project=args.project, group=args.group, name=name,
+               tags=[args.task, d["mode"], "flops", "relog"], extra_config={"source_json": str(path)})
+
+
+def log_points(wandb, d, split, project, group, name, tags, job_type=None, extra_config=None):
+    """One wandb run for a sweep result dict ``d`` (the JSON amaze_flops_sweep.py writes)."""
     mode, pts = d["mode"], d["points"]
     cfg_scale = float(d.get("cfg_scale", 1.0))
     sampling = f"CFG {cfg_scale:g} (2 passes/step)" if cfg_scale != 1.0 else "no CFG (1 pass/step)"
@@ -85,11 +114,10 @@ def log_mode(wandb, path, split, args):
             if v is not None:
                 by_size.add_data(setting, series, f"size {s}", tf, v["exact"], v.get("n"))
 
-    name = f"flops_{args.task}_{mode}" + (f"_{args.suffix}" if args.suffix else "")
-    run = wandb.init(project=args.project, group=args.group, name=name, job_type="analysis" if mode not in ("dm", "trm_flat") else "sweep",
-                     tags=[args.task, mode, "flops", "relog"], reinit=True,
-                     config={k: v for k, v in d.items() if k not in ("points", "profile", "timesteps")} | {"source_json": str(path)})
-    run.summary.update({"description": DESCRIPTIONS[mode], "split": SPLITS[split], "sampling": sampling,
+    job_type = job_type or ("sweep" if mode in ("dm", "trm_flat", "trm_wise", "alloc") else "analysis")
+    run = wandb.init(project=project, group=group, name=name, job_type=job_type, tags=list(tags), reinit=True,
+                     config={k: v for k, v in d.items() if k not in ("points", "profile", "timesteps")} | (extra_config or {}))
+    run.summary.update({"description": DESCRIPTIONS.get(mode, mode), "split": SPLITS[split], "sampling": sampling,
                         "n_mazes": d.get("n_puzzles"), "n_settings": len(pts)})
     log = {"results": table, "by_size": by_size,
            "exact_vs_tflops": wandb.plot.line(table, "tflops_per_maze", "exact", stroke="series",
@@ -110,6 +138,7 @@ def log_mode(wandb, path, split, args):
     run.log(log)
     run.finish()
     print(f"{name}: {len(pts)} settings -> {run.url}")
+    return run.url
 
 
 def main():

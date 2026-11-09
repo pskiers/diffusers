@@ -418,50 +418,22 @@ def _flops_sample(model, cb, device):
 # ── wandb ───────────────────────────────────────────────────────────────────
 
 
-def _wandb_log(sw, name: str, config: dict, points: list, x_key: str, label_key: str, summary: dict):
-    """Log one run per mode. Never lets logging break the sweep (JSON is the source of truth);
-    falls back to an offline run (sync later with `wandb sync`) if the cluster has no route out."""
+def _wandb_log(sw, out: dict):
+    """One readable wandb run per sweep (experiments/amaze_flops_relog.log_points): a labelled
+    "results" table (one row per setting), exact / pass vs TFLOPs per maze, exact per board
+    size. Never lets logging break the sweep (the JSON written before this is the source of truth)."""
     if not sw.get("wandb", True):
         return
     try:
         import wandb
-    except Exception as e:  # pragma: no cover
-        logger.warning(f"wandb not importable ({e!r}); skipping.")
-        return
-    # +sweep.wandb_name overrides the run name (e.g. one dm run per DiT size); phase-1
-    # modes are analyses of the trained thinker, the rest are FLOPs sweeps.
-    job_type = sw.get("wandb_job_type", None) or (
-        "analysis" if sw["mode"] in ("profile", "cut_at_k", "converge", "carry") else "sweep")
-    kw = dict(project=sw.get("wandb_project", "amaze_flops"), name=sw.get("wandb_name", None) or name, config=config,
-              group=sw.get("wandb_group", None), job_type=job_type,
-              tags=[sw["task"], sw["mode"], "flops"] + list(sw.get("wandb_tags", None) or []))
-    try:
-        run = wandb.init(settings=wandb.Settings(init_timeout=int(sw.get("wandb_init_timeout", 90))), **kw)
-    except Exception as e:
-        logger.warning(f"wandb online init failed ({e!r}); logging OFFLINE instead.")
-        try:
-            run = wandb.init(mode="offline", **kw)
-        except Exception as e2:
-            logger.warning(f"wandb offline init failed too ({e2!r}); skipping.")
-            return
-    try:
-        cols = [label_key, x_key, "exact", "pass", "violation", "coverage"]
-        table = wandb.Table(columns=cols)
-        for p in points:
-            table.add_data(*[p.get(c) for c in cols])
-            run.log({f"{x_key}": p[x_key], "exact": p["exact"], "pass": p["pass"],
-                     "violation": p["violation"], "coverage": p["coverage"],
-                     **{f"exact/size_{s}": v["exact"] for s, v in p["per_scale"].items()}})
-        run.log({"points": table})
-        run.summary.update(summary)
-        logger.info(f"wandb: logged {len(points)} points to run {run.name} ({run.url if hasattr(run, 'url') else ''})")
+        from amaze_flops_relog import log_points, split_of
+        mode = sw["mode"]
+        log_points(wandb, out, split_of(out), project=sw.get("wandb_project", "amaze_flops"),
+                   group=sw.get("wandb_group", None), name=sw.get("wandb_name", None) or f"flops_{sw['task']}_{mode}",
+                   tags=[sw["task"], mode, "flops"] + list(sw.get("wandb_tags", None) or []),
+                   job_type=sw.get("wandb_job_type", None))
     except Exception as e:
         logger.warning(f"wandb logging failed ({e!r}); results are in the JSON.")
-    finally:
-        try:
-            run.finish()
-        except Exception:
-            pass
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -702,13 +674,7 @@ def main(cfg: DictConfig):
 
         if not points:
             return points
-        best = max(points, key=lambda p: p["exact"])
-        _wandb_log(
-            sw, name=f"{task}_{mode}", config={k: v for k, v in out.items() if k not in ("points", "profile")}, points=points,
-            x_key="flops", label_key=label_key,
-            summary={"best_exact": best["exact"], "n_puzzles": n_puzzles, "min_flops": min(p["flops"] for p in points),
-                     "max_flops": max(p["flops"] for p in points)},
-        )
+        _wandb_log(sw, out)
     return points
 
 

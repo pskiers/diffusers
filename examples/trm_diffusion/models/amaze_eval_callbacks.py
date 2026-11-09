@@ -14,15 +14,12 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
 
     Uses ``eval.amaze_eval.AmazeMetrics``, which scores each generated image and
     accumulates the per-sample metrics. ``AmazeMetrics.return_metrics()`` then
-    yields the aggregate (global mean/std/min/max per key + generated_samples).
-    For both tasks that covers:
-    - mse_inside/mse_outside
-    - gt_cell_coverage
-    - background_violation
-    - Pass@1.
+    yields the aggregate; the callback returns the paper's metric set from it:
+    coverage, violation, pass (max(0, coverage - violation)) and exact1, one
+    attempt per board.
 
     The AmazeMetrics import is lazy so a missing optional dep (OpenCV/scikit-image)
-    just disables scoring (reward_available=False) instead of breaking the callback.
+    just disables scoring (only the sample images are returned) instead of breaking the callback.
     """
 
     _task: str = ""
@@ -139,11 +136,15 @@ class _AmazeEvalCallbackBase(EvalCallbackBase):
 
             n_done += B
 
-        result: dict = {"reward_available": scorer is not None}
+        # Logged as val/<key>: the paper's metric set, single attempt per board
+        # (exact1; there is no exact5 in-training). AmazeMetrics.return_metrics()
+        # also has std/min/max and the MSEs; those are not logged.
+        result: dict = {}
         if scorer is not None:
-            result.update(scorer.return_metrics())      # includes generated_samples
-        else:
-            result["generated_samples"] = float(n_done)
+            m = scorer.return_metrics()
+            result.update({"coverage": m.get("mean_gt_cell_coverage"), "violation": m.get("mean_background_violation"),
+                           "pass": m.get("mean_pass"), "exact1": m.get("mean_exact")})
+            result = {k: v for k, v in result.items() if v is not None}
         if panels:
             result["samples"] = panels
         return result
