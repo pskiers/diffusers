@@ -10,7 +10,9 @@ Mirrors the Sudoku App. K probe (experiments/train_digit_probe.py) and the Fig. 
    (step, iteration, cell) rows is kept and a logistic probe is trained on them (10% of train boards held out).
 2. Test trajectories (disjoint boards): at every step every (k, h, l) position is decoded through the probe:
    y = z_H after each H-cycle, and each fast state z_L through one hypothetical slow update (z_scratchpad_probe's
-   recipe). Reported: probe accuracy by step and iteration vs the final-image labels, with the control floor (the
+   recipe). Dips are counted from group 1 on: the thinker restarts from its initial state at every step (as in the
+   AMAZE eval), so group 0 starts from the reset state, not from an answer (counting it put a constant ~1/48 dip
+   rate on every step). Reported: probe accuracy by step and iteration vs the final-image labels, with the control floor (the
    probe on the initial state, the same for every board); violations of the decoded grid (amaze_boards.violations,
    no ground truth); dip ("rethink") per group = the group's worst z more violated than the y it started from, rate
    and magnitude given a dip, by % of sampling (Fig. 9); W3a: the same restricted to steps where the probe is >= 95%
@@ -269,6 +271,9 @@ def main() -> None:
                 vzc = violations(z_mixed.reshape(G * L, N), b).reshape(G, L)
                 dip_c = vzc.max(1).values > prev
                 mag_c = (vzc.max(1).values - prev).clamp(min=0)
+                # the sampler resets the thinker every step (as the AMAZE eval does): group 0 starts from the reset
+                # state, not from an answer, so a "rethink" is only measured from group 1 on
+                dip, mag, dip_c, mag_c = dip[1:], mag[1:], dip_c[1:], mag_c[1:]
                 iter_end = ys[1:][H - 1::H]                                              # y at the end of each iteration
                 stats["acc"][s] += (iter_end == lab.bool()).float().mean(1).cpu().numpy()
                 stats["acc_n"][s] += 1
