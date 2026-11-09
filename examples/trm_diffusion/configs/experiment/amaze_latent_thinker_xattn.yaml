@@ -26,6 +26,13 @@ defaults:
 
 mode: "thinker_base"
 
+# DDPMScheduler defaults to clip_sample=True (x0 clamped to [-1,1] at every
+# sampling step). Fine for pixels, destructive for latents: the normalised SD-VAE
+# latents have std ~1, so a large fraction of values lie outside [-1,1] and get
+# truncated every step. Training (add_noise) is unaffected -- sampling only.
+diffusion:
+  clip_sample: false
+
 data:
   image_size: 288
   painter_size: 288

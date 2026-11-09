@@ -238,65 +238,113 @@ def fig_carry(d: Path, task: str, out: Path):
 # ── tuning boards: allocation ────────────────────────────────────────────────
 
 
-def fig_alloc(d: Path, task: str, out: Path):
-    r = _load(d / "tune_split" / f"{task}_alloc.json")
-    if not r:
+def _bump_curve(S, fn, ratio, peak, width, n=400):
+    """The reasoning budget (x uniform) of a Gaussian bump, as a SMOOTH curve: the same formula as
+    ablate_trm_loop_budget._matched_budget_schedule before integer rounding (floor `lo`, height `hi`, rescaled so the
+    total over the S denoising steps equals the uniform budget). The run itself used the rounded integers, min 1."""
+    lo = max(1, round(fn / ratio))
+    hi = max(lo + 1, round(fn * ratio))
+    sigma = max(width * S, 1e-6)
+    center = peak * (S - 1)
+
+    def raw(pos):
+        return lo + (hi - lo) * np.exp(-0.5 * ((pos - center) / sigma) ** 2)
+
+    scale = (fn * S) / raw(np.arange(S)).sum()
+    pos = np.linspace(0, S - 1, n)
+    return 100.0 * (1 - pos / (S - 1)), raw(pos) * scale / fn
+
+
+_SERIF = {"font.family": "serif", "font.serif": ["Times New Roman", "Times", "DejaVu Serif"], "mathtext.fontset": "stix"}
+_GOOD, _BAD, _NEUTRAL = "#2e8b3a", "#a11d1d", "#7a7a7a"
+
+
+def _load_alloc(d: Path, task: str):
+    """Bump grid at flat_n=16 (base PaTh, fresh state every step): merge tune_split/<task>_alloc16_*.json. Returns
+    (flat, bumps, S, fn, ratio) with flat = mean of the (identical-config) flat baselines, or None."""
+    files = sorted((d / "tune_split").glob(f"{task}_alloc16_*.json"))
+    rs = [json.loads(f.read_text()) for f in files]
+    if not rs:
         return None
-    pts = r["points"]
-    flat = next((q for q in pts if q["direction"] == "flat"), None)
-    bumps = [q for q in pts if q["direction"] == "bump"]
-    prof = next((q for q in pts if q["direction"] == "profile"), None)
-    if flat is None or not bumps:
+    pts = [q for r in rs for q in r["points"]]
+    flats = [q for q in pts if q["direction"] == "flat"]
+    bumps = {(q["peak"], q["width"]): q for q in pts if q["direction"] == "bump"}
+    if not flats or not bumps:
         return None
-    S = len(flat["schedule"])
-    uni = float(np.mean(flat["schedule"]))
-    x = [100.0 * (1 - i / (S - 1)) for i in range(S)]          # % of the sampling trajectory remaining
-    delta = {id(q): _pct(q["exact"] - flat["exact"]) for q in pts}
-    vmax = max(1.0, max(abs(v) for v in delta.values()))
-    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
-    cmap = plt.get_cmap("RdYlGn")
-    widths = sorted({q["width"] for q in bumps})
+    S = len(flats[0]["schedule"])
+    flat_exact = float(np.mean([q["exact"] for q in flats]))
+    return flat_exact, list(bumps.values()), S, float(np.mean(flats[0]["schedule"])), float(rs[0].get("alloc_ratio", 3.0))
+
+
+def fig_alloc_heatmap(d: Path, task: str, out: Path):
+    """Sudoku-style: delta exact vs the uniform schedule (same total reasoning), rows = width, columns = peak."""
+    L = _load_alloc(d, task)
+    if L is None:
+        return None
+    flat, bumps, S, fn, ratio = L
     peaks = sorted({q["peak"] for q in bumps})
-    nrow = len(widths) + (1 if prof else 0)
-    fig, axes = plt.subplots(nrow, 1, figsize=(8.6, 2.5 * nrow + 0.6), sharex=True, squeeze=False)
-    axes = axes[:, 0]
+    widths = sorted({q["width"] for q in bumps})
+    diff = np.full((len(widths), len(peaks)), np.nan)
+    for q in bumps:
+        diff[widths.index(q["width"]), peaks.index(q["peak"])] = _pct(q["exact"] - flat)
+    vabs = max(1.0, np.nanmax(np.abs(diff)))
+    with plt.rc_context({**_SERIF, "axes.grid": False, "axes.spines.top": False, "axes.spines.right": False,
+                         "axes.labelsize": 16, "xtick.labelsize": 14, "ytick.labelsize": 14}):
+        fig, ax = plt.subplots(figsize=(4.2, 3.0))
+        ax.imshow(diff, cmap="RdBu", vmin=-vabs, vmax=vabs, aspect="auto")
+        ax.set_xticks(range(len(peaks)), [f"{p:g}" for p in peaks])
+        ax.set_yticks(range(len(widths)), [f"{w:g}" for w in widths])
+        ax.set_xlabel("Peak")
+        ax.set_ylabel("Width")
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        for i in range(len(widths)):
+            for j in range(len(peaks)):
+                v = diff[i, j]
+                if not np.isnan(v):
+                    ax.text(j, i, f"{v:+.1f}", ha="center", va="center", fontsize=15,
+                            color="white" if abs(v) > 0.6 * vabs else "black")
+        fig.tight_layout(pad=0.3)
+        fig.savefig(out, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    return out
 
-    def draw(ax, q, label_x=None):
-        y = [n / uni for n in q["schedule"]]
-        c = cmap(norm(delta[id(q)]))
-        ax.plot(x, y, "-o", color=c, ms=3)
-        ax.fill_between(x, 0, y, color=c, alpha=0.18)
-        i = int(np.argmax(y))
-        ax.annotate(f"{delta[id(q)]:+.1f}", (x[i], y[i]), textcoords="offset points", xytext=(0, 5), ha="center",
-                    fontsize=8, color="0.2")
 
-    for ax, w in zip(axes, widths):
-        for pk in peaks:
-            q = next((b for b in bumps if b["width"] == w and b["peak"] == pk), None)
-            if q:
-                draw(ax, q)
-        ax.axhline(1.0, color="0.4", ls=":", lw=1)
-        ax.set_ylim(0, max(ax.get_ylim()[1], 1.0) * 1.18)
-        ax.set_ylabel("budget (x uniform)")
-        ax.text(0.99, 0.92, f"width = {w:g}", transform=ax.transAxes, ha="right", va="top", fontsize=9)
-    if prof:
-        ax = axes[-1]
-        draw(ax, prof)
-        ax.axhline(1.0, color="0.4", ls=":", lw=1)
-        ax.set_ylim(0, max(ax.get_ylim()[1], 1.0) * 1.18)
-        ax.set_ylabel("budget (x uniform)")
-        ax.text(0.99, 0.92, f"from z_H change (eps = {r.get('alloc_profile_eps', '?')})", transform=ax.transAxes,
-                ha="right", va="top", fontsize=9)
-    axes[-1].set_xlim(100, 0)
-    axes[-1].set_xlabel("Sampling trajectory (% of sampling remaining)")
-    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    fig.tight_layout(rect=(0, 0, 0.9, 1))
-    cax = fig.add_axes([0.92, 0.12, 0.02, 0.76])
-    fig.colorbar(sm, cax=cax).set_label("change in exact vs uniform (points)")
-    fig.suptitle(f"Same total reasoning (avg n_sup {uni:g}) moved along the trajectory; "
-                 f"uniform exact = {_pct(flat['exact']):.1f}%", fontsize=10, y=0.995)
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
+def fig_alloc_curves(d: Path, task: str, out: Path):
+    """The schedules behind the heatmap: budget (x uniform) along the trajectory, one panel per width, one curve per
+    peak, bold number = delta exact vs uniform (points). Green = better than uniform, red = worse, grey = within noise."""
+    L = _load_alloc(d, task)
+    if L is None:
+        return None
+    flat, bumps, S, fn, ratio = L
+    peaks = sorted({q["peak"] for q in bumps})
+    widths = sorted({q["width"] for q in bumps})
+    with plt.rc_context({**_SERIF, "axes.grid": False, "axes.spines.top": False, "axes.spines.right": False}):
+        fig, axes = plt.subplots(1, len(widths), figsize=(3.6 * len(widths), 3.0), sharey=True, squeeze=False)
+        for ax, w in zip(axes[0], widths):
+            ax.axhline(1.0, color="0.55", ls="--", lw=1)
+            ax.text(99, 1.0, "uniform", ha="right", va="bottom", fontsize=9, color="0.35",
+                    bbox=dict(fc="white", ec="none", pad=1, alpha=0.85), zorder=5)
+            for pk in peaks:
+                q = next((b for b in bumps if b["peak"] == pk and b["width"] == w), None)
+                if q is None:
+                    continue
+                dv = _pct(q["exact"] - flat)
+                c = _GOOD if dv > 0.7 else _BAD if dv < -0.7 else _NEUTRAL
+                x, y = _bump_curve(S, int(round(fn)), ratio, pk, w)
+                x = 100.0 - x
+                ax.plot(x, y, color=c, lw=2)
+                i = int(np.argmax(y))
+                ax.annotate(f"{dv:+.1f}", (x[i], y[i]), textcoords="offset points", xytext=(0, 4), ha="center",
+                            fontsize=11, fontweight="bold", color=c)
+            ax.set_title(f"width {w:g}", fontsize=12)
+            ax.set_xlim(0, 100)
+            ax.set_xlabel("Sampling trajectory (%)", fontsize=12)
+            ax.set_ylim(0, None)
+        axes[0][0].set_ylabel("Recursion budget (\u00d7 uniform)", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(out, dpi=200)
+        plt.close(fig)
     return out
 
 
@@ -326,7 +374,8 @@ def main():
             "05_cut_at_k": fig_cut(d, task, o("05_cut_at_k")),
             "05_cut_at_k_by_size": fig_cut_by_size(d, task, o("05_cut_at_k_by_size")),
             "06_carry": fig_carry(d, task, o("06_carry")),
-            "07_allocation": fig_alloc(d, task, o("07_allocation")),
+            "07_allocation_heatmap": fig_alloc_heatmap(d, task, o("07_allocation_heatmap")),
+            "07_allocation_curves": fig_alloc_curves(d, task, o("07_allocation_curves")),
         }
         for k, p in figs.items():
             print(f"{task}/{k}: {p}")

@@ -17,6 +17,13 @@ defaults:
 
 mode: "painter_base"
 
+# DDPMScheduler defaults to clip_sample=True (x0 clamped to [-1,1] at every
+# sampling step). Fine for pixels, destructive for latents: the normalised SD-VAE
+# latents have std ~1, so a large fraction of values lie outside [-1,1] and get
+# truncated every step. Training (add_noise) is unaffected -- sampling only.
+diffusion:
+  clip_sample: false
+
 # 288 px -> 36x36 latent (f=8). 144 px would give 18x18, too coarse for 16x16 mazes.
 data:
   image_size: 288
