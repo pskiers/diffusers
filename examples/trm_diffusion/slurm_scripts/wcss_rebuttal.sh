@@ -32,6 +32,13 @@
 #                    (sudoku_hard_trm_0_26_x0_hint_repro, pvpx8kbs), CFG dropout 0.1; 1 GPU, batch 256.
 #                    Output/W&B name: mnist_trm_diffusion_backbone_hard.
 #                    The TRM denoiser runs on 1 GPU, as vu78kfn4 did.
+#   hard_[1state_]{xt,no_xt} (rating 2 Q4) the states / x_t ablation of EXTREME, on HARD (many solutions per
+#                    puzzle). The recipe of sudoku_hard_trm_0_26_x0_hint_repro (pvpx8kbs: thinker_base, puzzle + x_t
+#                    encoder, wd 1, 0-26 givens, batch 384 x accum 2 on 1 GPU); hard_xt reruns it on current code (an
+#                    optional control: pvpx8kbs itself is the reference). no_xt swaps only the encoder for the
+#                    puzzle-only spatial_image_v0 (as extreme_no_xt, m8kd4c46); 1state swaps only the thinker for
+#                    thinker=mnist_single_state (as mnist_thinker_single_state, wwxz6aws). 60k steps (pvpx8kbs peaks by
+#                    ~40k). Output/W&B names: sudoku_hard_thinker_[1state_]{xt,no_xt}.
 #   clevr_trm        (03_trm_baselines) the TRM denoiser on CLEVR (SDXL-VAE latents; the CLEVR thinker's object +
 #                    [x_t, centroid mask] tokens), CFG dropout 0.1; 1 GPU, batch 256. num_steps 400k is a ceiling:
 #                    the run is meant to go until the 72 h limit (checkpoints every 20k), evals every 20k.
@@ -75,6 +82,18 @@ case $RUN in
     OUT=mnist_trm_diffusion_backbone_hard
     ARGS=(experiment=mnist_trm_diffusion_backbone data=mnist_sudoku_srm "data.train_dataset.given_cells_range=[0,26]"
           train.batch_size=256 train.gradient_accumulation_steps=1 train.grad_clip=256 train.cfg_prob=0.1)
+    NGPU=1 ;;
+  hard_xt|hard_no_xt|hard_1state_xt|hard_1state_no_xt)
+    OUT=sudoku_hard_thinker_${RUN#hard_}
+    ARGS=(experiment=mnist_thinker_controlnet painter.checkpoint=runs/mnist_unet_painter/checkpoint_final.pt
+          translator.bridge_mode=normalized data=mnist_sudoku_srm "data.train_dataset.given_cells_range=[0,26]"
+          train.batch_size=384 train.gradient_accumulation_steps=2 train.num_steps=60000)
+    if [[ $RUN == *no_xt ]]; then
+      ARGS+=(condition_encoder=spatial_image_v0 condition_encoder.with_timestep_emb=false)
+    else
+      ARGS+=(condition_encoder=x0_hint_v1 +condition_encoder.enabled=false condition_encoder.inner.with_timestep_emb=false)
+    fi
+    [[ $RUN == *1state* ]] && ARGS+=(thinker=mnist_single_state)
     NGPU=1 ;;
   clevr_trm)
     OUT=clevr_trm_diffusion_backbone
