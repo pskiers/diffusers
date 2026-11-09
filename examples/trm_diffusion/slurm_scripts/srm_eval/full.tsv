@@ -1,0 +1,17 @@
+# task checkpoint scales ood  (wcss_srm_eval.sh; 300k AMAZE / 150k CLEVR SRM checkpoints)
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 5 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 7 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 8 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 9 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 11 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 13 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt 16 -
+maze outputs/srm_amaze_maze/checkpoints/epoch=639-step=300000-v1.ckpt - 3
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 4 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 5 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 6 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 7 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 8 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 9 -
+queens outputs/srm_amaze_queens/checkpoints/epoch=639-step=300000-v1.ckpt 10 -
+clevr outputs/srm_clevr/checkpoints/epoch=547-step=150000-v1.ckpt - -
