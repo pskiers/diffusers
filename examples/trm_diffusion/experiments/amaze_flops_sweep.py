@@ -382,6 +382,53 @@ def _profile_summary(rec: dict, num_steps: int) -> dict:
     return out
 
 
+def _load_profile(path: str) -> dict:
+    """The `profile` block of a maze_profile.json (relative z_H change per iteration + step-by-step cosine matrices)."""
+    return json.load(open(path))["profile"]
+
+
+def _carry_maps(profile: dict, cos_thr: float, kind: str = "cos_centered"):
+    """Reset maps derived from the same-board cosine of the final z_H (profile heatmap).
+    nb[i] = cosine between denoising step i and i+1 (how well the state of step i still describes step i+1).
+      regime boundary : the ONE step with the lowest neighbouring cosine (+1 = first step of the new regime)
+      adaptive map    : reset at every step i+1 whose neighbouring cosine is below cos_thr (plus step 0)
+    Returns (boundary_step, adaptive_reset_set, nb)."""
+    c = profile[kind]
+    nb = [c[i][i + 1] for i in range(len(c) - 1)]
+    boundary = min(range(len(nb)), key=lambda i: nb[i]) + 1
+    adaptive = {0} | {i + 1 for i, v in enumerate(nb) if v < cos_thr}
+    return boundary, adaptive, nb
+
+
+def _iters_needed(profile: dict, eps: float) -> list:
+    """Per denoising step: number of reasoning iterations after which the mean relative z_H change is < eps
+    (all iterations if it never gets there)."""
+    out = []
+    for rel in profile["rel_change_mean"]:
+        k = next((i + 1 for i, v in enumerate(rel) if v < eps), len(rel))
+        out.append(k)
+    return out
+
+
+def _rescale_schedule(needed: list, total: int) -> list:
+    """Integer per-step budget proportional to `needed`, >= 1 everywhere, summing exactly to `total`."""
+    scale = total / float(sum(needed))
+    sched = [max(1, int(round(n * scale))) for n in needed]
+    drift = total - sum(sched)
+    order = sorted(range(len(sched)), key=lambda i: -sched[i])
+    i = 0
+    while drift != 0 and i < 10 * len(sched):
+        j = order[i % len(order)]
+        if drift > 0:
+            sched[j] += 1
+            drift -= 1
+        elif sched[j] > 1:
+            sched[j] -= 1
+            drift += 1
+        i += 1
+    return sched
+
+
 # ── FLOPs accounting (identical formulas to sweep_trm_flops_vs_acc.py) ──────
 
 
@@ -573,16 +620,27 @@ def main(cfg: DictConfig):
             peaks = list(sw.get("alloc_peaks", [0.1, 0.3, 0.5, 0.7]))
             widths = list(sw.get("alloc_widths", [0.08, 0.2, 0.4]))
             flat_vals = list(sw.get("alloc_flat_n_values", [2, 4, 8]))
-            meta.update(alloc_reset_every=reset_every, alloc_ratio=ratio, alloc_peaks=peaks, alloc_widths=widths)
+            directions = list(sw.get("alloc_directions", ["bump", "dip", "front", "back"]))
+            meta.update(alloc_reset_every=reset_every, alloc_ratio=ratio, alloc_peaks=peaks, alloc_widths=widths,
+                        alloc_directions=directions)
+            needed = None
+            if sw.get("profile_json", None):
+                prof_eps = float(sw.get("alloc_profile_eps", 0.01))
+                needed = _iters_needed(_load_profile(str(sw["profile_json"])), prof_eps)
+                meta.update(alloc_profile_eps=prof_eps, alloc_profile_needed=needed, profile_json=str(sw["profile_json"]))
+                logger.info(f"profile-derived need per step (eps={prof_eps}): {needed}")
             reset_fn = _make_reset_fn(reset_every)
             for fn in flat_vals:
                 variants = [("flat", None, None, [fn] * num_steps)]
-                for d in ("bump", "dip"):
-                    for pk in peaks:
-                        for w in widths:
-                            variants.append((d, pk, w, _matched_budget_schedule(d, fn, num_steps, ratio, pk, w)))
-                for d in ("front", "back"):
-                    variants.append((d, None, None, _matched_budget_schedule(d, fn, num_steps, ratio)))
+                for d in directions:
+                    if d in ("bump", "dip"):
+                        for pk in peaks:
+                            for w in widths:
+                                variants.append((d, pk, w, _matched_budget_schedule(d, fn, num_steps, ratio, pk, w)))
+                    else:
+                        variants.append((d, None, None, _matched_budget_schedule(d, fn, num_steps, ratio)))
+                if needed is not None:
+                    variants.append(("profile", None, None, _rescale_schedule(needed, fn * num_steps)))
                 for d, pk, w, sched in variants:
                     r = _score_batches(model, scorer, cached, lambda cb, s=sched: _run_ablation_sampling(
                         model, cb["conditions"], cb["x_init"], num_steps, cfg_scale,
@@ -604,6 +662,19 @@ def main(cfg: DictConfig):
             boundary = int(sw.get("regime_boundary_step", 13))   # first step of the late regime (t=30 of 20 steps 95..0)
             meta["regime_boundary_step"] = boundary
             reset_sets = {"fresh": all_steps, "carry_all": {0}, "carry_regime": {0, boundary}}
+            for N in (1, 2, 5, 20):                       # "reset every N denoising steps" (every1 = fresh, every20 = carry_all)
+                reset_sets[f"every{N}"] = set(range(0, num_steps, N))
+            carry_default = ["fresh", "carry_all", "carry_regime"]
+            if sw.get("profile_json", None):
+                cos_thr = float(sw.get("cos_threshold", 0.93))
+                boundary, adaptive, nb = _carry_maps(_load_profile(str(sw["profile_json"])), cos_thr)
+                reset_sets["carry_regime"] = {0, boundary}
+                reset_sets["regime"] = {0, boundary}
+                reset_sets["adaptive"] = adaptive
+                carry_default = ["every1", "every2", "every5", "every20", "regime", "adaptive"]
+                meta.update(profile_json=str(sw["profile_json"]), cos_threshold=cos_thr, measured_boundary_step=boundary,
+                            adaptive_reset_steps=sorted(adaptive), neighbour_cos=nb, regime_boundary_step=boundary)
+                logger.info(f"cosine-derived maps: boundary step={boundary} adaptive resets={sorted(adaptive)} (thr={cos_thr})")
 
             def policy_point(label: dict, n_sup: int, freeze: int, resets, eps=None, **kw):
                 rec = _new_rec(num_steps)
@@ -649,7 +720,7 @@ def main(cfg: DictConfig):
 
             else:  # carry
                 for n in list(sw.get("carry_n_values", [2, 4, 8, 16])):
-                    for variant in ("fresh", "carry_all", "carry_regime"):
+                    for variant in list(sw.get("carry_variants", carry_default)):
                         pt, _ = policy_point({"n_sup": int(n), "variant": variant}, int(n), num_steps, reset_sets[variant])
                         record(pt, f"carry n_sup={n} {variant}")
             x_key, label_key = "flops", {"cut_at_k": "reason_frac", "converge": "eps", "carry": "variant"}.get(mode, "flops")

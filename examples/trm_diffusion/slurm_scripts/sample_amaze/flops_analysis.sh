@@ -24,6 +24,10 @@
 #     converge  exit inside the reasoning loop at relative z_H change < eps (3 thresholds), fresh / carry-in-regime
 #     carry     fresh vs carry-everywhere vs carry-within-regime, over n_sup
 #   later (after phase 1 is discussed): trm_wise, alloc;   report: figures + wandb images from the JSONs
+#   NEW_ABLATIONS=1 (v2 design): `carry` = reset every 1/2/5/20 + measured regime boundary + cosine reset map over
+#     n_sup 1..16; `alloc` = bump grid (5 centres x 3 widths) + the schedule from the z_H-change profile at an average
+#     budget of ALLOC_N (2) iterations/step. Both read PROFILE_JSON (default OUT_DIR/tune_split/<task>_profile.json),
+#     COS_THR (0.93) and ALLOC_EPS (0.01). SWEEP_WANDB=false keeps the sweeps out of wandb (the report logs one run).
 #
 # Usage (from the trm_diffusion dir; slurm_scripts/submit.sh swaps account/partition for Athena):
 #   bash slurm_scripts/submit.sh slurm_scripts/sample_amaze/flops_analysis.sh maze
@@ -72,6 +76,17 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
                '+sweep.regime_boundary_step=2' )
 fi
 mkdir -p "${OUT_DIR}/report_split" "${OUT_DIR}/tune_split"
+SWEEP_WANDB="${SWEEP_WANDB:-true}"
+[[ "${SMOKE:-0}" != "1" && "${SWEEP_WANDB}" == "false" ]] && COMMON+=( +sweep.wandb=false )
+PROFILE_JSON="${PROFILE_JSON:-${OUT_DIR}/tune_split/${TASK}_profile.json}"
+CARRY_ARGS=(); ALLOC_ARGS=()
+if [[ "${NEW_ABLATIONS:-0}" == "1" ]]; then
+  CARRY_ARGS=( +sweep.profile_json="${PROFILE_JSON}" +sweep.cos_threshold="${COS_THR:-0.93}" )
+  ALLOC_ARGS=( +sweep.profile_json="${PROFILE_JSON}" +sweep.alloc_profile_eps="${ALLOC_EPS:-0.01}"
+               "+sweep.alloc_flat_n_values=[${ALLOC_N:-2}]" '+sweep.alloc_directions=[bump]'
+               '+sweep.alloc_peaks=[0.1,0.3,0.5,0.7,0.9]' '+sweep.alloc_widths=[0.08,0.2,0.4]' )
+  [[ "${SMOKE:-0}" == "1" ]] || CARRY_ARGS+=( '+sweep.carry_n_values=[1,2,4,8,16]' )
+fi
 want() { [[ " ${STAGES} " == *" $1 "* ]]; }
 
 TRM_ARGS=( experiment=amaze_thinker_v2_controlnet painter.checkpoint="${PAINTER_CKPT}" +checkpoint="${TRM_CKPT}"
@@ -117,10 +132,11 @@ if want dm; then
 fi
 want trm_flat && trm_stage trm_flat report
 # ---- tuning boards: phase 1 ----
-for m in profile cut_at_k converge carry; do want "${m}" && trm_stage "${m}" tune; done
+for m in profile cut_at_k converge; do want "${m}" && trm_stage "${m}" tune; done
+want carry && trm_stage carry tune ${CARRY_ARGS[@]+"${CARRY_ARGS[@]}"}
 # ---- later stages (not in the default list) ----
 want trm_wise && trm_stage trm_wise report
-want alloc && trm_stage alloc tune
+want alloc && trm_stage alloc tune ${ALLOC_ARGS[@]+"${ALLOC_ARGS[@]}"}
 
 if want report; then
   R=( --dir "${OUT_DIR}" --tasks "${TASK}" --wandb-project "${WANDB_PROJECT}" --wandb-group "${WANDB_GROUP}" )
