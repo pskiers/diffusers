@@ -517,7 +517,20 @@ class ThinkerFrozenPainterBase(BaseModel):
         if not extra_params:
             return thinker_optims
         optim_cfg = self.painter.optim_cfg
-        enc_optim = torch.optim.AdamW(extra_params, lr=0, weight_decay=optim_cfg.weight_decay)
+        # use_adam_atan2: the loss reaching these params is divided by
+        # global_batch_size * K on top of being batch-mean-reduced (train_step),
+        # so their gradients are tiny and AdamW's eps floor damps the updates.
+        # AdamATan2 has no eps and is invariant to the gradient scale, like the
+        # thinker's own optimizer. Default False keeps existing runs unchanged.
+        if optim_cfg.get("use_adam_atan2", False):
+            from adam_atan2 import AdamATan2
+
+            enc_optim = AdamATan2(
+                extra_params, lr=0, weight_decay=optim_cfg.weight_decay,
+                betas=tuple(optim_cfg.get("betas", (0.9, 0.999))),
+            )
+        else:
+            enc_optim = torch.optim.AdamW(extra_params, lr=0, weight_decay=optim_cfg.weight_decay)
         enc_scheduled = ScheduledOptimizer(
             enc_optim,
             base_lr=optim_cfg.lr,
