@@ -26,7 +26,8 @@
 #   sbatch slurm_scripts/train_amaze/train_latent_painter_thinker.sh <maze|queens> [painter=false ...]
 #   (Athena: add --account=plgdiffusion3-gpu-a100 --partition=plgrid-gpu-a100)
 # Env: PAINTER_STEPS/THINKER_STEPS (40000), SAMPLES (Pass@K, 5), WANDB_PROJECT (PaTh-rebuttal, group latent),
-#      RUN_NAME, VAE_PATH, STATS_JSON, PAINTER_CKPT/THINKER_CKPT to reuse earlier stages.
+#      RUN_NAME, VAE_PATH, STATS_JSON, PAINTER_CKPT/THINKER_CKPT to reuse earlier stages,
+#      VAE_CACHE (true: cache the VAE posteriors, see below), EXTRA_PAINTER/EXTRA_THINKER (extra Hydra overrides).
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
@@ -88,13 +89,17 @@ COMMON=( data.amaze_root="${DATA_DIR}" eval_callbacks="${EVAL_CB}"
          vae.pretrained_model_name_or_path="${VAE_PATH}"
          "painter.latent_shift=${SHIFT}" "painter.latent_scale=${SCALE}"
          run.wandb_project="${WANDB_PROJECT}" run.wandb_group=latent )
+# The frozen VAE sees a fixed image set here (no random transforms), so each image's posterior
+# is computed once and then sampled from (models/painter_base.py: _VAEPosteriorCache) instead of
+# re-encoding all 768 images every step. Same training distribution; VAE_CACHE=false turns it off.
+[[ "${VAE_CACHE:-true}" == "true" ]] && COMMON+=( +painter.vae_posterior_cache=true )
 
 # Stage 1: unconditional latent painter
 if is_true "${PAINTER}"; then
   srun python train_trm.py experiment=amaze_latent_unet_painter "${COMMON[@]}" \
     train.num_steps=${PAINTER_STEPS} \
     run.wandb_job_type=train "run.wandb_tags=[latent,painter,${TASK},${CLUSTER}]" \
-    run.output_dir="runs/${RUN_NAME}_painter"
+    run.output_dir="runs/${RUN_NAME}_painter" ${EXTRA_PAINTER:-}
   echo "${TASK} latent painter complete -> ${PAINTER_CKPT}"
 fi
 
@@ -105,7 +110,7 @@ if is_true "${THINKER}"; then
     painter.checkpoint="${PAINTER_CKPT}" \
     train.num_steps=${THINKER_STEPS} \
     run.wandb_job_type=train "run.wandb_tags=[latent,thinker,${TASK},${CLUSTER}]" \
-    run.output_dir="runs/${RUN_NAME}_thinker"
+    run.output_dir="runs/${RUN_NAME}_thinker" ${EXTRA_THINKER:-}
   echo "${TASK} latent thinker complete -> ${THINKER_CKPT}"
 fi
 

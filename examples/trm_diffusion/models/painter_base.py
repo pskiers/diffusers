@@ -60,6 +60,76 @@ from models.optim_utils import ScheduledOptimizer, apply_lr_and_step
 # ── Abstract base ─────────────────────────────────────────────────────────────
 
 
+class _VAEPosteriorCache:
+    """GPU table of VAE posteriors (mean, std), keyed by image content.
+
+    Key = two exact integer fingerprints of the image's 8-bit pixel values (the
+    images come from PNGs, so x * 255 rounds back to the stored bytes): sums of
+    pixel * fixed random int weight in int64, which are order-independent and so
+    identical for the same image in any batch. Misses are encoded in one VAE call
+    and appended; storage grows by doubling. Not saved in checkpoints.
+    """
+
+    _CHUNK = 64   # images per fingerprint chunk (bounds the int64 temporaries)
+
+    def __init__(self):
+        self.index: dict[tuple[int, int], int] = {}
+        self.mean: Optional[torch.Tensor] = None
+        self.std: Optional[torch.Tensor] = None
+        self.size = 0
+        self._weights: Optional[torch.Tensor] = None
+        self.hits = 0
+        self.misses = 0
+
+    def _fingerprints(self, images: torch.Tensor) -> list[tuple[int, int]]:
+        flat = images.reshape(images.shape[0], -1)
+        if self._weights is None or self._weights.shape[1] != flat.shape[1] or self._weights.device != flat.device:
+            g = torch.Generator(device="cpu").manual_seed(1234)
+            # < 2^20 each: 255 * 2^20 * (3*512*512) < 2^63, so the sums never overflow.
+            self._weights = torch.randint(1, 1 << 20, (2, flat.shape[1]), generator=g, dtype=torch.int64).to(flat.device)
+        keys = []
+        for start in range(0, flat.shape[0], self._CHUNK):
+            px = (flat[start:start + self._CHUNK].float() * 255.0).round().to(torch.int64)
+            k = torch.stack([(px * self._weights[0]).sum(1), (px * self._weights[1]).sum(1)], dim=1).cpu().tolist()
+            keys += [tuple(x) for x in k]
+        return keys
+
+    def _store(self, mean: torch.Tensor, std: torch.Tensor) -> int:
+        n = mean.shape[0]
+        if self.mean is None:
+            cap = max(1024, n)
+            self.mean = torch.empty((cap, *mean.shape[1:]), dtype=mean.dtype, device=mean.device)
+            self.std = torch.empty_like(self.mean)
+        elif self.size + n > self.mean.shape[0]:
+            cap = max(2 * self.mean.shape[0], self.size + n)
+            grow = lambda t: torch.cat([t[: self.size], t.new_empty((cap - self.size, *t.shape[1:]))])
+            self.mean, self.std = grow(self.mean), grow(self.std)
+        self.mean[self.size : self.size + n] = mean
+        self.std[self.size : self.size + n] = std
+        start, self.size = self.size, self.size + n
+        return start
+
+    def lookup(self, images: torch.Tensor, encode_fn) -> tuple[torch.Tensor, torch.Tensor]:
+        keys = self._fingerprints(images)
+        rows = [self.index.get(k) for k in keys]
+        miss = [i for i, r in enumerate(rows) if r is None]
+        if miss:
+            # A batch can repeat an image: encode each distinct one once.
+            first: dict[tuple[int, int], int] = {}
+            for i in miss:
+                first.setdefault(keys[i], i)
+            uniq = list(first.values())
+            mean, std = encode_fn(images[uniq])
+            start = self._store(mean, std)
+            for j, i in enumerate(uniq):
+                self.index[keys[i]] = start + j
+            rows = [self.index[k] for k in keys]
+        self.hits += len(keys) - len(miss)
+        self.misses += len(miss)
+        idx = torch.tensor(rows, device=self.mean.device)
+        return self.mean[idx], self.std[idx]
+
+
 class PainterBase(nn.Module):
     """Common interface for all painter classes.
 
@@ -150,8 +220,15 @@ class UNetPainter(PainterBase, BaseModel):
         data_pixel_range: Optional[str] = None,
         latent_shift: Optional[list] = None,
         latent_scale: Optional[list] = None,
+        vae_posterior_cache: bool = False,
     ):
         super().__init__()
+        # Frozen VAE + a fixed image set (no random augmentation) -> each image's
+        # posterior N(mean, std^2) never changes, so it is computed once and every
+        # later encode() samples mean + std * eps from the stored values, the same
+        # distribution DiagonalGaussianDistribution.sample() draws from. Opt-in;
+        # wrong for datasets that transform images randomly (e.g. AmazeScaledDataset).
+        self._posterior_cache = _VAEPosteriorCache() if vae_posterior_cache else None
         self.unet: nn.Module = instantiate(unet)
         self.scheduler = scheduler
         self.optim_cfg = optim_cfg
@@ -302,11 +379,22 @@ class UNetPainter(PainterBase, BaseModel):
         if self.vae is None:
             raise RuntimeError("encode() requires a VAE")
         with torch.no_grad():
+            if self._posterior_cache is not None:
+                mean, std = self._posterior_cache.lookup(images, self._vae_posterior)
+                raw = mean + std * torch.randn_like(mean) if sample else mean
+                return self._normalize_latents(raw)
             if self._rescale_to_vae:
                 images = images * 2.0 - 1.0
             dist = self.vae.encode(images).latent_dist
             raw = dist.sample() if sample else dist.mode()
             return self._normalize_latents(raw)
+
+    def _vae_posterior(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mean, std) of the VAE posterior, exactly as DiagonalGaussianDistribution computes them."""
+        if self._rescale_to_vae:
+            images = images * 2.0 - 1.0
+        dist = self.vae.encode(images).latent_dist
+        return dist.mean, dist.std
 
     # ── Forward ─────────────────────────────────────────────────────────────
 
