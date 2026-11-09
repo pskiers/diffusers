@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -31,8 +32,39 @@ from eval.amaze_eval import AmazeMetrics, crop_to_content  # noqa: E402
 from models.utility_models import load_frozen_vae  # noqa: E402
 
 
-def _loader(dataset, batch_size, limit=None, seed=0):
-    if limit is not None and limit < len(dataset):
+def _group_of(meta) -> str:
+    """'<shape>_<width>' for mazes (e.g. hexagon_16); 'all' if metadata lacks it."""
+    try:
+        d = json.loads(meta) if isinstance(meta, str) else meta
+        cfg = d["maze_config"]
+        return f"{cfg['shape']}_{cfg['width']}"
+    except Exception:
+        return "all"
+
+
+def _stratified_indices(path, per_group, seed=0):
+    """`per_group` random rows from every (shape, width) group of the parquet, read from
+    the metadata column only (no images decoded). Returns (indices, test-set group counts)."""
+    import pyarrow.parquet as pq
+
+    groups = [_group_of(m) for m in pq.ParquetFile(path).read(columns=["metadata"]).column("metadata").to_pylist()]
+    by_group = collections.defaultdict(list)
+    for i, g in enumerate(groups):
+        by_group[g].append(i)
+    gen = torch.Generator().manual_seed(seed)
+    picked = []
+    for g in sorted(by_group):
+        idx = by_group[g]
+        perm = torch.randperm(len(idx), generator=gen)[:per_group].tolist()
+        picked += [idx[j] for j in perm]
+    return sorted(picked), {g: len(v) for g, v in by_group.items()}
+
+
+def _loader(dataset, batch_size, limit=None, seed=0, indices=None):
+    if indices is not None:
+        dataset = Subset(dataset, indices)
+        collate = dataset.dataset.collate_fn
+    elif limit is not None and limit < len(dataset):
         g = torch.Generator().manual_seed(seed)
         dataset = Subset(dataset, torch.randperm(len(dataset), generator=g)[:limit].tolist())
         collate = dataset.dataset.collate_fn
@@ -46,7 +78,7 @@ def _means(scorer):
 
 
 @torch.no_grad()
-def ceiling(vae, task, test_path, size, batch_size, limit, device, scaled=None):
+def ceiling(vae, task, test_path, size, batch_size, limit, device, scaled=None, indices=None, group_counts=None):
     """scaled: None, or dict(scale_min, scale_max, canvas_color, threshold, min_frac) —
     additionally score the GT after the AmazeScaledDataset transform + crop-back
     (does crop-back scoring itself reproduce the GT?) and that transformed GT
@@ -54,16 +86,21 @@ def ceiling(vae, task, test_path, size, batch_size, limit, device, scaled=None):
     ds = AmazeDataset(test_path, split="test", image_size=size, include_metadata=True)
     names = ["vae_recon", "resized_gt"] + (["scaled_gt_cropped", "scaled_vae_cropped"] if scaled else [])
     scorers = {k: AmazeMetrics(device=device, task=task) for k in names}
+    per_group = collections.defaultdict(lambda: collections.defaultdict(float))   # vae_recon only
     torch.manual_seed(1234)
     mse_sum, n = 0.0, 0
-    for batch in _loader(ds, batch_size, limit):
+    for batch in _loader(ds, batch_size, limit, indices=indices):
         x = batch.images.to(device)                                    # [0,1]
         z = vae.encode(x * 2 - 1).latent_dist.mode()
         rec = ((vae.decode(z).sample + 1) / 2).clamp(0, 1)
         mse_sum += (rec - x).pow(2).flatten(1).mean(1).sum().item()
         n += x.shape[0]
         meta = list(batch.metadata)
-        scorers["vae_recon"].compute_and_accumulate_metrics(rec.cpu(), meta)
+        for m, r in zip(meta, scorers["vae_recon"].compute_and_accumulate_metrics(rec.cpu(), meta)):
+            acc = per_group[_group_of(m.get("metadata") if isinstance(m, dict) else None)]
+            acc["n"] += 1
+            for k in ("pass", "exact", "gt_cell_coverage", "background_violation"):
+                acc[k] += float(r.get(k, 0.0))
         scorers["resized_gt"].compute_and_accumulate_metrics(x.cpu(), meta)
         if scaled:
             crop = dict(canvas_color=scaled["canvas_color"], threshold=scaled["threshold"], min_frac=scaled["min_frac"])
@@ -79,6 +116,13 @@ def ceiling(vae, task, test_path, size, batch_size, limit, device, scaled=None):
     latent_hw = list(z.shape[-2:])
     out = {"image_size": size, "latent_shape": [z.shape[1], *latent_hw], "pixel_mse": mse_sum / max(n, 1)}
     out.update({k: _means(v) for k, v in scorers.items()})
+    groups = {g: {k: (v / a["n"] if k != "n" else v) for k, v in a.items()} for g, a in sorted(per_group.items())}
+    out["vae_recon_by_group"] = groups
+    if group_counts:   # stratified subset -> reweight to the real test-set mix
+        tot = sum(group_counts[g] for g in groups)
+        out["vae_recon_test_weighted"] = {
+            k: sum(groups[g][k] * group_counts[g] / tot for g in groups)
+            for k in ("pass", "exact", "gt_cell_coverage", "background_violation")}
     return out
 
 
@@ -111,6 +155,11 @@ def main():
     p.add_argument("--sizes", type=int, nargs="+", default=[144, 288])
     p.add_argument("--stats_size", type=int, default=288)
     p.add_argument("--n_test", type=int, default=None, help="limit test puzzles (default: all)")
+    p.add_argument("--per_group", type=int, default=None,
+                   help="stratified subset: this many test puzzles per (shape, width) group; "
+                        "overall numbers are reweighted to the full test-set mix")
+    p.add_argument("--skip_stats", action="store_true",
+                   help="ceiling only (no train-latent statistics; no train_<size> parquet needed)")
     p.add_argument("--n_stats", type=int, default=4096, help="train images for latent statistics")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--out", required=True)
@@ -131,15 +180,31 @@ def main():
     task_dir = os.path.join(args.data_root, args.task)
     test_path = os.path.join(task_dir, "maze_dataset_test.parquet")
 
-    result = {"task": args.task, "vae": args.vae, "scaled": scaled, "ceiling": []}
+    indices = group_counts = None
+    if args.per_group:
+        indices, group_counts = _stratified_indices(test_path, args.per_group)
+        print(f"[{args.task}] stratified subset: {len(indices)} puzzles from {len(group_counts)} groups", flush=True)
+    result = {"task": args.task, "vae": args.vae, "scaled": scaled, "per_group": args.per_group, "ceiling": []}
     for size in args.sizes:
-        r = ceiling(vae, args.task, test_path, size, args.batch_size, args.n_test, device, scaled)
+        r = ceiling(vae, args.task, test_path, size, args.batch_size, args.n_test, device, scaled,
+                    indices=indices, group_counts=group_counts)
         result["ceiling"].append(r)
         print(f"[{args.task}] {size}px latent={r['latent_shape']} pixel_mse={r['pixel_mse']:.5f}", flush=True)
         for k in ("resized_gt", "vae_recon", "scaled_gt_cropped", "scaled_vae_cropped"):
             if k in r:
                 print(f"   {k:<19}: {json.dumps(r[k])}", flush=True)
+        if "vae_recon_test_weighted" in r:
+            print(f"   {'test-weighted':<19}: {json.dumps(r['vae_recon_test_weighted'])}", flush=True)
+        for g, a in r["vae_recon_by_group"].items():
+            print(f"     {g:<14} n={int(a['n']):>3} pass={a['pass']:.3f} exact={a['exact']:.3f} "
+                  f"cov={a['gt_cell_coverage']:.3f} viol={a['background_violation']:.3f}", flush=True)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w") as f:   # partial results survive a timeout at a larger size
+            json.dump(result, f, indent=2)
 
+    if args.skip_stats:
+        print(f"-> {args.out}")
+        return
     train_path = os.path.join(task_dir, f"maze_dataset_train_{args.stats_size}.parquet")
     shift, scale = latent_stats(vae, train_path, args.stats_size, args.batch_size, args.n_stats, device, scaled)
     result.update({"stats_size": args.stats_size, "latent_shift": shift, "latent_scale": scale})
