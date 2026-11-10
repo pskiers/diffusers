@@ -56,6 +56,18 @@ CURVES = [
     {"path": "runs/flops_sweep_trm_wise.json", "kind": "trm", "label": "PaTh (efficient)", "color": COLOR_TRM_WISE, "marker": "*"},
 ]
 
+# Predictor-corrector DM (rebuttal exp 02, results/pc_sweep): the EXTREME DM baseline at 20 steps with CFG 2 and K
+# corrector steps per denoising step, K in {0, 1, 2, 4, 8}; FLOPs = 20 x (1 + K) x 2 x F_dm (results/pc_sweep/flops.json).
+COLOR_PC_LANGEVIN = "#E69F00"
+COLOR_PC_RESTART = "#009E73"
+PC_DIR = "results/pc_sweep"
+PC_CURVES = [
+    {"variant": "langevin", "glob": "langevin_K{K}_r0.32_full.json", "label": "DM + Langevin corr.", "color": COLOR_PC_LANGEVIN},
+    {"variant": "restart", "glob": "restart_K{K}_full.json", "label": "DM + Restart corr.", "color": COLOR_PC_RESTART},
+]
+PC_KS = [0, 1, 2, 4, 8]
+PC_STEPS, PC_CFG_PASSES = 20, 2
+
 
 def _load_points(path: str) -> tuple[list[float], list[float]]:
     with open(path) as f:
@@ -66,7 +78,7 @@ def _load_points(path: str) -> tuple[list[float], list[float]]:
     return flops, acc
 
 
-fig, ax = plt.subplots(figsize=(6.9, 3.4))
+fig, ax = plt.subplots(figsize=(6.9, 4.3))
 
 for c in CURVES:
     try:
@@ -79,6 +91,17 @@ for c in CURVES:
         label=c["label"], zorder=3,
     )
 
+with open(f"{PC_DIR}/flops.json") as f:
+    f_dm = json.load(f)["extreme"]
+for c in PC_CURVES:
+    flops, acc = [], []
+    for K in PC_KS:
+        name = "none_K0_full.json" if K == 0 else c["glob"].format(K=K)
+        with open(f"{PC_DIR}/extreme/{name}") as f:
+            acc.append(100.0 * json.load(f)["metrics"]["puzzle_acc"])
+        flops.append(PC_STEPS * (1 + K) * PC_CFG_PASSES * f_dm)
+    ax.plot(flops, acc, linewidth=3.0, linestyle="--", color=c["color"], label=c["label"], zorder=3)
+
 ax.set_xscale("log")
 ax.set_xlabel("FLOPs")
 ax.set_ylabel("Puzzle accuracy (%)")
@@ -89,7 +112,7 @@ ax.spines["right"].set_visible(False)
 ax.grid(True, axis="y", linewidth=0.5, alpha=0.4)
 ax.set_axisbelow(True)
 
-ax.legend(frameon=True, loc="best")
+ax.legend(frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=3, fontsize=14, columnspacing=1.0, handlelength=1.6)
 
 fig.tight_layout(pad=0.0)
 fig.savefig("paper_plots/flops_vs_puzzle_acc.pdf", bbox_inches="tight")

@@ -21,9 +21,10 @@
 #   checkpoint  path relative to examples/srm_sudoku
 #   scales      in-distribution scales of this shard (MAZE_SCALES / QUEEN_SCALES), '-' for none
 #   ood         OOD scales of this shard (MAZE_OOD_SCALES), '-' for none
-# Protocol (the paper's AMAZE eval): every test board, 5 SRM samples per board, IPR budgets 10/25/50 on 1 of them;
-# SRM at 10 denoising steps per patch (3, IPR's Sudoku setting, leaves speckle noise on AMAZE/CLEVR), IPR at its
-# README "MS" settings. CLEVR: 1500 seeded val scenes, CFG 2.0; generation only (scored afterwards with
+# Protocol (the paper's AMAZE eval): every test board, 5 SRM samples per board, IPR budgets 5/10 on 1 of them.
+# SRM at 10 denoising steps per patch and IPR at 50 re-denoising steps per patch (IPR's Sudoku settings, 3 and 10,
+# leave speckle noise on AMAZE/CLEVR, which IPR accumulates round after round); other IPR settings as its README
+# "MS" column. CLEVR: 1500 seeded val scenes, CFG 2.0; generation only (scored afterwards with
 # clevr_score_samples.py in the trm env).
 # Output: examples/srm_sudoku/results/srm_eval/full/<task>_<scales>[_ood<ood>].json (AMAZE; merge the shards with
 # amaze_srm_merge.py) or results/srm_eval/full/clevr/ (images per budget).
@@ -36,7 +37,7 @@ read -r TASK CKPT SCALES OOD <<< "$LINE"
 [[ $OOD == - ]] && OOD=""
 
 OUTDIR=results/srm_eval/full
-COMMON=(--steps-per-patch 10 --score-budgets 10,25,50)
+COMMON=(--steps-per-patch 10 --ipr-steps-per-patch 50 --score-budgets 5,10)
 case $TASK in
   maze)
     NAME=maze${SCALES:+_${SCALES//,/-}}; [[ -n $OOD ]] && NAME+=_ood${OOD//,/-}

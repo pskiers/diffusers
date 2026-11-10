@@ -16,6 +16,8 @@
 #   sbatch slurm_scripts/wcss_mmdit.sh <run> [extra train_trm.py overrides...]
 #   resume: sbatch slurm_scripts/wcss_mmdit.sh <run> run.resume_from_checkpoint=runs/<output dir>/checkpoint_step-N.pt
 # Stage 1 (painters):  mnist_painter  clevr_painter
+#   clevr_painter_w<width>  clevr_painter with width <width> (12 blocks, 64-dim heads; clevr_painter is 512, 79M):
+#     painter-alone scaling for the rebuttal, e.g. w768 (~175M), w1024 (~310M). Output: clevr_mmdit_painter_w<width>
 # Stage 2 (thinkers, once the painter's checkpoint_final.pt exists):
 #   mnist_thinker  mnist_thinker_steer1  mnist_thinker_cnn  mnist_thinker_steercond
 #   clevr_thinker  clevr_thinker_steercond
@@ -178,6 +180,11 @@ case $RUN in
   clevr_painter)
     RUN=clevr_mmdit_painter
     clevr_train experiment=clevr_mmdit_painter eval.eval_every=10000 eval_callbacks.1.n_samples=1024 ;;
+  clevr_painter_w[0-9]*)
+    W=${RUN#clevr_painter_w}
+    RUN=clevr_mmdit_painter_w$W
+    clevr_train experiment=clevr_mmdit_painter painter.net.hidden_size=$W painter.net.num_heads=$(( W / 64 )) \
+      eval.eval_every=10000 eval_callbacks.1.n_samples=1024 ;;
   mnist_thinker)  # as T2I: reads the painter's hidden states after block 4, steers the image stream of blocks 4-7
     RUN=mnist_thinker_mmdit_norm
     train experiment=mnist_thinker_mmdit painter.checkpoint=$MNIST_PAINTER $MNIST_EVAL ;;
