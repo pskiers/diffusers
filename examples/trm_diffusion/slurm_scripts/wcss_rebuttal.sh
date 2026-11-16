@@ -24,6 +24,10 @@
 #                    (H 3, L 6), otherwise the recipe of mnist_painter_halt_pairhead_singlestage_nsup16 (y86cr9av:
 #                    thinker_act + pair halt head, wd 1.0), 160k steps (the paper's), batch 384 x 2 GPUs = 768.
 #                    Output/W&B name: mnist_painter_halt_pairhead_singlestage_nsup<N>.
+#   extreme_depth<D> (rating 1, depth-matched recursion) the extreme_nsup1 recipe with H 1, L D/2-1: the 2-layer
+#                    net is applied D/2 times per denoising step, so D layers of forward depth, all with gradient
+#                    (D even, >= 4). Matches the depth of the no-recursion Thinkers, whose k layers run twice (2k).
+#                    Output/W&B name: mnist_painter_halt_pairhead_singlestage_nsup1_depth<D>.
 #   amaze_trm_<task> (03_trm_baselines) TRM as the diffusion backbone, recipe of mnist_trm_diffusion_backbone (vu78kfn4),
 #                    on AMAZE <task> = maze | queens; 1 GPU, batch 256 (as vu78kfn4), 100k steps (each batch
 #                    makes n_sup = 16 optimizer steps), CFG dropout 0.1. Output/W&B name:
@@ -62,15 +66,24 @@ SRM=0    # 1: run examples/srm_sudoku/training.py in env_srm instead of train_tr
 XARGS=("${@:2}")  # extra train_trm.py overrides
 
 case $RUN in
-  extreme_nsup[0-9]*)
-    N=${RUN#extreme_nsup}
-    OUT=mnist_painter_halt_pairhead_singlestage_nsup$N
+  extreme_nsup[0-9]*|extreme_depth[0-9]*)
+    if [[ $RUN == extreme_depth* ]]; then
+      D=${RUN#extreme_depth}
+      (( D >= 4 && D % 2 == 0 )) || { echo "depth must be even and >= 4, got $D" >&2; exit 1; }
+      N=1
+      OUT=mnist_painter_halt_pairhead_singlestage_nsup1_depth$D
+      DEPTH_ARGS=(thinker.H_cycles=1 thinker.L_cycles=$(( D / 2 - 1 )))
+    else
+      N=${RUN#extreme_nsup}
+      OUT=mnist_painter_halt_pairhead_singlestage_nsup$N
+      DEPTH_ARGS=()
+    fi
     ARGS=(experiment=mnist_thinker_v1_controlnet painter.checkpoint=runs/mnist_unet_painter/checkpoint_final.pt
           condition_encoder=x0_hint_v1 condition_encoder.threshold=80 +condition_encoder.enabled=false
           condition_encoder.inner.with_timestep_emb=false mode=thinker_act thinker.with_halt_head=true
           thinker.n_sup=$N train.act_halt_threshold=0.0 train.act_continue_bias_init=-1.0
           +train.act_halt_label_margin=0.0001 train.act_halt_exploration_prob=0.1 train.batch_size=384
-          train.gradient_accumulation_steps=1 train.num_steps=160000 eval.log_every=200) ;;
+          train.gradient_accumulation_steps=1 train.num_steps=160000 eval.log_every=200 "${DEPTH_ARGS[@]}") ;;
   amaze_trm_maze|amaze_trm_queens)
     TASK=${RUN#amaze_trm_}
     OUT=amaze_trm_diffusion_backbone_$TASK
