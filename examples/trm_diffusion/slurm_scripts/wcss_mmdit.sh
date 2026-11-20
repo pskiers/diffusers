@@ -98,6 +98,12 @@
 #                   painter must stay blinded, so not with _cond)
 #           _tx0 (train.thinker_sees_x0=condition: only the thinker's condition image is the solved image, the
 #                 painter keeps the puzzle, so it works with _cond; blinded it equals _seex0 up to float rounding)
+#           _mix<p> (with _tx0: only a fraction p of training samples, drawn per ACT episode, read the solved image,
+#                    the rest the puzzle; eval reads the puzzle. One stage, painter's loss only)
+#           _pair<w> (with _act ... _tx0: mode=thinker_act_paired, one stage: every sample through the same thinker as
+#                     a teacher reading the solved image (painter's loss) and a student reading the puzzle (w * MSE to
+#                     the teacher's bridged code, teacher side detached); eval reads the puzzle)
+#           _klt<nats> (with _gram<beta>: KL budget, beta adapted from <beta> so the KL sits at <nats> per token)
 #           _distA / _distB (mode=thinker_act_distill: trained only to reproduce a frozen `_seex0` teacher's
 #                   steering code through its frozen translator, no painter in training; A = the no-lever seex0
 #                   run @20k, B = the tn2 seex0 run @5k; needs _act before it and the p16_all painter)
@@ -293,6 +299,9 @@ case $RUN in
         seex0) STAGE2="$STAGE2 +data.train_dataset.condition_is_solution=true +data.val_dataset.condition_is_solution=true"
                TV="${TV}_$tok" ;;
         tx0) STAGE2="$STAGE2 +train.thinker_sees_x0=condition"; TV="${TV}_$tok" ;;
+        mix[0-9]*) STAGE2="$STAGE2 +train.thinker_x0_prob=${tok#mix}"; TV="${TV}_$tok" ;;
+        pair[0-9]*) STAGE2="$STAGE2 mode=thinker_act_paired +train.pair_match_weight=${tok#pair}"; TV="${TV}_$tok" ;;
+        klt[0-9]*) STAGE2="$STAGE2 +train.gram_kl_target=${tok#klt}"; TV="${TV}_$tok" ;;
         distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
         distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
         gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
@@ -318,6 +327,11 @@ case $RUN in
       [[ $ISDDPM == 0 && $TV == *_tmax60* ]] && { echo "$RUN: _tmax60 needs a _ddpm or _all painter" >&2; exit 1; }
       [[ $TV == *_seex0* && -z $BLIND ]] && { echo "$RUN: _seex0 with _cond would show the painter the answer" >&2; exit 1; }
       [[ $TV == *_seex0* && $TV == *_tx0* ]] && { echo "$RUN: _seex0 and _tx0 are two ways to the same input" >&2; exit 1; }
+      [[ ( $TV == *_mix[0-9]* || $TV == *_pair[0-9]* ) && $TV != *_tx0* ]] && {
+        echo "$RUN: _mix<p> / _pair<w> need _tx0 (the teacher's view)" >&2; exit 1; }
+      [[ $TV == *_pair[0-9]* && $TV != *_act_*pair* ]] && { echo "$RUN: _pair<w> needs _act before it" >&2; exit 1; }
+      [[ $TV == *_pair[0-9]* && $TV == *_mix[0-9]* ]] && { echo "$RUN: _pair<w> reads both views, not _mix" >&2; exit 1; }
+      [[ $TV == *_klt[0-9]* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _klt<nats> needs _gram<beta>" >&2; exit 1; }
       [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
       [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
       [[ $TV == *_pstate* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _pstate needs _gram<beta>" >&2; exit 1; }

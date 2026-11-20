@@ -144,16 +144,17 @@ class GramSpatialTRM(SpatialTRM):
         finally:
             self.inner._h_transition = None
 
-    def kl_loss(self, balance: float, free_bits: float) -> tuple[torch.Tensor, dict]:
+    def kl_loss(self, balance: float, free_bits: float, per_channel: bool = True) -> tuple[torch.Tensor, dict]:
         """(B,) per-sample KL loss of the last transition, consuming self._kl_terms: KL balancing (balance on the
         prior's side, 1 - balance on the posterior's), free bits per token on each side (no gradient below), the
-        per-token KL summed over channels, then averaged over tokens and divided by hidden_size (per channel)."""
+        per-token KL summed over channels, then averaged over tokens and, with per_channel, divided by hidden_size
+        (per channel; else nats per token)."""
         mu_q, sd_q, mu_p, sd_p = self._kl_terms
         self._kl_terms = None
         kl_prior = gauss_kl(mu_q.detach(), sd_q.detach(), mu_p, sd_p).expand_as(mu_q).sum(-1)  # (B, N), trains p
         kl_post = gauss_kl(mu_q, sd_q, mu_p.detach(), sd_p.detach()).expand_as(mu_q).sum(-1)  # (B, N), trains q
         tok = balance * kl_prior.clamp(min=free_bits) + (1 - balance) * kl_post.clamp(min=free_bits)
-        per_sample = tok.mean(1) / mu_q.shape[-1]
+        per_sample = tok.mean(1) / mu_q.shape[-1] if per_channel else tok.mean(1)
         stats = {
             "gram_kl_nats_per_token": kl_prior.detach().mean().item(),
             "gram_sd_q": sd_q.detach().mean().item(),
@@ -165,20 +166,37 @@ class GramSpatialTRM(SpatialTRM):
 
 class _LossPlusKL(nn.Module):
     """The model's loss plus beta * the thinker's KL loss whenever the last reasoning step went through the
-    posterior (training); unchanged otherwise (eval, prior passes)."""
+    posterior (training); unchanged otherwise (eval, prior passes).
 
-    def __init__(self, inner: nn.Module, beta: float, balance: float, free_bits: float):
+    kl_target (a KL budget): the KL is in nats per token and beta is adapted after every KL term by dual ascent,
+    log beta += kl_lr * (KL - kl_target) / kl_target, so the posterior carries about kl_target nats per token
+    beyond the prior; beta starts at `beta` and is a buffer (saved in checkpoints). The KL it reacts to is this
+    process's batch mean."""
+
+    def __init__(
+        self, inner: nn.Module, beta: float, balance: float, free_bits: float, kl_target=None, kl_lr: float = 0.01
+    ):
         super().__init__()
         self.inner = inner
         self.beta, self.balance, self.free_bits = beta, balance, free_bits
+        self.kl_target, self.kl_lr = kl_target, kl_lr
+        if kl_target is not None:
+            self.register_buffer("log_beta", torch.tensor(math.log(beta)))
         self.thinker = None  # set by the owning model; not a submodule
 
     def forward(self, noise_pred, logits, sample):
         loss, loss_dict = self.inner(noise_pred, logits, sample)
         if self.thinker._kl_terms is not None:
-            kl, stats = self.thinker.kl_loss(self.balance, self.free_bits)
-            loss = loss + self.beta * kl.mean()
+            budget = self.kl_target is not None
+            kl, stats = self.thinker.kl_loss(self.balance, self.free_bits, per_channel=not budget)
+            beta = self.log_beta.exp() if budget else self.beta
+            loss = loss + beta * kl.mean()
             loss_dict = {**loss_dict, "gram_kl_loss": kl.mean().item(), **stats}
+            if budget:
+                loss_dict["gram_beta"] = beta.item()
+                with torch.no_grad():
+                    kl_now = stats["gram_kl_nats_per_token"]
+                    self.log_beta += self.kl_lr * (kl_now - self.kl_target) / self.kl_target
         return loss, loss_dict
 
     def __getattr__(self, name):
@@ -196,12 +214,23 @@ class GramThinkerFrozenPainterACT(ThinkerFrozenPainterACT):
     the same step recomputed with eps = the prior mean (no sampling noise in the labels). Eval logs the callbacks
     twice: prior samples (the usual keys) and prior mean (keys with suffix _pmean)."""
 
-    def __init__(self, *args, gram_beta: float, gram_kl_balance: float = 0.8, gram_free_bits: float = 0.5, **kwargs):
+    def __init__(
+        self,
+        *args,
+        gram_beta: float,
+        gram_kl_balance: float = 0.8,
+        gram_free_bits: float = 0.5,
+        gram_kl_target=None,
+        gram_kl_lr: float = 0.01,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if not isinstance(self.thinker, GramSpatialTRM):
             raise ValueError("mode thinker_act_gram needs thinker._target_=models.gram_thinkers.GramSpatialTRM")
         self.posterior_encoder = instantiate(kwargs["condition_encoder"])
-        self.loss_fn = _LossPlusKL(self.loss_fn, gram_beta, gram_kl_balance, gram_free_bits)
+        self.loss_fn = _LossPlusKL(
+            self.loss_fn, gram_beta, gram_kl_balance, gram_free_bits, kl_target=gram_kl_target, kl_lr=gram_kl_lr
+        )
         object.__setattr__(self.loss_fn, "thinker", self.thinker)
         self._pre_step = None
 

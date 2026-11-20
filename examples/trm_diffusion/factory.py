@@ -122,6 +122,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         freeze_translator=bool(tr.get("freeze_translator", False)),
         thinker_checkpoint=tr.get("thinker_checkpoint"),
         thinker_sees_x0=tr.get("thinker_sees_x0"),
+        thinker_x0_prob=float(tr.get("thinker_x0_prob", 1.0)),
     )
 
 
@@ -219,6 +220,8 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             gram_beta=float(cfg.train.gram_beta),
             gram_kl_balance=float(cfg.train.get("gram_kl_balance", 0.8)),
             gram_free_bits=float(cfg.train.get("gram_free_bits", 0.5)),
+            gram_kl_target=float(cfg.train.gram_kl_target) if cfg.train.get("gram_kl_target") is not None else None,
+            gram_kl_lr=float(cfg.train.get("gram_kl_lr", 0.01)),
         )
 
     if mode == "thinker_act_distill":
@@ -246,6 +249,33 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
             teacher_checkpoint=str(cfg.train.distill_teacher_checkpoint),
             teacher_sees_x0=str(cfg.train.get("distill_teacher_sees_x0", "condition")),
+        )
+
+    if mode == "thinker_act_paired":
+        # thinker_act wiring; one-stage teacher/student: every sample through the same thinker as a teacher that
+        # reads the clean target (train.thinker_sees_x0, painter's loss) and a student that reads the usual input
+        # (train.pair_match_weight * MSE to the teacher's code). See models/paired_thinkers.py.
+        from models.paired_thinkers import ThinkerFrozenPainterPairedACT
+
+        return ThinkerFrozenPainterPairedACT(
+            thinker=cfg.thinker,
+            painter=cfg.painter,
+            train_cfg=train_cfg,
+            eval_cfg=eval_cfg,
+            condition_encoder=cfg.condition_encoder,
+            loss=cfg.loss,
+            thinker_painter_translator=cfg.translator,
+            eval_callbacks=_eval_callback_cfgs(cfg),
+            scheduler=scheduler,
+            sampling_pipeline=sampling,
+            halt_threshold=float(cfg.train.get("act_halt_threshold", 0.0)),
+            halt_exploration_prob=float(cfg.train.get("act_halt_exploration_prob", 0.1)),
+            continue_bias_init=float(cfg.train.get("act_continue_bias_init", 1.0)),
+            halt_label_margin=(
+                float(cfg.train.act_halt_label_margin) if cfg.train.get("act_halt_label_margin") is not None else None
+            ),
+            halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
+            match_weight=float(cfg.train.pair_match_weight),
         )
 
     if mode == "thinker_act":

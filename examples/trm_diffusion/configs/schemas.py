@@ -101,6 +101,9 @@ class TrainConfig:
     # target in [0, 1] in place of the condition image (Sudoku); "x_noisy": the target in the
     # painter's model range in place of x_t (CLEVR). None = off.
     thinker_sees_x0: Optional[str] = None
+    # With thinker_sees_x0: the fraction of training samples (fixed per ACT episode) that read the
+    # clean target; the others read their usual input. Below 1, eval and sampling use the usual input.
+    thinker_x0_prob: float = 1.0
 
 
 @dataclass

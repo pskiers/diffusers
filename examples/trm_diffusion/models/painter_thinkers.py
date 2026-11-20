@@ -89,6 +89,8 @@ class ThinkerFrozenPainterBase(BaseModel):
     train_cfg.thinker_sees_x0: the thinker's condition encoder reads the clean target instead of the condition
         image ("condition") or of x_t ("x_noisy"), via sample.thinker_x0; the painter's input is unchanged, so a
         painter that keeps its own condition (not blinded) still never sees the answer. None = off.
+        train_cfg.thinker_x0_prob < 1: only that fraction of training samples (drawn once per sample, so per ACT
+        episode) read the clean target, the rest their usual input; eval and sampling read the usual input.
 
     train_cfg.steer_grad_unweighted: the thinker's gradient through the painter undoes
         sample.loss_weight, so only the translator trains on the weighted loss
@@ -185,7 +187,13 @@ class ThinkerFrozenPainterBase(BaseModel):
         X0PredHintConditionEncoder wrapper's hint mechanism, none of which
         can do anything useful without it.
         """
-        return self._encode_with(self.condition_encoder, sample, self.train_cfg.thinker_sees_x0)
+        return self._encode_with(self.condition_encoder, sample, self._sees_x0_now())
+
+    def _sees_x0_now(self) -> Optional[str]:
+        """train_cfg.thinker_sees_x0, except None in eval when only a fraction of training samples read x0."""
+        if self.train_cfg.thinker_x0_prob < 1.0 and not self.training:
+            return None
+        return self.train_cfg.thinker_sees_x0
 
     def _encode_with(self, encoder, sample: DataSample, sees_x0: Optional[str]) -> torch.Tensor:
         """encoder's token embeddings of sample (see _encode_condition); with sees_x0 set, sample.thinker_x0
@@ -228,7 +236,14 @@ class ThinkerFrozenPainterBase(BaseModel):
     def _prepare_sample(self, mb: DataSample, device: torch.device) -> DataSample:
         """painter._prepare_training_sample (which leaves sample.images in the model range), plus thinker_x0."""
         sample = self.painter._prepare_training_sample(mb, device)
-        return self._with_thinker_x0(sample, sample.images, self.train_cfg.thinker_sees_x0)
+        mode = self._sees_x0_now()
+        sample = self._with_thinker_x0(sample, sample.images, mode)
+        if mode is not None and self.train_cfg.thinker_x0_prob < 1.0:
+            own = sample.spatial_conditions if mode == "condition" else sample.x_noisy
+            reads_x0 = torch.rand(own.shape[0], device=own.device) < self.train_cfg.thinker_x0_prob
+            m = reads_x0.view(-1, *[1] * (own.dim() - 1))
+            sample = dataclasses.replace(sample, thinker_x0=torch.where(m, sample.thinker_x0, own))
+        return sample
 
     # ── Core model methods ────────────────────────────────────────────────────
 
@@ -246,8 +261,8 @@ class ThinkerFrozenPainterBase(BaseModel):
 
     def with_eval_thinker_x0(self, sample: DataSample) -> DataSample:
         """An eval sample (dataset-range images) with thinker_x0 set under train_cfg.thinker_sees_x0; unchanged
-        when that is off."""
-        if self.train_cfg.thinker_sees_x0 is None:
+        when that is off (or only a fraction of training samples read x0: eval reads the usual input)."""
+        if self.train_cfg.thinker_sees_x0 is None or self.train_cfg.thinker_x0_prob < 1.0:
             return sample
         if sample.images is None:
             raise ValueError(
