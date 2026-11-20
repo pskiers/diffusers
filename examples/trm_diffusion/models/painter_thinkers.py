@@ -86,6 +86,10 @@ class ThinkerFrozenPainterBase(BaseModel):
         to the thinker through the painter (steering stays on and the translator still
         trains on them).
 
+    train_cfg.thinker_sees_x0: the thinker's condition encoder reads the clean target instead of the condition
+        image ("condition") or of x_t ("x_noisy"), via sample.thinker_x0; the painter's input is unchanged, so a
+        painter that keeps its own condition (not blinded) still never sees the answer. None = off.
+
     train_cfg.steer_grad_unweighted: the thinker's gradient through the painter undoes
         sample.loss_weight, so only the translator trains on the weighted loss
         (PainterResidualTranslator only: the rescale sits after its bridge, whose
@@ -181,7 +185,12 @@ class ThinkerFrozenPainterBase(BaseModel):
         X0PredHintConditionEncoder wrapper's hint mechanism, none of which
         can do anything useful without it.
         """
-        enc_keys = self.condition_encoder.condition_keys
+        return self._encode_with(self.condition_encoder, sample, self.train_cfg.thinker_sees_x0)
+
+    def _encode_with(self, encoder, sample: DataSample, sees_x0: Optional[str]) -> torch.Tensor:
+        """encoder's token embeddings of sample (see _encode_condition); with sees_x0 set, sample.thinker_x0
+        replaces the condition image ("condition") or x_t ("x_noisy") in the encoder's input."""
+        enc_keys = encoder.condition_keys
         primary = getattr(sample, enc_keys[0])
         extra: dict = {"timesteps": sample.timesteps}
         for k in enc_keys[1:]:
@@ -189,9 +198,37 @@ class ThinkerFrozenPainterBase(BaseModel):
                 extra["x_noisy"] = sample.enc_x_noisy if sample.enc_x_noisy is not None else sample.x_noisy
             else:
                 extra[k] = getattr(sample, k)
-        if getattr(self.condition_encoder, "needs_sample", False):
+        if sees_x0 is not None:
+            if sample.thinker_x0 is None:
+                raise ValueError(f"thinker_sees_x0={sees_x0!r} but the sample has no thinker_x0")
+            if sees_x0 == "condition" and enc_keys[0] == "spatial_conditions":
+                primary = sample.thinker_x0
+            elif sees_x0 == "x_noisy" and "x_noisy" in enc_keys[1:]:
+                extra["x_noisy"] = sample.thinker_x0
+            else:
+                raise ValueError(f"thinker_sees_x0={sees_x0!r} does not fit encoder inputs {enc_keys}")
+        if getattr(encoder, "needs_sample", False):
             extra["sample"] = sample
-        return self.condition_encoder(primary, **extra).enc_emb
+        return encoder(primary, **extra).enc_emb
+
+    def _with_thinker_x0(self, sample: DataSample, images: torch.Tensor, sees_x0: Optional[str]) -> DataSample:
+        """sample with thinker_x0 set from the clean target `images` (painter model range), in the space the
+        encoder reads it in: [0, 1] like a condition image ("condition"), model range like x_t ("x_noisy").
+        Unchanged when sees_x0 is None."""
+        if sees_x0 is None:
+            return sample
+        if sees_x0 == "condition":
+            view = self.painter.decode_for_eval(images)
+        elif sees_x0 == "x_noisy":
+            view = images
+        else:
+            raise ValueError(f"thinker_sees_x0 must be 'condition', 'x_noisy' or None, got {sees_x0!r}")
+        return dataclasses.replace(sample, thinker_x0=view)
+
+    def _prepare_sample(self, mb: DataSample, device: torch.device) -> DataSample:
+        """painter._prepare_training_sample (which leaves sample.images in the model range), plus thinker_x0."""
+        sample = self.painter._prepare_training_sample(mb, device)
+        return self._with_thinker_x0(sample, sample.images, self.train_cfg.thinker_sees_x0)
 
     # ── Core model methods ────────────────────────────────────────────────────
 
@@ -205,7 +242,18 @@ class ThinkerFrozenPainterBase(BaseModel):
             val = batch.get(f.name) if hasattr(batch, "get") else None
             if val is not None:
                 kwargs[f.name] = val.to(device) if isinstance(val, torch.Tensor) else val
-        return DataSample(**kwargs)
+        return self.with_eval_thinker_x0(DataSample(**kwargs))
+
+    def with_eval_thinker_x0(self, sample: DataSample) -> DataSample:
+        """An eval sample (dataset-range images) with thinker_x0 set under train_cfg.thinker_sees_x0; unchanged
+        when that is off."""
+        if self.train_cfg.thinker_sees_x0 is None:
+            return sample
+        if sample.images is None:
+            raise ValueError(
+                "thinker_sees_x0 needs the eval samples' target images (CLEVR callbacks: with_target_image=true)"
+            )
+        return self._with_thinker_x0(sample, self.painter.to_model_range(sample.images), self.train_cfg.thinker_sees_x0)
 
     def get_initial_states(self, bsz: int):
         return self.thinker.get_initial_states(bsz)
@@ -555,6 +603,8 @@ class ThinkerFrozenPainterBase(BaseModel):
             updates["enc_x_noisy"] = torch.zeros_like(sample.x_noisy)
         elif sample.enc_x_noisy is not None:
             updates["enc_x_noisy"] = torch.zeros_like(sample.enc_x_noisy)
+        if sample.thinker_x0 is not None:
+            updates["thinker_x0"] = torch.zeros_like(sample.thinker_x0)
         return dataclasses.replace(sample, **updates)
 
     # ── Parameter groups ──────────────────────────────────────────────────────
@@ -611,7 +661,7 @@ class ThinkerFrozenPainterBase(BaseModel):
         """
         result = []
         for mb in micro_batches:
-            sample = self.painter._prepare_training_sample(mb, device)
+            sample = self._prepare_sample(mb, device)
             bsz = sample.x_noisy.shape[0]
             z_H, z_L = self.get_initial_states(bsz)
             result.append({"sample": sample, "z_H": z_H.to(device), "z_L": z_L.to(device)})
@@ -959,7 +1009,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         if self._act_carry is None:
             self._act_carry = []
             for mb in micro_batches:
-                sample = self.painter._prepare_training_sample(mb, device)
+                sample = self._prepare_sample(mb, device)
                 bsz = sample.x_noisy.shape[0]
                 z_H, z_L = self.get_initial_states(bsz)
                 z_H, z_L = z_H.to(device), z_L.to(device)
@@ -989,7 +1039,7 @@ class ThinkerFrozenPainterACT(ThinkerFrozenPainterBase):
         for i, slot in enumerate(self._act_carry):
             prev_halted = slot["halted"]
             if prev_halted is not None and prev_halted.any():
-                fresh_sample = self.painter._prepare_training_sample(micro_batches[i], device)
+                fresh_sample = self._prepare_sample(micro_batches[i], device)
                 bsz = fresh_sample.x_noisy.shape[0]
                 fresh_z_H, fresh_z_L = self.get_initial_states(bsz)
                 fresh_z_H, fresh_z_L = fresh_z_H.to(device), fresh_z_L.to(device)

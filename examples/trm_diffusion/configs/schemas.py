@@ -96,6 +96,11 @@ class TrainConfig:
     # Thinker-frozen-painter models only: load the thinker and condition encoder
     # from this full thinker-stage checkpoint (painter and translator are not).
     thinker_checkpoint: Optional[str] = None
+    # Thinker-frozen-painter models only: the thinker's condition encoder reads the clean
+    # target (a privileged teacher view; the painter's input is unchanged). "condition": the
+    # target in [0, 1] in place of the condition image (Sudoku); "x_noisy": the target in the
+    # painter's model range in place of x_t (CLEVR). None = off.
+    thinker_sees_x0: Optional[str] = None
 
 
 @dataclass

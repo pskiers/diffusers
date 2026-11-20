@@ -25,6 +25,8 @@
 #     painter (experiment=clevr_thinker_mmdit_cnn: objects + x_t through a CNN, every block 0-11 steered, painter
 #     blinded, bf16); _steer<k> steers blocks k-11 only, _bsx<k> = batch 768 -> 768k (256 x 3k), _cond keeps the
 #     painter's own condition; _lr<x> / _wd<x> set the thinker's lr / weight decay (default 1e-4 / 0.3);
+#     _tx0 the thinker's CNN reads the clean target x0 in place of x_t (train.thinker_sees_x0=x_noisy: a
+#     distillation teacher; the painter's input is unchanged);
 #     _tn/_fp32/_act as for the p16 thinkers below
 # Oracle-screen follow-ups (Sudoku, steering from block 1):
 #   mnist_thinker_uncond_tshift  painter conditioning nulled + training t shifted noisy
@@ -94,6 +96,8 @@
 #           _seex0 (the thinker's condition image is the solved image instead of the puzzle, in training and eval:
 #                   can the painter's gradient teach a steering code when the answer is trivial to read?
 #                   painter must stay blinded, so not with _cond)
+#           _tx0 (train.thinker_sees_x0=condition: only the thinker's condition image is the solved image, the
+#                 painter keeps the puzzle, so it works with _cond; blinded it equals _seex0 up to float rounding)
 #           _distA / _distB (mode=thinker_act_distill: trained only to reproduce a frozen `_seex0` teacher's
 #                   steering code through its frozen translator, no painter in training; A = the no-lever seex0
 #                   run @20k, B = the tn2 seex0 run @5k; needs _act before it and the p16_all painter)
@@ -288,6 +292,7 @@ case $RUN in
              TV="${TV}_$tok" ;;
         seex0) STAGE2="$STAGE2 +data.train_dataset.condition_is_solution=true +data.val_dataset.condition_is_solution=true"
                TV="${TV}_$tok" ;;
+        tx0) STAGE2="$STAGE2 +train.thinker_sees_x0=condition"; TV="${TV}_$tok" ;;
         distA) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_A"; TV="${TV}_$tok" ;;
         distB) STAGE2="$STAGE2 mode=thinker_act_distill +train.distill_teacher_checkpoint=$DIST_B"; TV="${TV}_$tok" ;;
         gramch) STAGE2="$STAGE2 +thinker.gram_sigma=channel"; TV="${TV}_$tok" ;;
@@ -312,6 +317,7 @@ case $RUN in
         echo "$RUN: _hidden needs a painter with a condition stream (its hidden states carry the puzzle)" >&2; exit 1; }
       [[ $ISDDPM == 0 && $TV == *_tmax60* ]] && { echo "$RUN: _tmax60 needs a _ddpm or _all painter" >&2; exit 1; }
       [[ $TV == *_seex0* && -z $BLIND ]] && { echo "$RUN: _seex0 with _cond would show the painter the answer" >&2; exit 1; }
+      [[ $TV == *_seex0* && $TV == *_tx0* ]] && { echo "$RUN: _seex0 and _tx0 are two ways to the same input" >&2; exit 1; }
       [[ $TV == *_gram* && $TV != *_act_*gram* ]] && { echo "$RUN: _gram<beta> needs _act before it" >&2; exit 1; }
       [[ $TV == *_gramch* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _gramch needs _gram<beta>" >&2; exit 1; }
       [[ $TV == *_pstate* && $TV != *_gram[0-9]* ]] && { echo "$RUN: _pstate needs _gram<beta>" >&2; exit 1; }
@@ -375,6 +381,9 @@ case $RUN in
         cond) BLIND=""; TV="${TV}_$tok" ;;
         lr[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.lr=${tok#lr}"; TV="${TV}_$tok" ;;
         wd[0-9]*) STAGE2="$STAGE2 thinker.optim_cfg.weight_decay=${tok#wd}"; TV="${TV}_$tok" ;;
+        tx0) STAGE2="$STAGE2 +train.thinker_sees_x0=x_noisy"
+             STAGE2="$STAGE2 +eval_callbacks.0.with_target_image=true +eval_callbacks.1.with_target_image=true"
+             TV="${TV}_$tok" ;;
         *) echo "unknown variant '$tok' in $RUN" >&2; exit 1 ;;
       esac
     done

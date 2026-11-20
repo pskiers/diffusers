@@ -121,6 +121,7 @@ def _train_cfg(cfg: DictConfig) -> TrainConfig:
         translator_checkpoint=tr.get("translator_checkpoint"),
         freeze_translator=bool(tr.get("freeze_translator", False)),
         thinker_checkpoint=tr.get("thinker_checkpoint"),
+        thinker_sees_x0=tr.get("thinker_sees_x0"),
     )
 
 
@@ -244,6 +245,7 @@ def build_model(cfg: DictConfig, scheduler) -> BaseModel:
             ),
             halt_lookahead=bool(cfg.train.get("act_halt_lookahead", True)),
             teacher_checkpoint=str(cfg.train.distill_teacher_checkpoint),
+            teacher_sees_x0=str(cfg.train.get("distill_teacher_sees_x0", "condition")),
         )
 
     if mode == "thinker_act":

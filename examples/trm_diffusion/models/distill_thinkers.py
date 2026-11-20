@@ -38,10 +38,14 @@ class ThinkerFrozenPainterDistillACT(ThinkerFrozenPainterACT):
 
     teacher_checkpoint: a thinker-stage checkpoint of the teacher run; its EMA weights are used for the teacher's
         condition encoder and thinker, and for the translator (weights and bridge statistics) the student uses.
+    teacher_sees_x0: where the teacher read the clean target, as its run's train.thinker_sees_x0: "condition"
+        (default; also the dataset-level `_seex0` teachers, whose condition image was the solved image) or
+        "x_noisy".
     """
 
-    def __init__(self, *args, teacher_checkpoint: str, **kwargs):
+    def __init__(self, *args, teacher_checkpoint: str, teacher_sees_x0: str = "condition", **kwargs):
         super().__init__(*args, **kwargs)
+        self.teacher_sees_x0 = teacher_sees_x0
         ck = torch.load(teacher_checkpoint, map_location="cpu", weights_only=False)
         sd = {**strip_compiled_prefix(ck["model_state"]), **strip_compiled_prefix(ck["ema_state"] or {})}
         self.teacher_encoder = copy.deepcopy(self.condition_encoder)
@@ -83,14 +87,14 @@ class ThinkerFrozenPainterDistillACT(ThinkerFrozenPainterACT):
         return out.transpose(1, 2)
 
     def teacher_sample(self, sample: DataSample) -> DataSample:
-        """The sample as the teacher saw it in training: the solved image in [0, 1] as the condition image."""
-        return dataclasses.replace(sample, spatial_conditions=self.painter.decode_for_eval(sample.images))
+        """The training sample with the clean target as the teacher's encoder read it (sample.thinker_x0)."""
+        return self._with_thinker_x0(sample, sample.images, self.teacher_sees_x0)
 
     @torch.no_grad()
     def teacher_target(self, sample: DataSample) -> torch.Tensor:
         """(B, N, C) the teacher's bridged logits after n_sup reasoning steps from its initial state."""
         ts = self.teacher_sample(sample)
-        enc = self.teacher_encoder(ts.spatial_conditions, x_noisy=ts.x_noisy, timesteps=ts.timesteps).enc_emb
+        enc = self._encode_with(self.teacher_encoder, ts, self.teacher_sees_x0)
         z_H, z_L = self.teacher_thinker.get_initial_states(enc.shape[0])
         z_H, z_L = z_H.to(enc.device), z_L.to(enc.device)
         for _ in range(self.n_sup):

@@ -1,5 +1,6 @@
 # ABOUTME: Tests mode=thinker_act_distill against a real `_seex0` teacher checkpoint: the teacher sees the solved image,
 # ABOUTME: its cached target equals the teacher run's own bridged output, and training moves only the student.
+import dataclasses
 import os
 import sys
 from pathlib import Path
@@ -56,7 +57,8 @@ def test_teacher_input_and_target_match_the_teacher_run():
     s = d["sample"]
     assert torch.equal(s.spatial_conditions.cpu(), raw.spatial_conditions)  # the student reads the puzzle
     ts = model.teacher_sample(s)
-    assert torch.allclose(ts.spatial_conditions.cpu(), raw.images, atol=1e-6)  # the teacher reads the solved image
+    assert torch.allclose(ts.thinker_x0.cpu(), raw.images, atol=1e-6)  # the teacher reads the solved image
+    ts = dataclasses.replace(ts, spatial_conditions=ts.thinker_x0, thinker_x0=None)  # as the `_seex0` run's input
 
     # the teacher run's own model, on the same x_t / t and its own (solved-image) condition
     teacher, _ = _build(_overrides("ov_all_seex0.txt"))

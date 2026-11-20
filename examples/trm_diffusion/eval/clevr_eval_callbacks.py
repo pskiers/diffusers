@@ -63,6 +63,7 @@ def _scene_to_data_sample(
     centroid_mask_presence_only: bool = False,
     mask_size: int = 32,
     H_inv=None,
+    with_target_image: bool = False,
 ) -> DataSample:
     """Build a conditioning-only DataSample (no generated image yet) from a
     scene dict. Mirrors CLEVRHybridDataset.__getitem__'s spatial_conditions
@@ -71,7 +72,8 @@ def _scene_to_data_sample(
     populated here too, or sampling crashes with spatial_conditions=None —
     reveal/centroid-mask are diagnostic (using the scene's ground truth), but
     that ground truth is exactly this scene's known real image/attributes, so
-    it's available here the same way it is during training."""
+    it's available here the same way it is during training. with_target_image adds that real image as
+    `images` (as the dataset's), for thinkers that read the clean target (train.thinker_sees_x0)."""
     scene = dict(scene)
     scene["mode"] = mode
     cond_tensor, mask = make_tensor_from_scene(scene)
@@ -86,7 +88,13 @@ def _scene_to_data_sample(
     elif include_centroid_mask:
         spatial_conditions = make_mask_from_scene(scene, mask_size, H_inv)
 
-    return DataSample(embedding_conditions=cond_tensor[0], embedding_mask=mask[0], spatial_conditions=spatial_conditions)
+    images = None
+    if with_target_image:
+        images = transform(Image.open(os.path.join(image_dir, scene["image_filename"])).convert("RGB"))
+    return DataSample(
+        embedding_conditions=cond_tensor[0], embedding_mask=mask[0], spatial_conditions=spatial_conditions,
+        images=images,
+    )
 
 
 def _generate_images(model, samples: list[DataSample], device: torch.device) -> torch.Tensor:
@@ -97,6 +105,8 @@ def _generate_images(model, samples: list[DataSample], device: torch.device) -> 
         chunk = samples[start : start + pipeline.batch_size]
         with torch.no_grad():
             batch = collate_data_samples(chunk).to(device)
+            if hasattr(model, "with_eval_thinker_x0"):
+                batch = model.with_eval_thinker_x0(batch)
             latents = pipeline.sample_one_batch(model, batch, device)
         imgs.append(model.decode_for_eval(latents))
     return torch.cat(imgs, dim=0)
@@ -120,6 +130,8 @@ class ClevrImageLogCallback(EvalCallbackBase):
             must match the same-named data.* config keys whenever the bound
             condition encoder needs spatial_conditions (reveal/centroid-mask
             variants) — otherwise generation crashes on spatial_conditions=None.
+        with_target_image: give each scene's real image as `images` (thinkers with
+            train.thinker_sees_x0 read it at eval).
     """
 
     def __init__(
@@ -135,6 +147,7 @@ class ClevrImageLogCallback(EvalCallbackBase):
         include_centroid_mask: bool = False,
         centroid_mask_presence_only: bool = False,
         image_size: int = 256,
+        with_target_image: bool = False,
     ):
         self._mode = mode
         scenes = _load_scenes(root_dir, split, min_objects, max_objects)
@@ -161,6 +174,7 @@ class ClevrImageLogCallback(EvalCallbackBase):
                 centroid_mask_presence_only=centroid_mask_presence_only,
                 mask_size=image_size // 8,
                 H_inv=H_inv,
+                with_target_image=with_target_image,
             )
             for s in selected
         ]
@@ -208,6 +222,8 @@ class ClevrMetricsCallback(EvalCallbackBase):
             must match the same-named data.* config keys whenever the bound
             condition encoder needs spatial_conditions (reveal/centroid-mask
             variants) — otherwise generation crashes on spatial_conditions=None.
+        with_target_image: give each scene's real image as `images` (thinkers with
+            train.thinker_sees_x0 read it at eval).
     """
 
     def __init__(
@@ -223,6 +239,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
         include_centroid_mask: bool = False,
         centroid_mask_presence_only: bool = False,
         image_size: int = 256,
+        with_target_image: bool = False,
     ):
         self._root_dir = root_dir
         self._mode = mode
@@ -235,6 +252,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
         self._include_centroid_mask = include_centroid_mask
         self._centroid_mask_presence_only = centroid_mask_presence_only
         self._image_size = image_size
+        self._with_target_image = with_target_image
 
         # Lazy-loaded on first main-process call.
         self._scenes: Optional[list] = None
@@ -306,6 +324,7 @@ class ClevrMetricsCallback(EvalCallbackBase):
                 centroid_mask_presence_only=self._centroid_mask_presence_only,
                 mask_size=self._image_size // 8,
                 H_inv=self._H_inv,
+                with_target_image=self._with_target_image,
             )
             for s in selected
         ]

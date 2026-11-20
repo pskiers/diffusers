@@ -79,6 +79,12 @@ class DataSample:
     the encoder sees no noisy information while the painter still denoises
     the real ``x_noisy``."""
 
+    thinker_x0: Optional[Tensor] = None
+    """The clean target in the painter's model range, read only by a thinker's condition
+    encoder under ``train.thinker_sees_x0`` (a privileged teacher view). Shape matches
+    ``images``. Set at runtime by ThinkerFrozenPainterBase, never stored in a dataset and
+    never read by the painter."""
+
     timesteps: Optional[Tensor] = None
     """Diffusion timestep t sampled for this example.  Shape: (), dtype long
     (float in [0, 1] for flow-matching painters, e.g. MiniT2I).
